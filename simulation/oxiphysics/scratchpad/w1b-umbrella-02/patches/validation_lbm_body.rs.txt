@@ -1,0 +1,525 @@
+
+//! Phase 21.3 validation of the D3Q19 lattice Boltzmann solver, driven through its public API.
+//!
+//! Every test advances a [`D3q19Simulation`] with the library's own operators (`step`, `step_mrt`,
+//! `step_trt`, `collide`, `stream`, `apply_wall_bounce_back_y`, `apply_moving_wall_correction`):
+//! no collision operator, opposite-direction table or boundary condition is re-implemented here,
+//! so a defect in any of them shows up in the physics below.
+//!
+//! * **Poiseuille channel** (4 x 21 x 4 nodes, `tau = 0.8`, body force `1e-6`): the steady profile
+//!   of the force-driven flow between two on-node bounce-back walls must be the parabola
+//!   `u(y) = F / (2 nu) (y - 1/2) (H - y + 1/2)`, `H = ny - 2` (the no-slip planes lie half-way
+//!   between a wall row and the first fluid row). BGK is held to 2 %, the TRT scheme with the
+//!   "magic" parameter 3/16 places the half-way wall exactly and must be parabolic to 1e-4, MRT to
+//!   1 %. The two ways of reflecting the wall rows (`step()` on flagged solid rows and the
+//!   explicit `collide; stream; apply_wall_bounce_back_y` loop) must agree bit for bit.
+//! * **Beltrami vortex decay** (32^3 periodic box): the Arnold-Beltrami-Childress flow
+//!   `u = U (sin kz + cos ky, sin kx + cos kz, sin ky + cos kx)` has `curl u = k u`, so its
+//!   convective term is a pure gradient and it is an *exact* solution of the three-dimensional
+//!   Navier-Stokes equations, decaying as `exp(-nu k^2 t)` (kinetic energy as
+//!   `exp(-2 nu k^2 t)`). The classical 3-D Taylor-Green vortex is not: its nonlinear term
+//!   generates further modes, which would blur the check of the viscosity. The viscosity read off
+//!   the kinetic-energy decay must match `nu = (tau - 1/2) / 3` within 1 % for BGK, MRT (with the
+//!   non-uniform Lallemand-Luo rates, where only the shear moments carry the viscosity) and TRT.
+//! * **Lid-driven cavity** (Re = 100, `24 x 24` fluid cells, periodic in `z`): a flow that does not
+//!   depend on `z`, so the Ghia, Ghia & Shin (1982) centreline profile of the two-dimensional
+//!   cavity applies. The walls are on-node bounce-back at the library's solid nodes, the lid is
+//!   the library's moving-wall correction, the flow is run to a steady state (the test fails if
+//!   it does not converge) and compared with the Ghia table. A cavity closed in `z` is *not*
+//!   comparable with those two-dimensional data.
+//!
+//! The tests are cheap enough to run with the normal test suite.
+
+use oxiphysics::lbm::d3q19_full::D3q19Simulation;
+use oxiphysics::lbm::mrt3d::MrtRelaxationParams;
+
+/// Kinematic viscosity `nu = cs^2 (tau - 1/2)` of the BGK relaxation time `tau` (`cs^2 = 1/3`).
+/// The TRT scheme (`omega_plus = 1 / tau`) and the shear moments of the MRT scheme realise the
+/// same viscosity.
+fn kinematic_viscosity(tau: f64) -> f64 {
+    (tau - 0.5) / 3.0
+}
+
+/// Flat node index `x + y nx + z nx ny` of the library's population layout.
+fn node(sim: &D3q19Simulation, x: usize, y: usize, z: usize) -> usize {
+    x + y * sim.nx + z * sim.nx * sim.ny
+}
+
+/// The collision operators of the library under test.
+#[derive(Clone, Copy, Debug)]
+enum Operator {
+    /// Single relaxation time, `D3q19Simulation::step`.
+    Bgk,
+    /// Multiple relaxation time with the Lallemand-Luo rates, `D3q19Simulation::step_mrt`.
+    Mrt,
+    /// Two relaxation times with the magic parameter 3/16, `D3q19Simulation::step_trt`.
+    Trt,
+}
+
+/// One collision operator with its relaxation parameters for the BGK relaxation time `tau`.
+struct Scheme {
+    operator: Operator,
+    mrt_rates: [f64; 19],
+    omega_plus: f64,
+    omega_minus: f64,
+}
+
+impl Scheme {
+    fn new(operator: Operator, tau: f64) -> Self {
+        let omega_plus = 1.0 / tau;
+        Self {
+            operator,
+            // Only the shear moments are set by the viscosity; the energy, energy-flux and ghost
+            // moments relax at their own rates (1.19, 1.4, 1.2, 1.98).
+            mrt_rates: MrtRelaxationParams::from_viscosity(kinematic_viscosity(tau)).s,
+            omega_plus,
+            omega_minus: D3q19Simulation::optimal_omega_minus(omega_plus),
+        }
+    }
+
+    /// One step of the library: collision, periodic streaming, bounce-back at the solid nodes.
+    fn step(&self, sim: &mut D3q19Simulation) {
+        match self.operator {
+            Operator::Bgk => sim.step(),
+            Operator::Mrt => sim.step_mrt(&self.mrt_rates),
+            Operator::Trt => sim.step_trt(self.omega_plus, self.omega_minus),
+        }
+    }
+}
+
+/// Total mass `sum f_i` over all nodes (solid nodes included: their populations are only
+/// permuted by the bounce-back).
+fn total_mass(sim: &D3q19Simulation) -> f64 {
+    sim.f.iter().sum()
+}
+
+// ---------------------------------------------------------------------------
+// Force-driven Poiseuille channel
+// ---------------------------------------------------------------------------
+
+const CHANNEL_NX: usize = 4;
+const CHANNEL_NY: usize = 21;
+const CHANNEL_NZ: usize = 4;
+const CHANNEL_TAU: f64 = 0.8;
+const CHANNEL_FORCE: f64 = 1.0e-6;
+/// Time scale of the slowest mode is `H^2 / (pi^2 nu) = 366` steps: 8000 steps are 22 e-folds.
+const CHANNEL_STEPS: usize = 8_000;
+/// Extra steps used to prove that the profile is steady.
+const CHANNEL_STEADY_CHECK_STEPS: usize = 500;
+
+/// Channel with solid wall rows at `y = 0` and `y = ny - 1` driven by the body force along `x`.
+fn new_channel() -> D3q19Simulation {
+    let mut sim = D3q19Simulation::new(CHANNEL_NX, CHANNEL_NY, CHANNEL_NZ, CHANNEL_TAU);
+    sim.setup_poiseuille_channel(CHANNEL_FORCE);
+    sim
+}
+
+/// Analytic profile on the fluid rows `y = 1 ..= ny - 2`.
+fn analytic_channel_profile() -> Vec<f64> {
+    let nu = kinematic_viscosity(CHANNEL_TAU);
+    let gap = (CHANNEL_NY - 2) as f64;
+    (1..CHANNEL_NY - 1)
+        .map(|row| {
+            let distance = row as f64 - 0.5;
+            CHANNEL_FORCE / (2.0 * nu) * distance * (gap - distance)
+        })
+        .collect()
+}
+
+/// `u_x` over the fluid rows of the column `(x, z)`.
+fn channel_profile(sim: &D3q19Simulation, x: usize, z: usize) -> Vec<f64> {
+    (1..CHANNEL_NY - 1)
+        .map(|y| sim.macroscopic(node(sim, x, y, z)).1[0])
+        .collect()
+}
+
+/// `|a - b|_2 / |b|_2`.
+fn relative_l2_error(measured: &[f64], reference: &[f64]) -> f64 {
+    let difference: f64 = measured
+        .iter()
+        .zip(reference)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum();
+    let norm: f64 = reference.iter().map(|b| b * b).sum();
+    (difference / norm).sqrt()
+}
+
+/// Largest absolute difference of two equally long slices.
+fn max_difference(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// Check the profile of a developed channel against the parabola, and that it is steady, uniform
+/// along the periodic directions and free of cross flow. Returns the relative L2 error.
+fn check_channel(sim: &mut D3q19Simulation, scheme: &Scheme, label: &str) -> f64 {
+    let analytic = analytic_channel_profile();
+    let u_max = analytic.iter().copied().fold(0.0, f64::max);
+    let profile = channel_profile(sim, 1, 1);
+
+    // Homogeneity along x and z and absence of cross flow.
+    for z in 0..CHANNEL_NZ {
+        for x in 0..CHANNEL_NX {
+            let column = channel_profile(sim, x, z);
+            assert!(
+                max_difference(&column, &profile) < 1e-12 * u_max,
+                "{label}: column ({x}, {z}) differs from column (1, 1)"
+            );
+            for y in 1..CHANNEL_NY - 1 {
+                let u = sim.macroscopic(node(sim, x, y, z)).1;
+                assert!(
+                    u[1].abs() < 1e-12 * u_max && u[2].abs() < 1e-12 * u_max,
+                    "{label}: cross flow {u:?} at ({x}, {y}, {z})"
+                );
+            }
+        }
+    }
+
+    // Steady state: 500 more steps do not move the profile.
+    for _ in 0..CHANNEL_STEADY_CHECK_STEPS {
+        scheme.step(sim);
+    }
+    let later = channel_profile(sim, 1, 1);
+    assert!(
+        max_difference(&later, &profile) < 1e-10 * u_max,
+        "{label}: profile still changing by {:.3e} (u_max = {u_max:.3e})",
+        max_difference(&later, &profile)
+    );
+    relative_l2_error(&later, &analytic)
+}
+
+#[test]
+fn poiseuille_channel_with_library_bgk_matches_the_analytic_profile() {
+    let scheme = Scheme::new(Operator::Bgk, CHANNEL_TAU);
+    let mut with_step = new_channel();
+    let mut with_wall_loop = new_channel();
+    for _ in 0..CHANNEL_STEPS {
+        // `step()` reflects the flagged wall rows through `apply_bounce_back` ...
+        with_step.step();
+        // ... the explicit loop through `apply_wall_bounce_back_y`. (Calling both on the same
+        // step would swap the populations twice and cancel the wall.)
+        with_wall_loop.collide();
+        with_wall_loop.stream();
+        with_wall_loop.apply_wall_bounce_back_y();
+    }
+    assert!(
+        with_step.f == with_wall_loop.f,
+        "the two wall bounce-back paths of the library disagree"
+    );
+
+    let l2 = check_channel(&mut with_step, &scheme, "BGK");
+    assert!(l2 < 0.02, "BGK profile: relative L2 error {l2:.3e}");
+}
+
+#[test]
+fn poiseuille_channel_with_library_trt_is_parabolic_to_round_off() {
+    let scheme = Scheme::new(Operator::Trt, CHANNEL_TAU);
+    let mut sim = new_channel();
+    for _ in 0..CHANNEL_STEPS {
+        scheme.step(&mut sim);
+    }
+    let l2 = check_channel(&mut sim, &scheme, "TRT");
+    assert!(l2 < 1e-4, "TRT profile: relative L2 error {l2:.3e}");
+}
+
+#[test]
+fn poiseuille_channel_with_library_mrt_matches_the_analytic_profile() {
+    let scheme = Scheme::new(Operator::Mrt, CHANNEL_TAU);
+    let mut sim = new_channel();
+    for _ in 0..CHANNEL_STEPS {
+        scheme.step(&mut sim);
+    }
+    let l2 = check_channel(&mut sim, &scheme, "MRT");
+    assert!(l2 < 0.01, "MRT profile: relative L2 error {l2:.3e}");
+}
+
+// ---------------------------------------------------------------------------
+// Decay of an exact three-dimensional vortex flow
+// ---------------------------------------------------------------------------
+
+const VORTEX_N: usize = 32;
+const VORTEX_TAU: f64 = 0.8;
+const VORTEX_AMPLITUDE: f64 = 0.01;
+/// Kinetic energy is sampled after these many steps (the first window lets the start-up
+/// transient of the equilibrium initial condition die out).
+const VORTEX_SAMPLES: [usize; 3] = [20, 120, 220];
+
+/// Arnold-Beltrami-Childress flow with `A = B = C = 1`: `curl u = k u`.
+fn beltrami_velocity(position: [usize; 3], wavenumber: f64) -> [f64; 3] {
+    let [x, y, z] = position.map(|c| wavenumber * c as f64);
+    [
+        VORTEX_AMPLITUDE * (z.sin() + y.cos()),
+        VORTEX_AMPLITUDE * (x.sin() + z.cos()),
+        VORTEX_AMPLITUDE * (y.sin() + x.cos()),
+    ]
+}
+
+/// Momentum `sum rho u` of the whole box.
+fn total_momentum(sim: &D3q19Simulation) -> [f64; 3] {
+    let mut momentum = [0.0; 3];
+    for k in 0..sim.nx * sim.ny * sim.nz {
+        let (rho, u) = sim.macroscopic(k);
+        for (total, component) in momentum.iter_mut().zip(u) {
+            *total += rho * component;
+        }
+    }
+    momentum
+}
+
+/// Run the vortex with `operator` and check the viscosity read off the kinetic-energy decay.
+fn check_vortex_viscosity(operator: Operator) {
+    let n = VORTEX_N;
+    let wavenumber = std::f64::consts::TAU / n as f64;
+    let scheme = Scheme::new(operator, VORTEX_TAU);
+    let mut sim = D3q19Simulation::new(n, n, n, VORTEX_TAU);
+    sim.init_with_velocity(1.0, |x, y, z| beltrami_velocity([x, y, z], wavenumber));
+    let mass = total_mass(&sim);
+    let initial_energy = sim.total_kinetic_energy();
+    assert!(initial_energy > 0.0);
+
+    let mut energies = Vec::new();
+    let mut step = 0;
+    for &sample in &VORTEX_SAMPLES {
+        while step < sample {
+            scheme.step(&mut sim);
+            step += 1;
+        }
+        energies.push(sim.total_kinetic_energy());
+    }
+
+    // KE ~ exp(-2 nu k^2 t) for the Beltrami flow, whose velocity decays as exp(-nu k^2 t).
+    let nu = kinematic_viscosity(VORTEX_TAU);
+    for (window, pair) in energies.windows(2).zip(VORTEX_SAMPLES.windows(2)) {
+        let elapsed = (pair[1] - pair[0]) as f64;
+        let measured = (window[0] / window[1]).ln() / (2.0 * wavenumber * wavenumber * elapsed);
+        let error = (measured / nu - 1.0).abs();
+        assert!(
+            error < 0.01,
+            "{operator:?}: steps {}..{}: nu = {measured:.6} vs {nu:.6} ({:.3} %)",
+            pair[0],
+            pair[1],
+            100.0 * error
+        );
+    }
+
+    // Mass and momentum are conserved by every operator.
+    assert!(
+        (total_mass(&sim) - mass).abs() < 1e-10 * mass,
+        "{operator:?}: mass {} -> {}",
+        mass,
+        total_mass(&sim)
+    );
+    let momentum = total_momentum(&sim);
+    assert!(
+        momentum.iter().all(|p| p.abs() < 1e-9),
+        "{operator:?}: net momentum {momentum:?}"
+    );
+}
+
+#[test]
+fn beltrami_vortex_decays_with_the_bgk_viscosity() {
+    check_vortex_viscosity(Operator::Bgk);
+}
+
+#[test]
+fn beltrami_vortex_decays_with_the_mrt_viscosity() {
+    check_vortex_viscosity(Operator::Mrt);
+}
+
+#[test]
+fn beltrami_vortex_decays_with_the_trt_viscosity() {
+    check_vortex_viscosity(Operator::Trt);
+}
+
+// ---------------------------------------------------------------------------
+// Lid-driven cavity, Re = 100
+// ---------------------------------------------------------------------------
+
+/// Ghia, Ghia & Shin (1982), Table I, `Re = 100`: `(y/L, u/u_lid)` along the vertical centreline.
+/// Mirrors `crates/oxiphysics/tests/regression_baselines/lbm_ghia_re100_u_midline.json`.
+const GHIA_RE100: [(f64, f64); 17] = [
+    (1.0000, 1.00000),
+    (0.9766, 0.84123),
+    (0.9688, 0.78871),
+    (0.9609, 0.73722),
+    (0.9531, 0.68717),
+    (0.8516, 0.23151),
+    (0.7344, 0.00332),
+    (0.6172, -0.13641),
+    (0.5000, -0.20581),
+    (0.4531, -0.21090),
+    (0.2813, -0.15662),
+    (0.1719, -0.10150),
+    (0.1016, -0.06434),
+    (0.0703, -0.04775),
+    (0.0625, -0.04192),
+    (0.0547, -0.03717),
+    (0.0000, 0.00000),
+];
+
+/// Fluid cells per side. The no-slip planes lie half-way between the solid wall nodes and the
+/// first fluid nodes, so the cavity is exactly `CAVITY_N` lattice units wide.
+const CAVITY_N: usize = 24;
+/// Periodic depth: the flow does not depend on `z`.
+const CAVITY_NZ: usize = 3;
+const LID_VELOCITY: f64 = 0.1;
+const REYNOLDS: f64 = 100.0;
+const CAVITY_MAX_STEPS: usize = 20_000;
+const CAVITY_CHECK_INTERVAL: usize = 250;
+/// Steady when the centreline profile moves by less than this (in `u_lid`) per check interval.
+const CAVITY_CONVERGENCE: f64 = 1.0e-6;
+/// Largest admitted deviation from the Ghia table in units of `u_lid`. The grid is coarse (24
+/// cells): the measured deviations are 0.4 % (TRT) to 1 % (BGK, MRT) of `u_lid`.
+const GHIA_TOLERANCE: f64 = 0.02;
+
+/// Relaxation time of the cavity: `nu = u_lid L / Re`.
+fn cavity_tau() -> f64 {
+    3.0 * LID_VELOCITY * CAVITY_N as f64 / REYNOLDS + 0.5
+}
+
+/// Cavity with solid walls on the four sides and the flat list of lid nodes (the interior of the
+/// top row; the two corner nodes stay at rest).
+fn new_cavity() -> (D3q19Simulation, Vec<usize>) {
+    let (nx, ny, nz) = (CAVITY_N + 2, CAVITY_N + 2, CAVITY_NZ);
+    let mut sim = D3q19Simulation::new(nx, ny, nz, cavity_tau());
+    let mut lid = Vec::new();
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let k = node(&sim, x, y, z);
+                if x == 0 || x == nx - 1 || y == 0 || y == ny - 1 {
+                    sim.solid[k] = true;
+                }
+                if y == ny - 1 && x > 0 && x < nx - 1 {
+                    lid.push(k);
+                }
+            }
+        }
+    }
+    (sim, lid)
+}
+
+/// Cubic Lagrange interpolation through the four nodes of the uniform grid `nodes` that enclose
+/// `at`.
+fn lagrange_interpolate(nodes: &[f64], values: &[f64], at: f64) -> f64 {
+    const POINTS: usize = 4;
+    let upper = nodes.partition_point(|&s| s < at);
+    let start = upper.saturating_sub(POINTS / 2).min(nodes.len() - POINTS);
+    let window = start..start + POINTS;
+    window
+        .clone()
+        .map(|a| {
+            let weight: f64 = window
+                .clone()
+                .filter(|&b| b != a)
+                .map(|b| (at - nodes[b]) / (nodes[a] - nodes[b]))
+                .product();
+            values[a] * weight
+        })
+        .sum()
+}
+
+/// `u_x / u_lid` on the vertical centreline `x = L/2` at the centres of the fluid rows. Fluid
+/// node `i` (1-based) sits at `(i - 1/2) / L`.
+fn centreline_profile(sim: &D3q19Simulation) -> Vec<f64> {
+    let z = CAVITY_NZ / 2;
+    let positions: Vec<f64> = (1..=CAVITY_N)
+        .map(|i| (i as f64 - 0.5) / CAVITY_N as f64)
+        .collect();
+    (1..=CAVITY_N)
+        .map(|y| {
+            let across: Vec<f64> = (1..=CAVITY_N)
+                .map(|x| sim.macroscopic(node(sim, x, y, z)).1[0])
+                .collect();
+            lagrange_interpolate(&positions, &across, 0.5) / LID_VELOCITY
+        })
+        .collect()
+}
+
+/// Run the cavity with `operator` until the centreline profile is steady and compare it with
+/// the Ghia table.
+fn check_cavity(operator: Operator) {
+    let (mut sim, lid) = new_cavity();
+    let scheme = Scheme::new(operator, cavity_tau());
+    let mass = total_mass(&sim);
+
+    let mut previous = centreline_profile(&sim);
+    let mut change = f64::INFINITY;
+    let mut steps = 0;
+    while steps < CAVITY_MAX_STEPS && change >= CAVITY_CONVERGENCE {
+        for _ in 0..CAVITY_CHECK_INTERVAL {
+            scheme.step(&mut sim);
+            sim.apply_moving_wall_correction(&lid, [LID_VELOCITY, 0.0, 0.0], 1.0);
+        }
+        steps += CAVITY_CHECK_INTERVAL;
+        let current = centreline_profile(&sim);
+        change = max_difference(&current, &previous);
+        previous = current;
+    }
+    assert!(
+        change < CAVITY_CONVERGENCE,
+        "{operator:?}: cavity not steady after {steps} steps (profile still moving by {change:.3e} u_lid)"
+    );
+
+    // Centreline profile against Ghia et al.
+    let rows: Vec<f64> = (1..=CAVITY_N)
+        .map(|i| (i as f64 - 0.5) / CAVITY_N as f64)
+        .collect();
+    let mut worst = (0.0_f64, 0.0_f64);
+    for &(station, reference) in GHIA_RE100.iter().filter(|(s, _)| *s > 0.0 && *s < 1.0) {
+        let measured = lagrange_interpolate(&rows, &previous, station);
+        let deviation = (measured - reference).abs();
+        if deviation > worst.0 {
+            worst = (deviation, station);
+        }
+        assert!(
+            deviation <= GHIA_TOLERANCE,
+            "{operator:?}: y/L = {station}: u/u_lid = {measured:.5} vs Ghia {reference:.5} \
+             (deviation {deviation:.4}, tolerance {GHIA_TOLERANCE})"
+        );
+    }
+    assert!(
+        worst.0 > 1e-4,
+        "{operator:?}: suspiciously perfect agreement with the Ghia table ({worst:?})"
+    );
+
+    // The flow is two-dimensional: no dependence on z, no flow along z.
+    for y in 1..=CAVITY_N {
+        for x in 1..=CAVITY_N {
+            let (_, reference) = sim.macroscopic(node(&sim, x, y, 0));
+            for z in 0..CAVITY_NZ {
+                let (rho, u) = sim.macroscopic(node(&sim, x, y, z));
+                assert!(
+                    (u[0] - reference[0]).abs() < 1e-10 && (u[1] - reference[1]).abs() < 1e-10,
+                    "{operator:?}: flow depends on z at ({x}, {y}, {z})"
+                );
+                assert!(u[2].abs() < 1e-10, "{operator:?}: u_z = {} at ({x}, {y}, {z})", u[2]);
+                assert!(rho > 0.8 && rho < 1.2, "{operator:?}: density {rho}");
+            }
+        }
+    }
+
+    // The lid injects no net mass.
+    assert!(
+        (total_mass(&sim) - mass).abs() < 1e-9 * mass,
+        "{operator:?}: mass {} -> {}",
+        mass,
+        total_mass(&sim)
+    );
+
+    // The primary vortex: the lid drags the top layer along +x and the return flow runs along
+    // -x below the centre.
+    assert!(previous[CAVITY_N - 1] > 0.5 && previous[CAVITY_N / 2 - 1] < -0.1);
+}
+
+#[test]
+fn lid_driven_cavity_re100_with_library_bgk_matches_ghia() {
+    check_cavity(Operator::Bgk);
+}
+
+#[test]
+fn lid_driven_cavity_re100_with_library_trt_matches_ghia() {
+    check_cavity(Operator::Trt);
+}

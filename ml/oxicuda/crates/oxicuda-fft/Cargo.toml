@@ -1,0 +1,47 @@
+[package]
+name = "oxicuda-fft"
+description = "OxiCUDA FFT - GPU-accelerated FFT operations (cuFFT equivalent)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "fft", "gpu", "signal-processing", "fourier"]
+categories = ["mathematics", "science", "hardware-support"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+oxicuda-memory.workspace = true
+oxicuda-launch.workspace = true
+oxicuda-ptx.workspace = true
+oxicuda-blas.workspace = true
+num-complex.workspace = true
+thiserror.workspace = true
+
+[features]
+f16 = ["dep:half", "oxicuda-blas/f16"]
+# On-device GPU validation of generated PTX kernels. Enables the `gpu_tests`
+# module (requires a live CUDA device at test time; tests skip gracefully when
+# none is present). The infra crates (`oxicuda-driver`/`-memory`/`-launch`) are
+# already normal dependencies, so no extra dev-dependencies are needed.
+gpu-tests = []
+
+[dependencies.half]
+workspace = true
+optional = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "fft_throughput"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

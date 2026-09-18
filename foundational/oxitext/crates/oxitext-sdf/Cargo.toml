@@ -1,0 +1,29 @@
+[package]
+name = "oxitext-sdf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Signed-distance-field glyph atlas generation for OxiText"
+keywords = ["sdf", "glyph", "distance-field", "typography", "cooljapan"]
+categories = ["graphics", "rendering", "text-processing"]
+
+[features]
+default = []
+sdf = []   # activates the public SDF API (marker feature; all symbols public by default)
+simd = ["dep:wide"]
+
+[dependencies]
+# `png-encode` provides `SdfAtlas::export_png` / `MsdfAtlas::export_png` without
+# the `png` crate, which would drag in the `deny.toml`-banned flate2/miniz_oxide.
+oxitext-core   = { workspace = true, features = ["png-encode"] }
+oxitext-raster = { workspace = true }
+ttf-parser     = { workspace = true }
+rayon          = { workspace = true }
+wide           = { workspace = true, optional = true }
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["oxitext-raster"]

@@ -1,0 +1,108 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxihuman",
+    "crates/oxihuman-core",
+    "crates/oxihuman-morph",
+    "crates/oxihuman-mesh",
+    "crates/oxihuman-export",
+    "crates/oxihuman-wasm",
+    "crates/oxihuman-viewer",
+    "crates/oxihuman-physics",
+    "crates/oxihuman-cli",
+    "crates/oxihuman-tests",
+    "crates/oxihuman-test-utils",
+]
+
+[workspace.package]
+version       = "0.2.2"
+edition       = "2021"
+authors       = ["COOLJAPAN OU (Team KitaSan)"]
+license       = "Apache-2.0"
+repository    = "https://github.com/cool-japan/oxihuman"
+homepage      = "https://github.com/cool-japan/oxihuman"
+documentation = "https://docs.rs/oxihuman-core"
+description   = "Privacy-first, client-side parametric human body generator in pure Rust — MakeHuman-compatible independent implementation (reads .target/.mhclo formats)"
+
+[workspace.dependencies]
+# Error handling
+anyhow      = "1.0.103"
+thiserror   = "2.0.18"
+
+# Serialization
+serde       = { version = "1.0.228", features = ["derive"] }
+serde_json  = "1.0.150"
+toml        = "1.1.2"
+
+# Crypto (asset integrity)
+sha2        = "0.11"
+hex         = "0.4.3"
+
+# Font rendering (Pure Rust)
+fontdue     = "0.9.3"
+
+# Byte casting for GLB binary output
+bytemuck    = { version = "1.25.0", features = ["derive"] }
+
+# Pure-Rust portable SIMD (wide::f32x4 etc.) — enabled via oxihuman-morph's `simd` feature
+wide        = "1.5.0"
+
+# zlib compression for FBX binary array encoding (COOLJAPAN: use oxiarc-deflate, not miniz_oxide)
+oxiarc-deflate = "0.4.2"
+
+# ZIP archive container reading/writing (COOLJAPAN: use oxiarc-archive, not the `zip` crate)
+oxiarc-archive = "0.4.2"
+
+# PNG encode/decode (Pure Rust)
+zune-png    = "0.5.2"
+zune-core   = "0.5.1"
+
+# WASM / browser support (non-optional in workspace; mark optional per-crate)
+wasm-bindgen            = "0.2.126"
+console_error_panic_hook = "0.1.7"
+
+# Async runtime (TCP networking)
+tokio       = { version = "1.52.3", features = ["rt", "rt-multi-thread", "net", "time", "io-util"] }
+
+# Parallelism
+rayon       = "1.12.0"
+
+# GPU rendering (optional; used by oxihuman-viewer)
+pollster = "0.4"
+wgpu     = "29"
+winit    = "0.30"
+
+# Testing
+criterion   = { version = "0.8.2", features = ["html_reports"] }
+proptest    = "1.11.0"
+
+# Intra-workspace
+oxihuman         = { path = "crates/oxihuman",         version = "0.2.2" }
+oxihuman-core    = { path = "crates/oxihuman-core",    version = "0.2.2" }
+oxihuman-morph   = { path = "crates/oxihuman-morph",   version = "0.2.2" }
+oxihuman-mesh    = { path = "crates/oxihuman-mesh",    version = "0.2.2" }
+oxihuman-export  = { path = "crates/oxihuman-export",  version = "0.2.2" }
+oxihuman-physics = { path = "crates/oxihuman-physics", version = "0.2.2" }
+oxihuman-viewer  = { path = "crates/oxihuman-viewer",  version = "0.2.2" }
+oxihuman-wasm    = { path = "crates/oxihuman-wasm",    version = "0.2.2" }
+oxihuman-cli      = { path = "crates/oxihuman-cli",       version = "0.2.2" }
+oxihuman-test-utils = { path = "crates/oxihuman-test-utils" }
+
+[workspace.lints.rust]
+dead_code = "allow"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+
+# Release profile tuned primarily for the oxihuman-wasm build's gzip'd
+# size budget (see crates/oxihuman-wasm/wasm-opt.toml's `wasm_gzip_budget_bytes`
+# and the "Gzip size gate" step in .github/workflows/npm-publish.yml).
+# Cargo profiles are workspace-wide (not per-target-triple on stable), so
+# this also applies opt-level="z" to native release builds (CLI/viewer/
+# physics); if that ever regresses native perf unacceptably, split it out
+# via a package-specific `[profile.release.package.oxihuman-wasm]` override
+# instead of reverting this section.
+[profile.release]
+opt-level = "z"      # Optimize for size (matches crates/oxihuman-wasm/wasm-opt.toml intent)
+lto = true            # Link-time optimization
+codegen-units = 1     # Single codegen unit for better optimization

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "oxiephemeris"
+description = "Pure Rust astrology/ephemeris engine — natal charts, synastry, transits, progressions, composites, and Linked Open Data (RDF/SKOS/PROV-O) output"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "COOLJAPAN OU (Team Kitasan)" }]
+keywords = ["astrology", "ephemeris", "chart", "natal", "synastry", "rdf"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "License :: OSI Approved :: Apache Software License",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/cool-japan/oxiephemeris"
+
+[tool.maturin]
+# A pure-Rust extension module: maturin builds a single `oxiephemeris`
+# native module. (Type stubs live in ./python/oxiephemeris/*.pyi for
+# reference and can be shipped later via a mixed layout.)
+manifest-path = "Cargo.toml"
+module-name = "oxiephemeris"
+features = ["pyo3/extension-module"]

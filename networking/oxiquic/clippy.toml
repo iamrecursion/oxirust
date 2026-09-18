@@ -1,0 +1,7 @@
+# OxiQUIC clippy configuration.
+#
+# Pins the MSRV so msrv-aware lints (e.g. `clippy::manual_let_else`,
+# `clippy::manual_strip`) do not suggest constructs unavailable on the
+# workspace's declared minimum toolchain. Must track `rust-version` in the
+# root `Cargo.toml`'s `[workspace.package]`.
+msrv = "1.85"

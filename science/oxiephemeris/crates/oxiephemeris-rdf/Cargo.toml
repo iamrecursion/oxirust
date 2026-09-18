@@ -1,0 +1,24 @@
+[package]
+name = "oxiephemeris-rdf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: Linked Open Data layer — RDF graphs, SKOS vocabulary, and PROV-O provenance for astrological charts"
+keywords = ["rdf", "skos", "linked-data", "astrology", "provenance"]
+categories = ["science", "data-structures"]
+
+[dependencies]
+oxiephemeris-astro = { workspace = true, features = ["std"] }
+oxrdf.workspace = true
+oxttl.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

@@ -1,0 +1,28 @@
+[package]
+name = "oxixml-xpath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XPath 1.0/2.0/3.1 engine (replaces Apache Xalan XPath)."
+keywords = ["xpath", "xml", "xquery", "xdm", "query"]
+categories = ["parser-implementations", "text-processing", "data-structures"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-infoset = { workspace = true }
+oxixml-xsd = { workspace = true }
+oxixml-fn = { workspace = true }
+oxixml-regex = { workspace = true }
+oxixml-qname = { workspace = true }
+
+[lints]
+workspace = true

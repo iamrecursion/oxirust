@@ -1,0 +1,10 @@
+{
+  "name": "filter_loudnorm",
+  "args": ["-i", "in.mkv", "-af", "loudnorm=I=-23", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "audio_filters": 1,
+    "video_filters": 0
+  }
+}

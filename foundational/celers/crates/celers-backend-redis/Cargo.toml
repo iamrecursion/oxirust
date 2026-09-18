@@ -1,0 +1,52 @@
+[package]
+name = "celers-backend-redis"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Redis result backend for CeleRS"
+readme = "README.md"
+keywords = ["celery", "redis", "backend", "results", "async"]
+categories = ["asynchronous", "network-programming", "caching"]
+
+[dependencies]
+async-trait = { workspace = true }
+redis = { workspace = true }
+# Supplies the Pure-Rust rustls crypto provider that
+# `install_pure_tls_provider()` installs as the process default. Mandatory, not
+# optional: no rustls provider *feature* is enabled anywhere in this workspace,
+# so `redis`'s bare `rustls::ClientConfig::builder()` panics without it.
+oxitls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxiarc-zstd = { workspace = true, optional = true }
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+crc32fast = { workspace = true }
+
+# Core protocol
+celers-core = { workspace = true }
+celers-protocol = { workspace = true }
+
+[features]
+default = []
+distributed-locks = []
+zstd-compression = ["dep:oxiarc-zstd"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "backend_bench"
+harness = false

@@ -1,0 +1,12 @@
+[package]
+name = "minpo-715-employer-liability"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "minpo-715-employer-liability"
+path = "src/main.rs"
+
+[dependencies]
+legalis-jp = { path = "../../jurisdictions/jp" }

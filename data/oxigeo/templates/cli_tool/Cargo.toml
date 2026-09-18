@@ -1,0 +1,23 @@
+[package]
+name = "my-oxigeo-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+oxigeo-core = "0.2"
+oxigeo-algorithms = "0.2"
+oxigeo-geotiff = "0.2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+console = "0.15"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+[[bin]]
+name = "my-cli"
+path = "src/main.rs"

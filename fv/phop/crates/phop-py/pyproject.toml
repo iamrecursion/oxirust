@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "phop"
+version = "0.1.1"
+description = "Differentiable symbolic discovery on the EML operator (Python bindings)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "COOLJAPAN OÜ (Team KitaSan)", email = "contact@cooljapan.tech" }]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Repository = "https://github.com/cool-japan/phop"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "phop"
+# Ship the type stub (and PEP 561 marker) next to the compiled extension.
+include = ["phop.pyi", "py.typed"]

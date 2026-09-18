@@ -1,0 +1,171 @@
+[package]
+name = "voirs-acoustic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/voirs-acoustic"
+keywords = ["voirs", "acoustic", "tts", "mel-spectrogram", "vits"]
+categories = ["multimedia::audio", "science", "algorithms"]
+rust-version.workspace = true
+description = "Acoustic model inference for VoiRS speech synthesis (VITS/FastSpeech2)"
+readme = "README.md"
+
+[lib]
+name = "voirs_acoustic"
+crate-type = ["lib"]
+
+[dependencies]
+# ML/Tensor libraries
+# candle-core/candle-nn are hard (non-optional) dependencies: core
+# modules (e.g. vits/loader.rs, vits/duration.rs, vits/posterior.rs, parallel_attention.rs)
+# reference candle_core/candle_nn types unconditionally with no feature gate, so the crate
+# has never actually been able to compile without them. Making that explicit here (instead
+# of advertising a "candle" feature that silently can't be disabled) is the honest fix; see
+# the (now-empty) `candle` feature below for backward compatibility.
+candle-core.workspace = true
+candle-nn.workspace = true
+oxionnx = { workspace = true, optional = true }
+safetensors.workspace = true
+reqwest.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+
+# Pure-Rust TLS provider (rustls + RustCrypto) for the in-house HuggingFace downloader
+oxitls-adapter-rustls-rustcrypto.workspace = true
+rustls.workspace = true
+dirs.workspace = true
+
+# SciRS2 - Optimized DSP and linear algebra
+scirs2-core.workspace = true
+scirs2-fft.workspace = true
+
+# NumRS2 - For loading numpy .npz voice files
+numrs2.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+oxicode.workspace = true
+toml.workspace = true
+
+# Time handling
+chrono.workspace = true
+
+# Text processing
+regex.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Async support
+async-trait.workspace = true
+tokio.workspace = true
+futures.workspace = true
+
+# Random number generation
+fastrand.workspace = true
+
+# System info
+num_cpus.workspace = true
+
+# Memory-mapped files for lazy loading
+memmap2.workspace = true
+
+# Logging for memory pressure handler
+log.workspace = true
+
+# VoiRS crates
+voirs-g2p.workspace = true
+
+[dev-dependencies]
+voirs-vocoder.workspace = true
+tracing-subscriber.workspace = true
+criterion = { workspace = true }
+tokio-test.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "simple_benchmarks"
+harness = false
+
+[[bench]]
+name = "performance_validation"
+harness = false
+
+[[bench]]
+name = "advanced_features_benchmarks"
+harness = false
+
+[[bench]]
+name = "profiling_benchmarks"
+harness = false
+
+[[bench]]
+name = "scirs2_benchmarks"
+harness = false
+
+[[bench]]
+name = "fusion_benchmarks"
+harness = false
+
+[[bench]]
+name = "production_benchmarks"
+harness = false
+
+[[bench]]
+name = "simd_operations_benchmarks"
+harness = false
+
+[[example]]
+name = "acoustic_advanced_features_demo"
+required-features = ["candle"]
+
+[[example]]
+name = "scirs2_optimization_demo"
+
+[[example]]
+name = "fusion_optimization_demo"
+
+[[example]]
+name = "profiling_demo"
+
+[[example]]
+name = "production_monitoring_demo"
+
+[[example]]
+name = "simple_synthesis_demo"
+
+[[example]]
+name = "model_optimization"
+required-features = ["candle"]
+
+[[example]]
+name = "pretrained_models"
+required-features = ["candle"]
+
+[features]
+default = ["candle"]
+# candle-core/candle-nn are now hard dependencies (see above), so this
+# feature is intentionally empty. It is kept only for backward compatibility with existing
+# `--features candle` / `required-features = ["candle"]` usages (in this crate's own
+# [[example]] entries and in downstream Cargo.toml files) so they keep resolving without
+# error; enabling or disabling it no longer changes what compiles.
+candle = []
+onnx = ["dep:oxionnx"]
+gpu = ["metal", "oxionnx?/gpu"]  # On macOS, use Metal; on Linux/Windows would use cuda
+cuda = ["candle-core/cuda", "oxionnx?/gpu"]
+metal = ["dep:metal-rs"]  # Only available on macOS
+coreml = []  # oxionnx does not have a separate coreml feature; GPU via oxionnx/gpu
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal-rs = { version = "0.27", optional = true, package = "metal" }
+
+[lints]
+workspace = true

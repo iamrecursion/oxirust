@@ -1,0 +1,41 @@
+[package]
+name = "oxixml-jsonld"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "JSON-LD 1.1 processor (expansion, compaction, flattening, toRdf/fromRdf) and streaming parser/serializer (replaces oxjsonld)."
+keywords = ["json-ld", "rdf", "json", "linked-data", "semantic-web"]
+categories = ["parser-implementations", "encoding", "data-structures"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-model = { workspace = true }
+oxixml-iri = { workspace = true }
+oxixml-json = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+
+[dev-dependencies]
+oxixml-turtle = { path = "../oxixml-turtle" }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[features]
+default = []
+
+## Enables asynchronous parsing and serialization on top of `tokio`'s
+## `AsyncRead` / `AsyncWrite`, mirroring `oxjsonld`'s `async-tokio` feature:
+## `JsonLdParser::for_tokio_async_reader` and
+## `JsonLdSerializer::for_tokio_async_writer`. Off by default, so the crate
+## stays third-party-free in its default configuration.
+async-tokio = ["dep:tokio"]
+
+[lints]
+workspace = true

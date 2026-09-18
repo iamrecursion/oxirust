@@ -1,0 +1,53 @@
+[package]
+name = "oxixml-canon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "RDF Dataset Canonicalization (RDFC-1.0 / URDNA2015)."
+keywords = ["rdf", "canonicalization", "rdfc", "urdna2015", "nquads"]
+categories = ["data-structures", "algorithms"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+# RDF 1.2 (RDF-star): canonicalize datasets containing embedded triple terms.
+# The dev-dependency is forwarded too so that the test harness sees the same term model.
+rdf-12 = ["oxixml-model/rdf-12", "oxixml-turtle/rdf-12"]
+# Opt-in regression guard for the Cargo feature-unification hazard: enabling `oxixml-model/rdf-12`
+# through this crate feature, without also enabling this crate's own `rdf-12`, reproduces the
+# build configuration in which `Term::Triple` exists while the local `#[cfg(feature = "rdf-12")]`
+# match arms in this crate are compiled out. `cargo check -p oxixml-canon --lib --features
+# rdf-12-unification-guard` fails to compile if this crate's own fallback arms (see the
+# `unreachable_patterns` arms in engine.rs and terms.rs) are ever removed. The invocation must
+# stay scoped to `--lib`: `cargo test` with this feature also builds the integration tests below,
+# which pull in the `oxixml-turtle` dev-dependency unconditionally, and that crate has its own,
+# separate exhaustive `Term` matches that do not yet tolerate this combination (out of this
+# crate's scope; see `oxixml-turtle`'s `n3.rs`/`trig.rs`) — so `cargo test` with this feature
+# fails today regardless of whether this crate's own fallback arms are present.
+#
+# This is deliberately its own feature rather than a second `oxixml-model` dev-dependency edge:
+# Cargo unifies a package's features across the whole graph reachable from the package under
+# test, dev-dependencies included, so forcing `oxixml-model/rdf-12` on unconditionally would also
+# turn it on for the `oxixml-turtle` dev-dependency below (needed only to parse this crate's test
+# fixtures) — and that combination does not compile today (see above). Keeping the guard behind
+# its own feature lets a plain `cargo test -p oxixml-canon` build and run this crate's W3C
+# conformance suite, while the lib-scoped guard itself remains available on demand.
+rdf-12-unification-guard = ["oxixml-model/rdf-12"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-model = { workspace = true }
+
+[dev-dependencies]
+oxixml-turtle = { path = "../oxixml-turtle" }
+
+[lints]
+workspace = true

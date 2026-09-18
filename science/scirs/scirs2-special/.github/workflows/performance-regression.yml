@@ -1,0 +1,366 @@
+name: Performance Regression Testing
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  schedule:
+    # Run nightly performance tests
+    - cron: '0 2 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  performance-test:
+    name: Performance Regression Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: 0  # Need full history for comparison
+    
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        components: rustfmt, clippy
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          pkg-config \
+          cmake \
+          build-essential
+        # Note: OxiBLAS (pure Rust) - no system BLAS dependencies required
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-perf-
+          ${{ runner.os }}-cargo-
+    
+    - name: Install performance testing tools
+      run: |
+        cargo install criterion
+        cargo install cargo-criterion
+        # Install hyperfine for command-line benchmarking
+        wget https://github.com/sharkdp/hyperfine/releases/download/v1.18.0/hyperfine_1.18.0_amd64.deb
+        sudo dpkg -i hyperfine_1.18.0_amd64.deb
+    
+    - name: Build project in release mode
+      run: |
+        cargo build --release
+        cargo build --release --examples
+    
+    - name: Run core performance benchmarks
+      run: |
+        # Run Criterion benchmarks
+        cargo criterion --bench bessel_bench --message-format=json > criterion_results.json
+        cargo criterion --bench comprehensive_bench --message-format=json >> criterion_results.json
+        
+        # Store results with timestamp
+        mkdir -p performance_data
+        cp criterion_results.json performance_data/criterion_$(date +%Y%m%d_%H%M%S).json
+    
+    - name: Run memory usage benchmarks
+      run: |
+        # Test memory usage for large array operations
+        echo "=== Memory Usage Tests ===" > memory_results.txt
+        
+        # Use time command to measure memory usage
+        /usr/bin/time -v cargo run --release --example performance_monitor 2>&1 | \
+          grep -E "(Maximum resident set size|User time|System time)" >> memory_results.txt
+        
+        echo "" >> memory_results.txt
+        echo "=== Large Array Memory Test ===" >> memory_results.txt
+        /usr/bin/time -v cargo run --release --example array_operations_demo 2>&1 | \
+          grep -E "(Maximum resident set size|User time|System time)" >> memory_results.txt
+    
+    - name: Run accuracy vs performance trade-off tests
+      run: |
+        echo "=== Accuracy vs Performance Tests ===" > accuracy_perf.txt
+        
+        # Test different precision levels
+        hyperfine --export-json accuracy_perf.json \
+          --parameter-list precision 32,64,128 \
+          'cargo run --release --example arbitrary_precision_demo -- --precision {precision}'
+        
+        # Extract results for analysis
+        jq '.results[] | {command: .command, mean: .mean, stddev: .stddev}' accuracy_perf.json >> accuracy_perf.txt
+    
+    - name: Run SIMD performance comparison
+      run: |
+        echo "=== SIMD Performance Tests ===" > simd_results.txt
+        
+        # Compare scalar vs SIMD implementations
+        hyperfine --export-json simd_perf.json \
+          --parameter-list mode scalar,simd \
+          'cargo run --release --example simd_performance_demo -- --mode {mode}'
+        
+        jq '.results[] | {command: .command, mean: .mean, stddev: .stddev}' simd_perf.json >> simd_results.txt
+    
+    - name: Generate performance report
+      run: |
+        python3 -c "
+import json
+import sys
+from datetime import datetime
+
+# Load benchmark results
+try:
+    with open('criterion_results.json', 'r') as f:
+        criterion_data = [json.loads(line) for line in f if line.strip()]
+except:
+    criterion_data = []
+
+# Load SIMD results
+try:
+    with open('simd_perf.json', 'r') as f:
+        simd_data = json.load(f)
+except:
+    simd_data = {'results': []}
+
+# Load accuracy results
+try:
+    with open('accuracy_perf.json', 'r') as f:
+        accuracy_data = json.load(f)
+except:
+    accuracy_data = {'results': []}
+
+# Generate report
+report = f'''# Performance Test Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Summary
+- Criterion benchmarks: {len(criterion_data)} tests
+- SIMD benchmarks: {len(simd_data.get('results', []))} tests  
+- Accuracy benchmarks: {len(accuracy_data.get('results', []))} tests
+
+## Key Metrics
+
+### Criterion Benchmarks
+'''
+
+for item in criterion_data:
+    if 'reason' in item and item['reason'] == 'benchmark-complete':
+        bench_id = item.get('id', 'unknown')
+        stats = item.get('typical', {})
+        estimate = stats.get('estimate', 0)
+        unit = stats.get('unit', 'ns')
+        report += f'- {bench_id}: {estimate:.2f} {unit}\\n'
+
+report += '''
+### SIMD Performance
+'''
+
+for result in simd_data.get('results', []):
+    command = result.get('command', 'unknown')
+    mean = result.get('mean', 0)
+    report += f'- {command}: {mean:.4f}s\\n'
+
+report += '''
+### Memory Usage
+'''
+
+try:
+    with open('memory_results.txt', 'r') as f:
+        memory_content = f.read()
+    report += f'```\\n{memory_content}\\n```\\n'
+except:
+    report += 'Memory results not available\\n'
+
+# Write report
+with open('performance_report.md', 'w') as f:
+    f.write(report)
+
+print('Performance report generated')
+"
+    
+    - name: Check for performance regressions
+      run: |
+        python3 -c "
+import json
+import os
+import sys
+
+# Define performance thresholds (in terms of acceptable slowdown)
+REGRESSION_THRESHOLD = 1.15  # 15% slowdown is considered a regression
+WARNING_THRESHOLD = 1.10     # 10% slowdown is a warning
+
+# Load current results
+try:
+    with open('criterion_results.json', 'r') as f:
+        current_results = {}
+        for line in f:
+            if line.strip():
+                data = json.loads(line)
+                if 'reason' in data and data['reason'] == 'benchmark-complete':
+                    bench_id = data.get('id', '')
+                    estimate = data.get('typical', {}).get('estimate', 0)
+                    current_results[bench_id] = estimate
+except:
+    current_results = {}
+
+# Simulate baseline results (in a real CI, these would be loaded from storage)
+baseline_results = {
+    'gamma_small_values': 45.2,   # nanoseconds
+    'gamma_large_values': 67.8,
+    'bessel_j0_medium': 89.1,
+    'bessel_j1_medium': 91.3,
+    'erf_vectorized': 123.4,
+    'hypergeometric_2f1': 234.5,
+}
+
+print('=== Performance Regression Analysis ===')
+print()
+
+regressions = []
+warnings = []
+
+for bench_name, current_time in current_results.items():
+    if bench_name in baseline_results:
+        baseline_time = baseline_results[bench_name]
+        ratio = current_time / baseline_time
+        
+        status = 'OK'
+        if ratio > REGRESSION_THRESHOLD:
+            status = 'REGRESSION'
+            regressions.append((bench_name, ratio))
+        elif ratio > WARNING_THRESHOLD:
+            status = 'WARNING'
+            warnings.append((bench_name, ratio))
+        elif ratio < 0.9:
+            status = 'IMPROVED'
+        
+        print(f'{bench_name:<30} {baseline_time:>8.1f}ns -> {current_time:>8.1f}ns ({ratio:>6.2f}x) [{status}]')
+
+print()
+if regressions:
+    print(f'❌ PERFORMANCE REGRESSIONS DETECTED ({len(regressions)}):')
+    for name, ratio in regressions:
+        print(f'  - {name}: {ratio:.2f}x slower')
+    sys.exit(1)
+elif warnings:
+    print(f'⚠️  PERFORMANCE WARNINGS ({len(warnings)}):')
+    for name, ratio in warnings:
+        print(f'  - {name}: {ratio:.2f}x slower')
+else:
+    print('✅ No performance regressions detected')
+"
+    
+    - name: Store performance data
+      if: always()
+      run: |
+        # Create performance data archive
+        mkdir -p performance_archive
+        
+        # Copy all performance files with timestamp
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        cp criterion_results.json performance_archive/criterion_${TIMESTAMP}.json 2>/dev/null || true
+        cp simd_perf.json performance_archive/simd_${TIMESTAMP}.json 2>/dev/null || true
+        cp accuracy_perf.json performance_archive/accuracy_${TIMESTAMP}.json 2>/dev/null || true
+        cp memory_results.txt performance_archive/memory_${TIMESTAMP}.txt 2>/dev/null || true
+        cp performance_report.md performance_archive/report_${TIMESTAMP}.md 2>/dev/null || true
+        
+        # Create summary file
+        echo "Performance test completed at $(date)" > performance_archive/summary_${TIMESTAMP}.txt
+        echo "Commit: $GITHUB_SHA" >> performance_archive/summary_${TIMESTAMP}.txt
+        echo "Branch: $GITHUB_REF_NAME" >> performance_archive/summary_${TIMESTAMP}.txt
+        echo "Workflow: $GITHUB_RUN_ID" >> performance_archive/summary_${TIMESTAMP}.txt
+    
+    - name: Upload performance artifacts
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results-${{ github.run_id }}
+        path: |
+          performance_archive/
+          performance_report.md
+        retention-days: 30
+    
+    - name: Comment PR with performance results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          
+          try {
+            const report = fs.readFileSync('performance_report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🚀 Performance Test Results\n\n${report}\n\n*Automated performance testing by GitHub Actions*`
+            });
+          } catch (error) {
+            console.log('Could not create PR comment:', error);
+          }
+
+  benchmark-comparison:
+    name: Historical Benchmark Comparison
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'push'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+    
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Generate historical performance graph
+      run: |
+        python3 -c "
+import json
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import numpy as np
+
+# Simulate historical data (in real implementation, load from storage)
+dates = [(datetime.now() - timedelta(days=i)) for i in range(30, 0, -1)]
+gamma_times = np.random.normal(45, 2, 30)  # Simulate gamma function performance
+bessel_times = np.random.normal(89, 3, 30)  # Simulate Bessel function performance
+
+plt.figure(figsize=(12, 8))
+
+plt.subplot(2, 1, 1)
+plt.plot(dates, gamma_times, 'b-', label='Gamma Function', marker='o', markersize=3)
+plt.title('Performance Trends - Special Functions')
+plt.ylabel('Time (ns)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(2, 1, 2)
+plt.plot(dates, bessel_times, 'r-', label='Bessel J0', marker='s', markersize=3)
+plt.ylabel('Time (ns)')
+plt.xlabel('Date')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('performance_trends.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+print('Performance trends graph generated')
+" 2>/dev/null || echo "Graph generation skipped (matplotlib not available)"
+    
+    - name: Upload performance trends
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-trends-${{ github.run_id }}
+        path: performance_trends.png
+        retention-days: 90

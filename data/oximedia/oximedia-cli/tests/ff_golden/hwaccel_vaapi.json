@@ -1,0 +1,8 @@
+{
+  "name": "hwaccel_vaapi",
+  "args": ["-hwaccel", "vaapi", "-i", "in.mkv", "out.mkv"],
+  "expect": {
+    "jobs": 1,
+    "hwaccel": "Vaapi"
+  }
+}

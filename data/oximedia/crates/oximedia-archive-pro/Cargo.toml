@@ -1,0 +1,39 @@
+[package]
+name = "oximedia-archive-pro"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional archive and digital preservation system for OxiMedia"
+keywords = ["archive", "preservation", "digital", "multimedia", "video"]
+categories = ["multimedia", "filesystem"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-archive = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+rayon = { workspace = true }
+quick-xml = { workspace = true }
+oxiarc-archive = { workspace = true }
+sha2 = { workspace = true }
+md-5.workspace = true
+xxhash-rust = { workspace = true, features = ["xxh3"] }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+walkdir.workspace = true
+hex.workspace = true
+# "pure" forces the portable pure-Rust blake3 backend; without it a standalone
+# build of this crate would compile C/assembly SIMD kernels via `cc`.
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

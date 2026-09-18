@@ -1,0 +1,91 @@
+# OxiGeo Server Docker Image
+# WMS/WMTS/WFS tile server for serving geospatial data
+# Author: COOLJAPAN OU (Team Kitasan)
+
+# Build stage
+FROM rust:1.89-slim-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build server in release mode with optimizations
+RUN cargo build --release --bin oxigeo-server \
+    && strip target/release/oxigeo-server
+
+# Runtime stage - minimal image
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/bash oxigeo
+
+# Copy binary from builder
+COPY --from=builder /build/target/release/oxigeo-server /usr/local/bin/oxigeo-server
+
+# Create necessary directories
+RUN mkdir -p /data /config /cache && \
+    chown -R oxigeo:oxigeo /data /config /cache
+
+# Copy default configuration. `docker COPY` is not shell-interpreted (it takes literal
+# whitespace-separated source paths), so it cannot express a "copy if present" fallback -
+# docker/config/server.toml is committed unconditionally so this always succeeds. Operators
+# who want a different config should bind-mount over /config/server.toml instead of editing
+# this image.
+COPY --chown=oxigeo:oxigeo docker/config/server.toml /config/server.toml
+
+# Switch to non-root user
+USER oxigeo
+WORKDIR /data
+
+# Expose server ports
+# 8080 - HTTP server
+# 8081 - Metrics endpoint
+EXPOSE 8080 8081
+
+# Set environment variables
+ENV RUST_LOG=info \
+    RUST_BACKTRACE=1 \
+    OXIGEO_DATA_DIR=/data \
+    OXIGEO_CACHE_DIR=/cache \
+    OXIGEO_CONFIG=/config/server.toml \
+    OXIGEO_HOST=0.0.0.0 \
+    OXIGEO_PORT=8080
+
+# Health check - verify server responds
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Default command starts server. --config is passed explicitly as defense in depth alongside
+# the OXIGEO_CONFIG env var above (crates/oxigeo-server's `config` CLI arg also reads
+# OXIGEO_CONFIG directly via clap's `env` attribute; either mechanism alone is sufficient).
+ENTRYPOINT ["oxigeo-server"]
+CMD ["--host", "0.0.0.0", "--port", "8080", "--config", "/config/server.toml"]
+
+# Build-time version, defaulting to the last released version; override with
+# `--build-arg OXIGEO_VERSION=$(docker/build.sh --print-version)` (see docker/build.sh) so
+# this label never drifts from the workspace Cargo.toml version again.
+ARG OXIGEO_VERSION=0.2.0
+
+LABEL org.opencontainers.image.title="OxiGeo Server" \
+      org.opencontainers.image.description="WMS/WMTS tile server for OxiGeo" \
+      org.opencontainers.image.vendor="COOLJAPAN OU (Team Kitasan)" \
+      org.opencontainers.image.source="https://github.com/cool-japan/oxigeo" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${OXIGEO_VERSION}" \
+      org.opencontainers.image.url="https://github.com/cool-japan/oxigeo"

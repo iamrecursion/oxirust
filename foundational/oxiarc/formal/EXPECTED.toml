@@ -1,0 +1,343 @@
+# Machine-readable mirror of the "Measured L1 verdict" doc comment on every
+# `#[harness]` entry point in this package, in exactly the format
+# `cargo-formal`'s own `examples/checked-arith/EXPECTED.toml` uses.
+#
+# **MEASURED, not predicted** (2026-09-08, release `cargo-formal` 0.1.0 CLI +
+# release `formal-driver` with dependency-body and monomorphic-instance
+# lowering, OxiZ 0.3.3, rustc nightly-2026-06-20). The harnesses call the
+# public API of `oxiarc-core`, `oxiarc-lz4` and `oxiarc-deflate` by path;
+# `[package.metadata.formal] dep-crates` names those three, and the run lowered
+# 28 dependency bodies (27 reachable) plus 2 monomorphic instances into the
+# verification conditions. No verdict below was written before the run that
+# produced it.
+#
+# Re-measured 2026-09-14 with a release CLI **rebuilt from the cargo-formal
+# tree that carries that day's encoder rules** (the release driver, the OxiZ
+# 0.3.3 pin and rustc nightly-2026-06-20 are unchanged; wall time 36 s, exit
+# status 1 for the two intended refutations). Every row below, every layer
+# counter and both counterexamples came back unchanged. One thing did move:
+# the *reason and site* of `from_code_lengths_never_panics_harness`'s
+# whole-harness refusal, which is now `aliasing` at
+# `../oxiarc-deflate/src/huffman.rs:363:28` and no longer `unsupported-callee`
+# at `../oxiarc-core/src/error.rs:190:22`. The verdict -- and therefore the
+# row -- is the same; see that harness's row comment below.
+#
+# Naming. A property key is the word the **encoder actually mints**, never a
+# description:
+#
+#   * a user-written `oxiformal::assert(..)` is `assert`; a second distinct
+#     assertion raised at the *same* source site is `assert-2`, a third
+#     `assert-3`, and so on.
+#   * an `#[ensures]` clause checked through `#[proof_for_contract]` is
+#     `ensures`, and is reported under layer `contract`. This package has none.
+#   * everything else is the design section 9 closed vocabulary MIR's own
+#     inserted checks produce: `arith-overflow`, `shift-overflow`,
+#     `bounds-check`, `division-by-zero`, `remainder-by-zero`,
+#     `division-overflow`, `neg-overflow`, `unwrap`, `expect`, `panic`,
+#     `slice-range`, `unwinding-assertion`. A bare `debug_assert!` with no
+#     format arguments lowers to `core::panicking::panic`, so its key is
+#     `panic`, not `assert`.
+#   * the pseudo-key `harness` is a **whole-harness** verdict and nothing else:
+#     `"proved"` means "no obligation of this harness is anything but proved"
+#     (including a harness that raises none at all), and `"unsupported"` covers
+#     both `Verdict::Unsupported` and `Verdict::Unverifiable`. It is used here
+#     only for the two harnesses the encoder refused whole, which generate no
+#     verification condition at all.
+#
+# What is listed. Every obligation the harness is *about* -- its `assert`s,
+# plus its `unwinding-assertion` where it has one, plus the `panic` and
+# `shift-overflow` rows of the two precondition harnesses, which are their
+# whole point -- and every incidental MIR-inserted check whose verdict is
+# **not** `proved` (there are none). Incidental checks that came out `proved`
+# are deliberately not enumerated: they are numerous, they carry no
+# information, and listing them would make this file a copy of `report.json`
+# rather than a statement of intent.
+#
+# Keying rule. `[harness.expected]` is a map, so several obligations of one
+# harness that carry the same property name at *different* source sites share
+# one row. The row records the **worst** of their verdicts (`refuted` >
+# `timeout` > `unknown` > `unsupported`/`unverifiable` > `proved`), and a row
+# comment says how many sites there are. Checked mechanically against this
+# run: no such group disagrees in this package, so every row is also the
+# verdict of each of its sites.
+#
+# Measured tally (2026-09-08; re-measured 2026-09-14, unchanged): 17 property
+# rows over 13 harnesses -- 12 proved / 2 refuted / 1 timeout / 2 unsupported.
+# The run's own layer counters, which include the incidental `proved` rows this
+# file does not enumerate, are: bmc 505 proved / 2 refuted / 1 timeout /
+# 0 unknown / 2 unsupported / 0 unverifiable over 510 obligations (508 of them
+# backed by a `vc/NNNN.smt2` reproduction; the two `unsupported` ones generate
+# none), and contract 0 proved / 0 refuted. Hygiene passes with 0 errors,
+# 0 warnings and 0 notes over 2 files.
+#
+# The `audit` layer was *not* run in this invocation (`layers_run` is hygiene,
+# bmc, contract), so the histogram below is the one the run's `inventory.json`
+# actually records, not an audit-layer figure: `unverifiable_by_reason` is
+# `raw-pointer` 1, `dyn-trait` 1, `float` 1, all three on
+# `from_code_lengths_never_panics_harness` -- the only harness the inventory
+# marks `unverifiable` -- and the impurity histogram over the 13 harnesses is
+# `raw-pointer` 12, `dyn-dispatch` 1, `float` 1, the `raw-pointer` being the
+# `Vec` deref behind `any_vec` that 12 of the 13 harnesses reach.
+#
+# `solver-model-rejected` count: **0**. cargo-formal is pinned to OxiZ 0.3.3,
+# whose model gate (upstream item U-Z10) turns a solver model that does not
+# satisfy the verification condition into `unknown` rather than an invented
+# counterexample; sibling packages measured in this phase carry a large tail of
+# such rows. This package has none -- there is not a single `unknown` in the
+# run -- so no row here moves when the pin moves to the fixed OxiZ release.
+# The one `timeout` is a different failure and does not move either: it is a
+# genuinely hard bit-blasting problem (see the row's comment).
+#
+# The two `unsupported` rows are statements about the encoder, not about
+# `oxiarc`, and since the 2026-09-14 encoder rules landed they are the *same*
+# statement: a `&mut` borrow taken at an index the encoder knows only
+# symbolically -- `<[T; N] as IndexMut<I>>::index_mut` over a symbolic window,
+# and `<Vec<T, A> as IndexMut<I>>::index_mut` at a symbolically indexed
+# element. Both are cargo-formal TODO P3-26. `README.md` says what they need.
+#
+# Re-measured 2026-09-15 with the Phase 3 release CLI (options: autoharness
+# off, modular on, vacuity check on; release cargo-formal 0621fc0, 0
+# uncommitted files, OxiZ 0.3.3, rustc nightly-2026-06-20, --jobs 4, fresh
+# --target-dir, two runs): every row, the `peek_bits_count_bound_is_necessary_harness`
+# counterexample (count = 255), the one timeout and both refusal sites
+# unchanged; bmc 505 proved / 2 refuted / 1 timeout / 2 unsupported over 510
+# obligations (508 with a reproduction record), contract 0 proved / 0
+# refuted, hygiene PASS, exit 1, 35 s and 34 s. run1<->run2 is
+# byte-identical. **One counterexample moved**: `refill_bytes_want_bound_is_asserted_harness#panic`
+# refutes at want = 57 now, not want = 128 (see that row's comment) -- still
+# a real, model-checked witness of the same violated property (want > 56),
+# reproduced identically in both 2026-09-15 runs; verified, not inferred --
+# `diff`-ing this item's own `vc/0117.smt2` against the 2026-09-14 target
+# dir's copy of the same ordinal shows the scripts are genuinely different
+# (107 lines then, 32 now; the 2026-09-14 script hand-unrolls ~14 `ite`-chained
+# byte comparisons the 2026-09-15 script does not), not merely re-ordered --
+# consistent with the encoder's hypothesis assembly having been rebuilt since
+# 2026-09-14 (design phase3.md waves 1-4). Against the 2026-09-14 report
+# (`compare_expected.py --prev`): 0 added/removed ids, 0 FLIPs, 504
+# message-only changes -- every harness that draws a sequence gains the
+# Phase 3 clause `bounded-sequence: sequences cut at N` on its
+# `arith-overflow`/`bounds-check`/`shift-overflow`/`unwinding-assertion`
+# conditions (e.g. `align_to_byte_leaves_whole_bytes_harness#arith-overflow@../oxiarc-core/src/bitstream.rs:150:9`:
+# `inlined at src/harness.rs:224:5` -> `bounded-sequence: sequences cut at
+# 16; inlined at src/harness.rs:224:5`); no verdict moved. The
+# `solver-model-rejected` count stays 0. `coverage.claim` now appears
+# (`claim unmet 505 of 505 proved`) where 2026-09-14 had none -- confirmed
+# from `crates/formal-config/src/resolved.rs`'s `defaults::claim_requires()`
+# to be an unconditional CLI default (`["lrat", "oxilean-verify",
+# "external-replay"]`) applied to every package that does not set
+# `claim-requires` in its manifest, regardless of `self_host` -- a new
+# Phase 3 default report surface for every package, not a verdict row.
+#
+# Re-measured 2026-10-05 with a release CLI and driver built from the
+# cargo-formal tree at commit cab6f97 plus that day's hygiene-scanner and
+# conformance-suite changes (neither touches the encoder, the solver or the
+# driver); OxiZ 0.3.3, rustc nightly-2026-06-20, --jobs 2, a fresh
+# --target-dir. TWO
+# harnesses were added over the `HuffmanTree` entry accessors:
+# `entry_accessors_match_the_bit_layout_harness` (totality and the exact bit
+# fields over every `u32`) and `entry_accessors_ignore_the_high_byte_harness`
+# (both accessors read only bits 0..24). Both come back `proved`. The tally is
+# now 19 property rows over 15 harnesses -- 14 proved / 2 refuted / 1 timeout /
+# 2 unsupported -- and the layer counters are bmc 513 proved / 2 refuted /
+# 1 timeout / 0 unknown / 2 unsupported over 518 obligations (516 backed by a
+# `vc/NNNN.smt2` reproduction; the two `unsupported` harnesses generate none),
+# contract 0 proved / 0 refuted, hygiene PASS over 2 files, exit status 1 for
+# the two intended refutations (counterexamples want = 57 and count = 255, each
+# on an empty source). Every 2026-09 row above is unchanged; the two new rows
+# are appended below in source order, between `entry_round_trip_harness` and
+# `from_code_lengths_never_panics_harness`. One figure this file records moved
+# that is not a verdict: the run now lowers 39 dependency bodies (27
+# reachable) rather than the 28 the 2026-09 header records -- the encoder
+# lowers more bodies since, the 27 reachable and every verdict unchanged.
+#
+# Evidence grade (2026-10-05, the same binaries). Every `proved` row is
+# "reproduction only (claim unmet)" under cargo-formal's default
+# `claim-requires` (lrat, oxilean-verify, external-replay): the pinned
+# solver's `unsat`, reproduced under a fixed seed and conflict budget, not an
+# independently checked proof (`claim unmet 513 of 513 proved`). The same
+# day's `cargo formal check --evidence lrat` (a fresh --target-dir,
+# --no-cache; two runs, identical) raised 0 soundness incidents and exited 1
+# for the two intended refutations: 74 of the 513 proved obligations carry an
+# LRAT certificate from the bit-level engine, checked by oxiz-proof (8 of the
+# 26 user-written `assert` obligations); in 83 more the bit-level encoder
+# folded an assertion to the constant `false`, which leaves no clause set to
+# certify; the other 356 carry no bit-level check, because the pinned solver
+# answered their vacuity question `unsat` and the certificate pass skips a
+# condition on that answer. OxiZ 0.3.3 has a documented wrong-`unsat` class
+# (upstream U-Z19; cargo-formal's conformance fixture
+# u21_pinned_selector_two_define_funs, reduced from a deliberately false
+# assertion over oxiarc-core's BitCache that a default run reported proved
+# and --evidence lrat refuted), which is why a reproduction alone is not a
+# proof.
+#
+# Re-measured 2026-10-06 with a release CLI and driver built from the
+# cargo-formal tree at e3a3053 plus that day's cross-check change; OxiZ 0.3.3,
+# rustc nightly-2026-06-20, --jobs 2, a fresh --target-dir, --no-cache. Every
+# row below reproduces unchanged. A default `cargo formal check` now
+# cross-checks every proved obligation at bit level (bit-blasted, solved by
+# oxiz-sat, its proof checked by oxiz-proof): of the 513, 367 confirmed, 146
+# folded (the encoder reduced an assertion to the constant `false`), 0
+# contradicted, 0 not confirmed; every verdict, message and piece of evidence
+# is identical to what the binaries built at e3a3053 report, and every proved
+# row is still "reproduction only (claim unmet)" -- a default run attaches no
+# certificate. `cargo formal check --evidence lrat` now also cross-checks
+# every vacuity `unsat` at bit level before relying on it: of the 353 the
+# pinned solver answers `unsat`, 296 confirmed, 32 folded, and 25 satisfied at
+# bit level by a model of the hypotheses the evaluator accepts -- 25 soundness
+# incidents, so that run exits 5 (1 for the two intended refutations alone).
+# Those 25 are not vacuous and lose the `proved vacuously` label (328 keep
+# it), and 89 of the 513 proved obligations carry an LRAT certificate checked
+# by oxiz-proof (13 of the 15 more follow the incidents; 2 follow from every
+# query now being solved on a solver context of its own). The incidents are
+# the pinned OxiZ 0.3.3's wrong-`unsat` class (upstream U-Z19), fixed in OxiZ
+# 0.3.4, which answers all of them `sat`; this package reports them under
+# --evidence lrat until cargo-formal's solver pin moves. No verdict moved.
+
+[[harness]]
+name = "refill_bytes_never_overfills_harness"
+
+[harness.expected]
+"assert" = "proved"  # 4 sites, all proved
+
+[[harness]]
+name = "refill_bytes_want_bound_is_asserted_harness"
+
+[harness.expected]
+"panic" = "refuted"  # `debug_assert!(want <= 56)`; counterexample want = 128
+# on 2026-09-08/09/14 (Phase 2b binaries); want = 57 on the 2026-09-15 Phase 3
+# binaries (`in17` in `vc/0117.model.json`, both runs agree), `in0` (the
+# unconstrained input buffer, `any_vec` at src/harness.rs:116:24) empty rather
+# than seven zero bytes. Both are real, model-checked witnesses of the same
+# violated property (want > 56); the concrete value moved because waves 1-4
+# rebuilt hypothesis assembly (design phase3.md, so the .smt2 script differs
+# byte-for-byte even though the formula is equisatisfiable -- see
+# docs/src/design/phase3.md section 8/D0-D4 "message changes"), not because
+# the property changed. Reproduced identically in both 2026-09-15 runs.
+
+[[harness]]
+name = "peek_bits_within_its_precondition_harness"
+
+[harness.expected]
+"assert" = "proved"  # 2 sites, all proved
+
+[[harness]]
+name = "peek_bits_count_bound_is_necessary_harness"
+
+[harness.expected]
+"panic" = "refuted"  # `debug_assert!(count <= 32)`; counterexample count = 255
+# The shift the assertion protects is proved, not refuted: the encoder
+# continues along the edge where the assertion holds, so `1u64 << count` at
+# `bitstream.rs:136` is only reachable with `count <= 32`. 2 sites.
+"shift-overflow" = "proved"
+
+[[harness]]
+name = "consume_never_underflows_harness"
+
+[harness.expected]
+"assert" = "proved"  # 2 sites, all proved
+
+[[harness]]
+name = "align_to_byte_leaves_whole_bytes_harness"
+
+[harness.expected]
+"assert" = "proved"  # 3 sites, all proved
+
+[[harness]]
+name = "take_byte_is_some_iff_eight_bits_harness"
+
+[harness.expected]
+"assert" = "proved"  # 5 sites, all proved
+
+[[harness]]
+name = "refill_bulk_zero_extends_harness"
+
+[harness.expected]
+"assert" = "proved"  # 4 sites, all proved
+
+[[harness]]
+name = "xxhash32_never_panics_on_a_short_input_harness"
+
+[harness.expected]
+"bounds-check" = "proved"        # 126 obligations over 5 sites, all proved
+"slice-range" = "proved"         # 31 obligations over 6 sites, all proved
+"unwinding-assertion" = "proved" # 3 sites; the `unwind = 6` bound was enough
+
+[[harness]]
+name = "xxhash32_one_shot_equals_streaming_harness"
+
+[harness.expected]
+# `unsupported(aliasing)` at `../oxiarc-lz4/src/xxhash.rs:156:24`: the callee
+# is `<[T; N] as IndexMut<I>>::index_mut`, which "takes a mutable borrow of a
+# window whose bounds are not constants". Column 24 is the `[..remaining]` of
+# `self.buffer[..remaining].copy_from_slice(&data[pos..])`, where
+# `self.buffer` is `[u8; 16]`. No verification condition is generated.
+"harness" = "unsupported"
+
+[[harness]]
+name = "xxhash32_agrees_with_seed_zero_harness"
+
+[harness.expected]
+# The solver gave up after a measured 30 505 ms against the 30 000 ms budget
+# ("the solver did not finish within 30000 ms"): a miter of two structurally
+# identical bit-blasted avalanche circuits under a disequality. Not a
+# model-gate `unknown`. A separate probe at a four-fold budget (120 000 ms)
+# still returned `unknown` -- OxiZ intake #P2b-14.
+"assert" = "timeout"
+"unwinding-assertion" = "proved" # 3 sites; the `unwind = 6` bound was enough
+
+[[harness]]
+name = "entry_round_trip_harness"
+
+[harness.expected]
+"assert" = "proved"  # 2 sites, all proved
+
+[[harness]]
+name = "entry_accessors_match_the_bit_layout_harness"
+
+[harness.expected]
+"assert" = "proved"  # 2 sites, all proved (totality + exact bit fields over
+# every u32; the two proved `shift-overflow` rows -- the `>> 8` in
+# `entry_symbol` at huffman.rs:606 and the harness's own `>> 8` -- are
+# incidental and, per this file's rule, not enumerated)
+
+[[harness]]
+name = "entry_accessors_ignore_the_high_byte_harness"
+
+[harness.expected]
+"assert" = "proved"  # 2 sites, all proved (both accessors read only bits
+# 0..24; the two proved `shift-overflow` rows -- `entry_symbol`'s `>> 8` and the
+# harness's own `<< 24` -- are incidental and not enumerated)
+
+[[harness]]
+name = "from_code_lengths_never_panics_harness"
+
+[harness.expected]
+# `unsupported(aliasing)` at `../oxiarc-deflate/src/huffman.rs:363:28`: the
+# callee is `<Vec<T, A> as IndexMut<I>>::index_mut`, which "takes a mutable
+# borrow of a symbolically indexed element". Column 28 is the `[idx]` of
+# `symbols[idx] = symbol as u16` in `build_into`'s symbol-assignment loop,
+# whose index is
+# `symbol_offsets[len] + (current_code[len] - base_codes[len])` -- symbolic in
+# the code lengths the harness draws. That is the same design limit that
+# refuses `xxhash32_one_shot_equals_streaming_harness` (cargo-formal TODO
+# P3-26). No verification condition is generated.
+#
+# Measured 2026-09-14 with the rebuilt CLI. The refusal MOVED, and the older
+# explanation of it was wrong in an instructive way: it read
+# `unsupported-callee` at `../oxiarc-core/src/error.rs:190:22`, "no
+# `From<&str> for std::string::String` implementation in the module set", and
+# that did NOT mean the table builder was one `From<&str> for String` rule
+# short. The rule was there; the copy was refused on LENGTH, because the
+# literal `"Empty code lengths"` (`huffman.rs:272`) is 18 bytes against this
+# package's sequence bound of 16, and the generic-conversion path swallowed
+# that error and reported its own fallback message instead. With the length
+# check fixed, the encoder now walks the whole `impl Into<String>`
+# constructor, the `1..=max_length` loop (`huffman.rs:302`), the `format!`
+# inside `invalid_header(format!(..))` (`huffman.rs:282`) and
+# `code_lengths.len().next_power_of_two()` (`huffman.rs:332`) before stopping
+# at the write above. The blockers predicted before the first run
+# (`Iterator::sum` at `huffman.rs:311`, `Vec::resize`, `Vec::reserve_exact`)
+# are walked past as well. None of this moved a counter: the package is still
+# bmc 505 proved / 2 refuted / 0 unknown / 1 timeout / 2 unsupported over 510
+# obligations, and this harness still mints no verification condition.
+"harness" = "unsupported"

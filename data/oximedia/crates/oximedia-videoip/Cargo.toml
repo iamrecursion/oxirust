@@ -1,0 +1,86 @@
+[package]
+name = "oximedia-videoip"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional video-over-IP protocol for OxiMedia (patent-free NDI alternative)"
+keywords = ["streaming", "multimedia", "network", "video", "hls"]
+categories = ["multimedia", "network-programming"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace dependencies
+oximedia-core = { workspace = true }
+# Real VP8/VP9/AV1 *decoders* (see src/codec.rs for the per-codec evidence).
+# `opus` is deliberately NOT enabled: oximedia-codec's Opus encoder mislabels
+# its packets and its Opus decoder returns silence for real libopus CELT
+# packets, so this crate refuses Opus in both directions rather than wiring it.
+oximedia-codec = { workspace = true, features = ["av1", "vp8", "vp9"] }
+oximedia-net = { workspace = true }
+oximedia-monitor = { workspace = true }
+oximedia-timecode = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+bitflags = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+
+# Networking
+socket2 = "0.6"
+
+# mDNS/DNS-SD for service discovery
+mdns-sd = { workspace = true }
+
+# Forward Error Correction
+reed-solomon-erasure = { workspace = true }
+
+# Compression (optional, for compressed video formats)
+oxiarc-deflate = { workspace = true }
+
+# Performance
+crossbeam.workspace = true
+flume = { workspace = true }
+
+# Scatter/gather I/O — libc only used on Linux (cfg-gated in source)
+libc = { workspace = true }
+
+# QUIC transport (optional, feature-gated)
+# Note: quinn 0.11 requires ring or aws-lc-rs for crypto (C dependencies) —
+# there is no vendor-neutral "rustls" Cargo feature on quinn 0.11.x, and the
+# workspace's Pure-Rust `rustls-rustcrypto` provider does not implement QUIC
+# support (all its Tls13CipherSuite entries set `quic: None`), so it cannot
+# be substituted here; see quic_transport_quinn.rs module doc for the full
+# investigation. Per Pure Rust policy, `ring` is acceptable only inside
+# feature-gated code. The quic-quinn feature enables this — default features
+# remain 100% pure Rust.
+quinn = { workspace = true, features = ["rustls-ring"], optional = true }
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test.workspace = true
+tempfile.workspace = true
+criterion = { workspace = true }
+
+[features]
+default = []
+hw-accel = []
+# Enable real QUIC transport via quinn. NOT Pure Rust: pulls in `ring`
+# (C/assembly) both to compile (forced by quinn's Cargo feature graph) and at
+# runtime (rustls-rustcrypto lacks QUIC support) — see quic_transport_quinn.rs
+# module doc. Kept out of `default` per COOLJAPAN Pure Rust policy.
+quic-quinn = ["dep:quinn", "dep:rcgen", "dep:rustls", "dep:rustls-pemfile"]

@@ -1,0 +1,339 @@
+// ---------------------------------------------------------------------------
+// Test 2 — angular momentum conservation (torque-free spin)
+// ---------------------------------------------------------------------------
+
+/// Principal moments of a solid box with side lengths `0.2 × 0.4 × 0.3 m`
+/// and uniform unit mass.
+///
+/// The inertia tensor of a solid box of full extents `(sx, sy, sz)` and mass
+/// `m` has diagonal components `m/12 · (sy² + sz²)`, `m/12 · (sx² + sz²)`,
+/// `m/12 · (sx² + sy²)`. For `(0.2, 0.4, 0.3)` at `m = 1`:
+///
+/// * `Ixx = (0.16 + 0.09) / 12 = 0.020833…` (largest)
+/// * `Iyy = (0.04 + 0.09) / 12 = 0.010833…` (smallest)
+/// * `Izz = (0.04 + 0.16) / 12 = 0.016667…` (intermediate)
+///
+/// All three differ, so a torque-free box does not spin at a constant rate:
+/// its world-frame angular velocity precesses.
+const BOX_MOMENTS: [f64; 3] = [
+    0.020_833_333_333_333_332,
+    0.010_833_333_333_333_334,
+    0.016_666_666_666_666_666,
+];
+
+/// Undamped unit-mass box `0.2 × 0.4 × 0.3 m` with the given world-frame
+/// angular velocity.
+fn tumbling_box(omega: Vec3) -> RigidBody {
+    let mut body = RigidBody::new(1.0);
+    body.linear_damping = 0.0;
+    body.angular_damping = 0.0;
+    body.local_inertia = Mat3::from_diagonal(&Vec3::new(BOX_MOMENTS[0], BOX_MOMENTS[1], BOX_MOMENTS[2]));
+    body.update_world_inertia();
+    body.angular_velocity = omega;
+    body
+}
+
+/// World-frame angular momentum `L = R · I_local · Rᵀ · ω`.
+///
+/// The stored angular velocity is a world-frame vector, so the inertia
+/// tensor that pairs with it is the world-frame one, `R · I_local · Rᵀ`;
+/// `R · I_local · ω` (which mixes frames) is not an angular momentum.
+fn world_angular_momentum(body: &RigidBody) -> Vec3 {
+    let rotation = body.transform.rotation.to_rotation_matrix();
+    rotation.matrix() * body.local_inertia * rotation.matrix().transpose() * body.angular_velocity
+}
+
+/// Accumulates what a torque-free tumbling body does over a run: angular
+/// momentum drift (vector and magnitude), rotational energy, and the
+/// intermediate-axis flip (`z` is the intermediate principal axis of
+/// [`BOX_MOMENTS`]).
+struct TumbleTracker {
+    initial_momentum: Vec3,
+    initial_energy: f64,
+    /// First time the body-frame `z` component of `ω` is negative.
+    flip_time: Option<f64>,
+    /// Smallest cosine between the body's `z` axis (in world coordinates) and
+    /// `L`; `+1` for the initial spin, `-1` after a full flip.
+    min_axis_cosine: f64,
+    /// Largest `‖L − L₀‖ / ‖L₀‖`.
+    max_vector_drift: f64,
+    /// Largest `| ‖L‖ − ‖L₀‖ | / ‖L₀‖`.
+    max_magnitude_drift: f64,
+    min_energy_ratio: f64,
+    max_energy_ratio: f64,
+}
+
+impl TumbleTracker {
+    fn new(body: &RigidBody) -> Self {
+        let initial_momentum = world_angular_momentum(body);
+        Self {
+            initial_momentum,
+            initial_energy: 0.5 * initial_momentum.dot(&body.angular_velocity),
+            flip_time: None,
+            min_axis_cosine: 1.0,
+            max_vector_drift: 0.0,
+            max_magnitude_drift: 0.0,
+            min_energy_ratio: 1.0,
+            max_energy_ratio: 1.0,
+        }
+    }
+
+    /// Record the state of `body` at simulation time `time`.
+    fn record(&mut self, body: &RigidBody, time: f64) {
+        let momentum = world_angular_momentum(body);
+        let initial_norm = self.initial_momentum.norm();
+        self.max_vector_drift = self
+            .max_vector_drift
+            .max((momentum - self.initial_momentum).norm() / initial_norm);
+        self.max_magnitude_drift = self
+            .max_magnitude_drift
+            .max((momentum.norm() - initial_norm).abs() / initial_norm);
+        let energy_ratio = 0.5 * momentum.dot(&body.angular_velocity) / self.initial_energy;
+        self.min_energy_ratio = self.min_energy_ratio.min(energy_ratio);
+        self.max_energy_ratio = self.max_energy_ratio.max(energy_ratio);
+        let intermediate_axis = body.transform.rotation * Vec3::z();
+        self.min_axis_cosine = self
+            .min_axis_cosine
+            .min(intermediate_axis.dot(&momentum) / momentum.norm());
+        let omega_body = body
+            .transform
+            .rotation
+            .inverse_transform_vector(&body.angular_velocity);
+        if self.flip_time.is_none() && omega_body.z < 0.0 {
+            self.flip_time = Some(time);
+        }
+    }
+}
+
+const TUMBLE_DT: f64 = 0.01;
+const TUMBLE_STEPS: usize = 1000;
+
+fn tumble_spin() -> Vec3 {
+    Vec3::new(1.0, 0.1, 0.0)
+}
+
+/// A box with side lengths `0.2 × 0.4 × 0.3 m` and uniform unit mass is
+/// given an initial angular velocity `ω = (1.0, 0.1, 0.0) rad/s` under
+/// zero gravity and zero damping. Stepping only the integrator
+/// (`integrate_bodies`) for 1000 × 0.01 s = 10 s must conserve the
+/// world-frame angular momentum **vector** `L = R · I_local · Rᵀ · ω`
+/// within 1% of its length.
+///
+/// Checking only `‖L‖` would be vacuous: an integrator without a
+/// gyroscopic term keeps `ω` constant in the world frame, so `Rᵀ ω` stays
+/// constant and `‖L‖` is conserved to rounding while the vector `L` turns
+/// about `ω` and drifts by 9.5% (see
+/// `test_angular_momentum_vector_drifts_without_gyroscopic_term`).
+#[test]
+fn test_angular_momentum_conservation() {
+    let mut set = RigidBodySet::new();
+    let handle = set.insert(tumbling_box(tumble_spin()));
+    let mut tracker = TumbleTracker::new(set.get(handle).expect("handle inserted above must exist"));
+    assert!(
+        tracker.initial_momentum.norm() > 0.0,
+        "initial angular momentum must be non-zero"
+    );
+
+    let gravity = Vec3::zeros();
+    for step in 1..=TUMBLE_STEPS {
+        integrate_bodies(&mut set, TUMBLE_DT, &gravity);
+        let body = set.get(handle).expect("handle inserted above must exist");
+        tracker.record(body, step as f64 * TUMBLE_DT);
+    }
+
+    eprintln!(
+        "[test_angular_momentum_conservation] steps = {TUMBLE_STEPS}, dt = {TUMBLE_DT} s, \
+         max vector drift = {:.3e}, max magnitude drift = {:.3e}, \
+         rotational energy in [{:.6}, {:.6}] of its initial value",
+        tracker.max_vector_drift,
+        tracker.max_magnitude_drift,
+        tracker.min_energy_ratio,
+        tracker.max_energy_ratio,
+    );
+    assert!(
+        tracker.max_vector_drift < 0.01,
+        "angular momentum vector drifts by {:.3e} ({:.3}%), more than the 1% tolerance",
+        tracker.max_vector_drift,
+        tracker.max_vector_drift * 100.0,
+    );
+    assert!(tracker.max_magnitude_drift < 0.01);
+    // The implicit gyroscopic step is slightly dissipative and never gains energy.
+    assert!(tracker.max_energy_ratio <= 1.0 + 1e-12);
+    assert!(tracker.min_energy_ratio > 0.99);
+
+    // The library's own helper agrees with the formula above.
+    let body = set.get(handle).expect("handle inserted above must exist");
+    assert!((angular_momentum(body) - world_angular_momentum(body)).norm() < 1e-12);
+}
+
+/// The same box and spin through `PhysicsWorld::step` with the default
+/// solver configuration, which has the implicit gyroscopic stage enabled.
+#[test]
+fn test_angular_momentum_conservation_physics_world() {
+    let mut world = PhysicsWorld::new([0.0, 0.0, 0.0], TUMBLE_DT);
+    assert!(world.solver_config.use_implicit_gyroscopic);
+    let handle = world.add_rigid_body(tumbling_box(tumble_spin()));
+    let mut tracker = TumbleTracker::new(world.get_body(handle).expect("body was just added"));
+    for step in 1..=TUMBLE_STEPS {
+        world.step();
+        let body = world.get_body(handle).expect("body was just added");
+        tracker.record(body, step as f64 * TUMBLE_DT);
+    }
+    assert!(
+        tracker.max_vector_drift < 0.01,
+        "angular momentum vector drifts by {:.3e}",
+        tracker.max_vector_drift
+    );
+    assert!(tracker.max_energy_ratio <= 1.0 + 1e-12);
+    assert!(tracker.min_energy_ratio > 0.99);
+}
+
+/// The companion of the tests above: with the gyroscopic stage switched off
+/// the world-frame `ω` never changes, the magnitude of `L` is conserved to
+/// rounding, and the vector `L` drifts by almost 10% — which is why the
+/// vector, not the magnitude, is the quantity to assert on.
+#[test]
+fn test_angular_momentum_vector_drifts_without_gyroscopic_term() {
+    let mut world = PhysicsWorld::new([0.0, 0.0, 0.0], TUMBLE_DT);
+    world.solver_config.use_implicit_gyroscopic = false;
+    let handle = world.add_rigid_body(tumbling_box(tumble_spin()));
+    let mut tracker = TumbleTracker::new(world.get_body(handle).expect("body was just added"));
+    for step in 1..=TUMBLE_STEPS {
+        world.step();
+        let body = world.get_body(handle).expect("body was just added");
+        assert_eq!(body.angular_velocity, tumble_spin());
+        tracker.record(body, step as f64 * TUMBLE_DT);
+    }
+    assert!(
+        tracker.max_magnitude_drift < 1e-12,
+        "|L| drifts by {:.3e}",
+        tracker.max_magnitude_drift
+    );
+    assert!(
+        tracker.max_vector_drift > 0.05,
+        "L drifts by only {:.3e}",
+        tracker.max_vector_drift
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 2b — Dzhanibekov effect (intermediate-axis instability)
+// ---------------------------------------------------------------------------
+
+const DZHANIBEKOV_SPIN: f64 = 3.0;
+const DZHANIBEKOV_PERTURBATION: f64 = 1.0e-3;
+const DZHANIBEKOV_DT: f64 = 0.005;
+const DZHANIBEKOV_HORIZON: f64 = 20.0;
+
+/// Spin of `3 rad/s` about the intermediate axis (`z`) with a `1e-3 rad/s`
+/// perturbation along `x`.
+fn dzhanibekov_spin() -> Vec3 {
+    Vec3::new(DZHANIBEKOV_PERTURBATION, 0.0, DZHANIBEKOV_SPIN)
+}
+
+/// Time at which the intermediate-axis component of the body-frame angular
+/// velocity of a torque-free [`tumbling_box`] first changes sign, from an RK4
+/// integration of Euler's equations `I ω̇ = (I ω) × ω` — independent of the
+/// engine's integrator. `None` if there is no sign change before `horizon`.
+fn euler_flip_time(omega0: Vec3, horizon: f64) -> Option<f64> {
+    let inertia = Mat3::from_diagonal(&Vec3::new(BOX_MOMENTS[0], BOX_MOMENTS[1], BOX_MOMENTS[2]));
+    let inverse = Mat3::from_diagonal(&Vec3::new(
+        1.0 / BOX_MOMENTS[0],
+        1.0 / BOX_MOMENTS[1],
+        1.0 / BOX_MOMENTS[2],
+    ));
+    let rhs = |w: Vec3| inverse * (inertia * w).cross(&w);
+    let h = 1.0e-4;
+    let mut omega = omega0;
+    let mut time = 0.0;
+    while time < horizon {
+        let k1 = rhs(omega);
+        let k2 = rhs(omega + k1 * (0.5 * h));
+        let k3 = rhs(omega + k2 * (0.5 * h));
+        let k4 = rhs(omega + k3 * h);
+        let next = omega + (k1 + k2 * 2.0 + k3 * 2.0 + k4) * (h / 6.0);
+        if omega.z > 0.0 && next.z <= 0.0 {
+            return Some(time + h * omega.z / (omega.z - next.z));
+        }
+        omega = next;
+        time += h;
+    }
+    None
+}
+
+/// Check a Dzhanibekov run: the flip happens within the horizon at the time
+/// Euler's equations give, the intermediate axis ends up reversed with
+/// respect to `L`, and the integrator still conserves `L` and never gains
+/// energy.
+fn check_dzhanibekov_flip(tracker: &TumbleTracker) {
+    let reference = euler_flip_time(dzhanibekov_spin(), 2.0 * DZHANIBEKOV_HORIZON)
+        .expect("Euler's equations flip the box");
+    assert!(
+        reference < DZHANIBEKOV_HORIZON,
+        "reference flip at {reference:.3} s is outside the {DZHANIBEKOV_HORIZON} s horizon"
+    );
+    let flip = tracker
+        .flip_time
+        .expect("the box must flip over within 20 s");
+    assert!(
+        (flip - reference).abs() < 0.01 * reference,
+        "flip at {flip:.3} s, Euler's equations give {reference:.3} s"
+    );
+    assert!(
+        tracker.min_axis_cosine < -0.99,
+        "the intermediate axis must end up anti-parallel to L, cosine {:.4}",
+        tracker.min_axis_cosine
+    );
+    assert!(
+        tracker.max_vector_drift < 0.01,
+        "angular momentum vector drifts by {:.3e}",
+        tracker.max_vector_drift
+    );
+    assert!(tracker.max_energy_ratio <= 1.0 + 1e-12);
+    assert!(tracker.min_energy_ratio > 0.97);
+}
+
+/// `integrate_bodies` flips the box at the time Euler's equations give.
+#[test]
+fn test_dzhanibekov_flip_with_integrate_bodies() {
+    let mut set = RigidBodySet::new();
+    let handle = set.insert(tumbling_box(dzhanibekov_spin()));
+    let mut tracker = TumbleTracker::new(set.get(handle).expect("handle inserted above must exist"));
+    let gravity = Vec3::zeros();
+    let steps = (DZHANIBEKOV_HORIZON / DZHANIBEKOV_DT).round() as usize;
+    for step in 1..=steps {
+        integrate_bodies(&mut set, DZHANIBEKOV_DT, &gravity);
+        let body = set.get(handle).expect("handle inserted above must exist");
+        tracker.record(body, step as f64 * DZHANIBEKOV_DT);
+    }
+    check_dzhanibekov_flip(&tracker);
+}
+
+/// `PhysicsWorld::step` with the default configuration flips the box too, and
+/// the flip is a property of the gyroscopic term: with the stage disabled the
+/// box keeps spinning about the (unstable) axis forever.
+#[test]
+fn test_dzhanibekov_flip_with_physics_world() {
+    let steps = (DZHANIBEKOV_HORIZON / DZHANIBEKOV_DT).round() as usize;
+    let run = |gyroscopic: bool| {
+        let mut world = PhysicsWorld::new([0.0, 0.0, 0.0], DZHANIBEKOV_DT);
+        world.solver_config.use_implicit_gyroscopic = gyroscopic;
+        let handle = world.add_rigid_body(tumbling_box(dzhanibekov_spin()));
+        let mut tracker = TumbleTracker::new(world.get_body(handle).expect("body was just added"));
+        for step in 1..=steps {
+            world.step();
+            let body = world.get_body(handle).expect("body was just added");
+            tracker.record(body, step as f64 * DZHANIBEKOV_DT);
+        }
+        tracker
+    };
+    check_dzhanibekov_flip(&run(true));
+
+    let frozen = run(false);
+    assert!(
+        frozen.flip_time.is_none(),
+        "without the gyroscopic term the box cannot flip"
+    );
+    assert!(frozen.min_axis_cosine > 0.999);
+}
+

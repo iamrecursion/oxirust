@@ -1,0 +1,975 @@
+//! Advanced GGML quantization formats: Q5 and Q6 variants
+//!
+//! This module implements higher-precision quantization formats that offer
+//! better quality than Q4 variants while maintaining good compression ratios.
+
+use crate::errors::{Result, TrustformersError};
+use crate::tensor::Tensor;
+use anyhow::anyhow;
+use serde::{Deserialize, Serialize};
+
+/// GGML quantization type with Q5 and Q6 variants
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum GGMLQuantType {
+    /// 5-bit quantization (5.5 bits per weight)
+    Q5_0,
+    /// 5-bit quantization with 16-bit scales (5.5 bits per weight)
+    Q5_1,
+    /// 5-bit quantization with 6-bit scales (5.5 bits per weight)
+    Q5K,
+    /// 6-bit quantization (6.5 bits per weight)
+    Q6K,
+}
+
+impl GGMLQuantType {
+    /// Get block size for this quantization type
+    pub fn block_size(&self) -> usize {
+        match self {
+            Self::Q5_0 | Self::Q5_1 => 32,
+            Self::Q5K | Self::Q6K => 256,
+        }
+    }
+
+    /// Get bits per weight
+    pub fn bits_per_weight(&self) -> f32 {
+        match self {
+            Self::Q5_0 | Self::Q5_1 | Self::Q5K => 5.5,
+            Self::Q6K => 6.5625,
+        }
+    }
+}
+
+/// Q5_0 quantization block (32 weights packed into 22 bytes)
+#[derive(Debug, Clone)]
+pub struct BlockQ5_0 {
+    /// Scale factor (FP16)
+    pub d: F16,
+    /// High bits for 32 values (4 bytes)
+    pub qh: [u8; 4],
+    /// Low 4 bits for 32 values (16 bytes)
+    pub qs: [u8; 16],
+}
+
+/// Q5_1 quantization block (32 weights packed into 24 bytes)
+#[derive(Debug, Clone)]
+pub struct BlockQ5_1 {
+    /// Scale factor (FP16)
+    pub d: F16,
+    /// Minimum value (FP16)
+    pub m: F16,
+    /// High bits for 32 values (4 bytes)
+    pub qh: [u8; 4],
+    /// Low 4 bits for 32 values (16 bytes)
+    pub qs: [u8; 16],
+}
+
+/// Q5K quantization block (256 weights in super-blocks)
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Reserved for future GGML Q5K quantization support
+pub struct BlockQ5K {
+    /// Scale factors (8x FP16)
+    pub d: [F16; 8],
+    /// Minimum values (8x FP16)
+    pub dmin: [F16; 8],
+    /// 6-bit scales (12 bytes)
+    pub scales: [u8; 12],
+    /// High bits (32 bytes)
+    pub qh: [u8; 32],
+    /// Low 4 bits (128 bytes)
+    pub qs: [u8; 128],
+}
+
+/// Q6K quantization block (256 weights in super-blocks)
+#[derive(Debug, Clone)]
+pub struct BlockQ6K {
+    /// Scale factor (FP16)
+    pub d: F16,
+    /// 8-bit scales (16 values)
+    pub scales: [u8; 16],
+    /// Low 4 bits (128 bytes)
+    pub ql: [u8; 128],
+    /// High 2 bits (64 bytes)
+    pub qh: [u8; 64],
+}
+
+/// Helper type for f16 (using u16 storage)
+type F16 = u16;
+
+/// Convert f32 to IEEE-754 binary16 (round-to-nearest-even, denormals preserved).
+///
+/// Delegates to `half::f16`; the previous hand-rolled version truncated the
+/// mantissa (`mant >> 13`) instead of rounding and flushed every denormal to
+/// zero, so the stored block scales were systematically biased low.
+#[inline]
+fn f32_to_f16(val: f32) -> F16 {
+    half::f16::from_f32(val).to_bits()
+}
+
+/// Convert IEEE-754 binary16 to f32 (exact; every binary16 value fits in f32).
+#[inline]
+fn f16_to_f32(val: F16) -> f32 {
+    half::f16::from_bits(val).to_f32()
+}
+
+/// Quantize tensor to Q5_0 format
+pub fn quantize_q5_0(tensor: &Tensor) -> Result<Vec<BlockQ5_0>> {
+    let values: Vec<f32> = match tensor {
+        Tensor::F32(data) => {
+            data.as_slice().ok_or_else(|| anyhow!("Failed to get tensor data"))?.to_vec()
+        },
+        Tensor::F64(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v as f32)
+            .collect(),
+        Tensor::F16(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v.to_f32())
+            .collect(),
+        Tensor::BF16(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v.to_f32())
+            .collect(),
+        Tensor::I64(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v as f32)
+            .collect(),
+        Tensor::C32(_) => {
+            return Err(anyhow!("Complex32 tensors not yet supported for quantization").into())
+        },
+        Tensor::C64(_) => {
+            return Err(anyhow!("Complex64 tensors not yet supported for quantization").into())
+        },
+        Tensor::CF16(_) => {
+            return Err(anyhow!("Complex16 tensors not yet supported for quantization").into())
+        },
+        Tensor::CBF16(_) => {
+            return Err(
+                anyhow!("Complex BFloat16 tensors not yet supported for quantization").into(),
+            )
+        },
+        Tensor::Sparse(_) => {
+            return Err(anyhow!("Sparse tensors not yet supported for quantization").into())
+        },
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        Tensor::Metal(_) => {
+            return Err(anyhow!("Metal tensors not yet supported for quantization").into())
+        },
+        #[cfg(feature = "cuda")]
+        Tensor::CUDA(_) => {
+            return Err(anyhow!("CUDA tensors not yet supported for quantization").into())
+        },
+    };
+
+    let n = values.len();
+    let nb = n / 32; // Number of blocks
+    let mut blocks = Vec::with_capacity(nb);
+
+    for i in 0..nb {
+        let start = i * 32;
+        let block_data = &values[start..start + 32];
+
+        // Find absolute maximum for symmetric quantization
+        let amax = block_data.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+
+        // Calculate scale for Q5_0 (symmetric, 5 bits signed)
+        let scale = amax / 15.0;
+        let iscale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+
+        // Quantize values
+        let mut qs = [0u8; 16];
+        let mut qh = [0u8; 4];
+
+        for j in 0..32 {
+            let val = block_data[j];
+            let qi = (val * iscale + 15.5) as i32;
+            let qi = qi.clamp(0, 31) as u8;
+
+            // Store low 4 bits
+            if j % 2 == 0 {
+                qs[j / 2] = qi & 0xF;
+            } else {
+                qs[j / 2] |= (qi & 0xF) << 4;
+            }
+
+            // Store high bit
+            if qi & 0x10 != 0 {
+                qh[j / 8] |= 1 << (j % 8);
+            }
+        }
+
+        blocks.push(BlockQ5_0 {
+            d: f32_to_f16(scale),
+            qh,
+            qs,
+        });
+    }
+
+    Ok(blocks)
+}
+
+/// Dequantize Q5_0 blocks back to f32
+pub fn dequantize_q5_0(blocks: &[BlockQ5_0], shape: &[usize]) -> Result<Tensor> {
+    let n = blocks.len() * 32;
+    let mut values = vec![0.0f32; n];
+
+    for (i, block) in blocks.iter().enumerate() {
+        let scale = f16_to_f32(block.d);
+        let offset = i * 32;
+
+        for j in 0..32 {
+            // Extract 5-bit value
+            let ql = if j % 2 == 0 { block.qs[j / 2] & 0xF } else { block.qs[j / 2] >> 4 };
+
+            let qh = if block.qh[j / 8] & (1 << (j % 8)) != 0 { 0x10 } else { 0x00 };
+
+            let qi = ql | qh;
+            values[offset + j] = ((qi as f32) - 15.0) * scale;
+        }
+    }
+
+    Tensor::from_vec(values, shape)
+}
+
+/// Quantize tensor to Q5_1 format
+pub fn quantize_q5_1(tensor: &Tensor) -> Result<Vec<BlockQ5_1>> {
+    let values: Vec<f32> = match tensor {
+        Tensor::F32(data) => {
+            data.as_slice().ok_or_else(|| anyhow!("Failed to get tensor data"))?.to_vec()
+        },
+        Tensor::F64(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v as f32)
+            .collect(),
+        Tensor::F16(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v.to_f32())
+            .collect(),
+        Tensor::BF16(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v.to_f32())
+            .collect(),
+        Tensor::I64(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v as f32)
+            .collect(),
+        Tensor::C32(_) => {
+            return Err(anyhow!("Complex32 tensors not yet supported for quantization").into())
+        },
+        Tensor::C64(_) => {
+            return Err(anyhow!("Complex64 tensors not yet supported for quantization").into())
+        },
+        Tensor::CF16(_) => {
+            return Err(anyhow!("Complex16 tensors not yet supported for quantization").into())
+        },
+        Tensor::CBF16(_) => {
+            return Err(
+                anyhow!("Complex BFloat16 tensors not yet supported for quantization").into(),
+            )
+        },
+        Tensor::Sparse(_) => {
+            return Err(anyhow!("Sparse tensors not yet supported for quantization").into())
+        },
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        Tensor::Metal(_) => {
+            return Err(anyhow!("Metal tensors not yet supported for quantization").into())
+        },
+        #[cfg(feature = "cuda")]
+        Tensor::CUDA(_) => {
+            return Err(anyhow!("CUDA tensors not yet supported for quantization").into())
+        },
+    };
+
+    let n = values.len();
+    let nb = n / 32;
+    let mut blocks = Vec::with_capacity(nb);
+
+    for i in 0..nb {
+        let start = i * 32;
+        let block_data = &values[start..start + 32];
+
+        // Find min and max
+        let min = block_data.iter().fold(f32::MAX, |a, &b| a.min(b));
+        let max = block_data.iter().fold(f32::MIN, |a, &b| a.max(b));
+
+        // Calculate scale
+        let scale = (max - min) / 31.0;
+        let iscale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+
+        // Quantize values
+        let mut qs = [0u8; 16];
+        let mut qh = [0u8; 4];
+
+        for j in 0..32 {
+            let val = block_data[j];
+            let qi = ((val - min) * iscale + 0.5) as i32;
+            let qi = qi.clamp(0, 31) as u8;
+
+            // Store low 4 bits
+            if j % 2 == 0 {
+                qs[j / 2] = qi & 0xF;
+            } else {
+                qs[j / 2] |= (qi & 0xF) << 4;
+            }
+
+            // Store high bit
+            if qi & 0x10 != 0 {
+                qh[j / 8] |= 1 << (j % 8);
+            }
+        }
+
+        blocks.push(BlockQ5_1 {
+            d: f32_to_f16(scale),
+            m: f32_to_f16(min),
+            qh,
+            qs,
+        });
+    }
+
+    Ok(blocks)
+}
+
+/// Quantize tensor to Q6K format
+pub fn quantize_q6_k(tensor: &Tensor) -> Result<Vec<BlockQ6K>> {
+    let values: Vec<f32> = match tensor {
+        Tensor::F32(data) => {
+            data.as_slice().ok_or_else(|| anyhow!("Failed to get tensor data"))?.to_vec()
+        },
+        Tensor::F64(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v as f32)
+            .collect(),
+        Tensor::F16(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v.to_f32())
+            .collect(),
+        Tensor::BF16(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v.to_f32())
+            .collect(),
+        Tensor::I64(data) => data
+            .as_slice()
+            .ok_or_else(|| anyhow!("Failed to get tensor data"))?
+            .iter()
+            .map(|&v| v as f32)
+            .collect(),
+        Tensor::C32(_) => {
+            return Err(anyhow!("Complex32 tensors not yet supported for quantization").into())
+        },
+        Tensor::C64(_) => {
+            return Err(anyhow!("Complex64 tensors not yet supported for quantization").into())
+        },
+        Tensor::CF16(_) => {
+            return Err(anyhow!("Complex16 tensors not yet supported for quantization").into())
+        },
+        Tensor::CBF16(_) => {
+            return Err(
+                anyhow!("Complex BFloat16 tensors not yet supported for quantization").into(),
+            )
+        },
+        Tensor::Sparse(_) => {
+            return Err(anyhow!("Sparse tensors not yet supported for quantization").into())
+        },
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        Tensor::Metal(_) => {
+            return Err(anyhow!("Metal tensors not yet supported for quantization").into())
+        },
+        #[cfg(feature = "cuda")]
+        Tensor::CUDA(_) => {
+            return Err(anyhow!("CUDA tensors not yet supported for quantization").into())
+        },
+    };
+
+    let n = values.len();
+    let nb = n / 256; // Super-blocks of 256
+    let mut blocks = Vec::with_capacity(nb);
+
+    for i in 0..nb {
+        let start = i * 256;
+        let block_data = &values[start..start + 256];
+
+        // Find global scale
+        let max = block_data.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        let scale = max / 127.0;
+        let iscale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+
+        let mut scales = [0u8; 16];
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+
+        // Process 16 sub-blocks of 16 values each
+        for (sb, scale_ref) in scales.iter_mut().enumerate() {
+            let sb_start = sb * 16;
+            let sb_data = &block_data[sb_start..sb_start + 16];
+
+            // Find sub-block scale
+            let sb_max = sb_data.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            let sb_scale = sb_max * iscale;
+            *scale_ref = (sb_scale * 63.0 + 0.5) as u8;
+
+            // Quantize sub-block
+            for (j, &val) in sb_data.iter().enumerate() {
+                let scaled = val * iscale * 63.0 / (*scale_ref as f32 + 1e-10);
+                let qi = (scaled + 32.5) as i32;
+                let qi = qi.clamp(0, 63) as u8;
+
+                // Store low 4 bits
+                let idx = sb_start + j;
+                if idx % 2 == 0 {
+                    ql[idx / 2] = qi & 0xF;
+                } else {
+                    ql[idx / 2] |= (qi & 0xF) << 4;
+                }
+
+                // Store high 2 bits
+                let qh_idx = idx / 4;
+                let qh_shift = (idx % 4) * 2;
+                qh[qh_idx] |= ((qi >> 4) & 0x3) << qh_shift;
+            }
+        }
+
+        blocks.push(BlockQ6K {
+            d: f32_to_f16(scale),
+            scales,
+            ql,
+            qh,
+        });
+    }
+
+    Ok(blocks)
+}
+
+/// Advanced GGML quantizer supporting Q5 and Q6 variants
+pub struct AdvancedGGMLQuantizer {
+    pub quant_type: GGMLQuantType,
+}
+
+impl AdvancedGGMLQuantizer {
+    /// Create a new advanced GGML quantizer
+    pub fn new(quant_type: GGMLQuantType) -> Self {
+        Self { quant_type }
+    }
+
+    /// Quantize a tensor
+    pub fn quantize(&self, tensor: &Tensor) -> Result<QuantizedGGMLTensor> {
+        let shape = tensor.shape().to_vec();
+
+        let data = match self.quant_type {
+            GGMLQuantType::Q5_0 => {
+                let blocks = quantize_q5_0(tensor)?;
+                GGMLQuantData::Q5_0(blocks)
+            },
+            GGMLQuantType::Q5_1 => {
+                let blocks = quantize_q5_1(tensor)?;
+                GGMLQuantData::Q5_1(blocks)
+            },
+            GGMLQuantType::Q5K => {
+                // Q5_K uses 256-weight super-blocks with 6-bit packed per-sub-block
+                // scales and mins; this module has neither an encoder nor a
+                // decoder for that layout. Emitting Q5_0 blocks under a `Q5K`
+                // type tag (what this arm used to do) makes the payload and the
+                // tag disagree, so every consumer dispatching on `quant_type` --
+                // including the GGUF writer -- would read 22-byte Q5_0 blocks as
+                // 176-byte Q5_K super-blocks.
+                return Err(TrustformersError::not_implemented(
+                    "GGML Q5_K quantization: no Q5_K encoder/decoder is implemented. \
+                     Use Q5_0, Q5_1 or Q6_K, or the K-quant path in `gguf_k_quants`."
+                        .to_string(),
+                ));
+            },
+            GGMLQuantType::Q6K => {
+                let blocks = quantize_q6_k(tensor)?;
+                GGMLQuantData::Q6K(blocks)
+            },
+        };
+
+        Ok(QuantizedGGMLTensor {
+            data,
+            shape,
+            quant_type: self.quant_type,
+        })
+    }
+
+    /// Calculate compression ratio
+    pub fn compression_ratio(&self, original_size: usize) -> f32 {
+        let bits_per_weight = self.quant_type.bits_per_weight();
+        let compressed_bits = (original_size as f32) * bits_per_weight;
+        let original_bits = (original_size * 32) as f32; // 32 bits per f32
+        original_bits / compressed_bits
+    }
+}
+
+/// Quantized GGML tensor
+#[derive(Debug, Clone)]
+pub struct QuantizedGGMLTensor {
+    pub data: GGMLQuantData,
+    pub shape: Vec<usize>,
+    pub quant_type: GGMLQuantType,
+}
+
+/// GGML quantized data variants
+#[derive(Debug, Clone)]
+pub enum GGMLQuantData {
+    Q5_0(Vec<BlockQ5_0>),
+    Q5_1(Vec<BlockQ5_1>),
+    Q6K(Vec<BlockQ6K>),
+}
+
+impl QuantizedGGMLTensor {
+    /// Dequantize back to f32 tensor
+    pub fn dequantize(&self) -> Result<Tensor> {
+        match &self.data {
+            GGMLQuantData::Q5_0(blocks) => dequantize_q5_0(blocks, &self.shape),
+            GGMLQuantData::Q5_1(blocks) => {
+                // Implement Q5_1 dequantization
+                let n = blocks.len() * 32;
+                let mut values = vec![0.0f32; n];
+
+                for (i, block) in blocks.iter().enumerate() {
+                    let scale = f16_to_f32(block.d);
+                    let min = f16_to_f32(block.m);
+                    let offset = i * 32;
+
+                    for j in 0..32 {
+                        let ql =
+                            if j % 2 == 0 { block.qs[j / 2] & 0xF } else { block.qs[j / 2] >> 4 };
+
+                        let qh = if block.qh[j / 8] & (1 << (j % 8)) != 0 { 0x10 } else { 0x00 };
+
+                        let qi = ql | qh;
+                        values[offset + j] = min + (qi as f32) * scale;
+                    }
+                }
+
+                Tensor::from_vec(values, &self.shape)
+            },
+            GGMLQuantData::Q6K(blocks) => {
+                // Implement Q6K dequantization
+                let n = blocks.len() * 256;
+                let mut values = vec![0.0f32; n];
+
+                for (i, block) in blocks.iter().enumerate() {
+                    let scale = f16_to_f32(block.d);
+                    let offset = i * 256;
+
+                    for sb in 0..16 {
+                        let sb_scale = (block.scales[sb] as f32) / 63.0;
+                        let sb_start = sb * 16;
+
+                        for j in 0..16 {
+                            let idx = sb_start + j;
+
+                            // Extract 6-bit value
+                            let ql = if idx % 2 == 0 {
+                                block.ql[idx / 2] & 0xF
+                            } else {
+                                block.ql[idx / 2] >> 4
+                            };
+
+                            let qh_idx = idx / 4;
+                            let qh_shift = (idx % 4) * 2;
+                            let qh = (block.qh[qh_idx] >> qh_shift) & 0x3;
+
+                            let qi = ql | (qh << 4);
+                            values[offset + idx] = (qi as f32 - 32.0) * scale * sb_scale;
+                        }
+                    }
+                }
+
+                Tensor::from_vec(values, &self.shape)
+            },
+        }
+    }
+
+    /// Get memory usage in bytes
+    pub fn memory_usage(&self) -> usize {
+        match &self.data {
+            GGMLQuantData::Q5_0(blocks) => blocks.len() * 22,
+            GGMLQuantData::Q5_1(blocks) => blocks.len() * 24,
+            GGMLQuantData::Q6K(blocks) => blocks.len() * 210,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_q5_0_quantization() {
+        // Create test tensor
+        let values: Vec<f32> = (0..64).map(|i| i as f32 * 0.1).collect();
+        let tensor = Tensor::from_vec(values.clone(), &[64]).expect("tensor operation failed");
+
+        // Quantize
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q5_0);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+
+        // Check compression
+        let compression = quantizer.compression_ratio(64);
+        assert!(compression > 5.0 && compression < 6.0);
+
+        // Dequantize and check error
+        let dequantized = quantized.dequantize().expect("Dequantization failed");
+        match dequantized {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                let max_error = values
+                    .iter()
+                    .zip(deq_values.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, |a, b| a.max(b));
+
+                assert!(max_error < 0.25); // Reasonable error for 5-bit quantization
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+    }
+
+    #[test]
+    fn test_q6_k_quantization() {
+        // Create larger test tensor for super-blocks
+        let values: Vec<f32> = (0..512).map(|i| (i as f32 * 0.01).sin()).collect();
+        let tensor = Tensor::from_vec(values.clone(), &[512]).expect("tensor operation failed");
+
+        // Quantize
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q6K);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+
+        // Check memory usage
+        let memory = quantized.memory_usage();
+        assert!(memory < values.len() * 4); // Should be compressed
+
+        // Dequantize and check
+        let dequantized = quantized.dequantize().expect("Dequantization failed");
+        match dequantized {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                assert_eq!(deq_values.len(), values.len());
+
+                // Check reconstruction quality
+                let mse: f32 =
+                    values.iter().zip(deq_values.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>()
+                        / values.len() as f32;
+
+                assert!(mse < 0.01); // Good quality for 6-bit
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+    }
+
+    #[test]
+    fn test_f64_i64_tensor_support() {
+        use crate::tensor::DType;
+
+        let values_f32: Vec<f32> = (0..64).map(|i| i as f32 * 0.1).collect();
+        let base_tensor_f64 =
+            Tensor::from_vec(values_f32.clone(), &[64]).expect("tensor operation failed");
+        let tensor_f64 = base_tensor_f64.to_dtype(DType::F64).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q5_0);
+        let quantized_f64 = quantizer.quantize(&tensor_f64).expect("Quantization failed");
+        let dequantized_f64 = quantized_f64.dequantize().expect("Dequantization failed");
+
+        match dequantized_f64 {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                let max_error = values_f32
+                    .iter()
+                    .zip(deq_values.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, |a, b| a.max(b));
+                assert!(max_error < 0.25);
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+
+        let values_i32: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let base_tensor_i64 =
+            Tensor::from_vec(values_i32.clone(), &[64]).expect("tensor operation failed");
+        let tensor_i64 = base_tensor_i64.to_dtype(DType::I64).expect("tensor operation failed");
+
+        let quantized_i64 = quantizer.quantize(&tensor_i64).expect("Quantization failed");
+        let dequantized_i64 = quantized_i64.dequantize().expect("Dequantization failed");
+
+        match dequantized_i64 {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                let max_error = values_i32
+                    .iter()
+                    .zip(deq_values.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, |a, b| a.max(b));
+                assert!(max_error < 2.1);
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+    }
+
+    // ── GGMLQuantType tests ──
+
+    #[test]
+    fn test_ggml_quant_type_block_sizes() {
+        assert_eq!(GGMLQuantType::Q5_0.block_size(), 32);
+        assert_eq!(GGMLQuantType::Q5_1.block_size(), 32);
+        assert_eq!(GGMLQuantType::Q5K.block_size(), 256);
+        assert_eq!(GGMLQuantType::Q6K.block_size(), 256);
+    }
+
+    #[test]
+    fn test_ggml_quant_type_bits_per_weight() {
+        assert!((GGMLQuantType::Q5_0.bits_per_weight() - 5.5).abs() < 1e-2);
+        assert!((GGMLQuantType::Q5_1.bits_per_weight() - 5.5).abs() < 1e-2);
+        assert!((GGMLQuantType::Q5K.bits_per_weight() - 5.5).abs() < 1e-2);
+        assert!((GGMLQuantType::Q6K.bits_per_weight() - 6.5625).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_ggml_quant_type_eq() {
+        assert_eq!(GGMLQuantType::Q5_0, GGMLQuantType::Q5_0);
+        assert_ne!(GGMLQuantType::Q5_0, GGMLQuantType::Q5_1);
+        assert_ne!(GGMLQuantType::Q5K, GGMLQuantType::Q6K);
+    }
+
+    #[test]
+    fn test_ggml_quant_type_clone() {
+        let qt = GGMLQuantType::Q6K;
+        let cloned = qt;
+        assert_eq!(qt, cloned);
+    }
+
+    // ── AdvancedGGMLQuantizer tests ──
+
+    #[test]
+    fn test_quantizer_q5_1() {
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1).sin()).collect();
+        let tensor = Tensor::from_vec(values.clone(), &[64]).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q5_1);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+        let dequantized = quantized.dequantize().expect("Dequantization failed");
+
+        match dequantized {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                assert_eq!(deq_values.len(), values.len());
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+    }
+
+    #[test]
+    fn test_quantizer_memory_usage() {
+        let values: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
+        let tensor = Tensor::from_vec(values, &[64]).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q5_0);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+        let memory = quantized.memory_usage();
+        // 64 floats = 256 bytes. 5-bit quant should use less.
+        assert!(memory < 256);
+    }
+
+    #[test]
+    fn test_quantizer_q5_0_all_zeros() {
+        let values = vec![0.0f32; 64];
+        let tensor = Tensor::from_vec(values, &[64]).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q5_0);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+        let dequantized = quantized.dequantize().expect("Dequantization failed");
+
+        match dequantized {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                for val in deq_values {
+                    assert!(val.abs() < 1e-3, "Expected ~0, got {}", val);
+                }
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+    }
+
+    #[test]
+    fn test_q6k_all_zeros() {
+        let values = vec![0.0f32; 256];
+        let tensor = Tensor::from_vec(values, &[256]).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q6K);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+        let dequantized = quantized.dequantize().expect("Dequantization failed");
+
+        match dequantized {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                for val in deq_values {
+                    assert!(val.abs() < 1e-3, "Expected ~0, got {}", val);
+                }
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+    }
+
+    #[test]
+    fn test_q5_0_negative_values() {
+        let values: Vec<f32> = (0..64).map(|i| -(i as f32) * 0.1).collect();
+        let tensor = Tensor::from_vec(values.clone(), &[64]).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q5_0);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+        let dequantized = quantized.dequantize().expect("Dequantization failed");
+
+        match dequantized {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                assert_eq!(deq_values.len(), values.len());
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+    }
+
+    #[test]
+    fn test_q6k_large_tensor() {
+        let values: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.001).sin()).collect();
+        let tensor = Tensor::from_vec(values.clone(), &[1024]).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q6K);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+        let memory = quantized.memory_usage();
+        assert!(memory < values.len() * 4);
+
+        let dequantized = quantized.dequantize().expect("Dequantization failed");
+        match dequantized {
+            Tensor::F32(data) => {
+                let deq_values = data.as_slice().expect("operation failed in test");
+                assert_eq!(deq_values.len(), 1024);
+            },
+            _ => panic!("Unexpected tensor type"),
+        }
+    }
+
+    // ── FP16 conversion tests ──
+
+    #[test]
+    fn test_f16_roundtrip_zero() {
+        let f16 = f32_to_f16(0.0);
+        let back = f16_to_f32(f16);
+        assert!((back).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_f16_roundtrip_one() {
+        let f16 = f32_to_f16(1.0);
+        let back = f16_to_f32(f16);
+        assert!((back - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_f16_roundtrip_negative() {
+        let f16 = f32_to_f16(-42.0);
+        let back = f16_to_f32(f16);
+        assert!((back - (-42.0)).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_f16_special_inf() {
+        let f16 = f32_to_f16(f32::INFINITY);
+        let back = f16_to_f32(f16);
+        assert!(back.is_infinite() && back > 0.0);
+    }
+
+    #[test]
+    fn test_f16_special_neg_inf() {
+        let f16 = f32_to_f16(f32::NEG_INFINITY);
+        let back = f16_to_f32(f16);
+        assert!(back.is_infinite() && back < 0.0);
+    }
+
+    #[test]
+    fn test_f16_special_nan() {
+        let f16 = f32_to_f16(f32::NAN);
+        let back = f16_to_f32(f16);
+        assert!(back.is_nan());
+    }
+
+    // ── Block structure tests ──
+
+    #[test]
+    fn test_block_q5_0_clone() {
+        let block = BlockQ5_0 {
+            d: f32_to_f16(1.0),
+            qh: [0, 0, 0, 0],
+            qs: [0u8; 16],
+        };
+        let cloned = block.clone();
+        assert_eq!(cloned.d, block.d);
+    }
+
+    #[test]
+    fn test_block_q5_1_clone() {
+        let block = BlockQ5_1 {
+            d: f32_to_f16(1.0),
+            m: f32_to_f16(0.0),
+            qh: [0, 0, 0, 0],
+            qs: [0u8; 16],
+        };
+        let cloned = block.clone();
+        assert_eq!(cloned.d, block.d);
+        assert_eq!(cloned.m, block.m);
+    }
+
+    #[test]
+    fn test_block_q6k_clone() {
+        let block = BlockQ6K {
+            d: f32_to_f16(1.0),
+            scales: [0u8; 16],
+            ql: [0u8; 128],
+            qh: [0u8; 64],
+        };
+        let cloned = block.clone();
+        assert_eq!(cloned.d, block.d);
+    }
+
+    // ── Quantized tensor info tests ──
+
+    #[test]
+    fn test_quantized_shape_preserved() {
+        let values: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let tensor = Tensor::from_vec(values, &[64]).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q5_0);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+        assert_eq!(quantized.shape, vec![64]);
+    }
+
+    #[test]
+    fn test_quantized_quant_type_field() {
+        let values: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let tensor = Tensor::from_vec(values, &[64]).expect("tensor operation failed");
+
+        let quantizer = AdvancedGGMLQuantizer::new(GGMLQuantType::Q5_1);
+        let quantized = quantizer.quantize(&tensor).expect("Quantization failed");
+        assert_eq!(quantized.quant_type, GGMLQuantType::Q5_1);
+    }
+}

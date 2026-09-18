@@ -1,0 +1,1209 @@
+//! # ML Frameworks Integration Module
+//!
+//! This module provides integration with the latest machine learning frameworks
+//! for voice conversion, including Candle, ONNX Runtime, TensorFlow Lite, and PyTorch.
+
+use crate::{Error, Result};
+use candle_core::{Device, Tensor};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+
+/// Supported ML framework types
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum MLFramework {
+    /// Candle framework (Rust-native)
+    Candle,
+    /// ONNX Runtime
+    OnnxRuntime,
+    /// TensorFlow Lite
+    TensorFlowLite,
+    /// PyTorch (via Candle integration)
+    PyTorch,
+    /// Custom framework implementation
+    Custom,
+}
+
+/// ML framework configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MLFrameworkConfig {
+    /// Primary framework to use
+    pub primary_framework: MLFramework,
+    /// Fallback frameworks in order of preference
+    pub fallback_frameworks: Vec<MLFramework>,
+    /// Device preference (CPU, GPU, etc.)
+    pub device_preference: DevicePreference,
+    /// Model optimization settings
+    pub optimization: ModelOptimization,
+    /// Memory management settings
+    pub memory_config: MemoryConfig,
+    /// Performance tuning settings
+    pub performance_config: PerformanceConfig,
+    /// Framework-specific settings
+    pub framework_settings: HashMap<MLFramework, FrameworkSettings>,
+}
+
+/// Device preference for ML computations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DevicePreference {
+    /// Prefer CPU computation
+    Cpu,
+    /// Prefer GPU computation (CUDA, Metal, etc.)
+    Gpu {
+        /// GPU device index
+        device_index: Option<usize>,
+        /// Memory limit in MB
+        memory_limit_mb: Option<usize>,
+    },
+    /// Automatic device selection
+    Auto,
+    /// Custom device specification
+    Custom {
+        /// Device identifier
+        device_id: String,
+        /// Device capabilities
+        capabilities: HashMap<String, String>,
+    },
+}
+
+/// Model optimization configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelOptimization {
+    /// Enable quantization
+    pub quantization_enabled: bool,
+    /// Quantization precision
+    pub quantization_precision: QuantizationPrecision,
+    /// Enable pruning
+    pub pruning_enabled: bool,
+    /// Pruning ratio (0.0 - 1.0)
+    pub pruning_ratio: f32,
+    /// Enable knowledge distillation
+    pub distillation_enabled: bool,
+    /// Enable operator fusion
+    pub operator_fusion: bool,
+    /// Enable constant folding
+    pub constant_folding: bool,
+}
+
+/// Quantization precision options
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum QuantizationPrecision {
+    /// 8-bit integer quantization
+    Int8,
+    /// 16-bit integer quantization
+    Int16,
+    /// 16-bit floating point
+    Float16,
+    /// Dynamic quantization
+    Dynamic,
+}
+
+/// Memory management configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Maximum memory usage in MB
+    pub max_memory_mb: usize,
+    /// Memory pool size for intermediate tensors
+    pub memory_pool_size_mb: usize,
+    /// Enable memory optimization
+    pub memory_optimization_enabled: bool,
+    /// Garbage collection frequency
+    pub gc_frequency: usize,
+    /// Enable memory mapping for large models
+    pub memory_mapping_enabled: bool,
+}
+
+/// Performance tuning configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceConfig {
+    /// Number of threads for CPU inference
+    pub cpu_threads: Option<usize>,
+    /// Batch size for inference
+    pub batch_size: usize,
+    /// Enable asynchronous execution
+    pub async_execution: bool,
+    /// Prefetch buffer size
+    pub prefetch_buffer_size: usize,
+    /// Enable pipeline parallelism
+    pub pipeline_parallelism: bool,
+    /// Cache compiled models
+    pub model_caching: bool,
+}
+
+/// Framework-specific settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameworkSettings {
+    /// Library path or configuration
+    pub library_path: Option<PathBuf>,
+    /// Custom initialization parameters
+    pub init_params: HashMap<String, String>,
+    /// Provider-specific options
+    pub provider_options: HashMap<String, String>,
+    /// Session configuration
+    pub session_config: HashMap<String, String>,
+}
+
+/// ML model metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MLModelMetadata {
+    /// Model name
+    pub name: String,
+    /// Model version
+    pub version: String,
+    /// Framework this model was trained with
+    pub framework: MLFramework,
+    /// Input tensor specifications
+    pub input_specs: Vec<TensorSpec>,
+    /// Output tensor specifications
+    pub output_specs: Vec<TensorSpec>,
+    /// Model file path
+    pub model_path: PathBuf,
+    /// Model size in bytes
+    pub model_size_bytes: u64,
+    /// Supported sample rates
+    pub supported_sample_rates: Vec<u32>,
+    /// Model capabilities
+    pub capabilities: ModelCapabilities,
+}
+
+/// Tensor specification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorSpec {
+    /// Tensor name
+    pub name: String,
+    /// Tensor shape (-1 for dynamic dimensions)
+    pub shape: Vec<i64>,
+    /// Data type
+    pub data_type: TensorDataType,
+    /// Optional description
+    pub description: Option<String>,
+}
+
+/// Supported tensor data types
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum TensorDataType {
+    /// 32-bit floating point
+    Float32,
+    /// 64-bit floating point
+    Float64,
+    /// 32-bit signed integer
+    Int32,
+    /// 64-bit signed integer
+    Int64,
+    /// 8-bit unsigned integer
+    UInt8,
+    /// 8-bit signed integer
+    Int8,
+    /// 16-bit floating point (half precision)
+    Float16,
+}
+
+/// Model capabilities
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    /// Supports real-time processing
+    pub realtime_capable: bool,
+    /// Supports batch processing
+    pub batch_capable: bool,
+    /// Supports streaming input
+    pub streaming_capable: bool,
+    /// GPU acceleration support
+    pub gpu_accelerated: bool,
+    /// Quantization support
+    pub quantization_support: bool,
+    /// Maximum input length
+    pub max_input_length: Option<usize>,
+}
+
+/// ML inference session
+pub struct MLInferenceSession {
+    /// Framework being used
+    framework: MLFramework,
+    /// Model metadata
+    model_metadata: MLModelMetadata,
+    /// Candle-specific session
+    candle_session: Option<CandleSession>,
+    /// Framework configuration
+    config: MLFrameworkConfig,
+    /// Performance metrics
+    metrics: Arc<RwLock<InferenceMetrics>>,
+}
+
+/// Candle-specific inference session
+pub struct CandleSession {
+    /// Candle device
+    device: Device,
+    /// Loaded model tensors/weights
+    model_weights: HashMap<String, Tensor>,
+    /// Model architecture
+    model_architecture: ModelArchitecture,
+}
+
+/// Model architecture for Candle
+#[derive(Debug, Clone)]
+pub enum ModelArchitecture {
+    /// Transformer-based architecture
+    Transformer {
+        /// Number of layers
+        num_layers: usize,
+        /// Hidden dimension
+        hidden_dim: usize,
+        /// Number of attention heads
+        num_heads: usize,
+    },
+    /// Convolutional neural network
+    Cnn {
+        /// Convolution layers configuration
+        conv_layers: Vec<ConvLayerConfig>,
+        /// Fully connected layers
+        fc_layers: Vec<usize>,
+    },
+    /// Recurrent neural network
+    Rnn {
+        /// RNN type (LSTM, GRU, etc.)
+        rnn_type: RnnType,
+        /// Hidden size
+        hidden_size: usize,
+        /// Number of layers
+        num_layers: usize,
+        /// Bidirectional
+        bidirectional: bool,
+    },
+    /// Custom architecture
+    Custom {
+        /// Architecture description
+        description: String,
+        /// Layer specifications
+        layers: Vec<LayerSpec>,
+    },
+}
+
+/// Convolution layer configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvLayerConfig {
+    /// Input channels
+    pub in_channels: usize,
+    /// Output channels
+    pub out_channels: usize,
+    /// Kernel size
+    pub kernel_size: usize,
+    /// Stride
+    pub stride: usize,
+    /// Padding
+    pub padding: usize,
+    /// Activation function
+    pub activation: ActivationFunction,
+}
+
+/// RNN types
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum RnnType {
+    /// Long Short-Term Memory
+    Lstm,
+    /// Gated Recurrent Unit
+    Gru,
+    /// Vanilla RNN
+    Vanilla,
+}
+
+/// Activation functions for neural network layers
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ActivationFunction {
+    /// Rectified Linear Unit activation function
+    ReLU,
+    /// Leaky ReLU with small negative slope for negative values
+    LeakyReLU,
+    /// Hyperbolic tangent activation function
+    Tanh,
+    /// Sigmoid activation function mapping to (0, 1)
+    Sigmoid,
+    /// Swish activation function (x * sigmoid(x))
+    Swish,
+    /// Gaussian Error Linear Unit activation function
+    GELU,
+    /// Mish activation function (smooth non-monotonic)
+    Mish,
+}
+
+/// Layer specification for custom architectures defining layer configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerSpec {
+    /// Layer type
+    pub layer_type: String,
+    /// Layer parameters
+    pub parameters: HashMap<String, f32>,
+    /// Input shape
+    pub input_shape: Vec<usize>,
+    /// Output shape
+    pub output_shape: Vec<usize>,
+}
+
+/// Inference performance metrics tracking timing and resource usage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceMetrics {
+    /// Total inference count
+    pub inference_count: u64,
+    /// Total inference time in milliseconds
+    pub total_inference_time_ms: u64,
+    /// Average inference time in milliseconds
+    pub avg_inference_time_ms: f32,
+    /// Minimum inference time in milliseconds
+    pub min_inference_time_ms: f32,
+    /// Maximum inference time in milliseconds
+    pub max_inference_time_ms: f32,
+    /// Memory usage statistics
+    pub memory_usage: MemoryUsageStats,
+    /// Error count
+    pub error_count: u64,
+    /// Last update timestamp
+    pub last_update: std::time::SystemTime,
+}
+
+impl Default for InferenceMetrics {
+    fn default() -> Self {
+        Self {
+            inference_count: 0,
+            total_inference_time_ms: 0,
+            avg_inference_time_ms: 0.0,
+            min_inference_time_ms: 0.0,
+            max_inference_time_ms: 0.0,
+            memory_usage: MemoryUsageStats::default(),
+            error_count: 0,
+            last_update: std::time::SystemTime::now(),
+        }
+    }
+}
+
+/// Memory usage statistics for ML inference operations
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct MemoryUsageStats {
+    /// Peak memory usage in bytes
+    pub peak_usage_bytes: u64,
+    /// Current memory usage in bytes
+    pub current_usage_bytes: u64,
+    /// Average memory usage in bytes
+    pub avg_usage_bytes: u64,
+    /// Memory allocations count
+    pub allocation_count: u64,
+}
+
+/// ML framework manager for coordinating multiple inference backends
+pub struct MLFrameworkManager {
+    /// Available frameworks
+    frameworks: HashMap<MLFramework, FrameworkInfo>,
+    /// Active sessions
+    active_sessions: Arc<RwLock<HashMap<String, MLInferenceSession>>>,
+    /// Configuration
+    config: MLFrameworkConfig,
+    /// Model registry
+    model_registry: Arc<RwLock<HashMap<String, MLModelMetadata>>>,
+}
+
+/// Framework information containing version, providers, and capabilities
+#[derive(Debug, Clone)]
+pub struct FrameworkInfo {
+    /// Framework version
+    version: String,
+    /// Available providers
+    providers: Vec<String>,
+    /// Initialization status
+    initialized: bool,
+    /// Capabilities
+    capabilities: FrameworkCapabilities,
+}
+
+/// Framework capabilities defining supported features
+#[derive(Debug, Clone)]
+pub struct FrameworkCapabilities {
+    /// GPU support
+    gpu_support: bool,
+    /// Quantization support
+    quantization_support: bool,
+    /// Dynamic shapes support
+    dynamic_shapes: bool,
+    /// Streaming support
+    streaming_support: bool,
+}
+
+impl Default for MLFrameworkConfig {
+    fn default() -> Self {
+        Self {
+            primary_framework: MLFramework::Candle,
+            fallback_frameworks: vec![MLFramework::OnnxRuntime],
+            device_preference: DevicePreference::Auto,
+            optimization: ModelOptimization::default(),
+            memory_config: MemoryConfig::default(),
+            performance_config: PerformanceConfig::default(),
+            framework_settings: HashMap::new(),
+        }
+    }
+}
+
+impl Default for ModelOptimization {
+    fn default() -> Self {
+        Self {
+            quantization_enabled: true,
+            quantization_precision: QuantizationPrecision::Int8,
+            pruning_enabled: false,
+            pruning_ratio: 0.1,
+            distillation_enabled: false,
+            operator_fusion: true,
+            constant_folding: true,
+        }
+    }
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_mb: 4096,      // 4GB
+            memory_pool_size_mb: 512, // 512MB
+            memory_optimization_enabled: true,
+            gc_frequency: 100,
+            memory_mapping_enabled: true,
+        }
+    }
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            cpu_threads: None, // Auto-detect
+            batch_size: 1,
+            async_execution: true,
+            prefetch_buffer_size: 4,
+            pipeline_parallelism: false,
+            model_caching: true,
+        }
+    }
+}
+
+impl MLFrameworkManager {
+    /// Create new ML framework manager
+    pub fn new(config: MLFrameworkConfig) -> Result<Self> {
+        let mut frameworks = HashMap::new();
+
+        // Initialize Candle framework (always available)
+        frameworks.insert(
+            MLFramework::Candle,
+            FrameworkInfo {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                providers: vec!["CPU".to_string(), "CUDA".to_string(), "Metal".to_string()],
+                initialized: true,
+                capabilities: FrameworkCapabilities {
+                    gpu_support: true,
+                    quantization_support: true,
+                    dynamic_shapes: true,
+                    streaming_support: true,
+                },
+            },
+        );
+
+        // ONNX Runtime is listed for discoverability (list_frameworks /
+        // get_framework_capabilities) but honestly marked `initialized: false`:
+        // no ONNX Runtime bindings are linked into this manager (see
+        // create_onnx_session), so select_framework will never choose it.
+        frameworks.insert(
+            MLFramework::OnnxRuntime,
+            FrameworkInfo {
+                version: "1.16.0".to_string(),
+                providers: vec!["CPU".to_string(), "CUDA".to_string()],
+                initialized: false,
+                capabilities: FrameworkCapabilities {
+                    gpu_support: true,
+                    quantization_support: true,
+                    dynamic_shapes: true,
+                    streaming_support: false,
+                },
+            },
+        );
+
+        Ok(Self {
+            frameworks,
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            config,
+            model_registry: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    /// Register a new model
+    pub fn register_model(&self, metadata: MLModelMetadata) -> Result<()> {
+        let mut registry = self.model_registry.write().map_err(|_| {
+            Error::runtime("Failed to acquire write lock on model registry".to_string())
+        })?;
+
+        registry.insert(metadata.name.clone(), metadata);
+        Ok(())
+    }
+
+    /// Create inference session for a model
+    pub fn create_session(&self, model_name: &str, session_id: String) -> Result<()> {
+        let model_metadata = {
+            let registry = self.model_registry.read().map_err(|_| {
+                Error::runtime("Failed to acquire read lock on model registry".to_string())
+            })?;
+
+            registry.get(model_name).cloned().ok_or_else(|| {
+                Error::model(format!("Model '{model_name}' not found in registry"))
+            })?
+        };
+
+        // Select framework based on configuration and model requirements
+        let framework = self.select_framework(&model_metadata)?;
+
+        let session = match framework {
+            MLFramework::Candle => self.create_candle_session(&model_metadata)?,
+            MLFramework::OnnxRuntime => self.create_onnx_session(&model_metadata)?,
+            MLFramework::TensorFlowLite => self.create_tflite_session(&model_metadata)?,
+            MLFramework::PyTorch => self.create_pytorch_session(&model_metadata)?,
+            MLFramework::Custom => self.create_custom_session(&model_metadata)?,
+        };
+
+        let mut sessions = self.active_sessions.write().map_err(|_| {
+            Error::runtime("Failed to acquire write lock on active sessions".to_string())
+        })?;
+
+        sessions.insert(session_id, session);
+        Ok(())
+    }
+
+    /// Run inference on a session
+    pub fn run_inference(&self, session_id: &str, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        let mut sessions = self.active_sessions.write().map_err(|_| {
+            Error::runtime("Failed to acquire write lock on active sessions".to_string())
+        })?;
+
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| Error::runtime(format!("Session '{session_id}' not found")))?;
+
+        let start_time = std::time::Instant::now();
+
+        let outputs = match session.framework {
+            MLFramework::Candle => self.run_candle_inference(session, inputs)?,
+            MLFramework::OnnxRuntime => self.run_onnx_inference(session, inputs)?,
+            MLFramework::TensorFlowLite => self.run_tflite_inference(session, inputs)?,
+            MLFramework::PyTorch => self.run_pytorch_inference(session, inputs)?,
+            MLFramework::Custom => self.run_custom_inference(session, inputs)?,
+        };
+
+        let inference_time = start_time.elapsed();
+
+        // Update metrics
+        {
+            let mut metrics = session.metrics.write().map_err(|_| {
+                Error::runtime("Failed to acquire write lock on metrics".to_string())
+            })?;
+
+            metrics.inference_count += 1;
+            let inference_time_ms = inference_time.as_millis() as u64;
+            metrics.total_inference_time_ms += inference_time_ms;
+            metrics.avg_inference_time_ms =
+                metrics.total_inference_time_ms as f32 / metrics.inference_count as f32;
+
+            if metrics.inference_count == 1 {
+                metrics.min_inference_time_ms = inference_time_ms as f32;
+                metrics.max_inference_time_ms = inference_time_ms as f32;
+            } else {
+                metrics.min_inference_time_ms =
+                    metrics.min_inference_time_ms.min(inference_time_ms as f32);
+                metrics.max_inference_time_ms =
+                    metrics.max_inference_time_ms.max(inference_time_ms as f32);
+            }
+
+            metrics.last_update = std::time::SystemTime::now();
+        }
+
+        Ok(outputs)
+    }
+
+    /// Select appropriate framework for a model
+    fn select_framework(&self, model_metadata: &MLModelMetadata) -> Result<MLFramework> {
+        // Check if primary framework supports the model
+        if self.framework_supports_model(self.config.primary_framework, model_metadata)? {
+            return Ok(self.config.primary_framework);
+        }
+
+        // Try fallback frameworks
+        for &framework in &self.config.fallback_frameworks {
+            if self.framework_supports_model(framework, model_metadata)? {
+                return Ok(framework);
+            }
+        }
+
+        Err(Error::model(format!(
+            "No compatible framework found for model '{}'",
+            model_metadata.name
+        )))
+    }
+
+    /// Check if framework supports a model
+    fn framework_supports_model(
+        &self,
+        framework: MLFramework,
+        model_metadata: &MLModelMetadata,
+    ) -> Result<bool> {
+        let framework_info = self
+            .frameworks
+            .get(&framework)
+            .ok_or_else(|| Error::model(format!("Framework {framework:?} not available")))?;
+
+        if !framework_info.initialized {
+            return Ok(false);
+        }
+
+        // Check framework compatibility with model
+        match (framework, model_metadata.framework) {
+            (MLFramework::Candle, _) => Ok(true), // Candle can handle most formats
+            (a, b) if a == b => Ok(true),         // Same framework
+            (MLFramework::OnnxRuntime, MLFramework::PyTorch) => Ok(true), // ONNX can run PyTorch models
+            (MLFramework::OnnxRuntime, MLFramework::TensorFlowLite) => Ok(true), // ONNX can run TF models
+            _ => Ok(false),
+        }
+    }
+
+    /// Create Candle inference session
+    fn create_candle_session(
+        &self,
+        model_metadata: &MLModelMetadata,
+    ) -> Result<MLInferenceSession> {
+        let device = match &self.config.device_preference {
+            DevicePreference::Cpu => Device::Cpu,
+            DevicePreference::Gpu { device_index, .. } => match device_index {
+                Some(idx) => std::panic::catch_unwind(move || Device::cuda_if_available(*idx))
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .ok_or_else(|| Error::model(format!("Failed to create CUDA device {idx}")))?,
+                None => std::panic::catch_unwind(|| Device::cuda_if_available(0))
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .ok_or_else(|| Error::model("Failed to create CUDA device".to_string()))?,
+            },
+            DevicePreference::Auto => std::panic::catch_unwind(|| Device::cuda_if_available(0))
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(Device::Cpu),
+            DevicePreference::Custom { .. } => Device::Cpu, // Fallback to CPU for custom
+        };
+
+        // Real safetensors loading: when a file actually exists at
+        // `model_metadata.model_path`, its weights are loaded and used by
+        // `run_candle_inference`'s linear-projection path below. When no
+        // file is present (e.g. a purely structural/registered-only model),
+        // the session still runs a real (non-fabricated) layer-norm + tanh
+        // transform rather than failing - see `apply_candle_normalization`.
+        // A file that *does* exist but fails to parse as safetensors is
+        // treated as a hard error: the caller clearly intended a real model
+        // there, so we must not silently fall back.
+        let model_weights = if model_metadata.model_path.exists() {
+            candle_core::safetensors::load(&model_metadata.model_path, &device).map_err(|e| {
+                Error::model(format!(
+                    "Failed to load Candle model weights from {:?}: {e}",
+                    model_metadata.model_path
+                ))
+            })?
+        } else {
+            HashMap::new()
+        };
+
+        // Model architecture metadata (informational): the forward pass
+        // itself is architecture-agnostic (layer-norm or linear-projection,
+        // selected by whether real weights were loaded above).
+        let model_architecture = ModelArchitecture::Transformer {
+            num_layers: 12,
+            hidden_dim: 768,
+            num_heads: 12,
+        };
+
+        let candle_session = CandleSession {
+            device,
+            model_weights,
+            model_architecture,
+        };
+
+        Ok(MLInferenceSession {
+            framework: MLFramework::Candle,
+            model_metadata: model_metadata.clone(),
+            candle_session: Some(candle_session),
+            config: self.config.clone(),
+            metrics: Arc::new(RwLock::new(InferenceMetrics::default())),
+        })
+    }
+
+    /// Create an ONNX Runtime session.
+    ///
+    /// No ONNX Runtime bindings are linked into `MLFrameworkManager`. Real,
+    /// pure-Rust ONNX inference *is* available in this crate via
+    /// [`crate::backends::onnx`] (an `oxionnx`-backed content/speaker/decoder
+    /// pipeline) - but that is a different, specialized API shape, not a
+    /// drop-in for this generic manager. Rather than return a session that
+    /// would silently run unrelated Candle computations under an "ONNX"
+    /// label, this fails closed.
+    fn create_onnx_session(&self, model_metadata: &MLModelMetadata) -> Result<MLInferenceSession> {
+        Err(Error::model(format!(
+            "ONNX Runtime backend is not implemented in MLFrameworkManager for model '{}'; use \
+             crate::backends::onnx for real ONNX Runtime (oxionnx-backed) inference",
+            model_metadata.name
+        )))
+    }
+
+    /// Create a TensorFlow Lite session.
+    ///
+    /// No TensorFlow Lite runtime (pure-Rust or otherwise) is linked into
+    /// this build, so this fails closed instead of fabricating a session.
+    fn create_tflite_session(
+        &self,
+        model_metadata: &MLModelMetadata,
+    ) -> Result<MLInferenceSession> {
+        Err(Error::model(format!(
+            "TensorFlow Lite backend is not implemented in this build (no TFLite runtime is \
+             linked) for model '{}'",
+            model_metadata.name
+        )))
+    }
+
+    /// Create a PyTorch session.
+    ///
+    /// No native PyTorch runtime is linked into this build. The Candle
+    /// backend (`MLFramework::Candle`) is the pure-Rust alternative
+    /// available in this crate.
+    fn create_pytorch_session(
+        &self,
+        model_metadata: &MLModelMetadata,
+    ) -> Result<MLInferenceSession> {
+        Err(Error::model(format!(
+            "PyTorch backend is not implemented in this build (no native PyTorch runtime is \
+             linked) for model '{}'; consider the Candle backend instead",
+            model_metadata.name
+        )))
+    }
+
+    /// Create a custom-framework session.
+    ///
+    /// No custom inference runtime is registered, so this fails closed
+    /// rather than returning a session with no actual backend behind it.
+    fn create_custom_session(
+        &self,
+        model_metadata: &MLModelMetadata,
+    ) -> Result<MLInferenceSession> {
+        Err(Error::model(format!(
+            "Custom framework backend is not implemented; no inference runtime is registered \
+             for model '{}'",
+            model_metadata.name
+        )))
+    }
+
+    /// Apply layer normalization followed by tanh activation using Candle ops.
+    ///
+    /// Each input tensor is normalized to mean=0, std=1 along the last dimension,
+    /// then a tanh activation is applied.  This is the shared computation kernel
+    /// for all five inference back-ends in this file.
+    fn apply_candle_normalization(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            // Layer normalization: (x - mean) / (std + eps)
+            let mean = input
+                .mean_keepdim(candle_core::D::Minus1)
+                .map_err(|e| Error::model(format!("Layer-norm mean error: {e}")))?;
+            let diff = input
+                .broadcast_sub(&mean)
+                .map_err(|e| Error::model(format!("Layer-norm sub error: {e}")))?;
+            let variance = diff
+                .sqr()
+                .map_err(|e| Error::model(format!("Layer-norm sqr error: {e}")))?
+                .mean_keepdim(candle_core::D::Minus1)
+                .map_err(|e| Error::model(format!("Layer-norm var error: {e}")))?;
+            // Candle supports adding an f64 scalar directly to a Tensor
+            let std = (variance + 1e-5)
+                .map_err(|e| Error::model(format!("Layer-norm add-eps error: {e}")))?
+                .sqrt()
+                .map_err(|e| Error::model(format!("Layer-norm sqrt error: {e}")))?;
+            let normalized = diff
+                .broadcast_div(&std)
+                .map_err(|e| Error::model(format!("Layer-norm div error: {e}")))?;
+            // Tanh activation simulates a learned non-linearity
+            let activated = normalized
+                .tanh()
+                .map_err(|e| Error::model(format!("Tanh activation error: {e}")))?;
+            outputs.push(activated);
+        }
+        Ok(outputs)
+    }
+
+    /// Run Candle inference.
+    ///
+    /// When `model_weights` is non-empty the first weight entry is used as a
+    /// linear projection matrix.  When the weight map is empty a layer
+    /// normalization + tanh transformation is applied instead — both paths
+    /// produce a meaningful transformation rather than a pass-through.
+    fn run_candle_inference(
+        &self,
+        session: &MLInferenceSession,
+        inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        let candle_session = session
+            .candle_session
+            .as_ref()
+            .ok_or_else(|| Error::model("Candle session not initialized".to_string()))?;
+
+        if candle_session.model_weights.is_empty() {
+            // No weights loaded: apply layer normalization as the transformation
+            return self.apply_candle_normalization(inputs);
+        }
+
+        // Weights available: apply a linear projection using the first weight tensor.
+        // W shape is assumed to be [out_features, in_features]; inputs are [*, in_features].
+        let weight = candle_session
+            .model_weights
+            .values()
+            .next()
+            .expect("model_weights is non-empty");
+
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            // matmul: [*, in] @ [in, out] = [*, out]
+            let weight_t = weight
+                .t()
+                .map_err(|e| Error::model(format!("Weight transpose error: {e}")))?;
+            let projected = input
+                .matmul(&weight_t)
+                .map_err(|e| Error::model(format!("Linear projection error: {e}")))?;
+            let activated = projected
+                .tanh()
+                .map_err(|e| Error::model(format!("Tanh activation error: {e}")))?;
+            outputs.push(activated);
+        }
+        Ok(outputs)
+    }
+
+    /// Run ONNX Runtime inference.
+    ///
+    /// No ONNX Runtime bindings are linked into `MLFrameworkManager` (see
+    /// [`Self::create_onnx_session`], which already fails closed before a
+    /// session could reach this point). Kept fail-closed here too, in
+    /// defense of any future caller that might construct a session without
+    /// going through `create_session`.
+    fn run_onnx_inference(
+        &self,
+        session: &MLInferenceSession,
+        _inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        Err(Error::model(format!(
+            "ONNX Runtime inference is not implemented in MLFrameworkManager for model '{}'; \
+             use crate::backends::onnx for real ONNX Runtime inference",
+            session.model_metadata.name
+        )))
+    }
+
+    /// Run TensorFlow Lite inference. No TFLite runtime is linked; see
+    /// [`Self::create_tflite_session`].
+    fn run_tflite_inference(
+        &self,
+        session: &MLInferenceSession,
+        _inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        Err(Error::model(format!(
+            "TensorFlow Lite inference is not implemented in this build for model '{}'",
+            session.model_metadata.name
+        )))
+    }
+
+    /// Run PyTorch inference. No native PyTorch runtime is linked; see
+    /// [`Self::create_pytorch_session`].
+    fn run_pytorch_inference(
+        &self,
+        session: &MLInferenceSession,
+        _inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        Err(Error::model(format!(
+            "PyTorch inference is not implemented in this build for model '{}'",
+            session.model_metadata.name
+        )))
+    }
+
+    /// Run custom framework inference. No custom runtime is registered; see
+    /// [`Self::create_custom_session`].
+    fn run_custom_inference(
+        &self,
+        session: &MLInferenceSession,
+        _inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        Err(Error::model(format!(
+            "Custom framework inference is not implemented for model '{}'",
+            session.model_metadata.name
+        )))
+    }
+
+    /// Get inference metrics for a session
+    pub fn get_metrics(&self, session_id: &str) -> Result<InferenceMetrics> {
+        let sessions = self.active_sessions.read().map_err(|_| {
+            Error::runtime("Failed to acquire read lock on active sessions".to_string())
+        })?;
+
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| Error::runtime(format!("Session '{session_id}' not found")))?;
+
+        let metrics = session
+            .metrics
+            .read()
+            .map_err(|_| Error::runtime("Failed to acquire read lock on metrics".to_string()))?;
+
+        Ok(metrics.clone())
+    }
+
+    /// Close inference session
+    pub fn close_session(&self, session_id: &str) -> Result<()> {
+        let mut sessions = self.active_sessions.write().map_err(|_| {
+            Error::runtime("Failed to acquire write lock on active sessions".to_string())
+        })?;
+
+        sessions
+            .remove(session_id)
+            .ok_or_else(|| Error::runtime(format!("Session '{session_id}' not found")))?;
+
+        Ok(())
+    }
+
+    /// List available frameworks
+    pub fn list_frameworks(&self) -> Vec<(MLFramework, &FrameworkInfo)> {
+        self.frameworks
+            .iter()
+            .map(|(&framework, info)| (framework, info))
+            .collect()
+    }
+
+    /// Get framework capabilities
+    pub fn get_framework_capabilities(
+        &self,
+        framework: MLFramework,
+    ) -> Option<&FrameworkCapabilities> {
+        self.frameworks
+            .get(&framework)
+            .map(|info| &info.capabilities)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_ml_framework_config_default() {
+        let config = MLFrameworkConfig::default();
+        assert_eq!(config.primary_framework, MLFramework::Candle);
+        assert!(config.optimization.quantization_enabled);
+        assert_eq!(config.performance_config.batch_size, 1);
+    }
+
+    #[test]
+    fn test_ml_framework_manager_creation() {
+        let config = MLFrameworkConfig::default();
+        let manager = MLFrameworkManager::new(config).unwrap();
+
+        let frameworks = manager.list_frameworks();
+        assert!(!frameworks.is_empty());
+
+        // Candle should always be available
+        assert!(frameworks
+            .iter()
+            .any(|(framework, _)| *framework == MLFramework::Candle));
+    }
+
+    #[test]
+    fn test_model_registration() {
+        let config = MLFrameworkConfig::default();
+        let manager = MLFrameworkManager::new(config).unwrap();
+
+        let model_metadata = MLModelMetadata {
+            name: "test-model".to_string(),
+            version: "1.0.0".to_string(),
+            framework: MLFramework::Candle,
+            input_specs: vec![TensorSpec {
+                name: "input".to_string(),
+                shape: vec![1, -1, 80],
+                data_type: TensorDataType::Float32,
+                description: Some("Audio features".to_string()),
+            }],
+            output_specs: vec![TensorSpec {
+                name: "output".to_string(),
+                shape: vec![1, -1, 80],
+                data_type: TensorDataType::Float32,
+                description: Some("Converted features".to_string()),
+            }],
+            model_path: PathBuf::from("test_model.safetensors"),
+            model_size_bytes: 1024 * 1024, // 1MB
+            supported_sample_rates: vec![22050, 44100],
+            capabilities: ModelCapabilities {
+                realtime_capable: true,
+                batch_capable: true,
+                streaming_capable: true,
+                gpu_accelerated: true,
+                quantization_support: true,
+                max_input_length: Some(1000),
+            },
+        };
+
+        manager.register_model(model_metadata).unwrap();
+    }
+
+    fn sample_metadata(model_path: PathBuf) -> MLModelMetadata {
+        MLModelMetadata {
+            name: "test-model".to_string(),
+            version: "1.0.0".to_string(),
+            framework: MLFramework::Candle,
+            input_specs: vec![],
+            output_specs: vec![],
+            model_path,
+            model_size_bytes: 0,
+            supported_sample_rates: vec![22050],
+            capabilities: ModelCapabilities {
+                realtime_capable: true,
+                batch_capable: true,
+                streaming_capable: true,
+                gpu_accelerated: false,
+                quantization_support: false,
+                max_input_length: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_candle_session_loads_and_uses_real_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights_path = dir.path().join("weights.safetensors");
+
+        let device = Device::Cpu;
+        let weight = Tensor::from_vec(vec![0.5f32; 16], (4, 4), &device).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("proj.weight".to_string(), weight);
+        candle_core::safetensors::save(&tensors, &weights_path).unwrap();
+
+        let config = MLFrameworkConfig::default();
+        let manager = MLFrameworkManager::new(config).unwrap();
+
+        let with_weights = manager
+            .create_candle_session(&sample_metadata(weights_path))
+            .unwrap();
+        let without_weights = manager
+            .create_candle_session(&sample_metadata(
+                dir.path().join("does_not_exist.safetensors"),
+            ))
+            .unwrap();
+
+        assert!(!with_weights
+            .candle_session
+            .as_ref()
+            .unwrap()
+            .model_weights
+            .is_empty());
+        assert!(without_weights
+            .candle_session
+            .as_ref()
+            .unwrap()
+            .model_weights
+            .is_empty());
+
+        let input = Tensor::from_vec(vec![1.0f32; 4], (1, 4), &device).unwrap();
+        let with_output = manager
+            .run_candle_inference(&with_weights, std::slice::from_ref(&input))
+            .unwrap();
+        let without_output = manager
+            .run_candle_inference(&without_weights, std::slice::from_ref(&input))
+            .unwrap();
+
+        let with_vec = with_output[0]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let without_vec = without_output[0]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_ne!(
+            with_vec, without_vec,
+            "loading real weights must change the inference output vs. the no-weights fallback"
+        );
+    }
+
+    #[test]
+    fn test_candle_session_fails_closed_on_malformed_weights_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("not_safetensors.safetensors");
+        std::fs::write(&bad_path, b"not a real safetensors file").unwrap();
+
+        let config = MLFrameworkConfig::default();
+        let manager = MLFrameworkManager::new(config).unwrap();
+
+        let result = manager.create_candle_session(&sample_metadata(bad_path));
+        assert!(
+            result.is_err(),
+            "a file present at model_path that fails to parse must be a hard error, not a \
+             silent fallback to empty weights"
+        );
+    }
+
+    #[test]
+    fn test_onnx_tflite_pytorch_custom_sessions_fail_closed() {
+        let config = MLFrameworkConfig::default();
+        let manager = MLFrameworkManager::new(config).unwrap();
+        let metadata = sample_metadata(PathBuf::from("unused.safetensors"));
+
+        assert!(manager.create_onnx_session(&metadata).is_err());
+        assert!(manager.create_tflite_session(&metadata).is_err());
+        assert!(manager.create_pytorch_session(&metadata).is_err());
+        assert!(manager.create_custom_session(&metadata).is_err());
+    }
+
+    #[test]
+    fn test_quantization_precision() {
+        let mut config = MLFrameworkConfig::default();
+        config.optimization.quantization_precision = QuantizationPrecision::Float16;
+
+        assert_eq!(
+            config.optimization.quantization_precision,
+            QuantizationPrecision::Float16
+        );
+    }
+
+    #[test]
+    fn test_device_preference() {
+        let cpu_preference = DevicePreference::Cpu;
+        let gpu_preference = DevicePreference::Gpu {
+            device_index: Some(0),
+            memory_limit_mb: Some(4096),
+        };
+
+        match cpu_preference {
+            DevicePreference::Cpu => {}
+            _ => panic!("Expected CPU preference"),
+        }
+
+        match gpu_preference {
+            DevicePreference::Gpu {
+                device_index: Some(0),
+                memory_limit_mb: Some(4096),
+            } => {}
+            _ => panic!("Expected GPU preference with specific settings"),
+        }
+    }
+
+    #[test]
+    fn test_inference_metrics() {
+        let mut metrics = InferenceMetrics::default();
+
+        // Simulate some inference runs
+        metrics.inference_count = 10;
+        metrics.total_inference_time_ms = 1000;
+        metrics.avg_inference_time_ms = 100.0;
+        metrics.min_inference_time_ms = 50.0;
+        metrics.max_inference_time_ms = 200.0;
+
+        assert_eq!(metrics.inference_count, 10);
+        assert_eq!(metrics.avg_inference_time_ms, 100.0);
+    }
+}

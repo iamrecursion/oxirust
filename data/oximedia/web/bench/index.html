@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>oximedia-web benchmark harness</title>
+    <!--
+      Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+
+      Loads bench.js, which imports the real published ../dist/*.js
+      wrappers. No build step, no bundler, no external network requests —
+      drop this whole directory behind any static file server (see
+      ../scripts/serve.sh) and open this file.
+
+      Append ?auto=1 to run automatically and report completion via
+      console.log (see bench.js's module doc and ./run.sh).
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1a1a1a;
+        --bg: #ffffff;
+        --muted: #666666;
+        --border: #d7d7d7;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e8e8e8;
+          --bg: #14161a;
+          --muted: #9aa0a6;
+          --border: #33363c;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 2rem clamp(1rem, 4vw, 3rem);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        color: var(--fg);
+        background: var(--bg);
+        line-height: 1.5;
+      }
+      h1 {
+        font-size: 1.35rem;
+        margin: 0 0 0.25rem;
+      }
+      p.lede {
+        color: var(--muted);
+        margin: 0 0 1.5rem;
+        max-width: 60ch;
+      }
+      .controls {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        margin-bottom: 1rem;
+        flex-wrap: wrap;
+      }
+      button {
+        font: inherit;
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--fg);
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #status {
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 0.85rem;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1rem 0;
+        font-size: 0.9rem;
+      }
+      caption {
+        text-align: left;
+        color: var(--muted);
+        margin-bottom: 0.4rem;
+        font-size: 0.85rem;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 0.4rem 0.6rem;
+        border-bottom: 1px solid var(--border);
+        font-family: var(--mono);
+      }
+      th {
+        color: var(--muted);
+        font-weight: 600;
+      }
+      td:nth-child(n + 2),
+      th:nth-child(n + 2) {
+        text-align: right;
+      }
+      .wrap-x {
+        overflow-x: auto;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: color-mix(in srgb, var(--fg) 5%, transparent);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 0.75rem;
+        font-family: var(--mono);
+        font-size: 0.8rem;
+        max-height: 40vh;
+        overflow: auto;
+      }
+      details summary {
+        cursor: pointer;
+        color: var(--muted);
+        margin: 1rem 0 0.25rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>oximedia-web benchmark harness</h1>
+    <p class="lede">
+      Measures the published <code>dist/*.js</code> wrappers (scopes, color, scale, quality) against
+      deterministic in-page-generated synthetic frames, plus honest pure-JS/Canvas2D baselines for
+      comparison. See <a href="./README.md">README.md</a> for methodology and limitations — read those
+      first. No number on this page is a placeholder; an empty table means nobody has run it here yet.
+    </p>
+
+    <div class="controls">
+      <button id="run-btn" type="button">Run benchmarks</button>
+      <button id="download-btn" type="button" disabled>Download results JSON</button>
+      <span id="status">idle</span>
+    </div>
+
+    <h2>Environment</h2>
+    <pre id="env-info">(run the benchmarks to populate this)</pre>
+
+    <h2>Results</h2>
+    <div class="wrap-x">
+      <table>
+        <caption>
+          Times are milliseconds per call; warmup excluded. n = measured sample count.
+        </caption>
+        <thead>
+          <tr>
+            <th>suite</th>
+            <th>n</th>
+            <th>median_ms</th>
+            <th>p95_ms</th>
+            <th>min_ms</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
+
+    <details>
+      <summary>Raw results JSON</summary>
+      <pre id="raw-json">(run the benchmarks to populate this)</pre>
+    </details>
+
+    <script type="module" src="./bench.js"></script>
+  </body>
+</html>

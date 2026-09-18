@@ -1,0 +1,42 @@
+[package]
+name = "oxicrypto-adapter-aws-lc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OxiCrypto adapter for aws-lc-rs: FIPS-validated AEAD, signatures, and hashes"
+readme = "README.md"
+keywords = ["cryptography", "aws-lc", "aead", "ed25519", "fips"]
+categories = ["cryptography"]
+
+[features]
+default = []
+aws-lc = ["dep:aws-lc-rs"]
+
+[dependencies]
+oxicrypto-core = { workspace = true }
+aws-lc-rs      = { workspace = true, optional = true }
+
+[dev-dependencies]
+oxicrypto-aead = { path = "../oxicrypto-aead" }
+oxicrypto-hash = { path = "../oxicrypto-hash" }
+oxicrypto-sig  = { path = "../oxicrypto-sig" }
+ed25519-dalek  = { workspace = true }
+criterion      = { workspace = true }
+
+[[bench]]
+name = "aws_lc_aead"
+harness = false
+required-features = ["aws-lc"]
+
+[[bench]]
+name = "aws_lc_sig"
+harness = false
+required-features = ["aws-lc"]
+
+[[bench]]
+name = "aws_lc_hash"
+harness = false
+required-features = ["aws-lc"]

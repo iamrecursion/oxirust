@@ -1,0 +1,1229 @@
+//! Linear algebra operations on tensors
+//!
+//! This module provides linear algebra operations including matrix multiplication,
+//! Hadamard (element-wise) product, diagonal extraction, trace computation,
+//! and broadcasting.
+
+use super::{functions::broadcast_copy, types::DenseND};
+use scirs2_core::numeric::Num;
+
+impl<T> DenseND<T>
+where
+    T: Clone + Num,
+{
+    /// Transpose a 2D matrix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not 2D.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let tensor = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
+    /// let transposed = tensor.transpose().unwrap();
+    ///
+    /// assert_eq!(transposed.shape(), &[3, 2]);
+    /// assert_eq!(transposed[&[0, 0]], 1.0);
+    /// assert_eq!(transposed[&[0, 1]], 4.0);
+    /// ```
+    pub fn transpose(&self) -> anyhow::Result<Self> {
+        if self.rank() != 2 {
+            anyhow::bail!(
+                "Transpose is only defined for 2D tensors, got rank {}",
+                self.rank()
+            );
+        }
+        self.permute(&[1, 0])
+    }
+
+    /// Dot product operation.
+    ///
+    /// Performs different operations based on the dimensions:
+    /// - Vector · Vector (1D · 1D): Returns scalar (inner product)
+    /// - Matrix · Vector (2D · 1D): Returns vector (matrix-vector product)
+    /// - Matrix · Matrix (2D · 2D): Returns matrix (delegates to matmul)
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The right-hand operand
+    ///
+    /// # Complexity
+    ///
+    /// O(n) for vector-vector, O(n²) for matrix-vector, O(n³) for matrix-matrix
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dimensions are incompatible or inputs are not 1D or 2D.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// // Vector dot product
+    /// let v1 = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+    /// let v2 = DenseND::<f64>::from_vec(vec![4.0, 5.0, 6.0], &[3]).unwrap();
+    /// let result = v1.dot(&v2).unwrap();
+    /// assert_eq!(result.shape(), &[1]);
+    /// assert_eq!(result[&[0]], 32.0);  // 1*4 + 2*5 + 3*6 = 32
+    ///
+    /// // Matrix-vector product
+    /// let m = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+    /// let v = DenseND::<f64>::from_vec(vec![5.0, 6.0], &[2]).unwrap();
+    /// let result = m.dot(&v).unwrap();
+    /// assert_eq!(result.shape(), &[2]);
+    /// assert_eq!(result[&[0]], 17.0);  // 1*5 + 2*6 = 17
+    /// assert_eq!(result[&[1]], 39.0);  // 3*5 + 4*6 = 39
+    /// ```
+    pub fn dot(&self, other: &Self) -> anyhow::Result<Self>
+    where
+        T: std::ops::Mul<Output = T> + std::iter::Sum,
+    {
+        match (self.rank(), other.rank()) {
+            (1, 1) => {
+                // Vector dot product
+                let n = self.shape()[0];
+                if n != other.shape()[0] {
+                    anyhow::bail!(
+                        "Vector dimensions incompatible for dot product: {} vs {}",
+                        n,
+                        other.shape()[0]
+                    );
+                }
+                let sum: T = (0..n)
+                    .map(|i| self[&[i]].clone() * other[&[i]].clone())
+                    .sum();
+                Ok(Self::from_elem(&[1], sum))
+            }
+            (2, 1) => {
+                // Matrix-vector product
+                let (m, n) = (self.shape()[0], self.shape()[1]);
+                let v_len = other.shape()[0];
+                if n != v_len {
+                    anyhow::bail!(
+                        "Matrix-vector dimensions incompatible: ({}, {}) · {}",
+                        m,
+                        n,
+                        v_len
+                    );
+                }
+                let mut result = Self::zeros(&[m]);
+                for i in 0..m {
+                    let sum: T = (0..n)
+                        .map(|j| self[&[i, j]].clone() * other[&[j]].clone())
+                        .sum();
+                    result[&[i]] = sum;
+                }
+                Ok(result)
+            }
+            (2, 2) => {
+                // Matrix-matrix product (delegate to matmul)
+                self.matmul(other)
+            }
+            _ => anyhow::bail!(
+                "Dot product only supports 1D and 2D tensors, got shapes {:?} and {:?}",
+                self.shape(),
+                other.shape()
+            ),
+        }
+    }
+
+    /// Matrix multiplication for 2D tensors.
+    ///
+    /// Computes the matrix product C = AB where A and B are 2D tensors.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The right-hand matrix
+    ///
+    /// # Complexity
+    ///
+    /// O(n³) for n×n matrices (uses standard matrix multiplication)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Either tensor is not 2D
+    /// - The inner dimensions don't match (A's columns != B's rows)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let a = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+    /// let b = DenseND::<f64>::from_vec(vec![5.0, 6.0, 7.0, 8.0], &[2, 2]).unwrap();
+    ///
+    /// let c = a.matmul(&b).unwrap();
+    /// assert_eq!(c.shape(), &[2, 2]);
+    /// // [[1*5 + 2*7, 1*6 + 2*8],
+    /// //  [3*5 + 4*7, 3*6 + 4*8]]
+    /// // = [[19, 22], [43, 50]]
+    /// assert_eq!(c[&[0, 0]], 19.0);
+    /// assert_eq!(c[&[0, 1]], 22.0);
+    /// assert_eq!(c[&[1, 0]], 43.0);
+    /// assert_eq!(c[&[1, 1]], 50.0);
+    /// ```
+    pub fn matmul(&self, other: &Self) -> anyhow::Result<Self>
+    where
+        T: std::ops::Mul<Output = T> + std::iter::Sum,
+    {
+        if self.rank() != 2 || other.rank() != 2 {
+            anyhow::bail!("Matrix multiplication requires 2D tensors");
+        }
+        let (m, k1) = (self.shape()[0], self.shape()[1]);
+        let (k2, n) = (other.shape()[0], other.shape()[1]);
+        if k1 != k2 {
+            anyhow::bail!(
+                "Matrix dimensions incompatible: ({}, {}) × ({}, {})",
+                m,
+                k1,
+                k2,
+                n
+            );
+        }
+        let mut result = Self::zeros(&[m, n]);
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = T::zero();
+                for k in 0..k1 {
+                    sum = sum + self[&[i, k]].clone() * other[&[k, j]].clone();
+                }
+                result[&[i, j]] = sum;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Element-wise multiplication (Hadamard product) with another tensor.
+    ///
+    /// Computes C[i,j,...] = A[i,j,...] * B[i,j,...] for all indices.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The tensor to multiply element-wise
+    ///
+    /// # Complexity
+    ///
+    /// O(n) where n is the number of elements
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shapes don't match.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let a = DenseND::<f64>::from_elem(&[2, 3], 2.0);
+    /// let b = DenseND::<f64>::from_elem(&[2, 3], 3.0);
+    ///
+    /// let c = a.hadamard(&b).unwrap();
+    /// assert_eq!(c[&[0, 0]], 6.0);
+    /// assert_eq!(c[&[1, 2]], 6.0);
+    /// ```
+    pub fn hadamard(&self, other: &Self) -> anyhow::Result<Self>
+    where
+        T: std::ops::Mul<Output = T>,
+    {
+        if self.shape() != other.shape() {
+            anyhow::bail!(
+                "Shape mismatch for Hadamard product: {:?} vs {:?}",
+                self.shape(),
+                other.shape()
+            );
+        }
+        let result_data = &self.data * &other.data;
+        Ok(Self { data: result_data })
+    }
+
+    /// Extract the diagonal of a 2D matrix.
+    ///
+    /// Returns a 1D tensor containing the diagonal elements.
+    ///
+    /// # Complexity
+    ///
+    /// O(min(m, n)) where m×n is the matrix shape
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not 2D.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let tensor = DenseND::<f64>::from_vec(
+    ///     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+    ///     &[3, 3]
+    /// ).unwrap();
+    ///
+    /// let diag = tensor.diagonal().unwrap();
+    /// assert_eq!(diag.shape(), &[3]);
+    /// assert_eq!(diag[&[0]], 1.0);
+    /// assert_eq!(diag[&[1]], 5.0);
+    /// assert_eq!(diag[&[2]], 9.0);
+    /// ```
+    pub fn diagonal(&self) -> anyhow::Result<Self> {
+        if self.rank() != 2 {
+            anyhow::bail!(
+                "Diagonal is only defined for 2D tensors, got rank {}",
+                self.rank()
+            );
+        }
+        let (rows, cols) = (self.shape()[0], self.shape()[1]);
+        let diag_len = std::cmp::min(rows, cols);
+        let mut diag_vec = Vec::with_capacity(diag_len);
+        for i in 0..diag_len {
+            diag_vec.push(self[&[i, i]].clone());
+        }
+        Self::from_vec(diag_vec, &[diag_len])
+    }
+
+    /// Compute the trace of a square matrix.
+    ///
+    /// The trace is the sum of diagonal elements.
+    ///
+    /// # Complexity
+    ///
+    /// O(n) where n is the matrix dimension
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not a square matrix.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let tensor = DenseND::<f64>::from_vec(
+    ///     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+    ///     &[3, 3]
+    /// ).unwrap();
+    ///
+    /// let trace = tensor.trace().unwrap();
+    /// assert_eq!(trace, 15.0); // 1 + 5 + 9
+    /// ```
+    pub fn trace(&self) -> anyhow::Result<T>
+    where
+        T: std::iter::Sum,
+    {
+        if !self.is_square() {
+            anyhow::bail!(
+                "Trace is only defined for square matrices, got shape {:?}",
+                self.shape()
+            );
+        }
+        let n = self.shape()[0];
+        Ok((0..n).map(|i| self[&[i, i]].clone()).sum())
+    }
+
+    /// Broadcast this tensor to a target shape
+    ///
+    /// # Arguments
+    ///
+    /// * `target_shape` - The shape to broadcast to
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if broadcasting is not possible
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let tensor = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+    /// let broadcasted = tensor.broadcast_to(&[2, 3]).unwrap();
+    ///
+    /// assert_eq!(broadcasted.shape(), &[2, 3]);
+    /// assert_eq!(broadcasted[&[0, 0]], 1.0);
+    /// assert_eq!(broadcasted[&[1, 2]], 3.0);
+    /// ```
+    pub fn broadcast_to(&self, target_shape: &[usize]) -> anyhow::Result<Self> {
+        // Validate that shapes are broadcastable
+        if !super::functions::shapes_broadcastable(self.shape(), target_shape) {
+            anyhow::bail!(
+                "Cannot broadcast shape {:?} to {:?}",
+                self.shape(),
+                target_shape
+            );
+        }
+
+        let mut result = Self::zeros(target_shape);
+        broadcast_copy(&self.data, &mut result.data, self.shape(), target_shape)?;
+        Ok(result)
+    }
+
+    /// Compute the outer product of two 1D arrays.
+    ///
+    /// For vectors a and b, returns a matrix M where M\[i,j\] = a\[i\] * b\[j\].
+    ///
+    /// # Complexity
+    ///
+    /// O(m * n) where m and n are the lengths of the vectors
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let a = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+    /// let b = DenseND::<f64>::from_vec(vec![4.0, 5.0], &[2]).unwrap();
+    ///
+    /// let outer = a.outer(&b).unwrap();
+    /// assert_eq!(outer.shape(), &[3, 2]);
+    /// assert_eq!(outer[&[0, 0]], 4.0);   // 1.0 * 4.0
+    /// assert_eq!(outer[&[0, 1]], 5.0);   // 1.0 * 5.0
+    /// assert_eq!(outer[&[1, 0]], 8.0);   // 2.0 * 4.0
+    /// assert_eq!(outer[&[2, 1]], 15.0);  // 3.0 * 5.0
+    /// ```
+    pub fn outer(&self, other: &Self) -> anyhow::Result<Self>
+    where
+        T: std::ops::Mul<Output = T>,
+    {
+        if self.rank() != 1 || other.rank() != 1 {
+            anyhow::bail!(
+                "Outer product requires 1D tensors, got shapes {:?} and {:?}",
+                self.shape(),
+                other.shape()
+            );
+        }
+
+        let m = self.shape()[0];
+        let n = other.shape()[0];
+
+        let mut result = Self::zeros(&[m, n]);
+
+        for i in 0..m {
+            for j in 0..n {
+                result[&[i, j]] = self[&[i]].clone() * other[&[j]].clone();
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Create a diagonal matrix from a 1D array, or extract diagonal from a 2D array.
+    ///
+    /// - If input is 1D (length n): Creates n×n matrix with values on diagonal
+    /// - If input is 2D: Extracts the main diagonal as a 1D array
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// // Create diagonal matrix from vector
+    /// let vec = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+    /// let diag_mat = vec.diag().unwrap();
+    /// assert_eq!(diag_mat.shape(), &[3, 3]);
+    /// assert_eq!(diag_mat[&[0, 0]], 1.0);
+    /// assert_eq!(diag_mat[&[1, 1]], 2.0);
+    /// assert_eq!(diag_mat[&[2, 2]], 3.0);
+    /// assert_eq!(diag_mat[&[0, 1]], 0.0);
+    ///
+    /// // Extract diagonal from matrix
+    /// let mat = DenseND::<f64>::from_vec(
+    ///     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+    ///     &[3, 3]
+    /// ).unwrap();
+    /// let diag_vec = mat.diag().unwrap();
+    /// assert_eq!(diag_vec.shape(), &[3]);
+    /// assert_eq!(diag_vec[&[0]], 1.0);
+    /// assert_eq!(diag_vec[&[1]], 5.0);
+    /// assert_eq!(diag_vec[&[2]], 9.0);
+    /// ```
+    pub fn diag(&self) -> anyhow::Result<Self> {
+        match self.rank() {
+            1 => {
+                // Create diagonal matrix
+                let n = self.shape()[0];
+                let mut result = Self::zeros(&[n, n]);
+
+                for i in 0..n {
+                    result[&[i, i]] = self[&[i]].clone();
+                }
+
+                Ok(result)
+            }
+            2 => {
+                // Extract diagonal
+                let m = self.shape()[0];
+                let n = self.shape()[1];
+                let diag_len = m.min(n);
+
+                let diag_values: Vec<T> = (0..diag_len).map(|i| self[&[i, i]].clone()).collect();
+
+                Self::from_vec(diag_values, &[diag_len])
+            }
+            _ => {
+                anyhow::bail!("diag() requires 1D or 2D tensor, got rank {}", self.rank());
+            }
+        }
+    }
+
+    /// Create a diagonal matrix with offset.
+    ///
+    /// Creates an n×n matrix with the given values on the k-th diagonal.
+    /// k > 0 means above the main diagonal, k < 0 means below.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let vec = DenseND::<f64>::from_vec(vec![1.0, 2.0], &[2]).unwrap();
+    ///
+    /// // Main diagonal
+    /// let diag0 = DenseND::diag_offset(&vec, 0, 3).unwrap();
+    /// assert_eq!(diag0[&[0, 0]], 1.0);
+    /// assert_eq!(diag0[&[1, 1]], 2.0);
+    ///
+    /// // Upper diagonal (k=1)
+    /// let diag1 = DenseND::diag_offset(&vec, 1, 3).unwrap();
+    /// assert_eq!(diag1[&[0, 1]], 1.0);
+    /// assert_eq!(diag1[&[1, 2]], 2.0);
+    /// ```
+    pub fn diag_offset(values: &Self, k: isize, size: usize) -> anyhow::Result<Self> {
+        if values.rank() != 1 {
+            anyhow::bail!("diag_offset requires 1D tensor, got rank {}", values.rank());
+        }
+
+        let mut result = Self::zeros(&[size, size]);
+
+        for (idx, val) in values.as_slice().iter().enumerate() {
+            let i = if k >= 0 {
+                idx
+            } else {
+                (idx as isize - k) as usize
+            };
+
+            let j = if k >= 0 {
+                (idx as isize + k) as usize
+            } else {
+                idx
+            };
+
+            if i < size && j < size {
+                result[&[i, j]] = val.clone();
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+// Advanced Linear Algebra Operations
+impl<T> DenseND<T>
+where
+    T: Copy
+        + scirs2_core::numeric::Float
+        + scirs2_core::numeric::NumCast
+        + scirs2_core::numeric::FromPrimitive
+        + std::iter::Sum
+        + std::iter::Product
+        + std::ops::Mul<Output = T>,
+{
+    /// Compute the determinant of a square matrix.
+    ///
+    /// Uses optimized direct formulas for 2×2 and 3×3 matrices, and LU decomposition
+    /// for larger matrices.
+    ///
+    /// # Complexity
+    ///
+    /// O(1) for 2×2, O(1) for 3×3, O(n³) for n×n (n > 3)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// // 2x2 matrix
+    /// let mat2 = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+    /// let det2 = mat2.det().unwrap();
+    /// assert!((det2 - (-2.0)).abs() < 1e-10);  // 1*4 - 2*3 = -2
+    ///
+    /// // 3x3 identity matrix
+    /// let mat3 = DenseND::<f64>::eye(3);
+    /// let det3 = mat3.det().unwrap();
+    /// assert!((det3 - 1.0).abs() < 1e-10);
+    /// ```
+    pub fn det(&self) -> anyhow::Result<T> {
+        if !self.is_square() {
+            anyhow::bail!(
+                "Determinant requires a square matrix, got shape {:?}",
+                self.shape()
+            );
+        }
+
+        let n = self.shape()[0];
+
+        match n {
+            1 => Ok(self[&[0, 0]]),
+            2 => {
+                // det = ad - bc for [[a, b], [c, d]]
+                let a = self[&[0, 0]];
+                let b = self[&[0, 1]];
+                let c = self[&[1, 0]];
+                let d = self[&[1, 1]];
+                Ok(a * d - b * c)
+            }
+            3 => {
+                // Use rule of Sarrus for 3x3
+                let a00 = self[&[0, 0]];
+                let a01 = self[&[0, 1]];
+                let a02 = self[&[0, 2]];
+                let a10 = self[&[1, 0]];
+                let a11 = self[&[1, 1]];
+                let a12 = self[&[1, 2]];
+                let a20 = self[&[2, 0]];
+                let a21 = self[&[2, 1]];
+                let a22 = self[&[2, 2]];
+
+                let pos = a00 * a11 * a22 + a01 * a12 * a20 + a02 * a10 * a21;
+
+                let neg = a02 * a11 * a20 + a01 * a10 * a22 + a00 * a12 * a21;
+
+                Ok(pos - neg)
+            }
+            _ => {
+                // For larger matrices, use LU decomposition
+                let (_l, u, perm) = self.lu_decomposition()?;
+
+                // det(A) = det(P) * det(L) * det(U)
+                // det(L) = 1 (unit lower triangular)
+                // det(U) = product of diagonal elements
+                // det(P) = sign of the pivot permutation.
+                //
+                // The sign of a permutation is (-1)^(number of transpositions),
+                // which equals (-1)^(n - number_of_disjoint_cycles). It is an
+                // invariant of the permutation itself and must NOT be inferred
+                // from the count of *displaced* elements: a single row swap
+                // displaces two elements (an even count) yet is one
+                // transposition -> an ODD permutation with det(P) = -1. Using
+                // the displaced-element parity therefore returns the wrong sign
+                // whenever the permutation has an odd number of non-trivial
+                // cycles. We instead decompose `perm` into disjoint cycles and
+                // use parity = (-1)^(n - num_cycles), which is exact.
+                //
+                // (Cycle decomposition is chosen over instrumenting
+                // `lu_decomposition` to count swaps because the latter is a
+                // public API whose 3-tuple return is also consumed by the
+                // verified `solve()`; recovering the parity from the returned
+                // permutation keeps this fix self-contained and leaves the
+                // permutation's parity — an invariant — provably correct.)
+
+                let det_u: T = (0..n).map(|i| u[&[i, i]]).product();
+
+                let mut visited = vec![false; n];
+                let mut num_cycles = 0usize;
+                for start in 0..n {
+                    if visited[start] {
+                        continue;
+                    }
+                    num_cycles += 1;
+                    let mut j = start;
+                    while !visited[j] {
+                        visited[j] = true;
+                        j = perm[j];
+                    }
+                }
+
+                let sign = if (n - num_cycles).is_multiple_of(2) {
+                    T::one()
+                } else {
+                    -T::one()
+                };
+
+                Ok(sign * det_u)
+            }
+        }
+    }
+
+    /// Compute the matrix inverse using Gauss-Jordan elimination.
+    ///
+    /// # Complexity
+    ///
+    /// O(n³) for n×n matrices
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let mat = DenseND::<f64>::from_vec(vec![4.0, 7.0, 2.0, 6.0], &[2, 2]).unwrap();
+    /// let inv = mat.inv().unwrap();
+    ///
+    /// // Verify A * A^(-1) ≈ I
+    /// let identity = mat.matmul(&inv).unwrap();
+    /// assert!((identity[&[0, 0]] - 1.0).abs() < 1e-10);
+    /// assert!((identity[&[1, 1]] - 1.0).abs() < 1e-10);
+    /// assert!(identity[&[0, 1]].abs() < 1e-10);
+    /// assert!(identity[&[1, 0]].abs() < 1e-10);
+    /// ```
+    pub fn inv(&self) -> anyhow::Result<Self> {
+        if !self.is_square() {
+            anyhow::bail!(
+                "Matrix inverse requires a square matrix, got shape {:?}",
+                self.shape()
+            );
+        }
+
+        let n = self.shape()[0];
+
+        // Create augmented matrix [A | I]
+        let mut aug = Self::zeros(&[n, 2 * n]);
+
+        // Copy A to left half
+        for i in 0..n {
+            for j in 0..n {
+                aug[&[i, j]] = self[&[i, j]];
+            }
+        }
+
+        // Set identity in right half
+        for i in 0..n {
+            aug[&[i, i + n]] = T::one();
+        }
+
+        // Gauss-Jordan elimination
+        for col in 0..n {
+            // Find pivot
+            let mut pivot_row = col;
+            let mut max_val = aug[&[col, col]].abs();
+
+            for i in (col + 1)..n {
+                let val = aug[&[i, col]].abs();
+                if val > max_val {
+                    max_val = val;
+                    pivot_row = i;
+                }
+            }
+
+            // Check for singularity; the 1e-10 tolerance is representable
+            // in any reasonable numeric `T`. Fall back to `T::zero()` so we
+            // still check `max_val < 0` conservatively (any singular-ish
+            // pivot will still be caught below).
+            let eps: T = T::from(1e-10).unwrap_or_else(T::zero);
+            if max_val < eps {
+                anyhow::bail!("Matrix is singular and cannot be inverted");
+            }
+
+            // Swap rows if needed
+            if pivot_row != col {
+                for j in 0..(2 * n) {
+                    let temp = aug[&[col, j]];
+                    aug[&[col, j]] = aug[&[pivot_row, j]];
+                    aug[&[pivot_row, j]] = temp;
+                }
+            }
+
+            // Scale pivot row
+            let pivot = aug[&[col, col]];
+            for j in 0..(2 * n) {
+                aug[&[col, j]] = aug[&[col, j]] / pivot;
+            }
+
+            // Eliminate column
+            for i in 0..n {
+                if i != col {
+                    let factor = aug[&[i, col]];
+                    for j in 0..(2 * n) {
+                        let val = aug[&[i, j]] - factor * aug[&[col, j]];
+                        aug[&[i, j]] = val;
+                    }
+                }
+            }
+        }
+
+        // Extract inverse from right half
+        let mut inv = Self::zeros(&[n, n]);
+        for i in 0..n {
+            for j in 0..n {
+                inv[&[i, j]] = aug[&[i, j + n]];
+            }
+        }
+
+        Ok(inv)
+    }
+
+    /// Compute LU decomposition with partial pivoting.
+    ///
+    /// Returns (L, U, P) where:
+    /// - L is unit lower triangular
+    /// - U is upper triangular
+    /// - P is the permutation vector (not matrix)
+    /// - PA = LU
+    ///
+    /// # Complexity
+    ///
+    /// O(n³) for n×n matrices
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// let mat = DenseND::<f64>::from_vec(
+    ///     vec![2.0, 1.0, 1.0, 4.0, -6.0, 0.0, -2.0, 7.0, 2.0],
+    ///     &[3, 3]
+    /// ).unwrap();
+    ///
+    /// let (l, u, _perm) = mat.lu_decomposition().unwrap();
+    /// assert_eq!(l.shape(), &[3, 3]);
+    /// assert_eq!(u.shape(), &[3, 3]);
+    /// ```
+    pub fn lu_decomposition(&self) -> anyhow::Result<(Self, Self, Vec<usize>)> {
+        if !self.is_square() {
+            anyhow::bail!(
+                "LU decomposition requires a square matrix, got shape {:?}",
+                self.shape()
+            );
+        }
+
+        let n = self.shape()[0];
+        let mut l = Self::zeros(&[n, n]);
+        let mut u = self.clone();
+        let mut perm: Vec<usize> = (0..n).collect();
+
+        for i in 0..n {
+            l[&[i, i]] = T::one();
+        }
+
+        for k in 0..n {
+            // Partial pivoting
+            let mut pivot_row = k;
+            let mut max_val = u[&[k, k]].abs();
+
+            for i in (k + 1)..n {
+                let val = u[&[i, k]].abs();
+                if val > max_val {
+                    max_val = val;
+                    pivot_row = i;
+                }
+            }
+
+            // Swap rows in U and permutation
+            if pivot_row != k {
+                for j in 0..n {
+                    let temp = u[&[k, j]];
+                    u[&[k, j]] = u[&[pivot_row, j]];
+                    u[&[pivot_row, j]] = temp;
+                }
+                perm.swap(k, pivot_row);
+
+                // Also swap already computed parts of L
+                for j in 0..k {
+                    let temp = l[&[k, j]];
+                    l[&[k, j]] = l[&[pivot_row, j]];
+                    l[&[pivot_row, j]] = temp;
+                }
+            }
+
+            // Check for singularity. See note in `inv()` about the 1e-10
+            // tolerance and the `T::zero()` fallback.
+            let eps: T = T::from(1e-10).unwrap_or_else(T::zero);
+            if u[&[k, k]].abs() < eps {
+                anyhow::bail!("Matrix is singular, LU decomposition failed");
+            }
+
+            // Gaussian elimination
+            for i in (k + 1)..n {
+                let factor = u[&[i, k]] / u[&[k, k]];
+                l[&[i, k]] = factor;
+
+                for j in k..n {
+                    let val = u[&[i, j]] - factor * u[&[k, j]];
+                    u[&[i, j]] = val;
+                }
+            }
+        }
+
+        Ok((l, u, perm))
+    }
+
+    /// Solve a linear system Ax = b using LU decomposition.
+    ///
+    /// # Arguments
+    ///
+    /// * `b` - Right-hand side vector (1D) or matrix (2D for multiple right-hand sides)
+    ///
+    /// # Complexity
+    ///
+    /// O(n³) for n×n system
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// // Solve: 2x + y = 5, x + y = 3
+    /// let a = DenseND::<f64>::from_vec(vec![2.0, 1.0, 1.0, 1.0], &[2, 2]).unwrap();
+    /// let b = DenseND::<f64>::from_vec(vec![5.0, 3.0], &[2]).unwrap();
+    ///
+    /// let x = a.solve(&b).unwrap();
+    /// assert!((x[&[0]] - 2.0).abs() < 1e-10);  // x = 2
+    /// assert!((x[&[1]] - 1.0).abs() < 1e-10);  // y = 1
+    /// ```
+    pub fn solve(&self, b: &Self) -> anyhow::Result<Self> {
+        if !self.is_square() {
+            anyhow::bail!(
+                "solve() requires a square matrix, got shape {:?}",
+                self.shape()
+            );
+        }
+
+        let n = self.shape()[0];
+
+        if b.rank() != 1 || b.shape()[0] != n {
+            anyhow::bail!(
+                "Right-hand side must be a vector of length {}, got shape {:?}",
+                n,
+                b.shape()
+            );
+        }
+
+        // LU decomposition with pivoting
+        let (l, u, perm) = self.lu_decomposition()?;
+
+        // Apply permutation to b
+        let mut pb = Self::zeros(&[n]);
+        for i in 0..n {
+            pb[&[i]] = b[&[perm[i]]];
+        }
+
+        // Forward substitution: Ly = Pb
+        let mut y = Self::zeros(&[n]);
+        for i in 0..n {
+            let mut sum = pb[&[i]];
+            for j in 0..i {
+                sum = sum - l[&[i, j]] * y[&[j]];
+            }
+            y[&[i]] = sum;
+        }
+
+        // Back substitution: Ux = y
+        let mut x = Self::zeros(&[n]);
+        for i in (0..n).rev() {
+            let mut sum = y[&[i]];
+            for j in (i + 1)..n {
+                sum = sum - u[&[i, j]] * x[&[j]];
+            }
+            x[&[i]] = sum / u[&[i, i]];
+        }
+
+        Ok(x)
+    }
+
+    /// Compute the matrix rank using row reduction.
+    ///
+    /// Returns the number of linearly independent rows.
+    ///
+    /// # Complexity
+    ///
+    /// O(m * n * min(m, n)) for m×n matrix
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// // Full rank matrix
+    /// let mat = DenseND::<f64>::eye(3);
+    /// assert_eq!(mat.rank_matrix().unwrap(), 3);
+    ///
+    /// // Rank-deficient matrix
+    /// let mat2 = DenseND::<f64>::from_vec(
+    ///     vec![1.0, 2.0, 3.0, 2.0, 4.0, 6.0],
+    ///     &[2, 3]
+    /// ).unwrap();
+    /// assert_eq!(mat2.rank_matrix().unwrap(), 1);  // Second row is 2 * first row
+    /// ```
+    pub fn rank_matrix(&self) -> anyhow::Result<usize> {
+        if self.rank() != 2 {
+            anyhow::bail!(
+                "rank_matrix() requires a 2D tensor, got rank {}",
+                self.rank()
+            );
+        }
+
+        let (m, n) = (self.shape()[0], self.shape()[1]);
+        let mut a = self.clone();
+        let mut rank = 0;
+        // Rank tolerance; fall back to zero if the cast fails (strict
+        // non-zero check).
+        let tol: T = T::from(1e-10).unwrap_or_else(T::zero);
+
+        for col in 0..n.min(m) {
+            // Find pivot
+            let mut pivot_row = None;
+            for row in rank..m {
+                if a[&[row, col]].abs() > tol {
+                    pivot_row = Some(row);
+                    break;
+                }
+            }
+
+            if let Some(prow) = pivot_row {
+                // Swap rows
+                if prow != rank {
+                    for j in 0..n {
+                        let temp = a[&[rank, j]];
+                        a[&[rank, j]] = a[&[prow, j]];
+                        a[&[prow, j]] = temp;
+                    }
+                }
+
+                // Eliminate below
+                let pivot = a[&[rank, col]];
+                for i in (rank + 1)..m {
+                    let factor = a[&[i, col]] / pivot;
+                    for j in col..n {
+                        let val = a[&[i, j]] - factor * a[&[rank, j]];
+                        a[&[i, j]] = val;
+                    }
+                }
+
+                rank += 1;
+            }
+        }
+
+        Ok(rank)
+    }
+
+    /// Compute the condition number of a matrix.
+    ///
+    /// The condition number κ(A) = ||A|| * ||A^(-1)|| measures how sensitive
+    /// the solution of Ax=b is to perturbations in A and b.
+    ///
+    /// Uses the Frobenius norm.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tenrso_core::DenseND;
+    ///
+    /// // For a 3×3 identity matrix, condition number (Frobenius norm) is 3
+    /// let mat = DenseND::<f64>::eye(3);
+    /// let cond = mat.cond().unwrap();
+    /// assert!((cond - 3.0).abs() < 1e-10);
+    ///
+    /// // For a 1×1 identity matrix, condition number is 1
+    /// let mat1 = DenseND::<f64>::eye(1);
+    /// let cond1 = mat1.cond().unwrap();
+    /// assert!((cond1 - 1.0).abs() < 1e-10);
+    /// ```
+    pub fn cond(&self) -> anyhow::Result<T> {
+        if !self.is_square() {
+            anyhow::bail!(
+                "Condition number requires a square matrix, got shape {:?}",
+                self.shape()
+            );
+        }
+
+        let norm_a = self.frobenius_norm();
+        let inv_a = self.inv()?;
+        let norm_inv = inv_a.frobenius_norm();
+
+        Ok(norm_a * norm_inv)
+    }
+}
+
+#[cfg(test)]
+mod det_sign_tests {
+    use super::DenseND;
+
+    /// Independent determinant oracle via recursive Laplace (cofactor)
+    /// expansion along the first row. This never touches LU, permutations, or
+    /// pivoting, so it is a faithful reference for the LU-path sign logic.
+    fn cofactor_det(rows: &[Vec<f64>]) -> f64 {
+        let n = rows.len();
+        match n {
+            1 => rows[0][0],
+            2 => rows[0][0] * rows[1][1] - rows[0][1] * rows[1][0],
+            _ => {
+                let mut det = 0.0;
+                for c in 0..n {
+                    let minor: Vec<Vec<f64>> = rows[1..]
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .enumerate()
+                                .filter(|(j, _)| *j != c)
+                                .map(|(_, &v)| v)
+                                .collect()
+                        })
+                        .collect();
+                    let sign = if c % 2 == 0 { 1.0 } else { -1.0 };
+                    det += sign * rows[0][c] * cofactor_det(&minor);
+                }
+                det
+            }
+        }
+    }
+
+    fn to_rows(a: &DenseND<f64>, n: usize) -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|i| (0..n).map(|j| a[&[i, j]]).collect())
+            .collect()
+    }
+
+    /// Deterministic LCG producing values in (-1, 1); pure-Rust, reproducible,
+    /// no `rand` dependency (SciRS2 policy) and no seedable-RNG requirement.
+    fn lcg_matrix(n: usize, seed: u64) -> DenseND<f64> {
+        let mut state = seed;
+        let mut next = || -> f64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 32) as f64 / (u32::MAX as f64) - 0.5
+        };
+        let data: Vec<f64> = (0..n * n).map(|_| next() * 2.0).collect();
+        DenseND::<f64>::from_vec(data, &[n, n]).expect("square matrix construction")
+    }
+
+    /// Unit lower-triangular matrix whose true determinant is +1. Partial
+    /// pivoting performs a single row swap (2 displaced elements -> the old
+    /// displaced-count parity is EVEN -> it returned -1). The true parity is
+    /// ODD, so the correct answer is +1.
+    #[test]
+    fn det_unit_lower_triangular_is_plus_one() {
+        let a = DenseND::<f64>::from_vec(
+            vec![
+                1.0, 0.0, 0.0, 0.0, //
+                2.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            &[4, 4],
+        )
+        .unwrap();
+        let d = a.det().unwrap();
+        // Old (displaced-element parity) logic returns -1 here.
+        assert!(
+            (d - 1.0).abs() < 1e-10,
+            "expected +1, got {d} (old sign bug returns -1)"
+        );
+    }
+
+    /// Oracle-verified dense 4x4 with true determinant -164. The old logic
+    /// returned +164.
+    #[test]
+    fn det_dense_4x4_is_minus_164() {
+        let a = DenseND::<f64>::from_vec(
+            vec![
+                0.0, 2.0, 1.0, 3.0, //
+                1.0, 0.0, 4.0, 2.0, //
+                3.0, 1.0, 0.0, 1.0, //
+                2.0, 5.0, 1.0, 0.0,
+            ],
+            &[4, 4],
+        )
+        .unwrap();
+        let d = a.det().unwrap();
+        assert!(
+            (d - (-164.0)).abs() < 1e-8,
+            "expected -164, got {d} (old sign bug returns +164)"
+        );
+        // Cross-check against the independent cofactor oracle.
+        let reference = cofactor_det(&to_rows(&a, 4));
+        assert!((reference - (-164.0)).abs() < 1e-9);
+    }
+
+    /// An explicit single-transposition permutation matrix (I_4 with rows 0
+    /// and 1 swapped) has determinant -1. The old displaced-count parity
+    /// (2 displaced elements -> even) wrongly yields +1.
+    #[test]
+    fn det_single_transposition_permutation_is_minus_one() {
+        let a = DenseND::<f64>::from_vec(
+            vec![
+                0.0, 1.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            &[4, 4],
+        )
+        .unwrap();
+        let d = a.det().unwrap();
+        assert!(
+            (d - (-1.0)).abs() < 1e-10,
+            "expected -1, got {d} (old sign bug returns +1)"
+        );
+    }
+
+    /// General regression: det() must match the independent Leibniz/cofactor
+    /// oracle across many random matrices of size 4, 5, 6. The old
+    /// displaced-count logic disagrees on roughly half of these because a
+    /// random pivot permutation has a random parity that only coincides with
+    /// its displaced-element parity when it has an even number of non-trivial
+    /// cycles.
+    #[test]
+    fn det_matches_cofactor_oracle_random() {
+        for n in 4..=6usize {
+            for seed in 0..24u64 {
+                let a = lcg_matrix(
+                    n,
+                    seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(n as u64),
+                );
+                let reference = cofactor_det(&to_rows(&a, n));
+                let got = a.det().unwrap();
+                assert!(
+                    (got - reference).abs() <= 1e-8 * (1.0 + reference.abs()),
+                    "n={n} seed={seed}: det()={got} vs cofactor oracle={reference}"
+                );
+            }
+        }
+    }
+
+    /// Multiplicativity det(A)·det(B) == det(A·B) for random 4x4 pairs. This is
+    /// a strong end-to-end check: under the old sign bug it fails on ~half the
+    /// pairs because the sign errors of det(A), det(B) and det(A·B) are
+    /// independent.
+    #[test]
+    fn det_is_multiplicative_random_4x4() {
+        for seed in 0..24u64 {
+            let a = lcg_matrix(4, 0x1234 ^ seed.wrapping_mul(2_654_435_761));
+            let b = lcg_matrix(4, 0xABCD ^ seed.wrapping_mul(40_503));
+            let ab = a.matmul(&b).unwrap();
+            let lhs = a.det().unwrap() * b.det().unwrap();
+            let rhs = ab.det().unwrap();
+            assert!(
+                (lhs - rhs).abs() <= 1e-7 * (1.0 + rhs.abs()),
+                "seed={seed}: det(A)det(B)={lhs} vs det(AB)={rhs}"
+            );
+        }
+    }
+
+    /// Sanity: already-correct cases still hold after the fix.
+    #[test]
+    fn det_known_correct_cases_preserved() {
+        // Identity (n>=4 exercises the LU path; no swaps -> sign +1).
+        let id4 = DenseND::<f64>::eye(4);
+        assert!((id4.det().unwrap() - 1.0).abs() < 1e-12);
+
+        // Singular 3x3 (two identical rows) via the closed-form Sarrus path.
+        let singular = DenseND::<f64>::from_vec(
+            vec![
+                1.0, 2.0, 3.0, //
+                1.0, 2.0, 3.0, //
+                4.0, 5.0, 7.0,
+            ],
+            &[3, 3],
+        )
+        .unwrap();
+        assert!(singular.det().unwrap().abs() < 1e-12);
+
+        // Closed-form 2x2 and 3x3 unchanged.
+        let m2 = DenseND::<f64>::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+        assert!((m2.det().unwrap() - (-2.0)).abs() < 1e-12);
+    }
+}

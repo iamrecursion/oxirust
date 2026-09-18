@@ -1,0 +1,81 @@
+[package]
+name = "oxixml-quickxml-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Drop-in quick_xml compatibility shim over oxixml-xml."
+keywords = ["xml", "quick-xml", "parser", "writer", "compat"]
+categories = ["parsing", "parser-implementations", "encoding", "text-processing"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-xml = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["rt", "macros", "io-util"] }
+
+[features]
+default = []
+
+## Implements `arbitrary::Arbitrary` for the event types, mirroring quick-xml
+## 0.41's optional `arbitrary` dependency. Forwards to `oxixml-xml`'s
+## `arbitrary` feature.
+arbitrary = ["oxixml-xml/arbitrary"]
+
+## Enables support for asynchronous reading and writing from `tokio`'s IO-Traits,
+## mirroring quick-xml 0.41's `async-tokio` feature. Forwards to `oxixml-xml`'s
+## `async-tokio` feature.
+async-tokio = ["oxixml-xml/async-tokio"]
+
+## Enables support of non-UTF-8 encoded documents. Forwards to `oxixml-xml`'s
+## `encoding` feature (backed by the Pure-Rust `oxixml-encoding` crate).
+encoding = ["oxixml-xml/encoding"]
+
+## Enables support for recognizing all HTML 5 entities in the `unescape`
+## function. Forwards to `oxixml-xml`'s `escape-html` feature.
+escape-html = ["oxixml-xml/escape-html"]
+
+## Enables buffering of elements that overlap a sequence being deserialized.
+## Forwards to `oxixml-xml`'s `overlapped-lists` feature. Requires `serialize`
+## to have any effect.
+overlapped-lists = ["oxixml-xml/overlapped-lists"]
+
+## Enables serialization of some `oxixml-xml` types using `serde`. Forwards to
+## `oxixml-xml`'s `serde-types` feature.
+serde-types = ["oxixml-xml/serde-types"]
+
+## Enables support for `serde` (de)serialization of XML through the `de` and
+## `se` modules. Forwards to `oxixml-xml`'s `serialize` feature.
+serialize = ["oxixml-xml/serialize"]
+
+[[test]]
+name = "serde_examples"
+required-features = ["serialize"]
+path = "tests/serde_examples.rs"
+
+[[test]]
+name = "decoding_reader"
+required-features = ["encoding"]
+path = "tests/decoding_reader.rs"
+
+[[test]]
+name = "serde_helpers"
+required-features = ["serialize", "serde-types"]
+path = "tests/serde_helpers.rs"
+
+[[test]]
+name = "async_examples"
+required-features = ["async-tokio"]
+path = "tests/async_examples.rs"
+
+[lints]
+workspace = true

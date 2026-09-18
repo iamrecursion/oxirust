@@ -1,0 +1,16 @@
+//! # UkfState - Trait Implementations
+//!
+//! This module contains trait implementations for `UkfState`.
+//!
+//! ## Implemented Traits
+//!
+//! - `Default`
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+use super::types::UkfState;
+
+impl Default for UkfState {
+    fn default() -> Self {
+        Self::new()
+    }
+}

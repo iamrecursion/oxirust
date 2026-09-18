@@ -1,0 +1,42 @@
+{
+  "name": "@cooljapan/oximedia-web",
+  "version": "0.1.9",
+  "description": "WebCodecs gives you the frames. OxiMedia gives you what to do with them — scopes, color, scale and quality metrics compiled to WebAssembly.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cool-japan/oximedia.git",
+    "directory": "web"
+  },
+  "homepage": "https://github.com/cool-japan/oximedia/tree/master/web",
+  "keywords": [
+    "webcodecs",
+    "wasm",
+    "video",
+    "color",
+    "scopes"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./scopes": {
+      "types": "./dist/scopes.d.ts",
+      "default": "./dist/scopes.js"
+    },
+    "./color": {
+      "types": "./dist/color.d.ts",
+      "default": "./dist/color.js"
+    },
+    "./scale": {
+      "types": "./dist/scale.d.ts",
+      "default": "./dist/scale.js"
+    },
+    "./quality": {
+      "types": "./dist/quality.d.ts",
+      "default": "./dist/quality.js"
+    }
+  }
+}

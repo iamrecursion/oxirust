@@ -1,0 +1,270 @@
+// Sources for the code snapshots in this repository, read by update.py.
+// This file is JSONC: // and /* */ comments and trailing commas are all fine.
+//
+// LAYOUT
+//   An object is a folder (key = folder name). A list holds the repositories that live in that
+//   folder. The key "." means "this folder itself", so the "." list at the top level holds
+//   repositories that land in the root. Folders nest to any depth.
+//
+// REPOSITORY FIELDS
+//   "url"         Required. Anything `git fetch` accepts: https, ssh, a local path; any host.
+//   "name"        Folder name for the snapshot. Default: last URL segment, minus ".git".
+//   "ref"         Leave it out (the normal case on this shelf) and the snapshot follows the
+//                 branch whose NAME IS THE HIGHEST VERSION NUMBER: "0.4.3" over "0.4.2" over
+//                 "0.4.2-rc.1"; a leading "v" is fine; branches like "master" are ignored.
+//                 It is chosen afresh on every run, so when upstream opens "0.4.4" the snapshot
+//                 moves to it by itself, and the result line reports the jump. If a remote has
+//                 no version-named branch, its default branch is used, and reported.
+//                 Or name a branch, tag, or full commit hash. "HEAD" = the default branch.
+//                 A branch is followed: every run moves the snapshot to its newest tip.
+//                 A tag or hash stays put. "manual" means: skip, and remind me at the end.
+//                 ("defaultBranch" is accepted as an older spelling of "ref".)
+//   "submodules"  Default true: all submodules are fetched, recursively. false fetches none.
+//                 To choose, give globs against the submodule paths (`*` crosses `/`):
+//                   { "exclude": ["src/llvm-project"] }  everything except these
+//                   { "only": ["src/tools/*"] }          just these, and what is inside them
+//                 A submodule nested inside an unfetched one cannot be reached, so with
+//                 "only", list the parent as well. Patterns matching nothing are reported.
+//   "lfs"         Default true: LFS content is downloaded (needs git-lfs installed). Set false
+//                 to keep pointer files. Either way nothing is ever pushed as LFS: update.py
+//                 keeps `* -filter` in this repository's info/attributes.
+//
+// EXAMPLE
+//   "signals": [
+//     { "url": "https://github.com/RustAudio/cpal" },
+//     { "url": "https://codeberg.org/someone/thing", "name": "thing-stable", "ref": "v1.2.0" },
+//   ],
+//   "lang": [
+//     // Everything except the one enormous submodule:
+//     { "url": "https://github.com/rust-lang/rust",
+//       "submodules": { "exclude": ["src/llvm-project"] } },
+//     // Only the submodules under vendor/, minus one of them:
+//     { "url": "https://example.org/some/project",
+//       "submodules": { "only": ["vendor/*"], "exclude": ["vendor/huge-assets"] } },
+//     // No submodules at all, and LFS files left as pointers:
+//     { "url": "https://example.org/some/other", "submodules": false, "lfs": false },
+//   ],
+//
+// Upstream .gitignore files are removed from every snapshot, so that `git add` keeps everything
+// that came down. Upstream .gitattributes stay: line endings follow upstream.
+//
+// manifest.json, next to this file, is written by update.py and records the exact commit each
+// snapshot was taken at. It is a record, never a pin; there is no need to edit it.
+{
+  "data": [
+    { "name": "amaters", "url": "git@github.com:cool-japan/amaters.git" },
+    { "name": "fop", "url": "git@github.com:cool-japan/fop.git" },
+    { "name": "numrs", "url": "git@github.com:cool-japan/numrs.git" },
+    { "name": "oxiaudio", "url": "git@github.com:cool-japan/oxiaudio.git" },
+    { "name": "oxicode", "url": "git@github.com:cool-japan/oxicode.git" },
+    {
+      "name": "oxigeo",
+      "url": "git@github.com:cool-japan/oxigeo.git",
+      "paths": {
+        "exclude": [
+          "docs/media",
+          "demo/geovault/data/*.tif",
+        ]
+      }
+    },
+    { "name": "oxih5", "url": "git@github.com:cool-japan/oxih5.git" },
+    { "name": "oximedia", "url": "git@github.com:cool-japan/oximedia.git" },
+    { "name": "oxisql", "url": "git@github.com:cool-japan/oxisql.git" },
+    { "name": "oxistore", "url": "git@github.com:cool-japan/oxistore.git" },
+    { "name": "oxixml", "url": "git@github.com:cool-japan/oxixml.git" },
+    { "name": "pandrs", "url": "git@github.com:cool-japan/pandrs.git" },
+    {
+      "name": "rs3gw",
+      "url": "git@github.com:cool-japan/rs3gw.git",
+      "paths": {
+        "exclude": [
+          "rust_out",
+        ]
+      }
+    },
+  ],
+  "foundational": [
+    { "name": "celers", "url": "git@github.com:cool-japan/celers.git" },
+    { "name": "kizzasi", "url": "git@github.com:cool-japan/kizzasi.git" },
+    { "name": "mielin", "url": "git@github.com:cool-japan/mielin.git" },
+    { "name": "oxiarc", "url": "git@github.com:cool-japan/oxiarc.git" },
+    { "name": "oxiblas", "url": "git@github.com:cool-japan/oxiblas.git" },
+    { "name": "oxicrypto", "url": "git@github.com:cool-japan/oxicrypto.git" },
+    {
+      "name": "oxifft",
+      "url": "git@github.com:cool-japan/oxifft.git",
+      "paths": {
+        "exclude": [
+          "oxifft/pkg_simd/*.wasm",
+        ]
+      }
+    },
+    { "name": "oxifont", "url": "git@github.com:cool-japan/oxifont.git" },
+    { "name": "oxinum", "url": "git@github.com:cool-japan/oxinum.git" },
+    {
+      "name": "oxirs",
+      "url": "git@github.com:cool-japan/oxirs.git",
+      "paths": {
+        "exclude": [
+          "engine/oxirs-arq/debug_tokens",
+        ]
+      }
+    },
+    { "name": "oxisound", "url": "git@github.com:cool-japan/oxisound.git" },
+    { "name": "oxitext", "url": "git@github.com:cool-japan/oxitext.git" },
+    { "name": "oxiui", "url": "git@github.com:cool-japan/oxiui.git" },
+  ],
+  "fv": [
+    { "name": "oxieml", "url": "git@github.com:cool-japan/oxieml.git" },
+    {
+      "name": "oxilean",
+      "url": "git@github.com:cool-japan/oxilean.git",
+      "paths": {
+        "exclude": [
+          "web/verify-demo/pkg/*.wasm",
+          "verify/differential/slices/*.ndjson",
+        ]
+      }
+    },
+    { "name": "oxiz", "url": "git@github.com:cool-japan/oxiz.git" },
+    { "name": "phop", "url": "git@github.com:cool-japan/phop.git" },
+  ],
+  "ml": [
+    {
+      "name": "mecrab",
+      "url": "git@github.com:cool-japan/mecrab.git",
+      "paths": {
+        "exclude": [
+          "docs/*.png",
+        ]
+      }
+    },
+    { "name": "optirs", "url": "git@github.com:cool-japan/optirs.git" },
+    { "name": "oxibonsai", "url": "git@github.com:cool-japan/oxibonsai.git" },
+    { "name": "oxicuda", "url": "git@github.com:cool-japan/oxicuda.git" },
+    {
+      "name": "oxify",
+      "url": "git@github.com:cool-japan/oxify.git",
+      "paths": {
+        "exclude": [
+          "libsvg.rlib",
+        ]
+      }
+    },
+    { "name": "oxigaf", "url": "git@github.com:cool-japan/oxigaf.git" },
+    { "name": "oxillama", "url": "git@github.com:cool-japan/oxillama.git" },
+    {
+      "name": "oxionnx",
+      "url": "git@github.com:cool-japan/oxionnx.git",
+      "paths": {
+        "exclude": [
+          "docs/images/*.jpg",
+        ]
+      }
+    },
+    { "name": "oxirag", "url": "git@github.com:cool-japan/oxirag.git" },
+    { "name": "oxiwhisper", "url": "git@github.com:cool-japan/oxiwhisper.git" },
+    {
+      "name": "sklears",
+      "url": "git@github.com:cool-japan/sklears.git",
+      "paths": {
+        "exclude": [
+          "crates/sklears-simd/src/vector/intrinsics",
+          "crates/sklears-model-selection/test_modules",
+          "*.rlib",
+        ]
+      }
+    },
+    { "name": "tenflowers", "url": "git@github.com:cool-japan/tenflowers.git" },
+    { "name": "tenrso", "url": "git@github.com:cool-japan/tenrso.git" },
+    { "name": "tensorlogic", "url": "git@github.com:cool-japan/tensorlogic.git" },
+    { "name": "torsh", "url": "git@github.com:cool-japan/torsh.git" },
+    { "name": "trustformers", "url": "git@github.com:cool-japan/trustformers.git" },
+    { "name": "voirs", "url": "git@github.com:cool-japan/voirs.git" },
+  ],
+  "networking": [
+    { "name": "chie", "url": "git@github.com:cool-japan/chie.git" },
+    { "name": "ipfrs", "url": "git@github.com:cool-japan/ipfrs.git" },
+    { "name": "oxihttp", "url": "git@github.com:cool-japan/oxihttp.git" },
+    { "name": "oxiproto", "url": "git@github.com:cool-japan/oxiproto.git" },
+    { "name": "oxiquic", "url": "git@github.com:cool-japan/oxiquic.git" },
+    { "name": "oxirouter", "url": "git@github.com:cool-japan/oxirouter.git" },
+    { "name": "oxirpc", "url": "git@github.com:cool-japan/oxirpc.git" },
+    { "name": "oxitls", "url": "git@github.com:cool-japan/oxitls.git" },
+  ],
+  "runtime": [
+    { "name": "oxictl", "url": "git@github.com:cool-japan/oxictl.git" },
+  ],
+  "science": [
+    { "name": "oxiephemeris", "url": "git@github.com:cool-japan/oxiephemeris.git" },
+    {
+      "name": "quantrs",
+      "url": "git@github.com:cool-japan/quantrs.git",
+      "paths": {
+        "exclude": [
+          "examples/src/bin/ultrathink_simple_demo",
+          "py/.coverage",
+        ]
+      }
+    },
+    {
+      "name": "scirs",
+      "url": "git@github.com:cool-japan/scirs.git",
+      "paths": {
+        "exclude": [
+          "scirs2-neural/src/layers/test_neural_network_demo",
+          "scirs2-neural/src/layers/test_dense_layer",
+          "*.coverage",
+          "scirs2-io/compressed_data.h5",
+          "mnist_model.json",
+        ]
+      }
+    },
+  ],
+  "simulation": [
+    { "name": "oxigrid", "url": "git@github.com:cool-japan/oxigrid.git" },
+    {
+      "name": "oxihuman",
+      "url": "git@github.com:cool-japan/oxihuman.git",
+      "paths": {
+        "exclude": [
+          "docs/media",
+          "assets/packs/*.ohpk",
+        ]
+      }
+    },
+    { "name": "oxiphoton", "url": "git@github.com:cool-japan/oxiphoton.git" },
+    {
+      "name": "oxiphysics",
+      "url": "git@github.com:cool-japan/oxiphysics.git",
+      "paths": {
+        "exclude": [
+          "scratchpad/*.log",
+          "scratchpad/*.rmeta",
+        ]
+      }
+    },
+    { "name": "spintronics", "url": "git@github.com:cool-japan/spintronics.git" },
+  ],
+  "tools": [
+    {
+      "name": "legalis",
+      "url": "git@github.com:cool-japan/legalis.git",
+      "paths": {
+        "exclude": [
+          "crates/legalis-core/target",
+        ]
+      }
+    },
+    {
+      "name": "oxigis",
+      "url": "git@github.com:cool-japan/oxigis.git",
+      "paths": {
+        "exclude": [
+          "docs/*.gif",
+        ]
+      }
+    },
+    { "name": "splitrs", "url": "git@github.com:cool-japan/splitrs.git" },
+  ],
+}

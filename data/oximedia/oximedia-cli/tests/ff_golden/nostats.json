@@ -1,0 +1,7 @@
+{
+  "name": "nostats",
+  "args": ["-nostats", "-i", "in.mkv", "out.mkv"],
+  "expect": {
+    "jobs": 1
+  }
+}

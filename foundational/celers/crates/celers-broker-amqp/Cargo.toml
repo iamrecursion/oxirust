@@ -1,0 +1,69 @@
+[package]
+name = "celers-broker-amqp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "RabbitMQ/AMQP broker implementation for CeleRS"
+readme = "README.md"
+keywords = ["celery", "rabbitmq", "amqp", "broker", "messaging"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxiarc-zstd = { workspace = true }
+
+# AMQP client
+lapin = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+
+# Pure-Rust TLS crypto provider (installed as the process default so AMQPS
+# handshakes go through rustls-rustcrypto instead of an FFI provider)
+oxitls = { workspace = true }
+
+# HTTP client for RabbitMQ Management API
+oxihttp-client = { workspace = true }
+urlencoding = { workspace = true }
+
+# Core dependencies
+celers-protocol = { workspace = true, features = ["gzip", "zlib", "zstd-compression"] }
+celers-kombu = { workspace = true }
+celers-core = { workspace = true, optional = true }
+
+[features]
+# On by default: without it `AmqpBroker` is a message transport and nothing
+# more, and a `celers_worker::Worker` cannot consume from RabbitMQ at all. See
+# `core_broker`.
+default = ["core-broker"]
+# `celers_core::Broker` over this crate's transport (`AmqpCoreBroker`).
+core-broker = ["dep:celers-core", "celers-kombu/core-adapter"]
+amqp-events = ["dep:celers-core"]
+# Opt-in, off by default: adds the OS trust store to the webpki roots the
+# workspace-level `lapin` declaration selects. Needed when RabbitMQ presents a
+# certificate signed by a private/corporate CA. `rustls-native-certs` is Pure
+# Rust (it reads the platform's certificate files), so this does not
+# reintroduce an FFI crypto provider.
+tls-native-certs = ["lapin/rustls-native-certs"]
+
+[dev-dependencies]
+celers-core = { workspace = true }
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which makes the
+# deduplication-cache TTL tests deterministic without sleeping.
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "amqp_benchmarks"
+harness = false

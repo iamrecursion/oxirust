@@ -1,0 +1,8 @@
+{
+  "name": "hwaccel_cuda",
+  "args": ["-hwaccel", "cuda", "-i", "in.mkv", "out.mkv"],
+  "expect": {
+    "jobs": 1,
+    "hwaccel": "Cuda"
+  }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "oximedia-web-scale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Lanczos, bicubic and Mitchell image/video resampling compiled to WebAssembly"
+keywords = ["multimedia", "video", "wasm", "resize", "scaling"]
+categories = ["multimedia::video", "multimedia::images", "wasm"]
+publish = false
+
+# Speed-tuned wasm-opt: the separable resampling passes need -O3's loop
+# optimisations; the module stays under its 120 KiB gzip soft budget.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O3", "--strip-debug"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+oximedia-web-core = { path = "../oximedia-web-core" }
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+# web-sys.workspace = true

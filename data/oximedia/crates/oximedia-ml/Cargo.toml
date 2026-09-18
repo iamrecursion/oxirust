@@ -1,0 +1,58 @@
+[package]
+name = "oximedia-ml"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Sovereign ML pipelines for media — Pure-Rust ONNX inference with typed pipelines (scene classification, shot boundary detection, aesthetic scoring, object detection, face embedding) built atop OxiONNX."
+readme = "README.md"
+keywords = ["machine-learning", "onnx", "media", "inference", "pipeline"]
+categories = ["multimedia", "science", "algorithms"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+# Device / backend feature gates
+onnx = ["dep:oxionnx"]
+cuda = ["onnx", "oxionnx/cuda"]
+webgpu = ["onnx", "oxionnx/gpu"]
+directml = ["onnx", "oxionnx/directml"]
+
+# Opt-in Serde derives on device/pipeline metadata types so callers (CLI,
+# Python, WASM) can emit structured JSON without hand-rolling serializers.
+serde = ["dep:serde"]
+
+# Pipeline feature gates
+scene-classifier = []
+shot-boundary = []
+aesthetic-score = ["onnx"]
+object-detector = ["onnx"]
+face-embedder = ["onnx"]
+auto-caption = ["onnx"]
+all-pipelines = [
+    "scene-classifier",
+    "shot-boundary",
+    "aesthetic-score",
+    "object-detector",
+    "face-embedder",
+    "auto-caption",
+]
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+# Audio feature extraction (compute_log_mel_spectrogram)
+oximedia-audio.workspace = true
+
+# Pure-Rust OxiONNX (feature-gated so the default build is symbol-free)
+oxionnx = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

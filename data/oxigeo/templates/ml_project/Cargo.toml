@@ -1,0 +1,28 @@
+[package]
+name = "my-oxigeo-ml-project"
+version = "0.1.0"
+edition = "2024"
+authors = ["Your Name <you@example.com>"]
+publish = false
+
+[dependencies]
+oxigeo-core = "0.2"
+oxigeo-algorithms = "0.2"
+oxigeo-ml = "0.2"
+oxigeo-geotiff = "0.2"
+
+# ML dependencies
+# Pure-Rust ONNX Runtime (COOLJAPAN Policy: no `ort` / no C++ ONNX Runtime FFI).
+oxionnx = { version = "0.1.7", features = ["ndarray"] }
+ndarray = "0.17"
+scirs2-core = "0.6.5"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"

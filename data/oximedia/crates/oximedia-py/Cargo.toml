@@ -1,0 +1,106 @@
+[package]
+name = "oximedia-py"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Python bindings for OxiMedia using PyO3"
+publish = false
+
+[lib]
+name = "oximedia_py"
+crate-type = ["cdylib", "rlib"]
+doc = false
+
+[lints]
+workspace = true
+
+[dependencies]
+pyo3 = { workspace = true }
+oximedia-core.workspace = true
+oximedia-io.workspace = true
+oximedia-codec = { workspace = true, default-features = true, features = ["av1", "vp9", "vp8", "opus"] }
+oximedia-audio = { workspace = true, features = ["opus", "vorbis", "flac"] }
+oximedia-container.workspace = true
+oximedia-quality.workspace = true
+oximedia-audio-analysis.workspace = true
+oximedia-metering.workspace = true
+oximedia-scene.workspace = true
+oximedia-shots.workspace = true
+oximedia-graph.workspace = true
+oximedia-effects.workspace = true
+oximedia-normalize.workspace = true
+oximedia-lut.workspace = true
+oximedia-cv.workspace = true
+oximedia-mir.workspace = true
+oximedia-plugin.workspace = true
+oximedia-metadata.workspace = true
+oximedia-edl.workspace = true
+oximedia-packager.workspace = true
+oximedia-stabilize.workspace = true
+oximedia-graphics.workspace = true
+oximedia-multicam.workspace = true
+oximedia-forensics.workspace = true
+oximedia-monitor.workspace = true
+oximedia-restore.workspace = true
+oximedia-captions.workspace = true
+oximedia-timecode.workspace = true
+oximedia-convert.workspace = true
+oximedia-transcode.workspace = true
+oximedia-workflow.workspace = true
+oximedia-colormgmt.workspace = true
+oximedia-image.workspace = true
+oximedia-watermark.workspace = true
+oximedia-scopes.workspace = true
+oximedia-denoise.workspace = true
+oximedia-mixer.workspace = true
+oximedia-audiopost.workspace = true
+oximedia-gaming.workspace = true
+oximedia-virtual.workspace = true
+oximedia-profiler.workspace = true
+oximedia-recommend.workspace = true
+oximedia-scaling.workspace = true
+oximedia-qc.workspace = true
+oximedia-imf.workspace = true
+oximedia-aaf.workspace = true
+oximedia-gpu.workspace = true
+oximedia-ndi.workspace = true
+oximedia-videoip.workspace = true
+oximedia-drm.workspace = true
+oximedia-dedup.workspace = true
+oximedia-archive-pro.workspace = true
+oximedia-dolbyvision.workspace = true
+oximedia-auto.workspace = true
+oximedia-neural.workspace = true
+oximedia-analytics.workspace = true
+oximedia-cache.workspace = true
+oximedia-ml = { workspace = true, optional = true, features = ["all-pipelines"] }
+chrono.workspace = true
+bytes.workspace = true
+oxiarc-deflate.workspace = true
+tokio = { workspace = true, features = ["full"] }
+pyo3-async-runtimes = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ndarray.workspace = true
+numpy = { workspace = true }
+image = { workspace = true }
+
+[features]
+default = ["av1", "vp9", "vp8", "opus", "cv2"]
+av1 = []
+vp9 = []
+vp8 = []
+opus = []
+cv2 = []
+ml = ["dep:oximedia-ml"]
+# Full-graph ONNX inference in `oximedia.neural.OnnxBackend` via the oxionnx
+# pure-Rust engine. Off by default: without it, `OnnxBackend` methods raise a
+# `RuntimeError` naming this flag instead of returning a fabricated result.
+# `oximedia.neural.inspect_onnx()` / `OnnxRuntime` (this crate's own
+# hand-written ONNX parser + node executor) work unconditionally.
+onnx = ["oximedia-neural/onnx"]

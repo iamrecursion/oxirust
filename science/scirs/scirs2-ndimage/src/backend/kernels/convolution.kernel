@@ -1,0 +1,41 @@
+// Convolution kernel for GPU execution
+
+__kernel void convolution_2d(
+    __global const float* input,
+    __global const float* kernel,
+    __global float* output,
+    const int input_height,
+    const int input_width,
+    const int kernel_height,
+    const int kernel_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= input_width || y >= input_height) return;
+    
+    int khalf_h = kernel_height / 2;
+    int khalf_w = kernel_width / 2;
+    
+    float sum = 0.0f;
+    
+    // Apply convolution
+    for (int ky = 0; ky < kernel_height; ky++) {
+        for (int kx = 0; kx < kernel_width; kx++) {
+            // Calculate input coordinates
+            int ix = x + kx - khalf_w;
+            int iy = y + ky - khalf_h;
+            
+            // Boundary handling (clamp to edge)
+            ix = clamp(ix, 0, input_width - 1);
+            iy = clamp(iy, 0, input_height - 1);
+            
+            // Accumulate convolution sum
+            float input_val = input[iy * input_width + ix];
+            float kernel_val = kernel[ky * kernel_width + kx];
+            sum += input_val * kernel_val;
+        }
+    }
+    
+    output[y * input_width + x] = sum;
+}

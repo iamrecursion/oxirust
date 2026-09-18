@@ -1,0 +1,36 @@
+[package]
+name         = "oxicuda-pinn"
+description  = "Physics-Informed Neural Networks for OxiCUDA: PINN losses, Neural ODEs/SDEs (adjoint method), Neural Operators (FNO/DeepONet/MWT/GNO), PDE templates, autodiff (dual numbers + tape), adaptive collocation sampling — pure Rust, zero CUDA SDK dependency."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme                 = "README.md"
+keywords = ["gpu", "pinn", "neural-ode", "neural-operator", "scientific-ml"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[features]
+# On-device PTX validation harness (src/gpu_tests.rs). Requires a CUDA device.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name    = "pinn_ops"
+harness = false

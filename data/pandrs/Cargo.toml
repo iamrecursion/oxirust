@@ -1,0 +1,375 @@
+[workspace]
+members = ["py_bindings"]
+resolver = "2"
+
+[workspace.package]
+version = "0.4.2"
+edition = "2021"
+# MSRV — honest floor for the DEFAULT feature set (`default = []`), DERIVED by sweeping
+# `rust_version` across the full resolved graph (cargo metadata + cargo tree), not guessed.
+#   * DEFAULT (default = []) → 1.88.0: driven by the icu 2.x stack (icu_locale_core /
+#     icu_normalizer 2.3.0, reached through url → idna) plus libloading 0.9 (via
+#     scirs2-core); the non-optional oxifft 0.4.2 needs 1.87.
+# Per-feature MSRV is HIGHER for some optional bundles. This field stays at the default
+# floor because cargo enforces each dependency's own rust-version when its feature is on:
+#   * distributed / flight        → 1.88 (datafusion 53).
+#   * cloud-storage / all-safe / stable → 1.89 (crc-fast 1.10, via object_store 0.14 aws-base).
+# README MSRV policy should document: 1.88 default & distributed, 1.89 for cloud-storage.
+rust-version = "1.88.0"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/pandrs"
+homepage = "https://github.com/cool-japan/pandrs"
+
+[workspace.dependencies]
+# Core numeric / serialization / misc
+num-traits = "0.2.19"
+chrono = { version = "0.4.45", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml = "0.9.34"  # YAML serialization support
+toml = "1.1.4"  # TOML serialization support
+thiserror = "2.0.20"
+csv = "1.4.0"
+rand = "0.10.2"  # Random number generation
+chrono-tz = "0.10.4"  # Timezone processing - compatible with chrono 0.4.38
+num_cpus = "1.17.0"  # For CPU core detection
+rayon = "1.12.0"  # For parallel processing
+regex = "1.12.4"  # For regular expression processing
+lazy_static = "1.5.0"  # For global variables/singletons
+url = "2.5.8"  # URL parsing for configuration validation
+pbkdf2 = "0.13.0"  # PBKDF2 key derivation for credential security
+sha2 = "0.11"  # SHA-2 cryptographic hash functions (must match digest 0.10.x used by pbkdf2/aes-gcm)
+aes-gcm = "0.11.0"  # AES-GCM encryption for secure credential storage
+async-trait = "0.1.89"  # Async trait support for mock implementations
+lru = "0.18.2"  # LRU cache for ReBAC permission caching
+crossbeam-channel = "0.5.15"  # For concurrent message passing
+memmap2 = "0.9.11"  # For memory-mapped files
+log = "0.4.33"  # Logging interface
+tempfile = "3.27.0"  # Create temporary files and directories
+oxiarc-lz4 = "0.4.2"  # Pure Rust LZ4 (COOLJAPAN OxiARC ecosystem)
+oxiarc-zstd = "0.4.2"  # Pure Rust Zstandard (COOLJAPAN OxiARC ecosystem)
+# Pure Rust FFT (COOLJAPAN OxiFFT ecosystem). Used by the time-series frequency
+# feature extractor for the real periodogram; `default-features = false` drops
+# the optional rayon threading layer (pandrs schedules its own parallelism).
+oxifft = { version = "0.4.2", default-features = false, features = ["std"] }
+
+# Visualization (optional in member)
+# Due to compatibility issues with plotters, using textplots-rs (text-based plots)
+textplots = "0.8.7"
+plotters = "0.3.7"
+
+# Parquet / Arrow (optional in member)
+# Pure Rust policy: default-features = false drops the C-backed `zstd` feature.
+# `flate2-zlib-rs` selects the Pure Rust zlib-rs backend (NOT miniz_oxide/C).
+# Regression note (scoped): zstd-compressed parquet is unreadable ONLY on the pure
+# builds that rely on THIS dependency alone — parquet / stable / excel. On the
+# `distributed` and `flight` features, datafusion pulls parquet with its own defaults
+# (which include `zstd`, C via zstd-sys) and Cargo feature unification takes the union,
+# so zstd parquet IS readable there. Snappy / gzip / brotli / lz4 work everywhere.
+parquet = { version = "58.1.0", default-features = false, features = [
+    "arrow",
+    "snap",
+    "brotli",
+    "flate2-zlib-rs",
+    "lz4",
+    "base64",
+    "simdutf8",
+] }  # For Parquet file support (arrow/parquet 58.x, aligned with datafusion 53.1.0)
+# Pure Rust policy: arrow 58.1.0 default = [csv, ipc, json] (no zstd by default).
+# We pin the default set explicitly to guard against upstream default drift that
+# might add ipc_compression (pulls zstd-sys / lz4-sys C libs).
+arrow = { version = "58.1.0", default-features = false, features = [
+    "csv",
+    "ipc",
+    "json",
+] }  # For Arrow format support (arrow 58.x, aligned with datafusion 53.1.0)
+
+# Excel support (Pure Rust - COOLJAPAN Policy)
+oxiarc-archive = "0.4.2"  # Pure Rust ZIP for xlsx
+quick-xml = { package = "oxixml-quickxml-compat", version = "0.1.2" }  # XML parsing for xlsx
+
+# WebAssembly support
+wasm-bindgen = "0.2.127"  # WebAssembly bindings
+web-sys = { version = "0.3.103", features = [
+    "Document", "Element", "HtmlCanvasElement", "HtmlElement", "Node",
+    "CssStyleDeclaration", "Window",
+    "CanvasRenderingContext2d", "MouseEvent", "console"
+] }  # Web API bindings
+plotters-canvas = "0.3.1"  # Canvas backend for plotters
+
+# CUDA / numerical support
+# (half removed: 0 references in src/; the `cuda` feature relies on cudarc's own
+# half handling. cudarc itself carries half transitively when the toolkit is present.)
+ndarray = "0.17.2"  # N-dimensional arrays (root/default; py_bindings also uses 0.17.2 to match numpy 0.29's ABI)
+
+# SciRS2 ecosystem integration
+scirs2-core = { version = "0.6.5", features = ["validation", "parallel", "random"] }
+scirs2-stats = "0.6.5"
+scirs2-linalg = "0.6.5"
+
+# Distributed processing support - downgraded for chrono compatibility
+# Pure Rust policy: default-features = false drops the `compression` feature, which
+# pulls C-backed liblzma-sys (xz) + zstd-sys + bzip2 via async-compression. We keep
+# all other default features so user-visible DataFusion APIs are unchanged.
+datafusion = { version = "53.1.0", default-features = false, features = [
+    "nested_expressions",
+    "crypto_expressions",
+    "datetime_expressions",
+    "encoding_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+    "parquet",
+    "recursive_protection",
+    "sql",
+] }  # DataFrame processing engine
+uuid = { version = "1.24.1", features = ["v4", "serde"] }  # For unique IDs in distributed processing and serving
+futures = "0.3.34"  # For async operations in distributed processing
+tokio = { version = "1.53.1", features = ["full"] }  # Async runtime for streaming, resilience, tests
+# Cloud storage (S3 / GCS / Azure Blob). object_store 0.14.1 splits the old `cloud`
+# feature into `*-base` building blocks plus a selectable TLS/crypto stack. We take
+# the `*-base` variants + `ring` + an explicit `reqwest` — NOT the aws/gcp/azure/http
+# shortcuts, which hardcode aws-lc-rs (a large C + assembly TLS stack via aws-lc-sys).
+# This path pulls quick-xml 0.41.0, closing RUSTSEC-2026-0194 / RUSTSEC-2026-0195.
+object_store = { version = "0.14.1", default-features = false, features = [
+    "aws-base", "gcp-base", "azure-base", "http-base", "reqwest", "ring", "tokio",
+] }
+# object_store 0.14 leaves reqwest's TLS provider to the downstream. reqwest 0.13
+# dropped the old `rustls-tls-webpki-roots` shortcut; `rustls-no-provider` wires in the
+# rustls plumbing WITHOUT the aws-lc-rs default that the plain `rustls` feature forces.
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "rustls-no-provider", "stream", "http2",
+] }
+# Supplies the actual ring CryptoProvider. Feature unification turns on `rustls/ring`
+# for reqwest's copy of rustls → ring (+ webpki/ring) in the tree, no aws-lc-sys.
+# `default-features = false` drops rustls' default `aws_lc_rs` + `prefer-post-quantum`
+# (which also pulls aws-lc); `logging`/`std`/`tls12` mirror the useful rustls defaults.
+rustls = { version = "0.23.43", default-features = false, features = [
+    "ring", "std", "tls12", "logging",
+] }
+bytes = "1.12.1"  # Byte handling for object_store
+
+# JIT compilation support
+cranelift = "0.133.1"  # JIT compiler
+cranelift-module = "0.133.1"  # Module system for JIT
+cranelift-jit = "0.133.1"  # JIT compilation backend
+cranelift-frontend = "0.133.1"  # Frontend for building IR
+cranelift-native = "0.133.1"  # Native target detection
+# (target-lexicon removed: 0 references in src/; cranelift_native::builder() performs
+# host ISA lookup internally, so the JIT feature does not need a direct dependency.)
+
+# Arrow Flight RPC
+arrow-flight = "58.1.0"
+tonic = "0.14"  # gRPC runtime for Arrow Flight
+# (prost removed: 0 references in src/; arrow-flight re-exports the prost types it
+# generates, so pandrs never names prost directly.)
+
+# Platform-specific: CUDA only on non-macOS (macOS doesn't support CUDA)
+cudarc = { version = "0.19.9", features = ["driver", "cublas", "cuda-version-from-build-system"] }
+
+# Dev dependencies (shared across workspace)
+criterion = { version = "0.8", features = ["html_reports"] }
+
+# Python bindings
+pyo3 = { version = "0.29.0", features = ["abi3-py38", "multiple-pymethods"] }
+
+[workspace.lints.rust]
+unused_variables = "warn"
+unused_imports = "warn"
+mismatched_lifetime_syntaxes = "allow"
+dead_code = "warn"
+unpredictable_function_pointer_comparisons = "allow"
+unknown_lints = "allow"
+
+[package]
+name = "pandrs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "A high-performance DataFrame library for Rust, providing pandas-like API with advanced features including SIMD optimization, parallel processing, and distributed computing capabilities"
+readme = "README.md"
+keywords = ["dataframe", "data", "analytics", "pandas", "statistics"]
+categories = ["data-structures", "science", "mathematics"]
+# Keep the published crate lean and free of internal/dev material. examples/ ships (so
+# docs.rs and readers get runnable samples); benches/, tests/, docs/, scripts/ and dev
+# config do not. TODO.md and SECURITY_FIX_REPORT.md are excluded so internal "code
+# honesty audit" notes never reach crates.io / docs.rs.
+exclude = [
+    "tests/",
+    "benches/",
+    "docs/",
+    "scripts/",
+    ".github/",
+    "TODO.md",
+    "SECURITY_FIX_REPORT.md",
+    "pandrs.sample.yml",
+    "rustfmt.toml",
+    ".gitignore",
+]
+
+# Configuration for docs.rs
+[package.metadata.docs.rs]
+all-features = false
+features = ["optimized", "jit", "distributed", "serving", "excel", "visualization", "parquet", "streaming", "backward_compat", "resilience"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+num-traits.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+csv.workspace = true
+chrono-tz.workspace = true
+num_cpus.workspace = true
+textplots = { workspace = true, optional = true }
+rayon.workspace = true
+regex.workspace = true
+lazy_static.workspace = true
+url.workspace = true
+pbkdf2.workspace = true
+sha2.workspace = true
+aes-gcm.workspace = true
+async-trait.workspace = true
+lru.workspace = true
+parquet = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
+plotters = { workspace = true, optional = true }
+crossbeam-channel.workspace = true
+memmap2.workspace = true
+oxiarc-lz4.workspace = true
+oxiarc-zstd.workspace = true
+oxifft.workspace = true
+oxiarc-archive = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+plotters-canvas = { workspace = true, optional = true }
+scirs2-core = { workspace = true }
+scirs2-stats = { workspace = true, optional = true }
+scirs2-linalg = { workspace = true, optional = true }
+datafusion = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+log.workspace = true
+cranelift = { workspace = true, optional = true }
+cranelift-module = { workspace = true, optional = true }
+cranelift-jit = { workspace = true, optional = true }
+cranelift-frontend = { workspace = true, optional = true }
+cranelift-native = { workspace = true, optional = true }
+arrow-flight = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tempfile.workspace = true
+
+[features]
+default = []
+optimized = []  # Flag for optimized implementation
+jit = ["cranelift", "cranelift-module", "cranelift-jit", "cranelift-frontend", "cranelift-native"]  # Just-In-Time compilation support
+backward_compat = []  # Backward compatibility for older APIs
+wasm = ["wasm-bindgen", "web-sys", "plotters-canvas", "visualization"]  # WebAssembly support
+cuda = ["cudarc"]  # CUDA support (requires CUDA toolkit; uses scirs2_core::ndarray; cudarc handles half internally)
+scirs2 = ["dep:scirs2-stats", "dep:scirs2-linalg"]  # SciRS2 scientific computing integration (scirs2-core is always-on)
+# Pure Rust policy note: pulls async-compression -> bzip2/brotli and arrow/parquet -> flate2/zstd/lz4_flex/snap transitively (upstream, feature-gated).
+distributed = ["datafusion", "uuid", "dep:arrow", "dep:parquet", "dep:futures", "dep:tokio"]  # Distributed processing support (tokio: owned runtime that drives DataFusion async execution)
+# Pure Rust policy note: pulls async-compression -> bzip2/brotli transitively (upstream, feature-gated).
+serving = ["uuid"]  # Model serving and deployment support (tokio/futures removed: unused here -- see src/ml/serving)
+excel = ["dep:oxiarc-archive", "dep:quick-xml"]  # Excel support (Pure Rust xlsx via OxiARC)
+visualization = ["textplots", "plotters"]  # Visualization support
+# Pure Rust policy note: arrow/parquet transitively pull flate2/zstd/lz4_flex/snap (upstream, feature-gated).
+parquet = ["dep:arrow", "dep:parquet"]  # Parquet file support
+streaming = ["dep:tokio", "dep:futures"]  # Streaming data processing support
+# Pure Rust policy note: cloud TLS uses rustls with the `ring` CryptoProvider (ring is
+# C + per-architecture assembly — the one accepted crypto exception, NOT aws-lc-sys).
+# object_store 0.14.1 `*-base` + reqwest 0.13 (`rustls-no-provider`) + rustls/`ring`
+# keep aws-lc-rs / aws-lc-sys out of the dependency graph.
+cloud-storage = ["dep:object_store", "dep:reqwest", "dep:rustls", "dep:bytes", "dep:tokio", "dep:futures"]  # Cloud-native storage backends (S3, GCS, Azure Blob)
+
+# Feature bundle for testing core features without external dependencies
+test-core = ["optimized", "backward_compat", "streaming"]
+
+# Feature bundle for testing most features without CUDA/WASM (visualization has compilation issues)
+test-safe = ["optimized", "parquet", "excel", "streaming", "backward_compat"]
+
+# Feature bundle for all safe features (excludes CUDA/WASM/distributed which require external tools)
+all-safe = ["optimized", "serving", "parquet", "excel", "streaming", "backward_compat", "resilience", "cloud-storage"]
+
+# Feature bundle that works reliably for CI/development (most stable features)
+stable = ["optimized", "parquet", "excel", "streaming", "backward_compat", "cloud-storage"]
+
+# Resilience patterns (retry mechanisms, circuit breakers)
+resilience = ["dep:tokio"]
+# Arrow Flight RPC for distributed data transfer
+# Pure Rust policy note: inherits distributed's transitives (flate2/zstd/lz4_flex/snap/bzip2/brotli) via arrow-flight/tonic (upstream, feature-gated).
+flight = ["dep:arrow-flight", "dep:tonic", "dep:arrow", "dep:tokio", "dep:futures", "dep:bytes", "distributed"]
+
+[dev-dependencies]
+criterion.workspace = true
+tokio.workspace = true  # Async runtime for integration tests
+rand.workspace = true
+
+[[bench]]
+name = "comprehensive_benchmark"
+harness = false
+
+[[bench]]
+name = "enhanced_comprehensive_benchmark"
+harness = false
+
+[[bench]]
+name = "regression_benchmark"
+harness = false
+
+[[bench]]
+name = "profiling_benchmark"
+harness = false
+
+[[bench]]
+name = "legacy_dataframe_bench"
+harness = false
+
+[[bench]]
+name = "pandas_comparison_benchmark"
+harness = false
+
+[[bench]]
+name = "ml_benchmarks"
+harness = false
+
+[[bench]]
+name = "query_optimizer_benchmarks"
+harness = false
+
+[[bench]]
+name = "multitenancy_benchmarks"
+harness = false
+
+[[bench]]
+name = "simd_string_benchmarks"
+harness = false
+
+[[bench]]
+name = "comprehensive_features_benchmark"
+harness = false
+
+[[bench]]
+name = "comparison_benchmark"
+harness = false
+
+[lints]
+workspace = true
+
+# Platform-specific dependencies: CUDA only on non-macOS (macOS doesn't support CUDA)
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+cudarc = { workspace = true, optional = true }

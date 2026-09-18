@@ -1,0 +1,43 @@
+[package]
+name = "oxiui-render-soft"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Software CPU framebuffer backend for OxiUI (headless / ffi-audit)"
+readme = "README.md"
+categories = ["rendering", "gui"]
+keywords = ["softbuffer", "headless", "oxiui", "cooljapan", "pure-rust"]
+
+[features]
+default = ["text"]
+parallel = ["dep:rayon"]
+text = ["dep:oxiui-text"]
+theme = ["dep:oxiui-theme"]
+# Pure-Rust SIMD: accelerates bulk pixel fill, alpha blend, gradient fill
+simd = ["dep:wide"]
+# FFT-based Gaussian blur for large kernels (OxiFFT, COOLJAPAN ecosystem)
+fft-blur = ["dep:oxifft"]
+# Runtime backend switching between SoftBackend and WgpuBackend (requires oxiui-render-wgpu)
+wgpu-compat = ["dep:oxiui-render-wgpu"]
+# Canvas 2D pixel upload path for wasm32 (alternative to WebGPU)
+canvas-2d = []
+
+[dependencies]
+oxiui-core.workspace = true
+png.workspace = true
+rayon = { workspace = true, optional = true }
+oxiui-text = { workspace = true, optional = true }
+oxiui-theme = { workspace = true, optional = true }
+wide = { workspace = true, optional = true }
+oxifft = { workspace = true, optional = true }
+oxiui-render-wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "rects"
+harness = false

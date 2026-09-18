@@ -1,0 +1,332 @@
+[package]
+name = "oxictl"
+version = "0.1.2"
+edition = "2021"
+rust-version = "1.75"
+description = "Pure Rust Real-Time Control Systems Framework"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+documentation = "https://docs.rs/oxictl"
+homepage = "https://github.com/cool-japan/oxictl"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxictl"
+readme = "README.md"
+keywords = ["control-systems", "robotics", "pid", "motor-control", "embedded"]
+categories = ["science::robotics", "algorithms", "simulation", "embedded", "no-std"]
+
+[workspace.package]
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxictl"
+
+[features]
+default = ["std", "pid", "safety"]
+std = ["alloc", "dep:thiserror"]
+alloc = []
+pid = []
+safety = []
+sim = ["std"]
+estimator = []
+state_feedback = ["estimator"]
+motor = ["pid"]
+scheduler = []
+adaptive = []
+trajectory = []
+mpc = []
+kinematics = []
+power = []
+protocol = []
+fuzzy = []
+optimal = []
+imc = []
+neural = []
+sysid = []
+flatness = []
+networked = []
+geometric = []
+passivity = []
+disturbance = []
+gp = []
+allocation = []
+fdi = []
+ilc = []
+navigation = []
+extremum = []
+comm = []
+optim = []
+repetitive = []
+data_driven = []
+antiwindup = []
+hybrid = []
+koopman = []
+fixed_point = ["dep:fixed"]
+dds = ["protocol"]
+dds-transport = ["dds", "std", "dep:socket2"]
+dds-discovery = ["dds-transport"]
+dds-stateless = ["dds-transport"]
+dds-stateful = ["dds-stateless"]
+dds-ros2 = ["dds-stateful", "dds-discovery"]
+dds-api = ["dds-ros2"]
+
+[dependencies]
+heapless = "0.9"
+libm = "0.2"
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+thiserror = { version = "2.0", optional = true }
+fixed = { version = "1.31", optional = true }
+socket2 = { version = "0.6", optional = true, features = ["all"] }
+
+[dev-dependencies]
+criterion = "0.8"
+proptest = "1.11"
+approx = "0.5"
+toml = "1.1"
+
+[[example]]
+name = "pid_temperature"
+required-features = ["sim", "pid", "safety"]
+
+[[example]]
+name = "foc_motor"
+required-features = ["motor", "sim"]
+
+[[example]]
+name = "kalman_tracking"
+required-features = ["estimator", "sim"]
+
+[[example]]
+name = "mpc_inverted_pendulum"
+required-features = ["mpc", "sim"]
+
+[[example]]
+name = "ethercat_servo"
+required-features = ["protocol"]
+
+[[example]]
+name = "safety_watchdog"
+required-features = ["safety"]
+
+[[example]]
+name = "trajectory_planning"
+required-features = ["trajectory"]
+
+[[example]]
+name = "adrc_servo"
+required-features = ["state_feedback"]
+
+[[example]]
+name = "robust_mpc_pendulum"
+required-features = ["mpc"]
+
+[[example]]
+name = "multi_sensor_fusion"
+required-features = ["estimator"]
+
+[[example]]
+name = "fuzzy_temperature"
+required-features = ["fuzzy"]
+
+[[example]]
+name = "optimal_trajectory"
+required-features = ["optimal"]
+
+[[example]]
+name = "geometric_attitude"
+required-features = ["geometric"]
+
+[[example]]
+name = "mppi_obstacle"
+required-features = ["mpc"]
+
+[[example]]
+name = "passive_control"
+required-features = ["passivity"]
+
+[[example]]
+name = "dob_motor"
+required-features = ["disturbance"]
+
+[[example]]
+name = "gp_learning"
+required-features = ["gp"]
+
+[[example]]
+name = "control_allocation_uav"
+required-features = ["allocation"]
+
+[[example]]
+name = "bicycle_mpc"
+required-features = ["sim"]
+
+[[example]]
+name = "ilc_repetitive"
+required-features = ["ilc"]
+
+[[example]]
+name = "super_twisting_motor"
+required-features = ["state_feedback"]
+
+[[example]]
+name = "battery_simulation"
+required-features = ["sim"]
+
+[[example]]
+name = "ekf_slam_demo"
+required-features = ["navigation"]
+
+[[example]]
+name = "fdi_motor"
+required-features = ["fdi"]
+
+[[example]]
+name = "extremum_seeking"
+required-features = ["extremum"]
+
+[[example]]
+name = "quantized_control"
+required-features = ["comm"]
+
+[[example]]
+name = "repetitive_control"
+required-features = ["repetitive"]
+
+[[example]]
+name = "pso_pid_tuning"
+required-features = ["optim"]
+
+[[example]]
+name = "vrft_tuning"
+required-features = ["data_driven"]
+
+[[example]]
+name = "koopman_pendulum"
+required-features = ["koopman"]
+
+[[example]]
+name = "switched_controller"
+required-features = ["hybrid"]
+
+[[example]]
+name = "antiwindup_demo"
+required-features = ["antiwindup"]
+
+[[example]]
+name = "fixed_point_pid"
+required-features = ["fixed_point", "pid"]
+
+[[example]]
+name = "ros2_chatter"
+required-features = ["dds-api"]
+
+[[example]]
+name = "ros2_imu_publisher"
+required-features = ["dds-api"]
+
+[[example]]
+name = "ros2_twist_subscriber"
+required-features = ["dds-api"]
+
+[[test]]
+name = "dds_api_integration"
+path = "tests/dds_api_integration/main.rs"
+required-features = ["dds-api"]
+
+[[test]]
+name = "dds_service_integration"
+path = "tests/dds_service_integration/main.rs"
+required-features = ["dds-api"]
+
+[[test]]
+name = "dds_action_integration"
+path = "tests/dds_action_integration/main.rs"
+required-features = ["dds-api"]
+
+[[test]]
+name = "step_response"
+path = "tests/step_response.rs"
+required-features = ["pid", "sim"]
+
+[[test]]
+name = "estimator_validation"
+path = "tests/estimator_validation/main.rs"
+required-features = ["estimator"]
+
+[[test]]
+name = "motor_validation"
+path = "tests/motor_validation/main.rs"
+required-features = ["motor"]
+
+[[test]]
+name = "mpc_validation"
+path = "tests/mpc_validation/main.rs"
+required-features = ["mpc"]
+
+[[test]]
+name = "pid_validation"
+path = "tests/pid_validation/main.rs"
+required-features = ["pid"]
+
+[[test]]
+name = "safety_validation"
+path = "tests/safety_validation/main.rs"
+required-features = ["safety"]
+
+[[test]]
+name = "issue_1_no_std"
+path = "tests/issue_1_no_std.rs"
+required-features = ["pid", "estimator", "motor", "trajectory"]
+
+[[test]]
+name = "fuzzy_validation"
+path = "tests/fuzzy_validation/main.rs"
+required-features = ["fuzzy"]
+
+[[test]]
+name = "optimal_validation"
+path = "tests/optimal_validation/main.rs"
+required-features = ["optimal"]
+
+[[test]]
+name = "fixed_point_validation"
+path = "tests/fixed_point_validation/main.rs"
+required-features = ["fixed_point", "pid"]
+
+[[bench]]
+name = "pid_bench"
+harness = false
+required-features = ["pid"]
+
+[[bench]]
+name = "foc_bench"
+harness = false
+required-features = ["motor"]
+
+[[bench]]
+name = "mpc_bench"
+harness = false
+required-features = ["mpc"]
+
+[[bench]]
+name = "kalman_bench"
+harness = false
+required-features = ["estimator"]
+
+[[bench]]
+name = "scheduler_bench"
+harness = false
+required-features = ["scheduler"]
+
+[[bench]]
+name = "kinematics_bench"
+harness = false
+required-features = ["kinematics"]
+
+[[bench]]
+name = "state_feedback_bench"
+harness = false
+required-features = ["state_feedback"]
+
+[[bench]]
+name = "control_bench"
+harness = false
+required-features = ["pid", "estimator", "trajectory"]

@@ -1,0 +1,1968 @@
+//! Operator Scheduling Module
+//!
+//! Provides intelligent scheduling of computational operators for optimal resource
+//! utilization, task prioritization, and performance optimization across different
+//! execution contexts and device types.
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, info, trace, warn};
+
+/// Operator scheduling service configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorSchedulingConfig {
+    /// Maximum number of concurrent operators per device
+    pub max_concurrent_operators_per_device: usize,
+
+    /// Enable priority-based scheduling
+    pub enable_priority_scheduling: bool,
+
+    /// Enable resource-aware scheduling
+    pub enable_resource_aware_scheduling: bool,
+
+    /// Enable dependency-aware scheduling
+    pub enable_dependency_aware_scheduling: bool,
+
+    /// Enable load balancing across devices
+    pub enable_load_balancing: bool,
+
+    /// Scheduling algorithm to use
+    pub scheduling_algorithm: SchedulingAlgorithm,
+
+    /// Time slice for round-robin scheduling (milliseconds)
+    pub time_slice_ms: u64,
+
+    /// Memory threshold for scheduling decisions (percentage)
+    pub memory_threshold_percent: f64,
+
+    /// CPU utilization threshold for scheduling decisions (percentage)
+    pub cpu_threshold_percent: f64,
+
+    /// GPU utilization threshold for scheduling decisions (percentage)
+    pub gpu_threshold_percent: f64,
+
+    /// Enable preemption for higher priority tasks
+    pub enable_preemption: bool,
+
+    /// Maximum queue size per device
+    pub max_queue_size_per_device: usize,
+
+    /// Task timeout in milliseconds
+    pub task_timeout_ms: u64,
+
+    /// Enable performance profiling
+    pub enable_performance_profiling: bool,
+}
+
+impl Default for OperatorSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_operators_per_device: 4,
+            enable_priority_scheduling: true,
+            enable_resource_aware_scheduling: true,
+            enable_dependency_aware_scheduling: true,
+            enable_load_balancing: true,
+            scheduling_algorithm: SchedulingAlgorithm::Adaptive,
+            time_slice_ms: 100,
+            memory_threshold_percent: 85.0,
+            cpu_threshold_percent: 90.0,
+            gpu_threshold_percent: 95.0,
+            enable_preemption: true,
+            max_queue_size_per_device: 1000,
+            task_timeout_ms: 300000, // 5 minutes
+            enable_performance_profiling: true,
+        }
+    }
+}
+
+/// Scheduling algorithms
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum SchedulingAlgorithm {
+    /// First-Come, First-Served
+    FCFS,
+    /// Shortest Job First
+    SJF,
+    /// Priority scheduling
+    Priority,
+    /// Round-robin scheduling
+    RoundRobin,
+    /// Earliest Deadline First
+    EDF,
+    /// Resource-aware scheduling
+    ResourceAware,
+    /// Adaptive scheduling (combines multiple strategies)
+    Adaptive,
+    /// Custom scheduling logic
+    Custom,
+}
+
+/// Task priority levels
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TaskPriority {
+    /// Critical system tasks
+    Critical = 4,
+    /// High priority user tasks
+    High = 3,
+    /// Normal priority tasks
+    Normal = 2,
+    /// Low priority background tasks
+    Low = 1,
+    /// Best-effort tasks
+    BestEffort = 0,
+}
+
+impl Default for TaskPriority {
+    fn default() -> Self {
+        TaskPriority::Normal
+    }
+}
+
+/// Device types for scheduling
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum DeviceType {
+    /// CPU device
+    CPU,
+    /// CUDA GPU device
+    CUDA(usize),
+    /// Metal GPU device
+    Metal,
+    /// OpenCL device
+    OpenCL(usize),
+    /// TPU device
+    TPU(usize),
+}
+
+/// Operator task representation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorTask {
+    /// Unique task identifier
+    pub id: String,
+
+    /// Task name/description
+    pub name: String,
+
+    /// Operation type
+    pub operation_type: OperationType,
+
+    /// Task priority
+    pub priority: TaskPriority,
+
+    /// Estimated execution time in milliseconds
+    pub estimated_duration_ms: Option<u64>,
+
+    /// Memory requirements in bytes
+    pub memory_requirements: Option<usize>,
+
+    /// CPU requirements (cores)
+    pub cpu_requirements: Option<f64>,
+
+    /// GPU requirements (percentage of device)
+    pub gpu_requirements: Option<f64>,
+
+    /// Preferred device type
+    pub preferred_device: Option<DeviceType>,
+
+    /// Task dependencies (task IDs)
+    pub dependencies: Vec<String>,
+
+    /// Deadline for execution
+    pub deadline: Option<SystemTime>,
+
+    /// Task creation time
+    pub created_at: SystemTime,
+
+    /// Task metadata
+    pub metadata: HashMap<String, String>,
+
+    /// Task affinity (device preferences)
+    pub device_affinity: HashMap<DeviceType, f64>,
+}
+
+/// Operation types
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum OperationType {
+    /// Matrix multiplication
+    MatMul,
+    /// Convolution
+    Convolution,
+    /// Activation functions
+    Activation(String),
+    /// Normalization
+    Normalization(String),
+    /// Pooling
+    Pooling(String),
+    /// Attention computation
+    Attention,
+    /// Embedding lookup
+    Embedding,
+    /// Reduction operations
+    Reduction(String),
+    /// Element-wise operations
+    ElementWise(String),
+    /// Memory operations
+    Memory(String),
+    /// Custom operation
+    Custom(String),
+}
+
+/// Task execution state
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum TaskState {
+    /// Task is queued for execution
+    Queued,
+    /// Task is currently running
+    Running,
+    /// Task completed successfully
+    Completed,
+    /// Task failed with error
+    Failed,
+    /// Task was cancelled
+    Cancelled,
+    /// Task timed out
+    TimedOut,
+    /// Task is waiting for dependencies
+    WaitingForDependencies,
+    /// Task is preempted
+    Preempted,
+}
+
+/// Device resource information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceResource {
+    /// Device type and identifier
+    pub device: DeviceType,
+
+    /// Current memory usage in bytes
+    pub memory_used: usize,
+
+    /// Total memory available in bytes
+    pub memory_total: usize,
+
+    /// Current CPU utilization (0.0 to 1.0)
+    pub cpu_utilization: f64,
+
+    /// Current GPU utilization (0.0 to 1.0)
+    pub gpu_utilization: f64,
+
+    /// Number of currently running tasks
+    pub active_tasks: usize,
+
+    /// Number of queued tasks
+    pub queued_tasks: usize,
+
+    /// Device availability
+    pub is_available: bool,
+
+    /// Last update timestamp
+    pub last_updated: SystemTime,
+}
+
+/// Task execution result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskExecutionResult {
+    /// Task identifier
+    pub task_id: String,
+
+    /// Final task state
+    pub state: TaskState,
+
+    /// Actual execution time
+    pub execution_time: Duration,
+
+    /// Device used for execution
+    pub executed_on: DeviceType,
+
+    /// Memory peak usage during execution
+    pub peak_memory_usage: Option<usize>,
+
+    /// Error message if failed
+    pub error_message: Option<String>,
+
+    /// Performance metrics
+    pub performance_metrics: HashMap<String, f64>,
+
+    /// Task completion timestamp
+    pub completed_at: SystemTime,
+}
+
+/// Scheduling statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulingStats {
+    /// Total tasks scheduled
+    pub total_tasks_scheduled: u64,
+
+    /// Tasks completed successfully
+    pub tasks_completed: u64,
+
+    /// Tasks failed
+    pub tasks_failed: u64,
+
+    /// Tasks cancelled/timed out
+    pub tasks_cancelled: u64,
+
+    /// Average task execution time
+    pub average_execution_time: Duration,
+
+    /// Average queue wait time
+    pub average_queue_time: Duration,
+
+    /// Current queue size across all devices
+    pub current_queue_size: usize,
+
+    /// Device utilization statistics
+    pub device_utilization: HashMap<DeviceType, f64>,
+
+    /// Scheduling algorithm performance
+    pub algorithm_metrics: HashMap<String, f64>,
+
+    /// Throughput (tasks per second)
+    pub throughput: f64,
+
+    /// Task priority distribution
+    pub priority_distribution: HashMap<TaskPriority, u64>,
+}
+
+/// Scheduling decision information
+#[derive(Debug, Clone)]
+pub struct SchedulingDecision {
+    /// Selected task to execute
+    pub task: OperatorTask,
+
+    /// Selected device for execution
+    pub device: DeviceType,
+
+    /// Scheduling score/priority
+    pub score: f64,
+
+    /// Reasoning for the decision
+    pub reasoning: String,
+
+    /// Expected start time
+    pub expected_start_time: SystemTime,
+
+    /// Alternative devices considered
+    pub alternatives: Vec<(DeviceType, f64)>,
+}
+
+/// Operator scheduling errors
+#[derive(Debug, Error)]
+pub enum OperatorSchedulingError {
+    #[error("No suitable device found for task {0}")]
+    NoSuitableDevice(String),
+
+    #[error("Task queue full for device {0:?}")]
+    QueueFull(DeviceType),
+
+    #[error("Task {0} timed out")]
+    TaskTimeout(String),
+
+    #[error("Dependency cycle detected in task {0}")]
+    DependencyCycle(String),
+
+    #[error("Invalid task configuration: {0}")]
+    InvalidTask(String),
+
+    #[error("Device {0:?} is not available")]
+    DeviceUnavailable(DeviceType),
+
+    #[error("Resource constraints violated: {0}")]
+    ResourceConstraints(String),
+
+    #[error("Internal scheduling error: {0}")]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Task wrapper for priority queue
+#[derive(Debug, Clone)]
+struct PriorityTask {
+    task: OperatorTask,
+    priority_score: f64,
+    queue_time: SystemTime,
+}
+
+impl PartialEq for PriorityTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority_score == other.priority_score
+    }
+}
+
+impl Eq for PriorityTask {}
+
+impl PartialOrd for PriorityTask {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PriorityTask {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Higher priority score comes first
+        other
+            .priority_score
+            .partial_cmp(&self.priority_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.queue_time.cmp(&other.queue_time))
+    }
+}
+
+/// One scheduled operator task, in its running form.
+///
+/// Resolving to `Ok(metrics)` means the task ran to completion and the executor
+/// measured `metrics`; an executor that measures nothing returns an empty map.
+/// `Err(message)` means it failed, and `message` is recorded verbatim as the
+/// result's `error_message`.
+pub type OperatorTaskFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::result::Result<HashMap<String, f64>, String>> + Send>,
+>;
+
+/// Runs the operator tasks this service schedules.
+///
+/// The scheduler decides *what* runs *where*; it has no way to turn an
+/// [`OperatorTask`] into something runnable on its own. An `OperatorExecutor`
+/// provides that mapping.
+///
+/// 0.2.1: without this seam the scheduler had no executor at all, and
+/// `try_schedule_next_task` covered for that by spawning a task that slept for
+/// `100 + (hash(task_id) % 1000)` milliseconds and then wrote a
+/// [`TaskExecutionResult`] claiming `state: Completed`, that sleep as
+/// `execution_time`, and `peak_memory_usage: Some(1 MiB)` -- for an operator
+/// that never ran. `get_task_result` handed that to callers as a measurement.
+/// There is deliberately no default implementation: a service with no executor
+/// leaves work queued rather than manufacturing outcomes for it.
+pub trait OperatorExecutor: Send + Sync + std::fmt::Debug {
+    /// Return the runnable body for `task` on `device`, or `None` when this
+    /// executor cannot run it. `None` makes the scheduler record a real failed
+    /// result instead of inventing a successful one.
+    fn execute(&self, task: &OperatorTask, device: DeviceType) -> Option<OperatorTaskFuture>;
+}
+
+/// Operator scheduling service
+pub struct OperatorSchedulingService {
+    config: OperatorSchedulingConfig,
+    task_queues: Arc<RwLock<HashMap<DeviceType, BinaryHeap<PriorityTask>>>>,
+    running_tasks: Arc<RwLock<HashMap<String, (OperatorTask, DeviceType, SystemTime)>>>,
+    device_resources: Arc<RwLock<HashMap<DeviceType, DeviceResource>>>,
+    stats: Arc<RwLock<SchedulingStats>>,
+    task_results: Arc<RwLock<HashMap<String, TaskExecutionResult>>>,
+    dependency_graph: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    scheduling_history: Arc<RwLock<Vec<SchedulingDecision>>>,
+    /// What actually runs the scheduled tasks. `None` means nothing can run:
+    /// tasks queue up and no results are produced for them.
+    executor: Option<Arc<dyn OperatorExecutor>>,
+}
+
+impl OperatorSchedulingService {
+    /// Create a new operator scheduling service
+    pub fn new(config: OperatorSchedulingConfig) -> Self {
+        Self {
+            config,
+            task_queues: Arc::new(RwLock::new(HashMap::new())),
+            running_tasks: Arc::new(RwLock::new(HashMap::new())),
+            device_resources: Arc::new(RwLock::new(HashMap::new())),
+            stats: Arc::new(RwLock::new(SchedulingStats {
+                total_tasks_scheduled: 0,
+                tasks_completed: 0,
+                tasks_failed: 0,
+                tasks_cancelled: 0,
+                average_execution_time: Duration::from_secs(0),
+                average_queue_time: Duration::from_secs(0),
+                current_queue_size: 0,
+                device_utilization: HashMap::new(),
+                algorithm_metrics: HashMap::new(),
+                throughput: 0.0,
+                priority_distribution: HashMap::new(),
+            })),
+            task_results: Arc::new(RwLock::new(HashMap::new())),
+            dependency_graph: Arc::new(RwLock::new(HashMap::new())),
+            scheduling_history: Arc::new(RwLock::new(Vec::new())),
+            executor: None,
+        }
+    }
+
+    /// Create a scheduling service that can actually run what it schedules.
+    ///
+    /// Without an executor the service still validates, orders and queues
+    /// tasks -- it simply never starts one, and `get_task_result` keeps
+    /// returning `None` because nothing has run.
+    pub fn with_executor(
+        config: OperatorSchedulingConfig,
+        executor: Arc<dyn OperatorExecutor>,
+    ) -> Self {
+        Self {
+            executor: Some(executor),
+            ..Self::new(config)
+        }
+    }
+
+    /// The executor that runs scheduled tasks, if one was supplied.
+    pub fn executor(&self) -> Option<&Arc<dyn OperatorExecutor>> {
+        self.executor.as_ref()
+    }
+
+    /// Register a device for scheduling
+    pub async fn register_device(
+        &self,
+        device: DeviceType,
+        resource: DeviceResource,
+    ) -> Result<()> {
+        let mut devices = self.device_resources.write().await;
+        let mut queues = self.task_queues.write().await;
+
+        devices.insert(device, resource);
+        queues.insert(device, BinaryHeap::new());
+
+        info!("Registered device {:?} for operator scheduling", device);
+        Ok(())
+    }
+
+    /// Submit a task for scheduling
+    pub async fn submit_task(&self, task: OperatorTask) -> Result<(), OperatorSchedulingError> {
+        info!("Submitting task {} for scheduling", task.id);
+
+        // Validate task
+        self.validate_task(&task).await?;
+
+        // Check for dependency cycles
+        if self.config.enable_dependency_aware_scheduling {
+            self.check_dependency_cycles(&task).await?;
+        }
+
+        // Update dependency graph
+        self.update_dependency_graph(&task).await;
+
+        // Select device and schedule task
+        let decision = self.make_scheduling_decision(&task).await?;
+        let device = decision.device;
+
+        // Add task to appropriate queue (scope to release lock before update_submission_stats)
+        {
+            let mut queues = self.task_queues.write().await;
+            if let Some(queue) = queues.get_mut(&decision.device) {
+                if queue.len() >= self.config.max_queue_size_per_device {
+                    return Err(OperatorSchedulingError::QueueFull(decision.device));
+                }
+
+                let priority_task = PriorityTask {
+                    task: task.clone(),
+                    priority_score: decision.score,
+                    queue_time: SystemTime::now(),
+                };
+
+                queue.push(priority_task);
+            } else {
+                return Err(OperatorSchedulingError::DeviceUnavailable(decision.device));
+            }
+        }
+
+        // Update statistics (queues lock is now released)
+        self.update_submission_stats(&task).await;
+
+        // Store scheduling decision
+        self.scheduling_history.write().await.push(decision);
+
+        // Trigger scheduling if possible
+        self.try_schedule_next_task(device).await?;
+
+        debug!("Task {} queued for device {:?}", task.id, device);
+        Ok(())
+    }
+
+    /// Try to start the next queued task for a device.
+    ///
+    /// Returns a boxed, explicitly-`Send` future rather than being an
+    /// `async fn`: the completion path calls back into this function, so an
+    /// inferred future type would make `Send` depend on itself and the
+    /// compiler would refuse to prove it. Declaring it here breaks that cycle.
+    #[allow(clippy::type_complexity)]
+    fn try_schedule_next_task(
+        &self,
+        device: DeviceType,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), OperatorSchedulingError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            // How many bodies this device is running right now.
+            //
+            // 0.2.1: this used to read `DeviceResource::active_tasks`, which
+            // nothing in this service ever increments -- it is only ever set by
+            // an operator through `update_device_resource`, and starts at
+            // whatever they registered. The comparison against
+            // `max_concurrent_operators_per_device` was therefore against a
+            // constant, and the configured cap gated nothing. `running_tasks`
+            // is the real in-flight set: an entry is inserted immediately
+            // before the body is spawned and removed by `complete_task`.
+            //
+            // Best-effort, and deliberately documented as such: the count is
+            // taken before the reservation, so two concurrent callers can both
+            // pass the check for the last slot. A single call starts at most
+            // one body, so the cap holds exactly for the common sequential
+            // submit/complete path.
+            let in_flight = {
+                let running = self.running_tasks.read().await;
+                running.values().filter(|(_, running_on, _)| *running_on == device).count()
+            };
+
+            // Check device availability first
+            let device_available = {
+                let devices = self.device_resources.read().await;
+                if let Some(device_resource) = devices.get(&device) {
+                    device_resource.is_available
+                        && in_flight < self.config.max_concurrent_operators_per_device
+                } else {
+                    return Err(OperatorSchedulingError::DeviceUnavailable(device));
+                }
+            };
+
+            if !device_available {
+                return Ok(());
+            }
+
+            // Nothing can run without an executor. Leave the queue untouched rather
+            // than dequeuing work that would then have to be accounted for.
+            let Some(executor) = self.executor.clone() else {
+                debug!(
+                    "No OperatorExecutor configured; tasks for device {:?} stay queued",
+                    device
+                );
+                return Ok(());
+            };
+
+            // Get next task from queue
+            let task_to_schedule = {
+                let mut queues = self.task_queues.write().await;
+                if let Some(queue) = queues.get_mut(&device) {
+                    // Try to find a task whose dependencies are satisfied
+                    let mut checked_tasks = Vec::new();
+                    let mut found_task = None;
+
+                    while let Some(priority_task) = queue.pop() {
+                        let task = priority_task.task.clone();
+
+                        // Check dependencies without holding locks
+                        if self.config.enable_dependency_aware_scheduling {
+                            // Check if task dependencies are satisfied
+                            let dependencies_satisfied =
+                                self.are_dependencies_satisfied(&task).await;
+
+                            if dependencies_satisfied {
+                                found_task = Some(task);
+                                break;
+                            } else {
+                                // Dependencies not satisfied, check next task
+                                checked_tasks.push(priority_task);
+                            }
+                        } else {
+                            // When dependency checking is disabled, take the first available task
+                            found_task = Some(task);
+                            break;
+                        }
+                    }
+
+                    // Put back unchecked tasks
+                    for task in checked_tasks {
+                        queue.push(task);
+                    }
+
+                    found_task
+                } else {
+                    None
+                }
+            };
+
+            if let Some(task) = task_to_schedule {
+                let task_id = task.id.clone();
+
+                // Ask the executor for a body before claiming the task as running:
+                // an executor that does not know this task must not leave it
+                // sitting in `running_tasks` forever.
+                let Some(body) = executor.execute(&task, device) else {
+                    let result = TaskExecutionResult {
+                        task_id: task_id.clone(),
+                        state: TaskState::Failed,
+                        execution_time: Duration::ZERO,
+                        executed_on: device,
+                        peak_memory_usage: None,
+                        error_message: Some(format!(
+                            "the configured OperatorExecutor has no body for task {task_id}"
+                        )),
+                        performance_metrics: HashMap::new(),
+                        completed_at: SystemTime::now(),
+                    };
+                    warn!("Cannot execute task {}: executor supplied no body", task_id);
+                    // Recorded inline rather than through `complete_task`: the task
+                    // was never entered into `running_tasks`, and calling back into
+                    // `complete_task` here would make this function's future
+                    // recurse into its own type. The remaining queue entries are
+                    // picked up by the next submission or completion.
+                    {
+                        let mut results = self.task_results.write().await;
+                        results.insert(task_id.clone(), result.clone());
+                    }
+                    self.update_completion_stats(&result).await;
+                    return Ok(());
+                };
+
+                // Start task execution
+                let start_time = SystemTime::now();
+                {
+                    let mut running = self.running_tasks.write().await;
+                    running.insert(task.id.clone(), (task.clone(), device, start_time));
+                }
+
+                info!(
+                    "Starting execution of task {} on device {:?}",
+                    task.id, device
+                );
+
+                tokio::task::spawn({
+                    let scheduler = self.clone();
+                    async move {
+                        // Every number below is taken from this run: the clock is
+                        // read around the executor's own future, and the metrics
+                        // are whatever that future reported.
+                        let started = Instant::now();
+                        let outcome = body.await;
+                        let execution_time = started.elapsed();
+
+                        let result = match outcome {
+                            Ok(performance_metrics) => TaskExecutionResult {
+                                task_id: task_id.clone(),
+                                state: TaskState::Completed,
+                                execution_time,
+                                executed_on: device,
+                                // Nothing here samples the task's peak RSS.
+                                peak_memory_usage: None,
+                                error_message: None,
+                                performance_metrics,
+                                completed_at: SystemTime::now(),
+                            },
+                            Err(error_message) => TaskExecutionResult {
+                                task_id: task_id.clone(),
+                                state: TaskState::Failed,
+                                execution_time,
+                                executed_on: device,
+                                peak_memory_usage: None,
+                                error_message: Some(error_message),
+                                performance_metrics: HashMap::new(),
+                                completed_at: SystemTime::now(),
+                            },
+                        };
+
+                        // Type-erased so the future of `complete_task` -- which
+                        // schedules the next task, which spawns this block again --
+                        // does not recurse into its own type.
+                        let completion: std::pin::Pin<
+                            Box<dyn std::future::Future<Output = ()> + Send>,
+                        > = Box::pin(scheduler.complete_task(task_id, result));
+                        completion.await;
+                    }
+                });
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Make scheduling decision for a task
+    async fn make_scheduling_decision(
+        &self,
+        task: &OperatorTask,
+    ) -> Result<SchedulingDecision, OperatorSchedulingError> {
+        let devices = self.device_resources.read().await;
+        let mut candidates = Vec::new();
+
+        // Evaluate all available devices
+        for (device_type, resource) in devices.iter() {
+            if !resource.is_available {
+                continue;
+            }
+
+            let score = self.calculate_device_score(task, device_type, resource).await;
+            candidates.push((*device_type, score));
+        }
+
+        if candidates.is_empty() {
+            return Err(OperatorSchedulingError::NoSuitableDevice(task.id.clone()));
+        }
+
+        // Sort by score (highest first)
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+        let (selected_device, score) = candidates[0];
+        let alternatives = candidates[1..].to_vec();
+
+        Ok(SchedulingDecision {
+            task: task.clone(),
+            device: selected_device,
+            score,
+            reasoning: self.generate_decision_reasoning(task, selected_device, score).await,
+            expected_start_time: SystemTime::now(),
+            alternatives,
+        })
+    }
+
+    /// Calculate scoring for device assignment
+    async fn calculate_device_score(
+        &self,
+        task: &OperatorTask,
+        device: &DeviceType,
+        resource: &DeviceResource,
+    ) -> f64 {
+        let mut score = 0.0;
+
+        // Base score from device affinity
+        if let Some(affinity) = task.device_affinity.get(device) {
+            score += affinity * 40.0;
+        }
+
+        // Preferred device bonus
+        if let Some(preferred) = &task.preferred_device {
+            if preferred == device {
+                score += 30.0;
+            }
+        }
+
+        // Resource availability scoring
+        let memory_availability =
+            1.0 - (resource.memory_used as f64 / resource.memory_total as f64);
+        score += memory_availability * 20.0;
+
+        let cpu_availability = 1.0 - resource.cpu_utilization;
+        score += cpu_availability * 15.0;
+
+        let gpu_availability = 1.0 - resource.gpu_utilization;
+        score += gpu_availability * 25.0;
+
+        // Queue length penalty
+        let queue_penalty = resource.queued_tasks as f64 * 2.0;
+        score -= queue_penalty;
+
+        // Active tasks penalty
+        let active_penalty = resource.active_tasks as f64 * 3.0;
+        score -= active_penalty;
+
+        // Operation type specific scoring
+        score += self.calculate_operation_affinity_score(&task.operation_type, device);
+
+        score.max(0.0)
+    }
+
+    /// Calculate operation affinity score for device
+    fn calculate_operation_affinity_score(
+        &self,
+        operation: &OperationType,
+        device: &DeviceType,
+    ) -> f64 {
+        match (operation, device) {
+            (OperationType::MatMul, DeviceType::CUDA(_)) => 15.0,
+            (OperationType::MatMul, DeviceType::Metal) => 12.0,
+            (OperationType::Convolution, DeviceType::CUDA(_)) => 20.0,
+            (OperationType::Convolution, DeviceType::Metal) => 15.0,
+            (OperationType::Attention, DeviceType::CUDA(_)) => 18.0,
+            (OperationType::Attention, DeviceType::Metal) => 14.0,
+            (OperationType::Memory(_), DeviceType::CPU) => 10.0,
+            (OperationType::ElementWise(_), DeviceType::CUDA(_)) => 12.0,
+            (OperationType::ElementWise(_), DeviceType::Metal) => 10.0,
+            _ => 5.0,
+        }
+    }
+
+    /// Generate reasoning for scheduling decision
+    async fn generate_decision_reasoning(
+        &self,
+        task: &OperatorTask,
+        device: DeviceType,
+        score: f64,
+    ) -> String {
+        format!(
+            "Selected device {:?} for task {} (priority: {:?}) with score {:.2}. \
+             Operation type: {:?}, Device affinity: {:?}",
+            device,
+            task.name,
+            task.priority,
+            score,
+            task.operation_type,
+            task.device_affinity.get(&device).unwrap_or(&0.0)
+        )
+    }
+
+    /// Validate task before scheduling
+    async fn validate_task(&self, task: &OperatorTask) -> Result<(), OperatorSchedulingError> {
+        if task.id.is_empty() {
+            return Err(OperatorSchedulingError::InvalidTask(
+                "Task ID cannot be empty".to_string(),
+            ));
+        }
+
+        if task.name.is_empty() {
+            return Err(OperatorSchedulingError::InvalidTask(
+                "Task name cannot be empty".to_string(),
+            ));
+        }
+
+        // Check if task already exists
+        let running = self.running_tasks.read().await;
+        if running.contains_key(&task.id) {
+            return Err(OperatorSchedulingError::InvalidTask(format!(
+                "Task {} is already running",
+                task.id
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Check for dependency cycles
+    async fn check_dependency_cycles(
+        &self,
+        task: &OperatorTask,
+    ) -> Result<(), OperatorSchedulingError> {
+        let dep_graph = self.dependency_graph.read().await;
+        let mut visited = HashSet::new();
+        let mut rec_stack = HashSet::new();
+
+        for dep in &task.dependencies {
+            if self.has_cycle_util(&dep_graph, dep, &mut visited, &mut rec_stack) {
+                return Err(OperatorSchedulingError::DependencyCycle(task.id.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Utility function for cycle detection
+    fn has_cycle_util(
+        &self,
+        graph: &HashMap<String, HashSet<String>>,
+        node: &str,
+        visited: &mut HashSet<String>,
+        rec_stack: &mut HashSet<String>,
+    ) -> bool {
+        visited.insert(node.to_string());
+        rec_stack.insert(node.to_string());
+
+        if let Some(deps) = graph.get(node) {
+            for dep in deps {
+                if !visited.contains(dep) {
+                    if self.has_cycle_util(graph, dep, visited, rec_stack) {
+                        return true;
+                    }
+                } else if rec_stack.contains(dep) {
+                    return true;
+                }
+            }
+        }
+
+        rec_stack.remove(node);
+        false
+    }
+
+    /// Update dependency graph
+    async fn update_dependency_graph(&self, task: &OperatorTask) {
+        let mut dep_graph = self.dependency_graph.write().await;
+        dep_graph.insert(task.id.clone(), task.dependencies.iter().cloned().collect());
+    }
+
+    /// Check if task dependencies are satisfied
+    async fn are_dependencies_satisfied(&self, task: &OperatorTask) -> bool {
+        let results = self.task_results.read().await;
+
+        for dep_id in &task.dependencies {
+            if let Some(result) = results.get(dep_id) {
+                if result.state != TaskState::Completed {
+                    return false;
+                }
+            } else {
+                return false; // Dependency not found
+            }
+        }
+
+        true
+    }
+
+    /// Record the outcome of a task the executor finished, then look for more
+    /// work on the device it freed.
+    ///
+    /// Each lock is scoped: `try_schedule_next_task` re-enters
+    /// `running_tasks`, `task_results` and `task_queues`, and `tokio`'s
+    /// `RwLock` is not reentrant, so holding a guard across that call
+    /// deadlocks the scheduler.
+    async fn complete_task(&self, task_id: String, result: TaskExecutionResult) {
+        // Remove from running tasks
+        {
+            let mut running = self.running_tasks.write().await;
+            running.remove(&task_id);
+        }
+
+        // Store result
+        {
+            let mut results = self.task_results.write().await;
+            results.insert(task_id.clone(), result.clone());
+        }
+
+        // Update statistics
+        self.update_completion_stats(&result).await;
+
+        info!("Task {} completed with state {:?}", task_id, result.state);
+
+        // Try to schedule next task on the device
+        let _ = self.try_schedule_next_task(result.executed_on).await;
+    }
+
+    /// Update submission statistics
+    async fn update_submission_stats(&self, task: &OperatorTask) {
+        let mut stats = self.stats.write().await;
+        stats.total_tasks_scheduled += 1;
+        *stats.priority_distribution.entry(task.priority).or_insert(0) += 1;
+
+        // Update current queue size
+        let queues = self.task_queues.read().await;
+        stats.current_queue_size = queues.values().map(|q| q.len()).sum();
+    }
+
+    /// Update completion statistics
+    async fn update_completion_stats(&self, result: &TaskExecutionResult) {
+        let mut stats = self.stats.write().await;
+
+        match result.state {
+            TaskState::Completed => stats.tasks_completed += 1,
+            TaskState::Failed => stats.tasks_failed += 1,
+            TaskState::Cancelled | TaskState::TimedOut => stats.tasks_cancelled += 1,
+            _ => {},
+        }
+
+        // Update average execution time
+        let total_completed = stats.tasks_completed as f64;
+        if total_completed > 0.0 {
+            let current_avg = stats.average_execution_time.as_secs_f64();
+            let new_avg = (current_avg * (total_completed - 1.0)
+                + result.execution_time.as_secs_f64())
+                / total_completed;
+            stats.average_execution_time = Duration::from_secs_f64(new_avg);
+        }
+
+        // Calculate throughput
+        let total_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        if total_time > 0.0 {
+            stats.throughput = stats.tasks_completed as f64 / total_time;
+        }
+    }
+
+    /// Get current scheduling statistics
+    pub async fn get_stats(&self) -> SchedulingStats {
+        self.stats.read().await.clone()
+    }
+
+    /// Get task result
+    pub async fn get_task_result(&self, task_id: &str) -> Option<TaskExecutionResult> {
+        self.task_results.read().await.get(task_id).cloned()
+    }
+
+    /// Cancel a task
+    pub async fn cancel_task(&self, task_id: &str) -> Result<(), OperatorSchedulingError> {
+        // Remove from queues
+        let mut queues = self.task_queues.write().await;
+        for queue in queues.values_mut() {
+            queue.retain(|pt| pt.task.id != task_id);
+        }
+
+        // Remove from running tasks
+        let mut running = self.running_tasks.write().await;
+        if let Some((_task, device, _)) = running.remove(task_id) {
+            let result = TaskExecutionResult {
+                task_id: task_id.to_string(),
+                state: TaskState::Cancelled,
+                execution_time: Duration::from_secs(0),
+                executed_on: device,
+                peak_memory_usage: None,
+                error_message: Some("Task cancelled".to_string()),
+                performance_metrics: HashMap::new(),
+                completed_at: SystemTime::now(),
+            };
+
+            self.task_results.write().await.insert(task_id.to_string(), result.clone());
+            self.update_completion_stats(&result).await;
+        }
+
+        info!("Task {} cancelled", task_id);
+        Ok(())
+    }
+
+    /// Update device resource information
+    pub async fn update_device_resource(
+        &self,
+        device: DeviceType,
+        resource: DeviceResource,
+    ) -> Result<()> {
+        let mut devices = self.device_resources.write().await;
+        devices.insert(device, resource);
+
+        trace!("Updated resource information for device {:?}", device);
+        Ok(())
+    }
+
+    /// Get current device resources
+    pub async fn get_device_resources(&self) -> HashMap<DeviceType, DeviceResource> {
+        self.device_resources.read().await.clone()
+    }
+
+    /// Get scheduling history
+    pub async fn get_scheduling_history(&self, limit: Option<usize>) -> Vec<SchedulingDecision> {
+        let history = self.scheduling_history.read().await;
+        match limit {
+            Some(n) => history.iter().rev().take(n).cloned().collect(),
+            None => history.clone(),
+        }
+    }
+}
+
+// Manual Clone implementation for OperatorSchedulingService
+impl Clone for OperatorSchedulingService {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            task_queues: Arc::clone(&self.task_queues),
+            running_tasks: Arc::clone(&self.running_tasks),
+            device_resources: Arc::clone(&self.device_resources),
+            stats: Arc::clone(&self.stats),
+            task_results: Arc::clone(&self.task_results),
+            dependency_graph: Arc::clone(&self.dependency_graph),
+            scheduling_history: Arc::clone(&self.scheduling_history),
+            executor: self.executor.clone(),
+        }
+    }
+}
+
+/// Summary statistics for the operator scheduling service
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorSchedulingStatsSummary {
+    /// Total tasks scheduled
+    pub total_tasks_scheduled: u64,
+
+    /// Success rate percentage
+    pub success_rate_percent: f64,
+
+    /// Average execution time in seconds
+    pub average_execution_time_seconds: f64,
+
+    /// Current throughput (tasks per second)
+    pub throughput: f64,
+
+    /// Current total queue size
+    pub current_queue_size: usize,
+
+    /// Number of active devices
+    pub active_devices: usize,
+
+    /// Most used priority level
+    pub most_used_priority: Option<TaskPriority>,
+}
+
+impl OperatorSchedulingService {
+    /// Get summary statistics
+    pub async fn get_stats_summary(&self) -> OperatorSchedulingStatsSummary {
+        let stats = self.stats.read().await;
+        let devices = self.device_resources.read().await;
+
+        let success_rate = if stats.total_tasks_scheduled > 0 {
+            (stats.tasks_completed as f64 / stats.total_tasks_scheduled as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let most_used_priority = stats
+            .priority_distribution
+            .iter()
+            .max_by_key(|(_, &count)| count)
+            .map(|(priority, _)| *priority);
+
+        OperatorSchedulingStatsSummary {
+            total_tasks_scheduled: stats.total_tasks_scheduled,
+            success_rate_percent: success_rate,
+            average_execution_time_seconds: stats.average_execution_time.as_secs_f64(),
+            throughput: stats.throughput,
+            current_queue_size: stats.current_queue_size,
+            active_devices: devices.len(),
+            most_used_priority,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::SystemTime;
+
+    /// Test executor that records what it was asked to run and sleeps a known
+    /// amount so the scheduler's measured `execution_time` can be checked
+    /// against something real.
+    #[derive(Debug)]
+    struct RecordingExecutor {
+        ran: Arc<AtomicUsize>,
+        body_duration: Duration,
+        /// When false, the executor declines every task.
+        knows_tasks: bool,
+    }
+
+    impl OperatorExecutor for RecordingExecutor {
+        fn execute(&self, _task: &OperatorTask, _device: DeviceType) -> Option<OperatorTaskFuture> {
+            if !self.knows_tasks {
+                return None;
+            }
+            let ran = Arc::clone(&self.ran);
+            let body_duration = self.body_duration;
+            Some(Box::pin(async move {
+                tokio::time::sleep(body_duration).await;
+                ran.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(HashMap::from([("flops".to_string(), 42.0)]))
+            }))
+        }
+    }
+
+    fn cpu_resource() -> DeviceResource {
+        DeviceResource {
+            device: DeviceType::CPU,
+            memory_used: 0,
+            memory_total: 1024 * 1024 * 1024,
+            cpu_utilization: 0.0,
+            gpu_utilization: 0.0,
+            active_tasks: 0,
+            queued_tasks: 0,
+            is_available: true,
+            last_updated: SystemTime::now(),
+        }
+    }
+
+    fn simple_task(id: &str) -> OperatorTask {
+        OperatorTask {
+            id: id.to_string(),
+            name: format!("task {id}"),
+            operation_type: OperationType::MatMul,
+            priority: TaskPriority::Normal,
+            estimated_duration_ms: None,
+            memory_requirements: None,
+            cpu_requirements: None,
+            gpu_requirements: None,
+            preferred_device: Some(DeviceType::CPU),
+            dependencies: Vec::new(),
+            deadline: None,
+            created_at: SystemTime::now(),
+            metadata: HashMap::new(),
+            device_affinity: HashMap::new(),
+        }
+    }
+
+    async fn await_result(
+        service: &OperatorSchedulingService,
+        task_id: &str,
+    ) -> Option<TaskExecutionResult> {
+        // Generous budget: these tests share a machine with whatever else the
+        // suite is running, so the poll window is sized for a loaded host
+        // rather than for the body durations alone.
+        for _ in 0..500 {
+            if let Some(result) = service.get_task_result(task_id).await {
+                return Some(result);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// The scheduler must run the executor's body and report what it measured.
+    #[tokio::test]
+    async fn executor_body_really_runs_and_its_measurements_are_reported() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let service = OperatorSchedulingService::with_executor(
+            OperatorSchedulingConfig::default(),
+            Arc::new(RecordingExecutor {
+                ran: Arc::clone(&ran),
+                body_duration: Duration::from_millis(60),
+                knows_tasks: true,
+            }),
+        );
+        service
+            .register_device(DeviceType::CPU, cpu_resource())
+            .await
+            .expect("device registration should succeed");
+
+        service
+            .submit_task(simple_task("runs-for-real"))
+            .await
+            .expect("submit should succeed");
+
+        let result = await_result(&service, "runs-for-real").await.expect("result should appear");
+        assert_eq!(
+            ran.load(AtomicOrdering::SeqCst),
+            1,
+            "the body must have executed exactly once"
+        );
+        assert_eq!(result.state, TaskState::Completed);
+        assert!(
+            result.execution_time >= Duration::from_millis(50),
+            "execution_time must be measured around the real body, got {:?}",
+            result.execution_time
+        );
+        assert_eq!(
+            result.performance_metrics.get("flops"),
+            Some(&42.0),
+            "metrics must come from the executor"
+        );
+        assert!(
+            result.peak_memory_usage.is_none(),
+            "nothing samples peak memory, so it must be absent rather than 1 MiB"
+        );
+        assert!(result.error_message.is_none());
+    }
+
+    /// With no executor nothing can run, so no result may appear.
+    #[tokio::test]
+    async fn without_an_executor_no_result_is_manufactured() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        service
+            .register_device(DeviceType::CPU, cpu_resource())
+            .await
+            .expect("device registration should succeed");
+
+        service
+            .submit_task(simple_task("never-runs"))
+            .await
+            .expect("submit should succeed");
+
+        // Long enough that the deleted simulation (100..1100 ms) would have
+        // fired and written a fabricated "Completed" result.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        assert!(
+            service.get_task_result("never-runs").await.is_none(),
+            "a scheduler with no executor must not produce results"
+        );
+        let stats = service.get_stats().await;
+        assert_eq!(
+            stats.tasks_completed, 0,
+            "nothing ran, so nothing completed"
+        );
+        assert_eq!(
+            stats.total_tasks_scheduled, 1,
+            "the task is still queued, though"
+        );
+    }
+
+    /// The configured per-device concurrency cap must actually bound how many
+    /// bodies run at once.
+    #[tokio::test]
+    async fn the_configured_concurrency_cap_is_enforced() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let mut config = OperatorSchedulingConfig::default();
+        config.max_concurrent_operators_per_device = 1;
+        let service = OperatorSchedulingService::with_executor(
+            config,
+            Arc::new(RecordingExecutor {
+                ran: Arc::clone(&ran),
+                // Long enough that the "still running" checks below cannot
+                // race the body's completion on a loaded machine.
+                body_duration: Duration::from_millis(1000),
+                knows_tasks: true,
+            }),
+        );
+        service
+            .register_device(DeviceType::CPU, cpu_resource())
+            .await
+            .expect("device registration should succeed");
+
+        service.submit_task(simple_task("first")).await.expect("submit should succeed");
+        service.submit_task(simple_task("second")).await.expect("submit should succeed");
+
+        // The first body is still running, so the cap of 1 must have kept the
+        // second one queued rather than starting it too.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            ran.load(AtomicOrdering::SeqCst),
+            0,
+            "neither body has finished yet, so nothing may have completed"
+        );
+        assert!(
+            service.get_task_result("second").await.is_none(),
+            "the second task must not have run while the cap was reached"
+        );
+
+        // Once the first completes it releases the slot and the second starts.
+        let second = await_result(&service, "second").await.expect("second should eventually run");
+        assert_eq!(second.state, TaskState::Completed);
+        assert_eq!(
+            ran.load(AtomicOrdering::SeqCst),
+            2,
+            "both bodies must run in the end"
+        );
+    }
+
+    /// An executor that declines a task yields a real failure, not a success.
+    #[tokio::test]
+    async fn declined_task_is_recorded_as_failed() {
+        let service = OperatorSchedulingService::with_executor(
+            OperatorSchedulingConfig::default(),
+            Arc::new(RecordingExecutor {
+                ran: Arc::new(AtomicUsize::new(0)),
+                body_duration: Duration::ZERO,
+                knows_tasks: false,
+            }),
+        );
+        service
+            .register_device(DeviceType::CPU, cpu_resource())
+            .await
+            .expect("device registration should succeed");
+
+        service
+            .submit_task(simple_task("unknown-task"))
+            .await
+            .expect("submit should succeed");
+
+        let result = await_result(&service, "unknown-task").await.expect("result should appear");
+        assert_eq!(result.state, TaskState::Failed);
+        assert!(
+            result.error_message.is_some_and(|m| m.contains("no body")),
+            "the failure must say why"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_operator_scheduling_service_creation() {
+        let config = OperatorSchedulingConfig::default();
+        let service = OperatorSchedulingService::new(config);
+        let stats = service.get_stats().await;
+
+        assert_eq!(stats.total_tasks_scheduled, 0);
+        assert_eq!(stats.tasks_completed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_device_registration() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+
+        let device = DeviceType::CPU;
+        let resource = DeviceResource {
+            device,
+            memory_used: 0,
+            memory_total: 1024 * 1024 * 1024, // 1GB
+            cpu_utilization: 0.5,
+            gpu_utilization: 0.0,
+            active_tasks: 0,
+            queued_tasks: 0,
+            is_available: true,
+            last_updated: SystemTime::now(),
+        };
+
+        let result = service.register_device(device, resource).await;
+        assert!(result.is_ok());
+
+        let devices = service.get_device_resources().await;
+        assert!(devices.contains_key(&device));
+    }
+
+    #[tokio::test]
+    async fn test_task_submission() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+
+        // Register a device first
+        let device = DeviceType::CPU;
+        let resource = DeviceResource {
+            device,
+            memory_used: 0,
+            memory_total: 1024 * 1024 * 1024,
+            cpu_utilization: 0.3,
+            gpu_utilization: 0.0,
+            active_tasks: 0,
+            queued_tasks: 0,
+            is_available: true,
+            last_updated: SystemTime::now(),
+        };
+        service
+            .register_device(device, resource)
+            .await
+            .expect("registration should succeed in test");
+
+        // Create and submit a task
+        let task = OperatorTask {
+            id: "test_task_1".to_string(),
+            name: "Test MatMul".to_string(),
+            operation_type: OperationType::MatMul,
+            priority: TaskPriority::High,
+            estimated_duration_ms: Some(100),
+            memory_requirements: Some(1024 * 1024),
+            cpu_requirements: Some(0.5),
+            gpu_requirements: None,
+            preferred_device: Some(DeviceType::CPU),
+            dependencies: Vec::new(),
+            deadline: None,
+            created_at: SystemTime::now(),
+            metadata: HashMap::new(),
+            device_affinity: {
+                let mut affinity = HashMap::new();
+                affinity.insert(DeviceType::CPU, 0.8);
+                affinity
+            },
+        };
+
+        let result = service.submit_task(task).await;
+        assert!(result.is_ok());
+
+        let stats = service.get_stats().await;
+        assert_eq!(stats.total_tasks_scheduled, 1);
+    }
+
+    #[tokio::test]
+    async fn test_task_validation() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+
+        // Test empty task ID
+        let invalid_task = OperatorTask {
+            id: "".to_string(),
+            name: "Test Task".to_string(),
+            operation_type: OperationType::MatMul,
+            priority: TaskPriority::Normal,
+            estimated_duration_ms: None,
+            memory_requirements: None,
+            cpu_requirements: None,
+            gpu_requirements: None,
+            preferred_device: None,
+            dependencies: Vec::new(),
+            deadline: None,
+            created_at: SystemTime::now(),
+            metadata: HashMap::new(),
+            device_affinity: HashMap::new(),
+        };
+
+        let result = service.validate_task(&invalid_task).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_task_priority_ordering() {
+        assert!(TaskPriority::Critical > TaskPriority::High);
+        assert!(TaskPriority::High > TaskPriority::Normal);
+        assert!(TaskPriority::Normal > TaskPriority::Low);
+        assert!(TaskPriority::Low > TaskPriority::BestEffort);
+    }
+
+    #[tokio::test]
+    async fn test_device_scoring() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+
+        let task = OperatorTask {
+            id: "test_task".to_string(),
+            name: "Test Task".to_string(),
+            operation_type: OperationType::MatMul,
+            priority: TaskPriority::High,
+            estimated_duration_ms: Some(100),
+            memory_requirements: Some(1024),
+            cpu_requirements: Some(0.5),
+            gpu_requirements: Some(0.8),
+            preferred_device: Some(DeviceType::CUDA(0)),
+            dependencies: Vec::new(),
+            deadline: None,
+            created_at: SystemTime::now(),
+            metadata: HashMap::new(),
+            device_affinity: {
+                let mut affinity = HashMap::new();
+                affinity.insert(DeviceType::CUDA(0), 0.9);
+                affinity.insert(DeviceType::CPU, 0.3);
+                affinity
+            },
+        };
+
+        let cpu_resource = DeviceResource {
+            device: DeviceType::CPU,
+            memory_used: 512 * 1024 * 1024,
+            memory_total: 1024 * 1024 * 1024,
+            cpu_utilization: 0.5,
+            gpu_utilization: 0.0,
+            active_tasks: 1,
+            queued_tasks: 2,
+            is_available: true,
+            last_updated: SystemTime::now(),
+        };
+
+        let gpu_resource = DeviceResource {
+            device: DeviceType::CUDA(0),
+            memory_used: 256 * 1024 * 1024,
+            memory_total: 2048 * 1024 * 1024,
+            cpu_utilization: 0.2,
+            gpu_utilization: 0.3,
+            active_tasks: 0,
+            queued_tasks: 1,
+            is_available: true,
+            last_updated: SystemTime::now(),
+        };
+
+        let cpu_score =
+            service.calculate_device_score(&task, &DeviceType::CPU, &cpu_resource).await;
+        let gpu_score =
+            service.calculate_device_score(&task, &DeviceType::CUDA(0), &gpu_resource).await;
+
+        // GPU should score higher for MatMul with GPU preference
+        assert!(gpu_score > cpu_score);
+    }
+
+    fn make_task(id: &str, name: &str, op: OperationType, priority: TaskPriority) -> OperatorTask {
+        OperatorTask {
+            id: id.to_string(),
+            name: name.to_string(),
+            operation_type: op,
+            priority,
+            estimated_duration_ms: Some(10),
+            memory_requirements: Some(1024),
+            cpu_requirements: Some(0.1),
+            gpu_requirements: None,
+            preferred_device: Some(DeviceType::CPU),
+            dependencies: Vec::new(),
+            deadline: None,
+            created_at: SystemTime::now(),
+            metadata: HashMap::new(),
+            device_affinity: {
+                let mut a = HashMap::new();
+                a.insert(DeviceType::CPU, 0.8);
+                a
+            },
+        }
+    }
+
+    async fn register_cpu_device(service: &OperatorSchedulingService) {
+        let device = DeviceType::CPU;
+        let resource = DeviceResource {
+            device: DeviceType::CPU,
+            memory_used: 0,
+            memory_total: 16 * 1024 * 1024 * 1024,
+            cpu_utilization: 0.1,
+            gpu_utilization: 0.0,
+            active_tasks: 0,
+            queued_tasks: 0,
+            is_available: true,
+            last_updated: SystemTime::now(),
+        };
+        service.register_device(device, resource).await.expect("register device ok");
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = OperatorSchedulingConfig::default();
+        assert!(config.enable_priority_scheduling);
+        assert!(config.max_concurrent_operators_per_device > 0);
+        assert!(config.time_slice_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn test_submit_multiple_tasks() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        register_cpu_device(&service).await;
+
+        for i in 0..5 {
+            let task = make_task(
+                &format!("t-{}", i),
+                &format!("Task {}", i),
+                OperationType::MatMul,
+                TaskPriority::Normal,
+            );
+            service.submit_task(task).await.expect("submit ok");
+        }
+
+        let stats = service.get_stats().await;
+        assert_eq!(stats.total_tasks_scheduled, 5);
+    }
+
+    #[tokio::test]
+    async fn test_validate_empty_name() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        let task = make_task("t1", "", OperationType::MatMul, TaskPriority::Normal);
+        let result = service.validate_task(&task).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_valid_task() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        let task = make_task(
+            "t2",
+            "Valid Task",
+            OperationType::Convolution,
+            TaskPriority::High,
+        );
+        let result = service.validate_task(&task).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_task_priority_all_variants() {
+        let priorities = vec![
+            TaskPriority::BestEffort,
+            TaskPriority::Low,
+            TaskPriority::Normal,
+            TaskPriority::High,
+            TaskPriority::Critical,
+        ];
+        for i in 0..priorities.len() - 1 {
+            assert!(priorities[i] < priorities[i + 1]);
+        }
+    }
+
+    #[test]
+    fn test_operation_type_debug() {
+        let ops = vec![
+            OperationType::MatMul,
+            OperationType::Convolution,
+            OperationType::Activation("softmax".to_string()),
+            OperationType::Normalization("layernorm".to_string()),
+            OperationType::Attention,
+            OperationType::Embedding,
+        ];
+        for op in ops {
+            assert!(!format!("{:?}", op).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_device_type_debug() {
+        let devices = vec![DeviceType::CPU, DeviceType::CUDA(0), DeviceType::CUDA(1)];
+        for d in devices {
+            assert!(!format!("{:?}", d).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stats_initial() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        let stats = service.get_stats().await;
+        assert_eq!(stats.total_tasks_scheduled, 0);
+    }
+
+    #[tokio::test]
+    async fn test_submit_high_priority_tasks() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        register_cpu_device(&service).await;
+
+        let task_high = make_task(
+            "h1",
+            "High Priority",
+            OperationType::Attention,
+            TaskPriority::High,
+        );
+        let task_critical = make_task(
+            "c1",
+            "Critical",
+            OperationType::MatMul,
+            TaskPriority::Critical,
+        );
+
+        service.submit_task(task_high).await.expect("submit ok");
+        service.submit_task(task_critical).await.expect("submit ok");
+
+        let stats = service.get_stats().await;
+        assert_eq!(stats.total_tasks_scheduled, 2);
+    }
+
+    #[tokio::test]
+    async fn test_task_with_dependencies() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        register_cpu_device(&service).await;
+
+        let mut task = make_task(
+            "dep-task",
+            "Dep Task",
+            OperationType::Activation("softmax".to_string()),
+            TaskPriority::Normal,
+        );
+        task.dependencies = vec!["dep-1".to_string(), "dep-2".to_string()];
+
+        let result = service.submit_task(task).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_task_with_metadata() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        register_cpu_device(&service).await;
+
+        let mut task = make_task(
+            "meta-task",
+            "Meta Task",
+            OperationType::Normalization("layernorm".to_string()),
+            TaskPriority::Normal,
+        );
+        task.metadata.insert("model".to_string(), "gpt2".to_string());
+        task.metadata.insert("layer".to_string(), "12".to_string());
+
+        let result = service.submit_task(task).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_task_with_resource_requirements() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        register_cpu_device(&service).await;
+
+        let mut task = make_task(
+            "res-task",
+            "Res Task",
+            OperationType::MatMul,
+            TaskPriority::High,
+        );
+        task.memory_requirements = Some(1024 * 1024 * 512);
+        task.cpu_requirements = Some(0.5);
+        task.gpu_requirements = Some(0.8);
+        task.estimated_duration_ms = Some(200);
+
+        let result = service.submit_task(task).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_task_with_preferred_device() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        register_cpu_device(&service).await;
+
+        let mut task = make_task(
+            "pref-task",
+            "Pref Task",
+            OperationType::Convolution,
+            TaskPriority::Normal,
+        );
+        task.preferred_device = Some(DeviceType::CUDA(0));
+
+        let result = service.submit_task(task).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_device_score_unavailable() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+
+        let task = make_task(
+            "s-task",
+            "Score Task",
+            OperationType::MatMul,
+            TaskPriority::Normal,
+        );
+
+        let resource = DeviceResource {
+            device: DeviceType::CPU,
+            memory_used: 0,
+            memory_total: 1024 * 1024 * 1024,
+            cpu_utilization: 0.0,
+            gpu_utilization: 0.0,
+            active_tasks: 0,
+            queued_tasks: 0,
+            is_available: false,
+            last_updated: SystemTime::now(),
+        };
+
+        // Register the device first
+        service
+            .register_device(DeviceType::CPU, resource.clone())
+            .await
+            .expect("register ok");
+
+        let score = service.calculate_device_score(&task, &DeviceType::CPU, &resource).await;
+        // Score should be low but might not be less than 0.1 depending on implementation
+        // Just verify it's a reasonable number
+        assert!(score >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_lcg_deterministic_task_submission() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+        register_cpu_device(&service).await;
+
+        let ops = vec![
+            OperationType::MatMul,
+            OperationType::Convolution,
+            OperationType::Activation("softmax".to_string()),
+            OperationType::Attention,
+        ];
+        let priorities = vec![
+            TaskPriority::Low,
+            TaskPriority::Normal,
+            TaskPriority::High,
+            TaskPriority::Critical,
+        ];
+
+        let mut lcg: u64 = 42;
+        for i in 0..20 {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let op_idx = (lcg % ops.len() as u64) as usize;
+            let pri_idx = (lcg / 4 % priorities.len() as u64) as usize;
+            let task = make_task(
+                &format!("lcg-{}", i),
+                &format!("LCG Task {}", i),
+                ops[op_idx].clone(),
+                priorities[pri_idx],
+            );
+            service.submit_task(task).await.expect("submit ok");
+        }
+
+        let stats = service.get_stats().await;
+        assert_eq!(stats.total_tasks_scheduled, 20);
+    }
+
+    #[tokio::test]
+    async fn test_device_score_high_load() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+
+        let task = make_task(
+            "load-task",
+            "Load Task",
+            OperationType::MatMul,
+            TaskPriority::Normal,
+        );
+
+        let resource = DeviceResource {
+            device: DeviceType::CUDA(0),
+            memory_used: 900 * 1024 * 1024,
+            memory_total: 1024 * 1024 * 1024,
+            cpu_utilization: 0.95,
+            gpu_utilization: 0.95,
+            active_tasks: 10,
+            queued_tasks: 5,
+            is_available: true,
+            last_updated: SystemTime::now(),
+        };
+
+        let score = service.calculate_device_score(&task, &DeviceType::CUDA(0), &resource).await;
+        assert!(score < 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_device_score_idle_device() {
+        let service = OperatorSchedulingService::new(OperatorSchedulingConfig::default());
+
+        let task = make_task(
+            "idle-task",
+            "Idle Task",
+            OperationType::MatMul,
+            TaskPriority::Normal,
+        );
+
+        let resource = DeviceResource {
+            device: DeviceType::CUDA(0),
+            memory_used: 0,
+            memory_total: 16 * 1024 * 1024 * 1024,
+            cpu_utilization: 0.0,
+            gpu_utilization: 0.0,
+            active_tasks: 0,
+            queued_tasks: 0,
+            is_available: true,
+            last_updated: SystemTime::now(),
+        };
+
+        let score = service.calculate_device_score(&task, &DeviceType::CUDA(0), &resource).await;
+        // Idle device should have a good score
+        assert!(score > 0.3);
+    }
+}

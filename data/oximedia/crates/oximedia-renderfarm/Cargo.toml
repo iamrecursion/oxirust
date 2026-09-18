@@ -1,0 +1,95 @@
+[package]
+name = "oximedia-renderfarm"
+description = "Distributed render farm management and job scheduling"
+keywords = ["workflow", "batch", "processing", "multimedia", "pipeline"]
+categories = ["multimedia", "algorithms"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+bitflags = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+oxisql-core = { workspace = true }
+oxisql-sqlite-compat = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+prometheus = { workspace = true }
+
+# Internal dependencies
+oximedia-core = { workspace = true }
+oximedia-farm = { workspace = true }
+oximedia-timeline = { workspace = true }
+oximedia-vfx = { workspace = true }
+oximedia-cloud = { workspace = true }
+oximedia-monitor = { workspace = true }
+oximedia-storage = { workspace = true }
+oximedia-distributed = { workspace = true }
+oximedia-net = { workspace = true }
+# Real post-render output assembly: MJPEG-in-AVI / Y4M muxing.
+oximedia-container = { workspace = true }
+# Real post-render quality metrics: PSNR/SSIM/blockiness/blur.
+oximedia-quality = { workspace = true }
+# Real frame decode (JPEG/PNG/WebP) for output assembly + quality metrics.
+# `image-io` is a default feature upstream but the workspace pins
+# `default-features = false`, so it must be re-enabled explicitly here.
+oximedia-codec = { workspace = true, features = ["image-io"] }
+
+# Additional dependencies
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+futures.workspace = true
+futures-util = { workspace = true }
+tokio-stream = "0.1"
+tokio-util = { workspace = true }
+# "pure" forces the portable pure-Rust blake3 backend; without it a standalone
+# build of this crate would compile C/assembly SIMD kernels via `cc`.
+blake3.workspace = true
+sha2 = { workspace = true }
+hex = { workspace = true }
+oxiarc-lz4 = { workspace = true }
+oxiarc-zstd = { workspace = true }
+walkdir.workspace = true
+notify = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam.workspace = true
+num_cpus = { workspace = true }
+sysinfo = { workspace = true }
+rayon = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion = { workspace = true }
+proptest = { workspace = true }
+# Real JPEG/PNG encode for building test fixtures (assembly/quality tests).
+oximedia-image = { workspace = true }
+
+[[bench]]
+name = "scheduler"
+harness = false
+
+[[bench]]
+name = "tile_merge"
+harness = false

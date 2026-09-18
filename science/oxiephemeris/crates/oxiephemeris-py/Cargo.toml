@@ -1,0 +1,34 @@
+[package]
+name = "oxiephemeris-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: Python bindings (PyO3) for the Pure Rust astrology/ephemeris engine — natal charts, synastry, transits, progressions, composites, and their Linked Open Data output"
+keywords = ["astrology", "ephemeris", "python", "pyo3", "chart"]
+categories = ["science", "api-bindings"]
+
+[lib]
+name = "oxiephemeris"
+crate-type = ["cdylib"]
+
+[dependencies]
+oxiephemeris-chart.workspace = true
+oxiephemeris-rdf.workspace = true
+oxiephemeris-core = { workspace = true, features = ["std"] }
+oxiephemeris-de = { workspace = true, features = ["std"] }
+pyo3.workspace = true
+pythonize.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+pyo3-build-config.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

@@ -1,0 +1,226 @@
+#version 430
+
+// Mixed-precision Runge-Kutta 4th order compute shader
+// Dynamically adjusts precision based on numerical requirements and performance
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Solution vectors with different precision levels
+layout(std430, binding = 0) buffer YBuffer {
+    float y[];  // Current solution (mixed precision storage)
+};
+
+layout(std430, binding = 1) buffer K1Buffer {
+    float k1[];  // RK4 stage 1
+};
+
+layout(std430, binding = 2) buffer K2Buffer {
+    float k2[];  // RK4 stage 2
+};
+
+layout(std430, binding = 3) buffer K3Buffer {
+    float k3[];  // RK4 stage 3
+};
+
+layout(std430, binding = 4) buffer K4Buffer {
+    float k4[];  // RK4 stage 4
+};
+
+layout(std430, binding = 5) buffer ResultBuffer {
+    float result[];  // Final result
+};
+
+// Precision control
+layout(std430, binding = 6) buffer PrecisionMaskBuffer {
+    int precision_mask[];  // 0=half, 1=single, 2=double emulation
+};
+
+layout(std430, binding = 7) buffer ErrorEstimateBuffer {
+    float error_estimate[];  // Error estimates for precision adaptation
+};
+
+// Performance metrics
+layout(std430, binding = 8) buffer PerformanceBuffer {
+    float performance_metrics[];  // [execution_time, memory_bandwidth, cache_misses]
+};
+
+uniform float t;
+uniform float h;
+uniform int n;
+uniform float precision_threshold_low;   // Switch to lower precision
+uniform float precision_threshold_high;  // Switch to higher precision
+uniform bool adaptive_precision;         // Enable adaptive precision control
+uniform int rk4_stage;                   // Which RK4 stage to compute (1-4, 5=combine)
+
+// Shared memory for performance optimization
+shared float shared_y[256];
+shared float shared_k[256];
+
+// Half precision emulation helpers
+float to_half_precision(float value) {
+    // Emulate half precision by reducing mantissa bits
+    const float scale = 1024.0;  // 2^10 for half precision range
+    return floor(value * scale) / scale;
+}
+
+// Double precision emulation using two floats
+vec2 to_double_precision(float value) {
+    float hi = value;
+    float lo = value - hi;
+    return vec2(hi, lo);
+}
+
+vec2 add_double(vec2 a, vec2 b) {
+    float s = a.x + b.x;
+    float v = s - a.x;
+    float e = (a.x - (s - v)) + (b.x - v);
+    return vec2(s, e + a.y + b.y);
+}
+
+vec2 mul_double(vec2 a, vec2 b) {
+    float p = a.x * b.x;
+    float e = p - a.x * b.x;
+    return vec2(p, ((a.x * b.y) + (a.y * b.x)) + e);
+}
+
+// ODE function with precision-aware computation
+float ode_function_precise(float time, float state_val, int precision_level) {
+    // Example: harmonic oscillator dy/dt = -y
+    float derivative = -state_val;
+    
+    if (precision_level == 0) {
+        // Half precision
+        return to_half_precision(derivative);
+    } else if (precision_level == 1) {
+        // Single precision (native)
+        return derivative;
+    } else {
+        // Double precision emulation
+        vec2 state_double = to_double_precision(state_val);
+        vec2 neg_one = vec2(-1.0, 0.0);
+        vec2 result_double = mul_double(neg_one, state_double);
+        return result_double.x + result_double.y;
+    }
+}
+
+// Adaptive precision control
+int update_precision_level(uint index, float current_error, int current_precision) {
+    if (!adaptive_precision) return current_precision;
+    
+    // Get performance metrics
+    float exec_time = performance_metrics[index * 3 + 0];
+    float memory_bw = performance_metrics[index * 3 + 1];
+    float cache_misses = performance_metrics[index * 3 + 2];
+    
+    // Performance pressure factor
+    float perf_pressure = (exec_time / 1000.0) + (cache_misses / 1000.0) + 
+                         max(0.0, memory_bw - 0.8) * 5.0;
+    
+    int new_precision = current_precision;
+    
+    // Increase precision if error is too high and performance allows
+    if (current_error > precision_threshold_high && perf_pressure < 0.5) {
+        new_precision = min(2, current_precision + 1);
+    }
+    // Decrease precision if error is low or performance pressure is high
+    else if (current_error < precision_threshold_low || perf_pressure > 1.0) {
+        new_precision = max(0, current_precision - 1);
+    }
+    
+    return new_precision;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (index >= n) return;
+    
+    // Load current precision level
+    int precision_level = precision_mask[index];
+    
+    // Load current state into shared memory
+    shared_y[tid] = y[index];
+    barrier();
+    
+    if (rk4_stage <= 4) {
+        // RK4 stage computation
+        float state_val = shared_y[tid];
+        float stage_time = t;
+        
+        // Adjust time for different stages
+        if (rk4_stage == 2 || rk4_stage == 3) {
+            stage_time += h * 0.5;
+        } else if (rk4_stage == 4) {
+            stage_time += h;
+        }
+        
+        // Add previous stage contributions
+        if (rk4_stage == 2) {
+            state_val += 0.5 * h * k1[index];
+        } else if (rk4_stage == 3) {
+            state_val += 0.5 * h * k2[index];
+        } else if (rk4_stage == 4) {
+            state_val += h * k3[index];
+        }
+        
+        // Compute derivative with precision-aware calculation
+        float derivative = ode_function_precise(stage_time, state_val, precision_level);
+        
+        // Store result in appropriate k buffer
+        if (rk4_stage == 1) {
+            k1[index] = derivative;
+        } else if (rk4_stage == 2) {
+            k2[index] = derivative;
+        } else if (rk4_stage == 3) {
+            k3[index] = derivative;
+        } else if (rk4_stage == 4) {
+            k4[index] = derivative;
+        }
+        
+    } else if (rk4_stage == 5) {
+        // Final combination stage
+        float y_val = shared_y[tid];
+        float k1_val = k1[index];
+        float k2_val = k2[index];
+        float k3_val = k3[index];
+        float k4_val = k4[index];
+        
+        float final_result;
+        
+        if (precision_level == 0) {
+            // Half precision computation
+            float rk_sum = to_half_precision(k1_val + 
+                                           2.0 * to_half_precision(k2_val) + 
+                                           2.0 * to_half_precision(k3_val) + 
+                                           to_half_precision(k4_val));
+            final_result = to_half_precision(y_val + to_half_precision(h / 6.0) * rk_sum);
+            
+        } else if (precision_level == 1) {
+            // Single precision computation
+            final_result = y_val + (h / 6.0) * (k1_val + 2.0 * k2_val + 2.0 * k3_val + k4_val);
+            
+        } else {
+            // Double precision emulation
+            vec2 y_double = to_double_precision(y_val);
+            vec2 h_sixth = to_double_precision(h / 6.0);
+            vec2 k_sum = add_double(add_double(to_double_precision(k1_val), 
+                                              mul_double(vec2(2.0, 0.0), to_double_precision(k2_val))),
+                                   add_double(mul_double(vec2(2.0, 0.0), to_double_precision(k3_val)),
+                                             to_double_precision(k4_val)));
+            vec2 increment = mul_double(h_sixth, k_sum);
+            vec2 result_double = add_double(y_double, increment);
+            final_result = result_double.x + result_double.y;
+        }
+        
+        result[index] = final_result;
+        
+        // Estimate local truncation error for precision adaptation
+        float error_est = abs(final_result - y_val) / max(abs(final_result), 1e-12);
+        error_estimate[index] = error_est;
+        
+        // Update precision level for next iteration
+        int new_precision = update_precision_level(index, error_est, precision_level);
+        precision_mask[index] = new_precision;
+    }
+}

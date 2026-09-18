@@ -1,0 +1,483 @@
+// OptiRS - Ranger Optimizer
+// RAdam + Lookahead combination for improved convergence and stability
+// Reference: "Ranger - a synergistic optimizer" by Less Wright (2019)
+//
+// Ranger combines:
+// 1. RAdam (Rectified Adam) - Adaptive learning rate with variance rectification
+// 2. Lookahead - Slow and fast weight updates for stability
+//
+// This combination provides:
+// - Fast convergence from RAdam
+// - Stability and reduced variance from Lookahead
+// - Better generalization than either optimizer alone
+
+use crate::error::{OptimError, Result};
+use crate::optimizers::Optimizer;
+use scirs2_core::ndarray::{Ix1, ScalarOperand};
+use scirs2_core::ndarray_ext::{Array1, ArrayView1};
+use scirs2_core::numeric::Float;
+use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
+
+/// Ranger optimizer configuration
+///
+/// Ranger combines RAdam (Rectified Adam) with Lookahead mechanism.
+/// This standalone implementation integrates both algorithms efficiently.
+///
+/// # Key Features
+/// - Fast convergence from RAdam's variance rectification
+/// - Stability from Lookahead's slow weight trajectory
+/// - Reduced sensitivity to hyperparameter choices
+/// - Better generalization than Adam or RAdam alone
+///
+/// # Type Parameters
+/// - `T`: Floating-point type (f32 or f64)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ranger<T: Float + ScalarOperand> {
+    // RAdam parameters
+    learning_rate: T,
+    beta1: T,
+    beta2: T,
+    epsilon: T,
+    weight_decay: T,
+
+    // Lookahead parameters
+    lookahead_k: usize,
+    lookahead_alpha: T,
+
+    // RAdam state
+    momentum: Option<Array1<T>>,
+    velocity: Option<Array1<T>>,
+
+    // Lookahead state
+    slow_weights: Option<Array1<T>>,
+
+    // Step counters
+    step_count: usize,
+    slow_update_count: usize,
+}
+
+impl<T: Float + ScalarOperand> Default for Ranger<T> {
+    fn default() -> Self {
+        Self::new(
+            T::from(0.001).expect("Ranger: default learning_rate (0.001) must fit in T"),
+            T::from(0.9).expect("Ranger: default beta1 (0.9) must fit in T"),
+            T::from(0.999).expect("Ranger: default beta2 (0.999) must fit in T"),
+            T::from(1e-8).expect("Ranger: default epsilon (1e-8) must fit in T"),
+            T::zero(),
+            5,
+            T::from(0.5).expect("Ranger: default lookahead_alpha (0.5) must fit in T"),
+        )
+        .expect("Ranger: default hyperparameters always satisfy validation")
+    }
+}
+
+impl<T: Float + ScalarOperand> Ranger<T> {
+    /// Create a new Ranger optimizer
+    ///
+    /// # Arguments
+    /// - `learning_rate`: Learning rate for RAdam (typically 0.001)
+    /// - `beta1`: First moment decay rate (typically 0.9)
+    /// - `beta2`: Second moment decay rate (typically 0.999)
+    /// - `epsilon`: Small constant for numerical stability (typically 1e-8)
+    /// - `weight_decay`: L2 regularization coefficient (typically 0.0)
+    /// - `lookahead_k`: Number of fast updates per slow update (typically 5-6)
+    /// - `lookahead_alpha`: Interpolation factor for slow weights (typically 0.5)
+    ///
+    /// # Example
+    /// ```
+    /// use optirs_core::optimizers::Ranger;
+    ///
+    /// let optimizer = Ranger::<f32>::new(
+    ///     0.001,  // learning_rate
+    ///     0.9,    // beta1
+    ///     0.999,  // beta2
+    ///     1e-8,   // epsilon
+    ///     0.0,    // weight_decay
+    ///     5,      // lookahead_k
+    ///     0.5     // lookahead_alpha
+    /// ).expect("Ranger::new succeeds for finite, in-range default hyperparameters");
+    /// ```
+    pub fn new(
+        learning_rate: T,
+        beta1: T,
+        beta2: T,
+        epsilon: T,
+        weight_decay: T,
+        lookahead_k: usize,
+        lookahead_alpha: T,
+    ) -> Result<Self> {
+        // Validate parameters
+        let lr_f64 = crate::optimizers::scalar_to_f64(learning_rate)?;
+        let beta1_f64 = crate::optimizers::scalar_to_f64(beta1)?;
+        let beta2_f64 = crate::optimizers::scalar_to_f64(beta2)?;
+        let eps_f64 = crate::optimizers::scalar_to_f64(epsilon)?;
+        let wd_f64 = crate::optimizers::scalar_to_f64(weight_decay)?;
+        let lookahead_alpha_f64 = crate::optimizers::scalar_to_f64(lookahead_alpha)?;
+
+        if lr_f64 <= 0.0 {
+            return Err(OptimError::InvalidParameter(format!(
+                "learning_rate must be positive, got {lr_f64}"
+            )));
+        }
+        if beta1_f64 <= 0.0 || beta1_f64 >= 1.0 {
+            return Err(OptimError::InvalidParameter(format!(
+                "beta1 must be in (0, 1), got {beta1_f64}"
+            )));
+        }
+        if beta2_f64 <= 0.0 || beta2_f64 >= 1.0 {
+            return Err(OptimError::InvalidParameter(format!(
+                "beta2 must be in (0, 1), got {beta2_f64}"
+            )));
+        }
+        if eps_f64 <= 0.0 {
+            return Err(OptimError::InvalidParameter(format!(
+                "epsilon must be positive, got {eps_f64}"
+            )));
+        }
+        if wd_f64 < 0.0 {
+            return Err(OptimError::InvalidParameter(format!(
+                "weight_decay must be non-negative, got {wd_f64}"
+            )));
+        }
+        if lookahead_k == 0 {
+            return Err(OptimError::InvalidParameter(
+                "lookahead_k must be positive".to_string(),
+            ));
+        }
+        if lookahead_alpha_f64 <= 0.0 || lookahead_alpha_f64 > 1.0 {
+            return Err(OptimError::InvalidParameter(format!(
+                "lookahead_alpha must be in (0, 1], got {lookahead_alpha_f64}"
+            )));
+        }
+
+        Ok(Self {
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            lookahead_k,
+            lookahead_alpha,
+            momentum: None,
+            velocity: None,
+            slow_weights: None,
+            step_count: 0,
+            slow_update_count: 0,
+        })
+    }
+
+    /// Perform a single optimization step
+    ///
+    /// Combines RAdam (fast weights) with Lookahead (slow weights)
+    ///
+    /// # Example
+    /// ```
+    /// use optirs_core::optimizers::Ranger;
+    /// use scirs2_core::ndarray_ext::array;
+    ///
+    /// let mut optimizer = Ranger::<f32>::default();
+    /// let params = array![1.0, 2.0, 3.0];
+    /// let grads = array![0.1, 0.2, 0.3];
+    ///
+    /// let updated_params = optimizer.step(params.view(), grads.view()).expect("optimizer.step succeeds");
+    /// ```
+    pub fn step<'a, P, G>(&mut self, params: P, grads: G) -> Result<Array1<T>>
+    where
+        P: Into<ArrayView1<'a, T>>,
+        G: Into<ArrayView1<'a, T>>,
+        T: 'a,
+    {
+        self.step_view(params.into(), grads.into())
+    }
+
+    /// Perform a single optimization step on borrowed views
+    ///
+    /// This is the concrete implementation behind [`Ranger::step`].
+    pub fn step_view(&mut self, params: ArrayView1<T>, grads: ArrayView1<T>) -> Result<Array1<T>> {
+        let n = params.len();
+
+        if grads.len() != n {
+            return Err(OptimError::DimensionMismatch(format!(
+                "Expected gradient size {}, got {}",
+                n,
+                grads.len()
+            )));
+        }
+
+        // Initialize state on first step
+        if self.slow_weights.is_none() {
+            self.slow_weights = Some(params.to_owned());
+        }
+
+        self.step_count += 1;
+        let t: T = crate::optimizers::cast_scalar(self.step_count)?;
+
+        let momentum = self.momentum.get_or_insert_with(|| Array1::zeros(n));
+        let velocity = self.velocity.get_or_insert_with(|| Array1::zeros(n));
+
+        let one = T::one();
+        let two: T = crate::optimizers::cast_scalar(2)?;
+
+        // Apply weight decay if configured
+        let effective_grads = if self.weight_decay > T::zero() {
+            grads.to_owned() + &(params.to_owned() * self.weight_decay)
+        } else {
+            grads.to_owned()
+        };
+
+        // RAdam: Update biased first moment
+        for i in 0..n {
+            momentum[i] = self.beta1 * momentum[i] + (one - self.beta1) * effective_grads[i];
+        }
+
+        // RAdam: Update biased second moment
+        for i in 0..n {
+            let grad_sq = effective_grads[i] * effective_grads[i];
+            velocity[i] = self.beta2 * velocity[i] + (one - self.beta2) * grad_sq;
+        }
+
+        // RAdam: Compute bias correction
+        let bias_correction1 = one - self.beta1.powf(t);
+        let bias_correction2 = one - self.beta2.powf(t);
+
+        // RAdam: Compute SMA (Simple Moving Average) length
+        let rho_inf = two / (one - self.beta2) - one;
+        let rho_t = rho_inf - two * t * self.beta2.powf(t) / bias_correction2;
+
+        // RAdam: Apply variance rectification
+        let mut updated_params = params.to_owned();
+
+        if crate::optimizers::scalar_to_f64(rho_t)? > 4.0 {
+            // Use adaptive learning rate with variance rectification
+            let four: T = crate::optimizers::cast_scalar(4)?;
+            let rect_term = ((rho_t - four) * (rho_t - two) * rho_inf
+                / ((rho_inf - four) * (rho_inf - two) * rho_t))
+                .sqrt();
+
+            for i in 0..n {
+                let m_hat = momentum[i] / bias_correction1;
+                let v_hat = velocity[i] / bias_correction2;
+                let step_size = self.learning_rate * rect_term / (v_hat.sqrt() + self.epsilon);
+                updated_params[i] = updated_params[i] - step_size * m_hat;
+            }
+        } else {
+            // Use simple momentum update during warmup
+            for i in 0..n {
+                let m_hat = momentum[i] / bias_correction1;
+                updated_params[i] = updated_params[i] - self.learning_rate * m_hat;
+            }
+        }
+
+        // Lookahead: Update slow weights every k steps
+        if self.step_count.is_multiple_of(self.lookahead_k) {
+            let slow = self.slow_weights.get_or_insert_with(|| params.to_owned());
+            for i in 0..n {
+                slow[i] = slow[i] + self.lookahead_alpha * (updated_params[i] - slow[i]);
+            }
+            self.slow_update_count += 1;
+
+            // Synchronize fast weights with slow weights
+            // This is the key to Lookahead: we return the slow weights after update
+            Ok(slow.clone())
+        } else {
+            // Between slow updates, return fast weights
+            Ok(updated_params)
+        }
+    }
+
+    /// Get the number of optimization steps performed
+    pub fn step_count(&self) -> usize {
+        self.step_count
+    }
+
+    /// Get the number of slow weight updates performed
+    pub fn slow_update_count(&self) -> usize {
+        self.slow_update_count
+    }
+
+    /// Reset the optimizer state
+    pub fn reset(&mut self) {
+        self.momentum = None;
+        self.velocity = None;
+        self.slow_weights = None;
+        self.step_count = 0;
+        self.slow_update_count = 0;
+    }
+
+    /// Get the slow weights (Lookahead trajectory)
+    pub fn slow_weights(&self) -> Option<&Array1<T>> {
+        self.slow_weights.as_ref()
+    }
+
+    /// Check if variance rectification is active
+    pub fn is_rectified(&self) -> bool {
+        if self.step_count == 0 {
+            return false;
+        }
+        let t = T::from(self.step_count)
+            .expect("Ranger: step_count must be representable in T (f32/f64)");
+        let one = T::one();
+        let two = T::from(2).expect("Ranger: integer literal 2 must be representable in T");
+        let bias_correction2 = one - self.beta2.powf(t);
+        let rho_inf = two / (one - self.beta2) - one;
+        let rho_t = rho_inf - two * t * self.beta2.powf(t) / bias_correction2;
+        rho_t
+            .to_f64()
+            .expect("Ranger: T (f32/f64) always converts to f64")
+            > 4.0
+    }
+}
+
+impl<T> Optimizer<T, Ix1> for Ranger<T>
+where
+    T: Float + ScalarOperand + Debug + Send + Sync,
+{
+    fn step(&mut self, params: &Array1<T>, gradients: &Array1<T>) -> Result<Array1<T>> {
+        self.step_view(params.view(), gradients.view())
+    }
+
+    fn get_learning_rate(&self) -> T {
+        self.learning_rate
+    }
+
+    fn set_learning_rate(&mut self, learning_rate: T) {
+        self.learning_rate = learning_rate;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scirs2_core::ndarray_ext::array;
+
+    #[test]
+    fn test_ranger_creation() {
+        let optimizer = Ranger::<f32>::default();
+        assert_eq!(optimizer.step_count(), 0);
+        assert_eq!(optimizer.slow_update_count(), 0);
+    }
+
+    #[test]
+    fn test_ranger_custom_creation() {
+        let optimizer = Ranger::<f32>::new(0.002, 0.95, 0.9999, 1e-7, 0.01, 6, 0.6)
+            .expect("Ranger::<f32>::new succeeds in test_ranger_custom_creation");
+        assert_eq!(optimizer.step_count(), 0);
+    }
+
+    #[test]
+    fn test_ranger_single_step() {
+        let mut optimizer = Ranger::<f32>::default();
+        let params = array![1.0, 2.0, 3.0];
+        let grads = array![0.1, 0.2, 0.3];
+
+        let updated_params = optimizer
+            .step(params.view(), grads.view())
+            .expect("step succeeds in test_ranger_single_step");
+        assert_eq!(updated_params.len(), 3);
+        assert_eq!(optimizer.step_count(), 1);
+
+        for i in 0..3 {
+            assert!(updated_params[i] < params[i]);
+        }
+    }
+
+    #[test]
+    fn test_ranger_slow_updates() {
+        let mut optimizer = Ranger::<f32>::new(0.001, 0.9, 0.999, 1e-8, 0.0, 3, 0.5)
+            .expect("Ranger::<f32>::new succeeds in test_ranger_slow_updates");
+        let mut params = array![1.0, 2.0, 3.0];
+
+        for _ in 0..3 {
+            let grads = array![0.1, 0.2, 0.3];
+            params = optimizer
+                .step(params.view(), grads.view())
+                .expect("step succeeds in test_ranger_slow_updates");
+        }
+        assert_eq!(optimizer.slow_update_count(), 1);
+    }
+
+    #[test]
+    fn test_ranger_convergence() {
+        // Use higher learning rate for this simple convex problem
+        // Default 0.001 is tuned for neural networks
+        let mut optimizer = Ranger::<f64>::new(
+            0.1,   // learning_rate: higher for simple problem
+            0.9,   // beta1
+            0.999, // beta2
+            1e-8,  // epsilon
+            0.0,   // weight_decay
+            5,     // lookahead_k
+            0.5,   // lookahead_alpha
+        )
+        .expect("Ranger::new succeeds in test_ranger_convergence");
+        let mut params = array![5.0];
+
+        // Ranger combines RAdam (adaptive LR) with Lookahead (slow updates)
+        for _ in 0..500 {
+            let grads = params.mapv(|x| 2.0 * x);
+            params = optimizer
+                .step(params.view(), grads.view())
+                .expect("step succeeds in test_ranger_convergence");
+        }
+
+        assert!(
+            params[0].abs() < 0.1,
+            "Failed to converge, got {}",
+            params[0]
+        );
+    }
+
+    #[test]
+    fn test_ranger_reset() {
+        let mut optimizer = Ranger::<f32>::default();
+        let params = array![1.0, 2.0, 3.0];
+        let grads = array![0.1, 0.2, 0.3];
+
+        for _ in 0..10 {
+            optimizer
+                .step(params.view(), grads.view())
+                .expect("step succeeds in test_ranger_reset");
+        }
+
+        optimizer.reset();
+        assert_eq!(optimizer.step_count(), 0);
+        assert_eq!(optimizer.slow_update_count(), 0);
+        assert!(optimizer.slow_weights().is_none());
+    }
+
+    #[test]
+    fn test_ranger_rectification() {
+        let mut optimizer = Ranger::<f32>::default();
+        let params = array![1.0];
+        let grads = array![0.1];
+
+        // Initially not rectified
+        assert!(!optimizer.is_rectified());
+
+        // After several steps, should be rectified
+        for _ in 0..10 {
+            optimizer
+                .step(params.view(), grads.view())
+                .expect("step succeeds in test_ranger_rectification");
+        }
+        assert!(optimizer.is_rectified());
+    }
+
+    /// Ranger must be usable through the generic `Optimizer` trait.
+    #[test]
+    fn test_ranger_optimizer_trait() {
+        let mut optimizer = Ranger::<f64>::default();
+        let params = array![1.0f64, 2.0, 3.0];
+        let grads = array![0.1f64, 0.2, 0.3];
+
+        let updated =
+            Optimizer::<f64, scirs2_core::ndarray::Ix1>::step(&mut optimizer, &params, &grads)
+                .expect("trait step failed");
+        assert_eq!(updated.len(), 3);
+
+        // The generic inherent `step` also accepts plain references.
+        let again = optimizer.step(&params, &grads).expect("ref step failed");
+        assert_eq!(again.len(), 3);
+    }
+}

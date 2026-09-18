@@ -1,0 +1,139 @@
+[package]
+name = "oxirs-cluster"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Raft-backed distributed dataset for high availability and horizontal scaling"
+keywords = ["distributed", "raft", "clustering", "consensus", "rdf"]
+categories = ["database", "network-programming", "concurrency"]
+readme = "README.md"
+rust-version.workspace = true
+
+[dependencies]
+oxirs-core.workspace = true
+
+# SciRS2 dependencies for distributed processing with full feature support
+scirs2-stats = { workspace = true }
+scirs2-core = { workspace = true, features = ["random", "array", "parallel", "simd", "profiling"] }
+# oxirs-tdb = { path = "../oxirs-tdb" }  # Temporarily commented out due to compilation issues
+openraft = { workspace = true, optional = true }
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+reqwest = { workspace = true }
+futures.workspace = true
+rayon.workspace = true  # Parallel processing for SIMD-accelerated operations
+
+# Byzantine fault tolerance dependencies
+sha2.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+rand = "0.10"  # Required by ed25519-dalek for key generation
+# Note: For other random functionality, use scirs2_core::random
+
+# MVCC dependencies
+dashmap.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+
+# TLS and encryption dependencies
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+# Pure Rust TLS facade + certificate generation (replaces `rcgen`, which pulls `ring`).
+oxitls.workspace = true
+oxitls-rcgen.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
+# Pure Rust cryptography (OxiCrypto) replaces ring for AEAD + CSPRNG.
+# Use leaf crates directly (not the `oxicrypto` facade) to avoid pulling in
+# `oxicrypto-sig`, whose 0.1.1 release is incompatible with the workspace's
+# resolved `ed448-goldilocks` pre-release.
+oxicrypto-core.workspace = true  # Aead trait + CryptoError
+oxicrypto-aead.workspace = true  # AES-256-GCM AEAD
+oxicrypto-rand.workspace = true  # CSPRNG (random_bytes / random_nonce)
+
+# Compression and serialization dependencies
+oxiarc-deflate.workspace = true  # Pure Rust DEFLATE/gzip/zlib (replaces flate2)
+oxiarc-zstd.workspace = true
+oxiarc-lz4.workspace = true
+oxiarc-lzma.workspace = true  # Pure Rust LZMA (replaces xz2/lzma-sys)
+crc32fast.workspace = true
+oxiarc-snappy.workspace = true   # Pure Rust Snappy (replaces snap)
+oxicode.workspace = true  # Replaces bincode per COOLJAPAN Policy
+rmp-serde.workspace = true
+ciborium.workspace = true
+
+# Storage dependencies
+memmap2.workspace = true
+
+# OpenTelemetry for distributed tracing
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+
+# Alerting and monitoring dependencies
+# Pure Rust TLS: `tokio1-rustls` (NOT `tokio1-rustls-tls`, which force-enables `ring`).
+# Uses the process-default CryptoProvider installed as Pure Rust OxiTLS by oxirs-core's ctor.
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1",
+    "smtp-transport",
+    "builder",
+    "tokio1-rustls",
+    "rustls-no-provider",
+    "webpki-roots",
+] }
+# Slack alerts use a plain reqwest webhook POST (see alerting.rs) — no slack-hook2 (pulls native-tls).
+
+# Web dashboard dependencies
+axum = { workspace = true, features = ["macros"] }
+tower.workspace = true
+tower-http = { workspace = true, features = ["cors", "compression-gzip"] }
+
+[[bench]]
+name = "cluster_benchmarks"
+harness = false
+
+[[bench]]
+name = "compression_backup_bench"
+harness = false
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+proptest.workspace = true
+tokio-test.workspace = true
+
+[features]
+default = []
+raft = ["openraft"]
+bft = []
+test-support = []
+leak_detection = []
+# GPU acceleration via scirs2-core's Pure-Rust `gpu` abstraction (`gpu = ["std"]`, no GPU FFI).
+# `gpu_acceleration.rs` imports `scirs2_core::gpu`, which scirs2-core gates behind its own `gpu`
+# feature; enabling this turns that module on. Mirrors oxirs-stream's `gpu = ["scirs2-core/gpu"]`.
+gpu = ["scirs2-core/gpu"]
+# `cuda`/`metal` are backend selectors consumed by gpu_acceleration.rs. They pull in the pure
+# `scirs2_core::gpu` module so the `use scirs2_core::gpu::{...}` imports resolve, WITHOUT enabling
+# scirs2-core's CUDA (`dep:cudarc`) or Metal (`dep:metal`/`objc2`) FFI backends (Pure Rust Policy v2).
+# Shape mirrors oxirs-geosparql's `cuda = ["gpu", ...]` / `metal = ["gpu", ...]`.
+cuda = ["gpu"]   # GPU acceleration with CUDA (NVIDIA) — resolves pure scirs2_core::gpu (no cudarc FFI)
+metal = ["gpu"]  # GPU acceleration with Metal (Apple Silicon) — resolves pure scirs2_core::gpu (no metal FFI)
+s3-backup = []   # S3-compatible backup destination (Pure Rust; enables DestinationConfig::S3)
+simulation = []  # In-memory cluster simulation harness for scalability testing (1000-node phase A)
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+

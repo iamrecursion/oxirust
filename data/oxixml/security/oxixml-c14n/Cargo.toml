@@ -1,0 +1,27 @@
+[package]
+name = "oxixml-c14n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Canonical XML 1.0/1.1/2.0 and Exclusive C14N."
+keywords = ["xml", "canonicalization", "c14n", "xmldsig", "security"]
+categories = ["encoding", "parsing", "cryptography", "text-processing"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-dom = { workspace = true }
+oxixml-qname = { workspace = true }
+
+[dev-dependencies]
+oxixml-xml = { path = "../../xml/oxixml-xml" }
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+[package]
+name = "oximedia-audiopost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Professional audio post-production suite: ADR, Foley, sound design, mixing, restoration"
+readme = "README.md"
+keywords = ["audio", "post-production", "mixing", "adr", "foley"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-audio = { workspace = true }
+oximedia-effects = { workspace = true }
+oximedia-timeline = { workspace = true }
+oximedia-metering = { workspace = true }
+oximedia-timecode = { workspace = true }
+thiserror = { workspace = true }
+oxifft = { workspace = true }
+bytes = { workspace = true }
+scirs2-core = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

@@ -1,0 +1,81 @@
+[package]
+name = "mecrab"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "A high-performance, thread-safe morphological analyzer compatible with MeCab, written in pure Rust"
+keywords = ["nlp", "morphology", "mecab", "japanese", "tokenizer"]
+categories = ["text-processing", "parsing", "science"]
+
+[dependencies]
+# Core dependencies (always needed)
+memmap2.workspace = true
+byteorder.workspace = true
+encoding_rs.workspace = true
+thiserror.workspace = true
+yada.workspace = true
+bytemuck = { workspace = true }
+unicode-normalization = { workspace = true }
+arc-swap = { workspace = true }
+
+# Optional: JSON output support
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+# Optional: Parallel processing (not for WASM)
+rayon = { workspace = true, optional = true }
+
+# Optional: WASM bindings
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+
+# Optional: Python bindings
+pyo3 = { workspace = true, optional = true }
+
+# Optional: Neural reranking (BERT perplexity scoring via candle-core).
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
+# Note: hf-hub was removed — it was never used in source (models are loaded
+# from a local directory) and pulled flate2 (ureq) + native-tls (OpenSSL)
+# transitively, violating the COOLJAPAN Pure-Rust / OxiARC policy.
+
+[features]
+default = ["serde", "serde_json"]
+json = ["serde", "serde_json"]
+parallel = ["rayon"]
+simd = []  # Enable SIMD optimizations (nightly)
+# `serde` joins `serde_json` here (which depends on it anyway) so the wasm
+# feature set matches `json` / `python`. Enabling `serde_json` without `serde`
+# used to leave `Error: From<serde_json::Error>` out of the build — the
+# `serde`-gated impl in error.rs — and `--no-default-features --features wasm`
+# failed with E0277 on `dict::Dictionary::load_with_semantics`.
+wasm = ["wasm-bindgen", "js-sys", "web-sys", "console_error_panic_hook", "serde", "serde_json"]
+python = ["pyo3/extension-module", "serde", "serde_json"]
+# Neural reranking — real BERT perplexity scoring via candle-core.
+neural = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "serde_json",
+]
+
+[lib]
+name = "mecrab"
+path = "src/lib.rs"
+# cdylib for Python extension, rlib for Rust library
+crate-type = ["cdylib", "rlib"]
+
+[dev-dependencies]
+mecrab-builder = { path = "../mecrab-builder" }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

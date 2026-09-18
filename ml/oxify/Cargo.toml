@@ -1,0 +1,194 @@
+[workspace]
+members = [
+    "crates/oxify",
+    "crates/oxify-api",
+    "crates/oxify-authn",
+    "crates/oxify-authz",
+    "crates/oxify-cli",
+    "crates/oxify-connect-comm",
+    "crates/oxify-connect-data",
+    "crates/oxify-connect-db",
+    "crates/oxify-connect-graphql",
+    "crates/oxify-connect-llm",
+    "crates/oxify-connect-storage",
+    "crates/oxify-connect-vector",
+    "crates/oxify-connect-vision",
+    "crates/oxify-engine",
+    "crates/oxify-mcp",
+    "crates/oxify-model",
+    "crates/oxify-server",
+    "crates/oxify-storage",
+    "crates/oxify-ui",
+    "crates/oxify-vector",
+    "crates/oxify-celers",
+]
+exclude = [
+    "examples/*",
+]
+resolver = "2"
+
+[patch.crates-io]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["OxiFY Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxify"
+
+[workspace.dependencies]
+# CeleRS — cross-workspace path dep (not published on crates.io)
+celers = { version = "0.3.0", default-features = false }
+# OxiFY-Model — in-workspace path dep, shared model/error/HTTP-util types
+oxify-model = { version = "0.2.0", path = "crates/oxify-model" }
+
+# Core dependencies
+tokio = { version = "1.52.3", features = ["full"] }
+async-trait = "0.1.89"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml = "0.9"
+rmp-serde = "1.3.1"
+thiserror = "2.0.18"
+anyhow = "1.0.103"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry"] }
+
+# Web framework
+axum = { version = "0.8.9", features = ["macros", "ws"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+hyper = { version = "1.10", features = ["full"] }
+# Needed only to name hyper_util::client::legacy::connect::{Connect, HttpConnector}
+# when writing connector-generic helpers against oxihttp::RequestBuilder<C> /
+# oxihttp::HttpsClient (oxihttp itself does not re-export these types).
+hyper-util = { version = "0.1.20", default-features = false, features = ["client-legacy"] }
+
+# GraphQL
+async-graphql = { version = "7.2", features = ["chrono"] }
+async-graphql-axum = "7.2"
+
+# LLM & Vector DB clients
+# COOLJAPAN pure-Rust HTTP client (OxiHTTP) — the reqwest replacement for all
+# first-party HTTP. reqwest is no longer a direct dependency of any oxify crate;
+# it survives only transitively inside third-party crates outside the noffi scope
+# (opentelemetry-otlp's HTTP exporter, oauth2, qdrant-client).
+# NOTE: 0.2.1 was requested but is NOT published on crates.io; 0.2.0 is the latest
+# published release (verified via `cargo add --dry-run`), and matches oxitls' pin.
+oxihttp = { version = "0.2.1", default-features = false, features = ["client", "tls", "decompression"] }
+percent-encoding = "2.3"
+qdrant-client = "1.18.0"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+# COOLJAPAN pure-Rust SQL stack (OxiSQL) — migration target replacing sqlx for the
+# SQLite storage layer (oxify-storage). sqlx is retained above because
+# oxify-connect-db / oxify-connect-vector still use it for the Postgres/MySQL paths.
+oxisql-core = "0.4.1"
+oxisql-sqlite-compat = "0.4.1"
+oxisql-pool = { version = "0.4.1", features = ["sqlite"] }
+oxisql-migrate = { version = "0.4.1", features = ["migrate"] }
+# Generic connection pool — names deadpool::managed::{Object, PoolError} in the
+# oxify-storage pool/error glue. Version pinned to match oxisql-pool 0.3.1.
+deadpool = { version = "0.13.0", features = ["managed"] }
+
+# Utilities
+clap = { version = "4.6.1", features = ["derive"] }
+# `js` is a no-op off wasm32: uuid target-gates its wasm-bindgen/js-sys
+# dependencies on `cfg(all(target_arch = "wasm32", target_os = "unknown"))`, so
+# host builds are byte-identical. Without it, `uuid` is a hard `compile_error!`
+# on wasm32-unknown-unknown ("specify a source of randomness"), which is the
+# target `oxify-model --features wasm` (wasm-bindgen bindings) exists for.
+uuid = { version = "1.23.4", features = ["v4", "serde", "js"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+futures = "0.3"
+tokio-stream = "0.1"
+cron = "0.17"
+rand = "0.10"
+# Not used directly by any oxify crate — this entry exists solely so
+# `oxify-model` can enable `wasm_js` on the `getrandom 0.4` that arrives through
+# `rand`. A feature can only be turned on by a crate that depends on the thing
+# directly, and `getrandom 0.4` is a hard `compile_error!` on
+# wasm32-unknown-unknown without it. `oxify-model` takes this as a
+# target-gated dependency, so it never enters a host build's graph as a direct
+# dep. The `wasm_js` *feature* is sufficient on 0.4; the
+# `--cfg getrandom_backend="wasm_js"` rustflag that getrandom 0.3 additionally
+# requires is NOT needed here (verified both with and without it).
+getrandom = { version = "0.4", features = ["wasm_js"] }
+rayon = "1.12"
+num_cpus = "1.17"
+toml = "1.1"
+dirs = "6.0"
+
+# Code execution
+rhai = { version = "1.25", features = ["sync"] }
+wasmer = "7.1"
+
+# OpenTelemetry
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["trace", "grpc-tonic"] }
+opentelemetry-semantic-conventions = "0.32"
+tracing-opentelemetry = "0.33"
+
+# Event-driven / messaging
+async-nats = "0.49"
+rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+lapin = "4.10.0"
+
+# GitHub API
+octocrab = "0.53"
+
+# Cryptography (AWS SigV4, etc.)
+sha2 = "0.11"
+hex = "0.4"
+
+# COOLJAPAN pure-Rust cryptography (OxiCrypto ecosystem)
+oxicrypto-hash = "0.3.0"
+oxicrypto-mac = "0.3.0"
+oxicrypto-core = "0.3.0"
+
+# JWT / auth tokens
+jsonwebtoken = "10.4"
+
+# Communications
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+
+# Document database
+mongodb = "3.7.0"
+
+# Object storage (COOLJAPAN pure-Rust OxiStore ecosystem)
+oxistore-blob       = { version = "0.3.0", features = ["blob"] }
+oxistore-blob-s3    = "0.3.0"
+oxistore-blob-gcs   = "0.3.0"
+oxistore-blob-azure = "0.3.0"
+bytes = "1.12"
+
+# Compression (Pure Rust, OxiARC ecosystem)
+oxiarc-deflate = "0.4.2"
+oxiarc-archive = "0.4.2"
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+# HTML parsing / scraping — OxiXML, pure Rust with zero C dependencies.
+# `oxixml-html` is an HTML5 tokenizer + tree builder producing an `oxixml-dom`
+# arena tree; `oxixml-dom` supplies the node handles and navigation API the
+# `web_scrape` tool's CSS-selector engine walks. Unconditional (pure Rust, no
+# reason to feature-gate).
+oxixml-html = "0.1.2"
+oxixml-dom = "0.1.2"
+
+# Headless browser automation — async-native Chrome DevTools Protocol (CDP) client.
+# The crate itself is pure Rust; it drives an external Chrome/Chromium *binary* over
+# the wire. Made optional / off by default at the consuming crate (oxify-mcp), which
+# gates it behind the `headless-browser` feature so default builds stay lean.
+# (Cargo forbids `optional` in `[workspace.dependencies]`; optionality is declared on
+# the member dependency, mirroring how `octocrab` is handled above.)
+chromiumoxide = { version = "0.9.1" }
+
+# Testing & Benchmarking
+criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3.27"
+proptest = "1.11"
+wiremock = "0.6"

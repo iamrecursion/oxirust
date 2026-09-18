@@ -1,0 +1,175 @@
+[package]
+name = "voirs-recognizer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/voirs-recognizer"
+keywords = ["voirs", "asr", "whisper", "recognition", "speech"]
+categories = ["multimedia::audio", "science", "algorithms"]
+rust-version.workspace = true
+description = "Voice recognition and analysis capabilities for VoiRS"
+readme = "README.md"
+
+[lib]
+name = "voirs_recognizer"
+crate-type = ["rlib"]
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core.workspace = true
+scirs2-fft.workspace = true
+
+# Core VoiRS dependencies
+voirs-sdk.workspace = true
+
+# Async and traits
+async-trait.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-stream.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+
+# Audio processing
+hound.workspace = true
+cpal.workspace = true
+dasp.workspace = true
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+hex = "0.4"
+sha2.workspace = true
+hmac = { version = "0.13", optional = true }
+quick-xml = { package = "oxixml-quickxml-compat", version = "0.1.2", optional = true }
+oxicode.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+once_cell.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true
+num_cpus.workspace = true
+
+# Machine learning backends
+candle-core.workspace = true
+candle-nn.workspace = true
+oxionnx = { workspace = true, optional = true }
+safetensors.workspace = true
+
+# Text processing
+unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
+regex.workspace = true
+
+# Audio format support
+claxon.workspace = true
+lewton.workspace = true
+# minimp3 is a C-FFI MP3 decoder (via minimp3-sys); gated behind the default-OFF
+# `ffi-codecs` feature to keep the default build Pure Rust (COOLJAPAN policy).
+minimp3 = { workspace = true, optional = true }
+symphonia.workspace = true
+
+# Performance
+crossbeam-utils.workspace = true
+
+# Additional dependencies for Pure Rust Whisper
+half.workspace = true  # For F16 support
+
+# Compression
+oxiarc-deflate.workspace = true
+
+# Configuration
+toml = "1.1"
+
+# Temporary corpora for the `mfa` feature, which drives the real Montreal Forced
+# Aligner executable over files it must read from disk.
+tempfile = { workspace = true, optional = true }
+
+# Homomorphic encryption (optional)
+num-bigint-dig = { workspace = true, features = ["rand", "prime"], optional = true }
+# Required by num-bigint-dig's RandPrime trait API for prime generation (cannot use fastrand here).
+# Pinned to the 0.9 line (not the newest 0.10) because num-bigint-dig 0.9.x's own
+# optional "rand" feature depends on `rand ^0.9` internally; its RandPrime trait
+# (see encrypted_inference.rs's `rng.gen_prime(..)` call) is generic over that
+# exact rand-0.9 RngCore/Rng trait identity. A direct dep on rand 0.10 here would
+# resolve a *different*, incompatible rand major for this crate's own `rand::`
+# call sites than the one num-bigint-dig's trait bound is implemented against,
+# which cannot type-check across the crate-version boundary.
+rand = { version = "0.9", optional = true }
+fastrand.workspace = true
+
+# Python bindings (optional)
+pyo3 = { workspace = true, features = ["auto-initialize"], optional = true }
+numpy = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }  # Using maintained fork for pyo3 0.25 compatibility
+
+# WASM bindings (optional)
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, features = ["console", "AudioContext", "AudioBuffer", "AudioBufferSourceNode", "AudioDestinationNode", "Window", "Performance", "Worker", "MessageEvent", "MessagePort", "DedicatedWorkerGlobalScope", "AudioWorkletNode"], optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+wasm-logger = { workspace = true, optional = true }
+
+# REST API dependencies (optional)
+axum = { workspace = true, features = ["ws", "macros", "multipart"], optional = true }
+tower = { workspace = true, features = ["full"], optional = true }
+tower-http = { workspace = true, features = ["fs", "trace", "cors", "limit"], optional = true }
+hyper = { workspace = true, features = ["full"], optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+mime = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["json", "stream"], optional = true }
+url = { version = "2.5", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile.workspace = true
+criterion.workspace = true
+wasm-bindgen-test = "0.3"
+
+[features]
+default = ["whisper", "analysis"]
+whisper = []
+whisper-pure = []  # Pure Rust Whisper implementation (no Python dependencies)
+deepspeech = []
+wav2vec2 = []
+transformer = []  # Transformer-based end-to-end ASR
+conformer = []  # Conformer: Convolution-augmented Transformer for Speech Recognition
+analysis = []
+forced-align = []
+mfa = ["dep:tempfile"]  # Montreal Forced Aligner integration (drives the real `mfa` CLI)
+python = ["pyo3", "numpy", "pyo3-async-runtimes"]  # Python bindings with async support
+wasm = ["wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "console_error_panic_hook", "wasm-logger"]  # WASM bindings for browser/Node.js
+c-api = []  # C/C++ API bindings
+rest-api = ["axum", "tower", "tower-http", "hyper", "tokio-tungstenite", "dep:base64", "dep:mime", "dep:reqwest", "dep:url", "voirs-sdk/http-compression"]  # REST API and microservice support
+cloud = ["dep:hmac", "dep:quick-xml", "dep:reqwest", "dep:url", "dep:base64"]
+all-models = ["whisper", "whisper-pure", "deepspeech", "wav2vec2", "transformer", "conformer", "forced-align", "mfa"]
+onnx = ["dep:oxionnx"]
+gpu = ["oxionnx?/gpu"]
+homomorphic = ["dep:num-bigint-dig", "dep:rand"]
+# C-FFI audio codecs (minimp3 MP3 decoder). Default-OFF to keep the default build
+# Pure Rust (COOLJAPAN policy). Enable to decode MP3 input via Mp3Loader.
+ffi-codecs = ["dep:minimp3"]
+
+# Windows-specific dependencies
+[target.'cfg(windows)'.dependencies]
+winapi = { workspace = true }
+
+# Benchmarks
+[[bench]]
+name = "preprocessing_benchmarks"
+harness = false
+
+[lints]
+workspace = true

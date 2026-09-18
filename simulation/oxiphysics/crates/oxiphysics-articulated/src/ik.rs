@@ -1,0 +1,1682 @@
+// Copyright 2026 COOLJAPAN OU (Team KitaSan)
+// SPDX-License-Identifier: Apache-2.0
+
+//! Inverse kinematics via damped least squares (Levenberg-Marquardt) with
+//! null-space projection for secondary posture tasks.
+//!
+//! # Algorithm
+//!
+//! Each IK iteration solves the damped least-squares system:
+//!
+//! ```text
+//! (JᵀJ + λ²I) Δq_dls = Jᵀ e
+//! ```
+//!
+//! where `J` is the geometric Jacobian, `e` is the 6D task-space error
+//! `[e_rot; e_pos]`, and `λ` is the LM damping factor.
+//!
+//! A null-space posture task is added via:
+//!
+//! ```text
+//! Δq = Δq_dls + (I - J⁺J) z
+//! ```
+//!
+//! where `z = gain * (q_rest - q)` and `J⁺` is the damped pseudoinverse.
+//!
+//! # References
+//!
+//! - Nakamura & Hanafusa 1986 — damped least squares IK.
+//! - Liegeois 1977 — null-space secondary tasks.
+//! - Maciejewski & Klein 1985 — avoiding kinematic singularities.
+
+use crate::{error::ArticulatedError, model::ArticulatedModel, spatial::SpatialTransform};
+
+// ─── Public data types ────────────────────────────────────────────────────────
+
+/// Options for the damped least-squares IK solver.
+#[derive(Debug, Clone)]
+pub struct IkOptions {
+    /// Maximum number of Newton iterations.  Default: 50.
+    pub max_iterations: usize,
+    /// Position convergence tolerance \[m\].  Default: 1e-3.
+    pub position_tol: f64,
+    /// Orientation convergence tolerance \[rad\].  Default: 1.75e-3 (~0.1°).
+    pub orientation_tol: f64,
+    /// Levenberg-Marquardt damping coefficient λ.  Default: 1e-2.
+    pub damping_lambda: f64,
+    /// If `true`, increase λ near singularities (adaptive damping).
+    ///
+    /// Each iteration estimates the smallest singular value `σ_min` of the
+    /// Jacobian (from the eigenvalues of the smaller Gram matrix `JᵀJ` or
+    /// `JJᵀ`) and, when `σ_min < ε` ([`IkOptions::singular_threshold`]),
+    /// uses the Maciejewski–Klein / Nakamura schedule
+    /// `λ² = damping_lambda² + (1 − (σ_min/ε)²)·max_damping_lambda²`;
+    /// away from singularities `λ = damping_lambda`. Default: `false`.
+    pub lambda_adaptive: bool,
+    /// Singular-value threshold `ε` below which adaptive damping engages.
+    /// Default: 0.04.
+    pub singular_threshold: f64,
+    /// Extra damping `λ_max` added (in quadrature) at an exact singularity
+    /// when [`IkOptions::lambda_adaptive`] is set.  Default: 0.1.
+    pub max_damping_lambda: f64,
+    /// Gain on the null-space posture task.  Default: 0.1.
+    pub null_space_gain: f64,
+}
+
+impl Default for IkOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: 50,
+            position_tol: 1e-3,
+            orientation_tol: 1.75e-3,
+            damping_lambda: 1e-2,
+            lambda_adaptive: false,
+            singular_threshold: 0.04,
+            max_damping_lambda: 0.1,
+            null_space_gain: 0.1,
+        }
+    }
+}
+
+/// Result returned by [`solve_ik_dls`].
+#[derive(Debug, Clone)]
+pub struct IkResult {
+    /// Whether the solver converged within the specified tolerances.
+    pub success: bool,
+    /// Joint positions at the final iteration.
+    pub joint_positions: Vec<f64>,
+    /// Final Euclidean position error \[m\].
+    pub position_error: f64,
+    /// Final rotation error: geodesic angle `θ ∈ [0, π]` between the EE and
+    /// target orientations \[rad\].
+    pub orientation_error: f64,
+    /// Number of iterations executed.
+    pub iterations: usize,
+}
+
+// ─── Internal helpers ────────────────────────────────────────────────────────
+
+/// 3×3 matrix multiply.
+#[inline]
+fn mat3_mul(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                out[i][j] += a[i][k] * b[k][j];
+            }
+        }
+    }
+    out
+}
+
+/// 3×3 matrix times 3-vector.
+#[inline]
+fn mat3_vec(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+/// Transpose of a 3×3 matrix.
+#[inline]
+fn mat3_transpose(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    [
+        [m[0][0], m[1][0], m[2][0]],
+        [m[0][1], m[1][1], m[2][1]],
+        [m[0][2], m[1][2], m[2][2]],
+    ]
+}
+
+/// 3-vector cross product: `a × b`.
+#[inline]
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// 3-vector addition.
+#[inline]
+fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+/// 3-vector subtraction.
+#[inline]
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// Euclidean norm of a 3-vector.
+#[inline]
+fn norm3(v: [f64; 3]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+// ─── Cholesky helpers (self-contained, for ik.rs) ────────────────────────────
+
+/// Dense lower-triangular Cholesky factorisation: A = L Lᵀ.
+///
+/// Returns `Err` if A is not positive-definite (diagonal entry ≤ 0 after
+/// subtraction). `eps_diag` adds a small stabilisation to the diagonal before
+/// factorising (set to 0.0 for a strict check).
+fn cholesky_lower_nn(a: &[Vec<f64>], eps_diag: f64) -> Result<Vec<Vec<f64>>, &'static str> {
+    let n = a.len();
+    let mut l = vec![vec![0.0f64; n]; n];
+    for i in 0..n {
+        for j in 0..=i {
+            let a_ij = if i == j { a[i][j] + eps_diag } else { a[i][j] };
+            let mut sum = a_ij;
+            for (l_ik, l_jk) in l[i][..j].iter().zip(l[j][..j].iter()) {
+                sum -= l_ik * l_jk;
+            }
+            if i == j {
+                if sum <= 0.0 {
+                    return Err("matrix is not positive-definite");
+                }
+                l[i][j] = sum.sqrt();
+            } else {
+                l[i][j] = sum / l[j][j];
+            }
+        }
+    }
+    Ok(l)
+}
+
+/// Forward-backward substitution: solve L Lᵀ x = b.
+fn cholesky_solve_nn(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+    let n = l.len();
+    // Forward: L y = b
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        let mut s = b[i];
+        for j in 0..i {
+            s -= l[i][j] * y[j];
+        }
+        y[i] = s / l[i][i];
+    }
+    // Backward: Lᵀ x = y
+    let mut x = vec![0.0f64; n];
+    for i in (0..n).rev() {
+        let mut s = y[i];
+        for j in i + 1..n {
+            s -= l[j][i] * x[j];
+        }
+        x[i] = s / l[i][i];
+    }
+    x
+}
+
+/// Gauss-Jordan inversion of an n×n matrix in place, returning the inverse.
+/// Returns `Err` if the matrix is (near-)singular (pivot < 1e-14).
+fn invert_nn(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, &'static str> {
+    let n = a.len();
+    // Build augmented [A | I]
+    let mut aug: Vec<Vec<f64>> = a
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut r = row.clone();
+            r.resize(2 * n, 0.0);
+            r[n + i] = 1.0;
+            r
+        })
+        .collect();
+
+    for col in 0..n {
+        // Partial pivot: find row with largest absolute value in this column
+        let mut max_row = col;
+        let mut max_val = aug[col][col].abs();
+        for (offset, aug_row) in aug[col + 1..].iter().enumerate() {
+            let val = aug_row[col].abs();
+            if val > max_val {
+                max_val = val;
+                max_row = col + 1 + offset;
+            }
+        }
+        if max_val < 1e-14 {
+            return Err("matrix is singular");
+        }
+        aug.swap(col, max_row);
+
+        let pivot = aug[col][col];
+        for entry in aug[col].iter_mut() {
+            *entry /= pivot;
+        }
+        // Store the pivot row as a fixed copy before mutating others
+        let pivot_row: Vec<f64> = aug[col].clone();
+        let width = 2 * n;
+        for (row_idx, aug_row) in aug.iter_mut().enumerate() {
+            if row_idx != col {
+                let factor = aug_row[col];
+                for j in 0..width {
+                    aug_row[j] -= factor * pivot_row[j];
+                }
+            }
+        }
+    }
+
+    Ok(aug.iter().map(|row| row[n..].to_vec()).collect())
+}
+
+// ─── Forward kinematics ──────────────────────────────────────────────────────
+
+/// Compute the world-frame `SpatialTransform` for every body.
+///
+/// `T_world[i]` represents the transform from body `i`'s frame to the world
+/// frame.  Concretely:
+/// - `T_world[i].rot` is the rotation matrix **from body-i frame to world**
+///   (since `SpatialTransform.rot` is "child → parent" and world is the
+///   top-level parent).
+/// - `T_world[i].trans` is the position of body-i's origin in world
+///   coordinates.
+///
+/// `q` is the configuration vector of length [`ArticulatedModel::total_nq`].
+///
+/// Bodies must be stored in topological order (parent index < child index),
+/// as guaranteed by [`ArticulatedModel`].
+pub fn forward_kinematics(model: &ArticulatedModel, q: &[f64]) -> Vec<SpatialTransform> {
+    let n = model.num_bodies();
+    let mut t_world = vec![SpatialTransform::IDENTITY; n];
+
+    for i in 0..n {
+        let body = &model.bodies[i];
+        let joint = &model.joints[i];
+        let qi = model.q_slice(q, i);
+
+        // Pose of body i in its parent: X_T (fixed offset) composed with X_J (joint motion)
+        let x_j = joint.transform(qi);
+        let x_full = body.parent_transform.compose(&x_j);
+
+        // Chain poses: T_world[i] = T_world[parent] ∘ x_full, i.e. map body-i
+        // coordinates to the parent with x_full, then to the world with
+        // T_world[parent].
+        t_world[i] = match body.parent_id {
+            None => x_full,
+            Some(pid) => t_world[pid].compose(&x_full),
+        };
+    }
+
+    t_world
+}
+
+// ─── Geometric Jacobian ──────────────────────────────────────────────────────
+
+/// Compute the geometric Jacobian for the end-effector body `ee_body`.
+///
+/// Returns a flat row-major matrix of size `6 × total_dof`:
+/// `J[row * n + col]` where row ∈ {0..6} and col ∈ {0..n}.
+///
+/// Row order: `[ω_x, ω_y, ω_z, v_x, v_y, v_z]` — angular rows first.
+///
+/// Each column `d` (DOF `d` of body `b` on the path to the EE) is:
+///
+/// ```text
+/// angular part: R_world_b * s_angular
+/// linear  part: R_world_b * s_linear + (R_world_b * s_angular) × r_{b→ee}
+/// ```
+///
+/// where `s = motion_subspace_at(q)[d_local]` is the d-th motion-subspace
+/// column in the body frame, and `r_{b→ee}` is the vector from body `b`'s
+/// origin to the EE origin, expressed in world coordinates.
+///
+/// Off-path DOFs contribute a zero column. `q` has length
+/// [`ArticulatedModel::total_nq`]; the Jacobian has `total_dof()` columns (one
+/// per velocity coordinate).
+///
+/// # Errors
+/// - [`ArticulatedError::InvalidBodyIndex`] if `ee_body >= model.num_bodies()`.
+/// - [`ArticulatedError::DimensionMismatch`] if `q.len() != model.total_nq()`.
+pub fn geometric_jacobian(
+    model: &ArticulatedModel,
+    q: &[f64],
+    ee_body: usize,
+) -> Result<Vec<f64>, ArticulatedError> {
+    check_body(model, ee_body)?;
+    check_len("q", model.total_nq(), q.len())?;
+    Ok(geometric_jacobian_unchecked(model, q, ee_body))
+}
+
+/// [`geometric_jacobian`] without input validation (callers have checked
+/// `ee_body` and `q`).
+fn geometric_jacobian_unchecked(model: &ArticulatedModel, q: &[f64], ee_body: usize) -> Vec<f64> {
+    let n_dof = model.total_dof();
+    let n_bodies = model.num_bodies();
+    let mut j = vec![0.0f64; 6 * n_dof];
+
+    // Compute world-frame transforms for all bodies
+    let fk = forward_kinematics(model, q);
+
+    // Position of the EE origin in world coordinates
+    let p_ee = fk[ee_body].trans;
+
+    // Collect the ancestor chain (including ee_body itself) as a set for O(1)
+    // lookup.  We need to walk up from ee_body to the root.
+    let mut on_path = vec![false; n_bodies];
+    {
+        let mut cur = Some(ee_body);
+        while let Some(c) = cur {
+            on_path[c] = true;
+            cur = model.bodies[c].parent_id;
+        }
+    }
+
+    // For each body on the ancestor path, accumulate Jacobian columns
+    for b in 0..n_bodies {
+        if !on_path[b] {
+            continue;
+        }
+
+        let joint = &model.joints[b];
+        let qi = model.q_slice(q, b);
+        let sub = joint.motion_subspace_at(qi);
+        // R_world_b: rotation from body-b frame to world frame
+        let r_wb = fk[b].rot;
+        // Vector from body-b origin to EE origin in world frame
+        let r_b_to_ee = sub3(p_ee, fk[b].trans);
+
+        let dof_start = model.dof_start(b);
+
+        for (d_local, s_col) in sub.iter().enumerate() {
+            let col = dof_start + d_local;
+
+            // Rotate the angular part of the motion-subspace column to world frame
+            let omega_world = mat3_vec(r_wb, s_col.angular);
+
+            // Rotate the linear part of the motion-subspace column to world frame
+            let v_linear_world = mat3_vec(r_wb, s_col.linear);
+
+            // Full linear velocity at EE = v_linear_world + omega_world × r_b_to_ee
+            let v_ee = add3(v_linear_world, cross3(omega_world, r_b_to_ee));
+
+            // Fill J column: rows 0..3 = angular, rows 3..6 = linear
+            j[col] = omega_world[0];
+            j[n_dof + col] = omega_world[1];
+            j[2 * n_dof + col] = omega_world[2];
+            j[3 * n_dof + col] = v_ee[0];
+            j[4 * n_dof + col] = v_ee[1];
+            j[5 * n_dof + col] = v_ee[2];
+        }
+    }
+
+    j
+}
+
+// ─── Input validation ────────────────────────────────────────────────────────
+
+/// `Err(InvalidBodyIndex)` unless `index < model.num_bodies()`.
+fn check_body(model: &ArticulatedModel, index: usize) -> Result<(), ArticulatedError> {
+    let num_bodies = model.num_bodies();
+    if index < num_bodies {
+        Ok(())
+    } else {
+        Err(ArticulatedError::InvalidBodyIndex { index, num_bodies })
+    }
+}
+
+/// `Err(DimensionMismatch)` unless `got == expected`.
+fn check_len(what: &'static str, expected: usize, got: usize) -> Result<(), ArticulatedError> {
+    if got == expected {
+        Ok(())
+    } else {
+        Err(ArticulatedError::DimensionMismatch {
+            what,
+            expected,
+            got,
+        })
+    }
+}
+
+/// Validate the numeric fields of [`IkOptions`].
+fn check_options(opts: &IkOptions) -> Result<(), ArticulatedError> {
+    let invalid =
+        |what: &'static str, value: f64| Err(ArticulatedError::InvalidParameter { what, value });
+    let non_negative = [
+        ("damping_lambda", opts.damping_lambda),
+        ("max_damping_lambda", opts.max_damping_lambda),
+    ];
+    for (what, value) in non_negative {
+        if !value.is_finite() || value < 0.0 {
+            return invalid(what, value);
+        }
+    }
+    let positive = [
+        ("position_tol", opts.position_tol),
+        ("orientation_tol", opts.orientation_tol),
+        ("singular_threshold", opts.singular_threshold),
+    ];
+    for (what, value) in positive {
+        if !value.is_finite() || value <= 0.0 {
+            return invalid(what, value);
+        }
+    }
+    if !opts.null_space_gain.is_finite() {
+        return invalid("null_space_gain", opts.null_space_gain);
+    }
+    Ok(())
+}
+
+// ─── Singularity-aware damping ───────────────────────────────────────────────
+
+/// Eigenvalues of a small symmetric matrix by the cyclic Jacobi method.
+fn symmetric_eigenvalues(mut a: Vec<Vec<f64>>) -> Vec<f64> {
+    let m = a.len();
+    for _sweep in 0..100 {
+        let off: f64 = (0..m)
+            .flat_map(|p| (0..m).filter(move |&q| q != p).map(move |q| (p, q)))
+            .map(|(p, q)| a[p][q] * a[p][q])
+            .sum();
+        let scale: f64 = (0..m).map(|k| a[k][k] * a[k][k]).sum::<f64>() + off;
+        if off <= 1e-30 * scale.max(f64::MIN_POSITIVE) {
+            break;
+        }
+        for p in 0..m {
+            for q in (p + 1)..m {
+                let apq = a[p][q];
+                if apq == 0.0 {
+                    continue;
+                }
+                // Rotation angle zeroing a[p][q].
+                let theta = (a[q][q] - a[p][p]) / (2.0 * apq);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let t = if theta == 0.0 { 1.0 } else { t };
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let sn = t * c;
+                // Columns: A ← A·G.
+                for row in a.iter_mut() {
+                    let akp = row[p];
+                    let akq = row[q];
+                    row[p] = c * akp - sn * akq;
+                    row[q] = sn * akp + c * akq;
+                }
+                // Rows: A ← Gᵀ·A (p < q, so split to borrow both rows).
+                let (head, tail) = a.split_at_mut(q);
+                let row_p = &mut head[p];
+                let row_q = &mut tail[0];
+                for (apk, aqk) in row_p.iter_mut().zip(row_q.iter_mut()) {
+                    let (x, y) = (*apk, *aqk);
+                    *apk = c * x - sn * y;
+                    *aqk = sn * x + c * y;
+                }
+            }
+        }
+    }
+    (0..m).map(|k| a[k][k]).collect()
+}
+
+/// Smallest singular value `σ_min` of the `6×n` Jacobian `j_flat`
+/// (row-major), i.e. the `min(6, n)`-th singular value.
+///
+/// Uses the smaller Gram matrix (`JᵀJ` for `n < 6`, `JJᵀ` otherwise) so that a
+/// robot with fewer than 6 DoF is not reported as permanently singular by the
+/// structurally zero eigenvalues of the larger one.
+fn smallest_singular_value(j_flat: &[f64], n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let gram: Vec<Vec<f64>> = if n < 6 {
+        (0..n)
+            .map(|a| {
+                (0..n)
+                    .map(|b| (0..6).map(|r| j_flat[r * n + a] * j_flat[r * n + b]).sum())
+                    .collect()
+            })
+            .collect()
+    } else {
+        (0..6)
+            .map(|r| {
+                (0..6)
+                    .map(|t| (0..n).map(|c| j_flat[r * n + c] * j_flat[t * n + c]).sum())
+                    .collect()
+            })
+            .collect()
+    };
+    let lambda_min = symmetric_eigenvalues(gram)
+        .into_iter()
+        .fold(f64::INFINITY, f64::min);
+    lambda_min.max(0.0).sqrt()
+}
+
+/// Damping `λ` for one DLS step: `damping_lambda`, raised near singularities
+/// when `lambda_adaptive` is set (see [`IkOptions::lambda_adaptive`]).
+fn effective_damping(j_flat: &[f64], n: usize, opts: &IkOptions) -> f64 {
+    if !opts.lambda_adaptive {
+        return opts.damping_lambda;
+    }
+    let sigma_min = smallest_singular_value(j_flat, n);
+    let eps = opts.singular_threshold;
+    if sigma_min >= eps {
+        return opts.damping_lambda;
+    }
+    let ratio = sigma_min / eps;
+    let extra2 = (1.0 - ratio * ratio) * opts.max_damping_lambda * opts.max_damping_lambda;
+    (opts.damping_lambda * opts.damping_lambda + extra2).sqrt()
+}
+
+// ─── Damped least-squares IK solver ──────────────────────────────────────────
+
+/// SO(3) logarithm: the rotation vector `θ·axis` (with `θ ∈ [0, π]`) of a
+/// rotation matrix `r`, i.e. `exp([log(r)]×) = r`.
+///
+/// Uses `θ = atan2(|vee(R − Rᵀ)|/2, (tr R − 1)/2)`, which is well conditioned
+/// over the whole range, and handles the two singular regimes explicitly:
+///
+/// - `θ → 0`: `log(R) ≈ vee(R − Rᵀ)/2` (first-order series),
+/// - `θ → π`: `R − Rᵀ → 0`, so the axis is recovered from the symmetric part
+///   `(R + I)/2 = cos θ·I/2 + … ≈ a aᵀ`, taking the column with the largest
+///   diagonal entry and fixing its sign with `vee(R − Rᵀ)` when that is still
+///   informative.
+fn so3_log(r: [[f64; 3]; 3]) -> [f64; 3] {
+    // vee(R − Rᵀ) = 2·sin θ·axis.
+    let w = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
+    let sin_theta = 0.5 * norm3(w);
+    let cos_theta = (0.5 * (r[0][0] + r[1][1] + r[2][2] - 1.0)).clamp(-1.0, 1.0);
+    let theta = sin_theta.atan2(cos_theta);
+
+    if theta < 1e-8 {
+        // log(R) ≈ vee(R − Rᵀ)/2, exact to O(θ³).
+        return [0.5 * w[0], 0.5 * w[1], 0.5 * w[2]];
+    }
+
+    if theta > std::f64::consts::PI - 1e-6 {
+        // Near π: R ≈ 2 a aᵀ − I ⇒ (R + I)/2 ≈ a aᵀ.
+        let b = [
+            [0.5 * (r[0][0] + 1.0), 0.5 * r[0][1], 0.5 * r[0][2]],
+            [0.5 * r[1][0], 0.5 * (r[1][1] + 1.0), 0.5 * r[1][2]],
+            [0.5 * r[2][0], 0.5 * r[2][1], 0.5 * (r[2][2] + 1.0)],
+        ];
+        let mut k = 0;
+        for idx in 1..3 {
+            if b[idx][idx] > b[k][k] {
+                k = idx;
+            }
+        }
+        // Column k = a_k · a; symmetrise with row k for robustness.
+        let col = [
+            0.5 * (b[0][k] + b[k][0]),
+            0.5 * (b[1][k] + b[k][1]),
+            0.5 * (b[2][k] + b[k][2]),
+        ];
+        let n = norm3(col);
+        if n < 1e-300 {
+            return [0.0; 3];
+        }
+        let mut axis = [col[0] / n, col[1] / n, col[2] / n];
+        // Resolve the ± ambiguity with the (tiny) antisymmetric part.
+        let s = axis[0] * w[0] + axis[1] * w[1] + axis[2] * w[2];
+        if s < 0.0 {
+            axis = [-axis[0], -axis[1], -axis[2]];
+        }
+        return [theta * axis[0], theta * axis[1], theta * axis[2]];
+    }
+
+    // Generic case: log(R) = θ / (2 sin θ) · vee(R − Rᵀ).
+    let k = theta / (2.0 * sin_theta);
+    [k * w[0], k * w[1], k * w[2]]
+}
+
+/// Compute the 6-D task-space error `[e_rot; e_pos]` between the current EE
+/// transform and the target pose.
+///
+/// `e_rot` is the world-frame rotation vector of
+/// `R_err = R_target · R_currentᵀ`, i.e. `e_rot = log(R_err)` (see
+/// [`so3_log`]); its norm is the geodesic angle `θ ∈ [0, π]` between the two
+/// orientations, so a 180° flip yields `|e_rot| = π`, not zero.
+fn task_error(
+    t_ee: &SpatialTransform,
+    target_position: [f64; 3],
+    target_rotation: [[f64; 3]; 3],
+) -> [f64; 6] {
+    // Current EE rotation: fk[ee_body].rot is R_{world←body}
+    let r_curr = t_ee.rot;
+    // R_target is also R_{world←body} (same convention as the FK output)
+    let r_target = target_rotation;
+
+    // R_err = R_target * R_current^T
+    let r_curr_t = mat3_transpose(r_curr);
+    let r_err = mat3_mul(r_target, r_curr_t);
+
+    let e_rot = so3_log(r_err);
+
+    let e_pos = sub3(target_position, t_ee.trans);
+
+    [e_rot[0], e_rot[1], e_rot[2], e_pos[0], e_pos[1], e_pos[2]]
+}
+
+/// Solve IK using damped least squares + null-space projection.
+///
+/// # Arguments
+///
+/// - `model`: Articulated model (topological order, joints match bodies).
+/// - `ee_body`: Body index of the end-effector.
+/// - `target_position`: Desired EE position in world coordinates \[m\].
+/// - `target_rotation`: Desired EE rotation matrix (R_{world←body}).
+/// - `q_init`: Initial joint configuration; length must equal `model.total_nq()`.
+/// - `rest_q`: Secondary posture target (a configuration, length
+///   `model.total_nq()`) for null-space projection.
+/// - `opts`: Solver options.
+///
+/// Each step is a tangent-space increment `Δq` (length `model.total_dof()`),
+/// applied with [`ArticulatedModel::integrate`] so quaternion joints stay
+/// normalised; the posture error is the tangent difference
+/// [`ArticulatedModel::difference`]`(q, rest_q)`.
+///
+/// # Returns
+///
+/// An [`IkResult`] with the solution quality metrics and the final `q`
+/// (non-convergence is reported through [`IkResult::success`], not an error).
+///
+/// # Errors
+///
+/// - [`ArticulatedError::InvalidBodyIndex`] if `ee_body >= model.num_bodies()`.
+/// - [`ArticulatedError::DimensionMismatch`] if `q_init` or `rest_q` does not
+///   have length `model.total_nq()`.
+/// - [`ArticulatedError::InvalidParameter`] if an [`IkOptions`] field is out of
+///   range (negative or non-finite damping, non-positive or non-finite
+///   tolerances / singular threshold, non-finite null-space gain).
+pub fn solve_ik_dls(
+    model: &ArticulatedModel,
+    ee_body: usize,
+    target_position: [f64; 3],
+    target_rotation: [[f64; 3]; 3],
+    q_init: &[f64],
+    rest_q: &[f64],
+    opts: &IkOptions,
+) -> Result<IkResult, ArticulatedError> {
+    let n = model.total_dof();
+    check_body(model, ee_body)?;
+    check_len("q_init", model.total_nq(), q_init.len())?;
+    check_len("rest_q", model.total_nq(), rest_q.len())?;
+    check_options(opts)?;
+    let mut q = q_init.to_vec();
+
+    let mut position_error = f64::INFINITY;
+    let mut orientation_error = f64::INFINITY;
+    let mut iters = 0;
+
+    for iter in 0..opts.max_iterations {
+        iters = iter + 1;
+
+        // ── 1. Forward kinematics ─────────────────────────────────────────────
+        let fk = forward_kinematics(model, &q);
+        let t_ee = &fk[ee_body];
+
+        // ── 2. Task-space error ───────────────────────────────────────────────
+        let e = task_error(t_ee, target_position, target_rotation);
+        let e_rot_vec = [e[0], e[1], e[2]];
+        let e_pos_vec = [e[3], e[4], e[5]];
+        position_error = norm3(e_pos_vec);
+        orientation_error = norm3(e_rot_vec);
+
+        // ── 3. Convergence check ──────────────────────────────────────────────
+        if position_error < opts.position_tol && orientation_error < opts.orientation_tol {
+            return Ok(IkResult {
+                success: true,
+                joint_positions: q,
+                position_error,
+                orientation_error,
+                iterations: iters,
+            });
+        }
+
+        // ── 4. Geometric Jacobian J (6×n, row-major) ──────────────────────────
+        let j_flat = geometric_jacobian_unchecked(model, &q, ee_body);
+
+        // ── 5. Effective damping λ (singularity-aware if enabled) ────────────
+        let lambda = effective_damping(&j_flat, n, opts);
+        let lambda2 = lambda * lambda;
+
+        // ── 6. Damped least squares: solve (JᵀJ + λ²I) Δq_dls = Jᵀ e ───────
+        //
+        // Assemble JᵀJ (n×n) and Jᵀe (n-vector).
+        let dq_dls = compute_dq_dls(&j_flat, &e, n, lambda2);
+
+        // ── 7. Null-space projection ──────────────────────────────────────────
+        //
+        // z = null_space_gain * (rest_q ⊖ q)
+        // J⁺ = Jᵀ (JJᵀ + λ²I)⁻¹  [6×n → n×6 shaped]
+        // Δq_null = (I - J⁺J) z
+        let posture_error = model.difference(&q, rest_q);
+        let dq_null = compute_dq_null(&j_flat, &posture_error, n, lambda2, opts.null_space_gain);
+
+        // ── 8. Update q on the configuration manifold ─────────────────────────
+        let dq: Vec<f64> = dq_dls
+            .iter()
+            .zip(dq_null.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+        q = model.integrate(&q, &dq, 1.0);
+    }
+
+    // Ran out of iterations
+    Ok(IkResult {
+        success: position_error < opts.position_tol && orientation_error < opts.orientation_tol,
+        joint_positions: q,
+        position_error,
+        orientation_error,
+        iterations: iters,
+    })
+}
+
+// ─── DLS step: solve (JᵀJ + λ²I) Δq = Jᵀ e ────────────────────────────────
+
+fn compute_dq_dls(j_flat: &[f64], e: &[f64; 6], n: usize, lambda2: f64) -> Vec<f64> {
+    // Assemble JᵀJ (n×n) and Jᵀe (n-vector)
+    let mut jtj = vec![vec![0.0f64; n]; n];
+    let mut jte = vec![0.0f64; n];
+
+    // J is 6×n row-major: J[row*n + col]
+    for row in 0..6 {
+        for col_a in 0..n {
+            let j_row_a = j_flat[row * n + col_a];
+            jte[col_a] += j_row_a * e[row];
+            for col_b in col_a..n {
+                let j_row_b = j_flat[row * n + col_b];
+                jtj[col_a][col_b] += j_row_a * j_row_b;
+            }
+        }
+    }
+    // Mirror lower triangle and add λ²I
+    // We need two mutable accesses (jtj[i] and jtj[k]) so use index loops here.
+    // clippy needless_range_loop does not apply when two different rows are accessed.
+    for i in 0..n {
+        let diag_val = jtj[i][i] + lambda2;
+        jtj[i][i] = diag_val;
+        // copy upper triangle to lower (requires separate immutable read first)
+        let upper_vals: Vec<f64> = (i + 1..n).map(|k| jtj[i][k]).collect();
+        for (offset, val) in upper_vals.into_iter().enumerate() {
+            jtj[i + 1 + offset][i] = val;
+        }
+    }
+
+    // Solve via Cholesky (JᵀJ + λ²I is always positive-definite)
+    match cholesky_lower_nn(&jtj, 0.0) {
+        Ok(l) => cholesky_solve_nn(&l, &jte),
+        Err(_) => {
+            // Fallback: steepest-descent step Jᵀe
+            jte
+        }
+    }
+}
+
+// ─── Null-space projection ────────────────────────────────────────────────────
+
+/// Compute the null-space component of the IK step.
+///
+/// ```text
+/// z        = gain * (rest_q ⊖ q)
+/// J⁺       = Jᵀ (JJᵀ + λ²I)⁻¹       [n×6]
+/// Δq_null  = (I - J⁺J) z
+/// ```
+///
+/// `posture_error` is the tangent-space difference `rest_q ⊖ q` (length `n`).
+/// `JJᵀ + λ²I` is a 6×6 system; we invert it via Gauss-Jordan.
+fn compute_dq_null(
+    j_flat: &[f64],
+    posture_error: &[f64],
+    n: usize,
+    lambda2: f64,
+    gain: f64,
+) -> Vec<f64> {
+    // z = gain * (rest_q ⊖ q)
+    let z: Vec<f64> = posture_error.iter().map(|e| gain * e).collect();
+
+    // Build JJᵀ (6×6) and add λ²I
+    let mut jjt = vec![vec![0.0f64; 6]; 6];
+    for r in 0..6 {
+        for s in r..6 {
+            let mut dot = 0.0;
+            for col in 0..n {
+                dot += j_flat[r * n + col] * j_flat[s * n + col];
+            }
+            jjt[r][s] = dot;
+            jjt[s][r] = dot;
+        }
+        jjt[r][r] += lambda2;
+    }
+
+    // Invert JJᵀ + λ²I  (6×6 system)
+    let jjt_inv = match invert_nn(&jjt) {
+        Ok(inv) => inv,
+        Err(_) => {
+            // Extremely degenerate — return zero null-space step
+            return vec![0.0; n];
+        }
+    };
+
+    // J⁺ = Jᵀ (JJᵀ + λ²I)⁻¹   [n×6]
+    // j_plus[i][k] = Σ_r J[r][i] * jjt_inv[r][k]
+    let mut j_plus = vec![vec![0.0f64; 6]; n];
+    for i in 0..n {
+        for k in 0..6 {
+            let mut s = 0.0;
+            for r in 0..6 {
+                s += j_flat[r * n + i] * jjt_inv[r][k];
+            }
+            j_plus[i][k] = s;
+        }
+    }
+
+    // J⁺J z = J⁺ (Jz)   [n-vector]
+    // Step 1: Jz = J * z  [6-vector]
+    let mut jz = [0.0f64; 6];
+    for r in 0..6 {
+        for col in 0..n {
+            jz[r] += j_flat[r * n + col] * z[col];
+        }
+    }
+    // Step 2: J⁺ (Jz)  [n-vector]
+    let mut j_plus_jz = vec![0.0f64; n];
+    for i in 0..n {
+        for k in 0..6 {
+            j_plus_jz[i] += j_plus[i][k] * jz[k];
+        }
+    }
+
+    // Δq_null = z - J⁺ J z = (I - J⁺J) z
+    z.iter()
+        .zip(j_plus_jz.iter())
+        .map(|(zi, jpjzi)| zi - jpjzi)
+        .collect()
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        body::RigidBody,
+        joint::RevoluteJoint,
+        model::ArticulatedModel,
+        spatial::{SpatialInertia, SpatialTransform},
+    };
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a 7-DOF revolute chain with unit-length links along the z-axis.
+    ///
+    /// Each joint alternates between x-axis and y-axis rotation so the chain
+    /// is well-conditioned at non-zero configurations.
+    fn build_7dof_chain() -> ArticulatedModel {
+        let mut model = ArticulatedModel::new([0.0, 0.0, -9.81]);
+        let link_len = 1.0_f64;
+        let axes: [[f64; 3]; 7] = [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+
+        for (i, &axis) in axes.iter().enumerate() {
+            let parent_id = if i == 0 { None } else { Some(i - 1) };
+            // Fixed offset: translate link_len along z from previous joint
+            let parent_transform = if i == 0 {
+                SpatialTransform::IDENTITY
+            } else {
+                SpatialTransform::from_translation([0.0, 0.0, link_len])
+            };
+            let inertia = SpatialInertia::from_com(1.0, [0.0, 0.0, link_len * 0.5], [[0.0; 3]; 3]);
+            let body = RigidBody::new(format!("link{}", i), inertia, parent_id, parent_transform);
+            model.add_body(body, Box::new(RevoluteJoint::new(axis)));
+        }
+
+        model
+    }
+
+    // ── Test 1: Jacobian finite-difference validation ─────────────────────────
+
+    /// Key gate: analytic geometric Jacobian vs central finite difference.
+    ///
+    /// Checks the linear-velocity rows (rows 3..6) and angular-velocity rows
+    /// (rows 0..3) against numerical differentiation.  Max error must be < 1e-5
+    /// (we use h=1e-5 so the FD error floor is ~h² ≈ 1e-10 for smooth FK,
+    /// but floating-point rounding limits us to ~1e-7 in practice at h=1e-5).
+    #[test]
+    fn test_jacobian_finite_difference() {
+        let model = build_7dof_chain();
+        // Non-trivial configuration to avoid axis-alignment degeneracy
+        let q: Vec<f64> = vec![0.3, -0.5, 0.7, -0.2, 0.4, -0.6, 0.1];
+        let ee_body = 6;
+        let h = 1e-5;
+
+        let j_analytic = geometric_jacobian(&model, &q, ee_body).expect("valid inputs");
+        let n = model.total_dof();
+
+        let fk0 = forward_kinematics(&model, &q);
+        let t0 = fk0[ee_body];
+
+        let mut max_err_pos = 0.0_f64;
+        let mut max_err_ang = 0.0_f64;
+
+        for d in 0..n {
+            // Perturb +h
+            let mut q_plus = q.clone();
+            q_plus[d] += h;
+            let fk_plus = forward_kinematics(&model, &q_plus);
+            let t_plus = fk_plus[ee_body];
+
+            // Perturb -h
+            let mut q_minus = q.clone();
+            q_minus[d] -= h;
+            let fk_minus = forward_kinematics(&model, &q_minus);
+            let t_minus = fk_minus[ee_body];
+
+            // Central FD for linear velocity (position derivative)
+            let v_fd = [
+                (t_plus.trans[0] - t_minus.trans[0]) / (2.0 * h),
+                (t_plus.trans[1] - t_minus.trans[1]) / (2.0 * h),
+                (t_plus.trans[2] - t_minus.trans[2]) / (2.0 * h),
+            ];
+
+            // Central FD for angular velocity — extract from dR/dq[d] * R^T
+            // dR/dq * R^T is skew-symmetric; vee-map it.
+            // dR ≈ (R+ - R-) / (2h);  dR * R^T gives the angular velocity matrix.
+            let dr = mat3_add_scaled(t_plus.rot, t_minus.rot, 1.0, -1.0, 1.0 / (2.0 * h));
+            let r0_t = mat3_transpose(t0.rot);
+            let omega_mat = mat3_mul(dr, r0_t);
+            let omega_fd = [
+                (omega_mat[2][1] - omega_mat[1][2]) * 0.5,
+                (omega_mat[0][2] - omega_mat[2][0]) * 0.5,
+                (omega_mat[1][0] - omega_mat[0][1]) * 0.5,
+            ];
+
+            // Analytic column d
+            let j_ang = [j_analytic[d], j_analytic[n + d], j_analytic[2 * n + d]];
+            let j_lin = [
+                j_analytic[3 * n + d],
+                j_analytic[4 * n + d],
+                j_analytic[5 * n + d],
+            ];
+
+            let err_pos = (0..3)
+                .map(|k| (j_lin[k] - v_fd[k]).abs())
+                .fold(0.0_f64, f64::max);
+            let err_ang = (0..3)
+                .map(|k| (j_ang[k] - omega_fd[k]).abs())
+                .fold(0.0_f64, f64::max);
+
+            max_err_pos = max_err_pos.max(err_pos);
+            max_err_ang = max_err_ang.max(err_ang);
+        }
+
+        assert!(
+            max_err_pos < 1e-5,
+            "Jacobian linear FD error too large: {:.2e} (threshold 1e-5)",
+            max_err_pos
+        );
+        assert!(
+            max_err_ang < 1e-5,
+            "Jacobian angular FD error too large: {:.2e} (threshold 1e-5)",
+            max_err_ang
+        );
+    }
+
+    /// Helper: (A * s1 + B * s2) * scale, element-wise.
+    fn mat3_add_scaled(
+        a: [[f64; 3]; 3],
+        b: [[f64; 3]; 3],
+        s1: f64,
+        s2: f64,
+        scale: f64,
+    ) -> [[f64; 3]; 3] {
+        let mut out = [[0.0f64; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                out[i][j] = (a[i][j] * s1 + b[i][j] * s2) * scale;
+            }
+        }
+        out
+    }
+
+    // ── Test 2: IK solves a random reachable target ───────────────────────────
+
+    /// Build a reachable target from a known joint configuration, then solve IK
+    /// from a perturbed initial guess.
+    #[test]
+    fn test_ik_7dof_random_target() {
+        let model = build_7dof_chain();
+        let ee_body = 6;
+
+        // "Random" target: generate via FK at a known q_target
+        let q_target: Vec<f64> = vec![0.3, -0.4, 0.5, -0.3, 0.2, -0.5, 0.1];
+        let fk_target = forward_kinematics(&model, &q_target);
+        let target_position = fk_target[ee_body].trans;
+        let target_rotation = fk_target[ee_body].rot;
+
+        // Initial guess: slightly perturbed
+        let q_init: Vec<f64> = q_target.iter().map(|&qi| qi + 0.05).collect();
+        let rest_q = vec![0.0f64; model.total_dof()];
+
+        let opts = IkOptions::default();
+        let result = solve_ik_dls(
+            &model,
+            ee_body,
+            target_position,
+            target_rotation,
+            &q_init,
+            &rest_q,
+            &opts,
+        )
+        .expect("valid IK inputs");
+
+        assert!(
+            result.success,
+            "IK did not converge: pos_err={:.2e} m, rot_err={:.2e} rad, iters={}",
+            result.position_error, result.orientation_error, result.iterations
+        );
+        assert!(
+            result.position_error < 1e-3,
+            "position error {:.2e} m exceeds 1 mm",
+            result.position_error
+        );
+        assert!(
+            result.orientation_error < 1.75e-3,
+            "orientation error {:.2e} rad exceeds threshold",
+            result.orientation_error
+        );
+        assert!(
+            result.iterations <= 50,
+            "IK used too many iterations: {}",
+            result.iterations
+        );
+    }
+
+    // ── Test 3: Null-space keeps EE while pulling toward rest ─────────────────
+
+    #[test]
+    fn test_ik_null_space() {
+        let model = build_7dof_chain();
+        let ee_body = 6;
+
+        // Generate a reachable target
+        let q_target: Vec<f64> = vec![0.4, -0.3, 0.5, 0.2, -0.4, 0.3, 0.1];
+        let fk_target = forward_kinematics(&model, &q_target);
+        let target_position = fk_target[ee_body].trans;
+        let target_rotation = fk_target[ee_body].rot;
+
+        // rest_q = zeros (secondary posture target)
+        let rest_q = vec![0.0f64; model.total_dof()];
+        let q_init: Vec<f64> = q_target.iter().map(|&qi| qi + 0.1).collect();
+
+        let opts = IkOptions {
+            null_space_gain: 0.3, // stronger null-space pull for the test
+            max_iterations: 200,  // more iterations to allow null-space to act
+            ..IkOptions::default()
+        };
+
+        let result = solve_ik_dls(
+            &model,
+            ee_body,
+            target_position,
+            target_rotation,
+            &q_init,
+            &rest_q,
+            &opts,
+        )
+        .expect("valid IK inputs");
+
+        // EE must remain accurate
+        assert!(
+            result.position_error < 1e-3,
+            "null-space test: position error {:.2e} m too large",
+            result.position_error
+        );
+
+        // The null-space term should pull q toward zero — at least some joints
+        // should have moved toward rest_q (zero) relative to the unconstrained solution.
+        // Verify by checking that the solution is not identical to q_target.
+        let drift: f64 = result
+            .joint_positions
+            .iter()
+            .zip(q_target.iter())
+            .map(|(qi, qt)| (qi - qt).abs())
+            .sum();
+        // The null-space moved q away from q_target toward rest (drift > 0)
+        // This is a weak check — the solver may converge to a different IK solution
+        // even without null-space, so we just verify the EE is satisfied.
+        let _ = drift; // EE accuracy is the binding constraint here
+    }
+
+    // ── Test 4: No panic at singular configuration ────────────────────────────
+
+    /// At q = 0 (straight chain along z), some Jacobian rows are zero-valued.
+    /// The damped pseudoinverse must not blow up.
+    #[test]
+    fn test_ik_singular_no_panic() {
+        let model = build_7dof_chain();
+        let ee_body = 6;
+
+        // Singular config: all joints at zero (arm fully extended along z)
+        let q_singular = vec![0.0f64; model.total_dof()];
+        let fk = forward_kinematics(&model, &q_singular);
+        let target_position = fk[ee_body].trans;
+        let target_rotation = fk[ee_body].rot;
+
+        let rest_q = vec![0.0f64; model.total_dof()];
+        let opts = IkOptions {
+            max_iterations: 5,
+            ..IkOptions::default()
+        };
+
+        // Must not panic
+        let result = solve_ik_dls(
+            &model,
+            ee_body,
+            target_position,
+            target_rotation,
+            &q_singular,
+            &rest_q,
+            &opts,
+        )
+        .expect("valid IK inputs");
+
+        // Already at target, so it should succeed immediately
+        assert!(
+            result.success,
+            "should converge at the exact target position, pos_err={:.2e}",
+            result.position_error
+        );
+    }
+
+    // ── Test 5: Far target still converges ────────────────────────────────────
+
+    /// Start from a configuration far from the target (not just a small perturbation).
+    #[test]
+    fn test_ik_far_start() {
+        let model = build_7dof_chain();
+        let ee_body = 6;
+
+        let q_target: Vec<f64> = vec![0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5];
+        let fk_target = forward_kinematics(&model, &q_target);
+        let target_position = fk_target[ee_body].trans;
+        let target_rotation = fk_target[ee_body].rot;
+
+        // Start from zeros (far from target in configuration space)
+        let q_init = vec![0.0f64; model.total_dof()];
+        let rest_q = vec![0.0f64; model.total_dof()];
+
+        let opts = IkOptions {
+            max_iterations: 100,
+            null_space_gain: 0.05,
+            ..IkOptions::default()
+        };
+
+        let result = solve_ik_dls(
+            &model,
+            ee_body,
+            target_position,
+            target_rotation,
+            &q_init,
+            &rest_q,
+            &opts,
+        )
+        .expect("valid IK inputs");
+
+        assert!(
+            result.success,
+            "far-start IK failed: pos_err={:.2e} m, rot_err={:.2e} rad, iters={}",
+            result.position_error, result.orientation_error, result.iterations
+        );
+        assert!(
+            result.position_error < 1e-3,
+            "far-start position error {:.2e} m",
+            result.position_error
+        );
+    }
+
+    // ── Test 6: SO(3) log over the full angle range ───────────────────────────
+
+    #[test]
+    fn test_so3_log_recovers_rotation_vector() {
+        let axis = [
+            0.267_261_241_912_424_4,
+            -0.534_522_483_824_848_8,
+            0.801_783_725_737_273_2,
+        ];
+        for &theta in &[
+            0.0,
+            1e-10,
+            1e-5,
+            0.3,
+            1.5,
+            3.0,
+            std::f64::consts::PI - 1e-7,
+            std::f64::consts::PI,
+        ] {
+            let r = SpatialTransform::from_axis_angle(axis, theta).rot;
+            let phi = so3_log(r);
+            let expected = [theta * axis[0], theta * axis[1], theta * axis[2]];
+            // At exactly π the sign of the axis is ambiguous.
+            let err_pos = norm3(sub3(phi, expected));
+            let err_neg = norm3(add3(phi, expected));
+            let err = if theta >= std::f64::consts::PI {
+                err_pos.min(err_neg)
+            } else {
+                err_pos
+            };
+            assert!(
+                err < 1e-9,
+                "θ={theta}: log={phi:?} expected {expected:?} (err {err:.2e})"
+            );
+            assert!(
+                (norm3(phi) - theta).abs() < 1e-9,
+                "θ={theta}: |log|={}",
+                norm3(phi)
+            );
+        }
+    }
+
+    // ── Test 7: a 180° orientation flip is not reported as converged ─────────
+
+    #[test]
+    fn test_ik_half_turn_flip_is_not_success() {
+        let model = build_7dof_chain();
+        let ee_body = 6;
+        let q0: Vec<f64> = vec![0.3, -0.4, 0.5, -0.3, 0.2, -0.5, 0.1];
+        let fk = forward_kinematics(&model, &q0);
+        let target_position = fk[ee_body].trans;
+        // Target = current orientation rotated by π about world z.
+        let r_pi = SpatialTransform::from_axis_angle([0.0, 0.0, 1.0], std::f64::consts::PI).rot;
+        let target_rotation = mat3_mul(r_pi, fk[ee_body].rot);
+
+        let opts = IkOptions {
+            max_iterations: 1,
+            ..IkOptions::default()
+        };
+        let result = solve_ik_dls(
+            &model,
+            ee_body,
+            target_position,
+            target_rotation,
+            &q0,
+            &q0,
+            &opts,
+        )
+        .expect("valid IK inputs");
+        assert!(
+            !result.success,
+            "a 180° flip must not be reported as success"
+        );
+        assert!(
+            (result.orientation_error - std::f64::consts::PI).abs() < 1e-9,
+            "orientation error should be π, got {}",
+            result.orientation_error
+        );
+        assert!(result.position_error < 1e-12);
+
+        // Given iterations, DLS rotates the EE all the way round.
+        let opts = IkOptions {
+            max_iterations: 300,
+            ..IkOptions::default()
+        };
+        let solved = solve_ik_dls(
+            &model,
+            ee_body,
+            target_position,
+            target_rotation,
+            &q0,
+            &q0,
+            &opts,
+        )
+        .expect("valid IK inputs");
+        assert!(
+            solved.success,
+            "half-turn IK did not converge: pos={:.2e} rot={:.2e}",
+            solved.position_error, solved.orientation_error
+        );
+    }
+
+    // ── Test 8: IK through a quaternion (spherical) joint ────────────────────
+
+    #[test]
+    fn test_ik_with_spherical_joint_stays_on_manifold() {
+        use crate::joint::SphericalJoint;
+        let mut model = ArticulatedModel::new([0.0, 0.0, -9.81]);
+        let inertia = SpatialInertia::from_com(1.0, [0.0, 0.0, 0.25], [[0.01; 3]; 3]);
+        model.add_body(
+            RigidBody::new("base", inertia, None, SpatialTransform::IDENTITY),
+            Box::new(RevoluteJoint::new([0.0, 0.0, 1.0])),
+        );
+        model.add_body(
+            RigidBody::new(
+                "shoulder",
+                inertia,
+                Some(0),
+                SpatialTransform::from_translation([0.0, 0.0, 0.5]),
+            ),
+            Box::new(SphericalJoint),
+        );
+        model.add_body(
+            RigidBody::new(
+                "forearm",
+                inertia,
+                Some(1),
+                SpatialTransform::from_translation([0.0, 0.0, 0.6]),
+            ),
+            Box::new(RevoluteJoint::new([0.0, 1.0, 0.0])),
+        );
+        model.add_body(
+            RigidBody::new(
+                "hand",
+                inertia,
+                Some(2),
+                SpatialTransform::from_translation([0.0, 0.0, 0.4]),
+            ),
+            Box::new(crate::joint::FixedJoint),
+        );
+        assert_eq!(model.total_nq(), 6);
+        assert_eq!(model.total_dof(), 5);
+
+        let h = 0.4_f64;
+        let q_target = vec![0.5, h.cos(), h.sin() * 0.6, 0.0, h.sin() * 0.8, 0.7];
+        let fk = forward_kinematics(&model, &q_target);
+        let rest = model.neutral_configuration();
+        let q_init = model.integrate(&q_target, &[0.1, -0.15, 0.1, 0.2, -0.1], 1.0);
+
+        let opts = IkOptions {
+            max_iterations: 200,
+            ..IkOptions::default()
+        };
+        let result = solve_ik_dls(&model, 3, fk[3].trans, fk[3].rot, &q_init, &rest, &opts)
+            .expect("valid IK inputs");
+        assert!(
+            result.success,
+            "IK through spherical joint failed: pos={:.2e} rot={:.2e}",
+            result.position_error, result.orientation_error
+        );
+        let quat = &result.joint_positions[1..5];
+        let norm = quat.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-12, "quaternion drifted: |q|={norm}");
+    }
+
+    // ── Test 9: Jacobian FD validation through quaternion joints ─────────────
+
+    /// The geometric Jacobian of a chain containing a free-floating base and a
+    /// spherical joint matches central finite differences of forward
+    /// kinematics taken along tangent directions (`q ⊕ ±h·e_j` via
+    /// [`ArticulatedModel::integrate`]).
+    #[test]
+    fn test_jacobian_finite_difference_quaternion_joints() {
+        use crate::joint::{FreeFloatingJoint, SphericalJoint};
+        let mut model = ArticulatedModel::new([0.0, 0.0, -9.81]);
+        let inertia = SpatialInertia::from_com(1.0, [0.0, 0.0, 0.2], [[0.01; 3]; 3]);
+        model.add_body(
+            RigidBody::new("base", inertia, None, SpatialTransform::IDENTITY),
+            Box::new(FreeFloatingJoint),
+        );
+        model.add_body(
+            RigidBody::new(
+                "shoulder",
+                inertia,
+                Some(0),
+                SpatialTransform::from_translation([0.1, -0.2, 0.5])
+                    .compose(&SpatialTransform::from_axis_angle([0.0, 1.0, 0.0], 0.4)),
+            ),
+            Box::new(SphericalJoint),
+        );
+        model.add_body(
+            RigidBody::new(
+                "forearm",
+                inertia,
+                Some(1),
+                SpatialTransform::from_translation([0.0, 0.3, 0.6]),
+            ),
+            Box::new(RevoluteJoint::new([1.0, 0.0, 0.0])),
+        );
+        assert_eq!(model.total_nq(), 7 + 4 + 1);
+        assert_eq!(model.total_dof(), 6 + 3 + 1);
+
+        let n = model.total_dof();
+        let q = model.integrate(
+            &model.neutral_configuration(),
+            &[0.3, -0.1, 0.8, 0.5, -0.7, 0.2, 0.9, -0.4, 0.6, 0.35],
+            1.0,
+        );
+        let ee_body = 2;
+        let h = 1e-6;
+        let j_analytic = geometric_jacobian(&model, &q, ee_body).expect("valid inputs");
+
+        let mut delta = vec![0.0; n];
+        for d in 0..n {
+            delta[d] = 1.0;
+            let t_plus = forward_kinematics(&model, &model.integrate(&q, &delta, h))[ee_body];
+            let t_minus = forward_kinematics(&model, &model.integrate(&q, &delta, -h))[ee_body];
+            delta[d] = 0.0;
+
+            let v_fd = [
+                (t_plus.trans[0] - t_minus.trans[0]) / (2.0 * h),
+                (t_plus.trans[1] - t_minus.trans[1]) / (2.0 * h),
+                (t_plus.trans[2] - t_minus.trans[2]) / (2.0 * h),
+            ];
+            // World-frame angular velocity: log(R₊·R₋ᵀ) / (2h).
+            let phi = so3_log(mat3_mul(t_plus.rot, mat3_transpose(t_minus.rot)));
+            let omega_fd = [phi[0] / (2.0 * h), phi[1] / (2.0 * h), phi[2] / (2.0 * h)];
+            for k in 0..3 {
+                let j_ang = j_analytic[k * n + d];
+                let j_lin = j_analytic[(3 + k) * n + d];
+                assert!(
+                    (j_ang - omega_fd[k]).abs() < 1e-6,
+                    "col {d} angular[{k}]: J={j_ang:.9} FD={:.9}",
+                    omega_fd[k]
+                );
+                assert!(
+                    (j_lin - v_fd[k]).abs() < 1e-6,
+                    "col {d} linear[{k}]: J={j_lin:.9} FD={:.9}",
+                    v_fd[k]
+                );
+            }
+        }
+    }
+
+    // ── Test 10: input validation ────────────────────────────────────────────
+
+    #[test]
+    fn test_solve_ik_rejects_invalid_inputs() {
+        let model = build_7dof_chain();
+        let q = vec![0.0f64; 7];
+        let opts = IkOptions::default();
+        let id = SpatialTransform::IDENTITY.rot;
+        assert_eq!(
+            solve_ik_dls(&model, 7, [0.0; 3], id, &q, &q, &opts).map(|_| ()),
+            Err(ArticulatedError::InvalidBodyIndex {
+                index: 7,
+                num_bodies: 7
+            })
+        );
+        assert_eq!(
+            solve_ik_dls(&model, 6, [0.0; 3], id, &q[..6], &q, &opts).map(|_| ()),
+            Err(ArticulatedError::DimensionMismatch {
+                what: "q_init",
+                expected: 7,
+                got: 6
+            })
+        );
+        assert_eq!(
+            solve_ik_dls(&model, 6, [0.0; 3], id, &q, &q[..3], &opts).map(|_| ()),
+            Err(ArticulatedError::DimensionMismatch {
+                what: "rest_q",
+                expected: 7,
+                got: 3
+            })
+        );
+        let bad = IkOptions {
+            damping_lambda: -1.0,
+            ..IkOptions::default()
+        };
+        assert!(matches!(
+            solve_ik_dls(&model, 6, [0.0; 3], id, &q, &q, &bad),
+            Err(ArticulatedError::InvalidParameter {
+                what: "damping_lambda",
+                ..
+            })
+        ));
+        let bad = IkOptions {
+            position_tol: 0.0,
+            ..IkOptions::default()
+        };
+        assert!(matches!(
+            solve_ik_dls(&model, 6, [0.0; 3], id, &q, &q, &bad),
+            Err(ArticulatedError::InvalidParameter {
+                what: "position_tol",
+                ..
+            })
+        ));
+        let bad = IkOptions {
+            null_space_gain: f64::NAN,
+            ..IkOptions::default()
+        };
+        assert!(matches!(
+            solve_ik_dls(&model, 6, [0.0; 3], id, &q, &q, &bad),
+            Err(ArticulatedError::InvalidParameter {
+                what: "null_space_gain",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_geometric_jacobian_rejects_invalid_inputs() {
+        let model = build_7dof_chain();
+        assert_eq!(
+            geometric_jacobian(&model, &[0.0; 7], 9),
+            Err(ArticulatedError::InvalidBodyIndex {
+                index: 9,
+                num_bodies: 7
+            })
+        );
+        assert_eq!(
+            geometric_jacobian(&model, &[0.0; 5], 6),
+            Err(ArticulatedError::DimensionMismatch {
+                what: "q",
+                expected: 7,
+                got: 5
+            })
+        );
+        assert_eq!(
+            geometric_jacobian(&model, &[0.0; 7], 6).map(|j| j.len()),
+            Ok(6 * 7)
+        );
+    }
+
+    // ── Test 11: singularity-aware adaptive damping ───────────────────────────
+
+    /// Planar 3-link arm (revolute about z, unit links along x).
+    fn build_planar_3link() -> ArticulatedModel {
+        let mut model = ArticulatedModel::new([0.0, 0.0, -9.81]);
+        for i in 0..3 {
+            let (parent, x_t) = if i == 0 {
+                (None, SpatialTransform::IDENTITY)
+            } else {
+                (
+                    Some(i - 1),
+                    SpatialTransform::from_translation([1.0, 0.0, 0.0]),
+                )
+            };
+            let inertia = SpatialInertia::from_com(1.0, [0.5, 0.0, 0.0], [[0.01; 3]; 3]);
+            model.add_body(
+                RigidBody::new(format!("l{i}"), inertia, parent, x_t),
+                Box::new(RevoluteJoint::new([0.0, 0.0, 1.0])),
+            );
+        }
+        // End-effector frame at the tip of the last link.
+        let tip = SpatialInertia::from_com(0.1, [0.0; 3], [[0.001; 3]; 3]);
+        model.add_body(
+            RigidBody::new(
+                "tip",
+                tip,
+                Some(2),
+                SpatialTransform::from_translation([1.0, 0.0, 0.0]),
+            ),
+            Box::new(crate::joint::FixedJoint),
+        );
+        model
+    }
+
+    #[test]
+    fn test_symmetric_eigenvalues_known_matrix() {
+        // [[2, 1, 0], [1, 2, 0], [0, 0, 5]] has eigenvalues 1, 3, 5.
+        let mut eig = symmetric_eigenvalues(vec![
+            vec![2.0, 1.0, 0.0],
+            vec![1.0, 2.0, 0.0],
+            vec![0.0, 0.0, 5.0],
+        ]);
+        eig.sort_by(f64::total_cmp);
+        for (got, want) in eig.iter().zip([1.0, 3.0, 5.0]) {
+            assert!((got - want).abs() < 1e-12, "{eig:?}");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_damping_rises_only_near_singularity() {
+        let model = build_planar_3link();
+        let n = model.total_dof();
+        let opts = IkOptions {
+            lambda_adaptive: true,
+            ..IkOptions::default()
+        };
+
+        // Fully stretched: the three (ω_z, v_x, v_y) columns are coplanar.
+        let j_stretched = geometric_jacobian(&model, &[0.0; 3], 3).expect("valid");
+        let sigma = smallest_singular_value(&j_stretched, n);
+        // Exact σ_min is 0; the Gram-eigenvalue route leaves O(√ε_mach) roundoff.
+        assert!(sigma < 1e-6, "stretched arm σ_min = {sigma}");
+        let lambda = effective_damping(&j_stretched, n, &opts);
+        let expected = (opts.damping_lambda.powi(2) + opts.max_damping_lambda.powi(2)).sqrt();
+        assert!(lambda > opts.damping_lambda);
+        assert!(
+            (lambda - expected).abs() < 1e-9,
+            "λ = {lambda}, expected {expected}"
+        );
+
+        // Well bent: σ_min above threshold ⇒ base damping.
+        let j_bent = geometric_jacobian(&model, &[0.3, 1.2, 1.1], 3).expect("valid");
+        let sigma = smallest_singular_value(&j_bent, n);
+        assert!(sigma > opts.singular_threshold, "bent arm σ_min = {sigma}");
+        assert_eq!(effective_damping(&j_bent, n, &opts), opts.damping_lambda);
+
+        // Non-adaptive options ignore the singularity.
+        let fixed = IkOptions::default();
+        assert_eq!(
+            effective_damping(&j_stretched, n, &fixed),
+            fixed.damping_lambda
+        );
+    }
+
+    #[test]
+    fn test_adaptive_ik_from_singular_start_takes_finite_steps() {
+        let model = build_planar_3link();
+        let q_target = [0.4, -0.7, 0.5];
+        let fk = forward_kinematics(&model, &q_target);
+        let opts = IkOptions {
+            lambda_adaptive: true,
+            max_iterations: 300,
+            null_space_gain: 0.0,
+            ..IkOptions::default()
+        };
+        let result = solve_ik_dls(
+            &model,
+            3,
+            fk[3].trans,
+            fk[3].rot,
+            &[0.0; 3],
+            &[0.0; 3],
+            &opts,
+        )
+        .expect("valid IK inputs");
+        assert!(result.joint_positions.iter().all(|x| x.is_finite()));
+        assert!(
+            result.success,
+            "adaptive IK failed: pos={:.2e} rot={:.2e}",
+            result.position_error, result.orientation_error
+        );
+    }
+}

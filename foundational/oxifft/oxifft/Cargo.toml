@@ -1,0 +1,193 @@
+[package]
+name = "oxifft"
+description = "Pure Rust implementation of FFTW - the Fastest Fourier Transform in the West"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/cool-japan/oxifft"
+documentation = "https://docs.rs/oxifft"
+readme = "README.md"
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = [
+    "benches/",
+    "tests/",
+    "fuzz/",
+    "proptest-regressions/",
+    ".github/",
+    "docs/",
+    "scripts/",
+    "BENCHMARK_RESULTS_TEMPLATE.md",
+    "BENCHMARKING.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "PERFORMANCE_ANALYSIS.md",
+    "PROJECT_STATUS.md",
+    "TESTING.md",
+    "TODO.md",
+    "oxifft.md",
+    # Prebuilt wasm-pack artifacts (`.wasm`/`.js`/`.d.ts`). These are still
+    # tracked in git from before this exclude rule existed (`.gitignore`
+    # cannot retroactively untrack already-committed files), so `exclude`
+    # here is the belt-and-suspenders defense that actually keeps them out
+    # of the published crates.io tarball. Rebuild locally with `wasm-pack`.
+    "pkg/",
+    "pkg_simd/",
+    "pkg_node/",
+]
+
+[dependencies]
+num-complex.workspace = true
+num-traits.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+hashbrown.workspace = true
+spin.workspace = true
+libm.workspace = true
+rayon = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+oxifft-codegen.workspace = true
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-fft = { workspace = true, optional = true }
+oxicuda-metal = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+approx.workspace = true
+rustfft.workspace = true
+
+[features]
+default = ["std", "threading"]
+# Standard library support (enables file I/O, timing, etc.)
+std = ["dep:serde_json", "num-complex/std", "num-traits/std", "serde/std"]
+# Threading support (requires std)
+threading = ["std", "dep:rayon"]
+# AVX-512 SIMD tier (x86_64). Runtime feature detection is std-gated; on no_std
+# it degrades to compile-time (`target_feature`) selection. no_std + alloc capable.
+avx512 = []
+# Experimental portable SIMD backend built on `core::simd`.
+# NIGHTLY-ONLY: enabling this requires a nightly toolchain because it turns on the
+# unstable `#![feature(portable_simd)]` crate attribute. no_std + alloc capable.
+portable_simd = []
+# Quad-precision (128-bit) floating-point support (pure Rust). Requires std.
+f128-support = ["std"]
+# Half-precision (16-bit) floating-point support (pure Rust). Requires std.
+f16-support = ["std"]
+# Sparse FFT support (O(k log n) for k-sparse signals). Requires std.
+sparse = ["std"]
+# Pruned FFT support (partial input/output computation). Requires std.
+pruned = ["std"]
+# ARM SVE (Scalable Vector Extension) support. Currently provides capability
+# and vector-length detection only — `has_sve` uses
+# `std::arch::is_aarch64_feature_detected!` and the vector length is read from
+# `/proc/sys/abi/sve_default_vector_length` on Linux (pure Rust, no libc). Not
+# yet wired into any transform path (the `Sve256*` types are portable scalar
+# wrappers). Requires std.
+sve = ["std"]
+# WebAssembly support (wasm-bindgen glue). Requires std.
+wasm = ["std", "dep:wasm-bindgen"]
+# Streaming FFT support (STFT, window functions, overlap-add). Requires std.
+streaming = ["std"]
+# Compile-time FFT with const generics. no_std + alloc capable.
+const-fft = []
+# GPU support (CUDA backend for NVIDIA GPUs). Driver bindings require an OS, so std.
+cuda = ["std", "dep:oxicuda-driver", "dep:oxicuda-fft"]
+# GPU support (Metal backend for Apple GPUs). Driver bindings require an OS, so std.
+metal = ["std", "dep:oxicuda-metal"]
+# GPU support (enables both CUDA and Metal when available). Requires std.
+gpu = ["std", "cuda", "metal"]
+# Signal processing: Hilbert transform, PSD (Welch's method), cepstral analysis
+signal = ["std"]
+# FFTW-compatible API surface (thin wrappers with FFTW-style names). no_std + alloc capable.
+fftw-compat = []
+# ndarray integration — FFT extension traits for ndarray arrays. ndarray needs std.
+ndarray = ["std", "dep:ndarray"]
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["oxifft-codegen", "spin"]
+development = ["approx", "proptest"]
+
+[package.metadata.docs.rs]
+# Curated feature list (NOT `all-features = true`): `cuda`/`metal`/`gpu` pull in
+# `oxicuda-driver`/`oxicuda-fft`/`oxicuda-metal`, and `oxicuda-metal` in turn
+# depends on the `metal` crate (Apple Metal framework bindings), which does not
+# compile on docs.rs's Linux build container. `portable_simd` is excluded too:
+# it requires a nightly toolchain (`#![feature(portable_simd)]`) and has not
+# been verified to build warning-free on docs.rs's nightly container; revisit
+# once that is confirmed. Every feature below was verified with a clean,
+# zero-warning `cargo check -p oxifft --no-default-features --features
+# "<this list>"`.
+features = [
+    "std",
+    "threading",
+    "avx512",
+    "f128-support",
+    "f16-support",
+    "sparse",
+    "pruned",
+    "sve",
+    "wasm",
+    "streaming",
+    "const-fft",
+    "signal",
+    "fftw-compat",
+    "ndarray",
+]
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[[bin]]
+name = "oxifft_tune"
+path = "src/bin/oxifft_tune.rs"
+required-features = ["std"]
+
+[[bench]]
+name = "dft_1d"
+harness = false
+
+[[bench]]
+name = "cooley_tukey_scaling"
+harness = false
+
+[[bench]]
+name = "multidim_parallel"
+harness = false
+required-features = ["threading"]
+
+[[bench]]
+name = "beyond_fftw"
+harness = false
+required-features = ["sparse", "pruned", "streaming", "const-fft"]
+
+[[bench]]
+name = "prime_sizes"
+harness = false
+
+[[bench]]
+name = "gpu_vs_cpu"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "dct_benchmarks"
+harness = false
+
+[[example]]
+name = "sparse_fft"
+required-features = ["sparse"]
+
+[[example]]
+name = "streaming_fft"
+required-features = ["streaming"]
+
+[[example]]
+name = "signal_processing"
+required-features = ["signal"]

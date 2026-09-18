@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all-features
+      - name: Run tests (no default features)
+        run: cargo test --no-default-features
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (all features)
+        run: cargo clippy --all-features -- -D warnings
+      - name: Clippy (no features)
+        run: cargo clippy -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs (no deps)
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  msrv:
+    name: MSRV Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV
+        run: cargo check --all-features
+
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile benchmarks
+        run: cargo bench --no-run
+
+  gpu-test:
+    name: GPU Tests (software renderer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mesa (software renderer)
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: Run GPU tests
+        run: cargo test --features gpu
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          MESA_VK_DEVICE_SELECT: "list"
+
+  simd-test:
+    name: SIMD Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Run SIMD tests
+        run: cargo test --features simd
+
+  # oxionnx-directml is a Windows-only execution provider (#[cfg(target_os = "windows")]
+  # FFI to D3D12/DirectML). windows-latest is the only runner in the `test` matrix above
+  # that can actually build and link its Win32 code, so this job builds and tests the
+  # `directml` feature in isolation, separate from the broader --all-features matrix run.
+  directml:
+    name: DirectML (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (directml feature)
+        run: cargo build --features directml
+      # DirectML GPU dispatch is opt-in behind OXIONNX_DIRECTML=1, and hosted
+      # windows-latest runners have no GPU -- so we deliberately do NOT set
+      # OXIONNX_DIRECTML=1 here. These tests still exercise the neutral core plus the
+      # documented "no device -> DirectMLContext::try_new() returns None -> CPU
+      # fallback" contract, which proves the crate's Windows FFI actually compiles,
+      # links, and behaves correctly with no adapter present. The software (WARP)
+      # adapter escape hatch, OXIONNX_DIRECTML_ALLOW_WARP=1, is not reliably available
+      # on hosted runners and is deliberately left off; real GPU dispatch can only be
+      # verified on real hardware, not in CI.
+      - name: Test (directml feature)
+        run: cargo test --features directml
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Generate coverage
+        run: cargo tarpaulin --all-features --out xml --output-dir coverage
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/cobertura.xml
+          fail_ci_if_error: false

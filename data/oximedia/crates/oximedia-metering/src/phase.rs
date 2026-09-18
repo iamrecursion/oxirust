@@ -1,0 +1,741 @@
+//! Phase and stereo analysis meters.
+//!
+//! Implements:
+//! - Phase correlation meter (-1 to +1)
+//! - Goniometer (Lissajous) display data
+//! - Phase scope (L vs R)
+//! - Stereo width analysis
+
+use crate::{MeteringError, MeteringResult};
+use std::collections::VecDeque;
+
+/// Phase correlation meter.
+///
+/// Measures the phase correlation between two channels (typically L and R).
+/// Correlation ranges from -1 (completely out of phase) to +1 (completely in phase).
+pub struct PhaseCorrelationMeter {
+    sample_rate: f64,
+    integration_time: f64,
+    buffer_size: usize,
+    left_buffer: VecDeque<f64>,
+    right_buffer: VecDeque<f64>,
+    correlation: f64,
+}
+
+impl PhaseCorrelationMeter {
+    /// Create a new phase correlation meter.
+    ///
+    /// # Arguments
+    ///
+    /// * `sample_rate` - Sample rate in Hz
+    /// * `integration_time` - Integration window in seconds (typically 0.4 for momentary)
+    ///
+    /// # Errors
+    ///
+    /// Returns error if configuration is invalid.
+    pub fn new(sample_rate: f64, integration_time: f64) -> MeteringResult<Self> {
+        if sample_rate <= 0.0 {
+            return Err(MeteringError::InvalidConfig(
+                "Sample rate must be positive".to_string(),
+            ));
+        }
+
+        if integration_time <= 0.0 {
+            return Err(MeteringError::InvalidConfig(
+                "Integration time must be positive".to_string(),
+            ));
+        }
+
+        let buffer_size = (sample_rate * integration_time) as usize;
+
+        Ok(Self {
+            sample_rate,
+            integration_time,
+            buffer_size,
+            left_buffer: VecDeque::with_capacity(buffer_size),
+            right_buffer: VecDeque::with_capacity(buffer_size),
+            correlation: 0.0,
+        })
+    }
+
+    /// Process a stereo sample pair.
+    ///
+    /// # Arguments
+    ///
+    /// * `left` - Left channel sample
+    /// * `right` - Right channel sample
+    pub fn process(&mut self, left: f64, right: f64) {
+        // Add to buffers
+        if self.left_buffer.len() >= self.buffer_size {
+            self.left_buffer.pop_front();
+        }
+        if self.right_buffer.len() >= self.buffer_size {
+            self.right_buffer.pop_front();
+        }
+
+        self.left_buffer.push_back(left);
+        self.right_buffer.push_back(right);
+
+        // Calculate correlation when buffer is full
+        if self.left_buffer.len() == self.buffer_size {
+            self.update_correlation();
+        }
+    }
+
+    /// Process interleaved stereo samples.
+    ///
+    /// # Arguments
+    ///
+    /// * `samples` - Interleaved stereo samples [L, R, L, R, ...]
+    pub fn process_interleaved(&mut self, samples: &[f64]) {
+        for chunk in samples.chunks_exact(2) {
+            self.process(chunk[0], chunk[1]);
+        }
+    }
+
+    /// Update the correlation calculation.
+    fn update_correlation(&mut self) {
+        let n = self.left_buffer.len();
+        if n == 0 {
+            self.correlation = 0.0;
+            return;
+        }
+
+        // Calculate means
+        let left_mean: f64 = self.left_buffer.iter().sum::<f64>() / n as f64;
+        let right_mean: f64 = self.right_buffer.iter().sum::<f64>() / n as f64;
+
+        // Calculate correlation coefficient
+        let mut numerator = 0.0;
+        let mut left_variance = 0.0;
+        let mut right_variance = 0.0;
+
+        for i in 0..n {
+            let left_diff = self.left_buffer[i] - left_mean;
+            let right_diff = self.right_buffer[i] - right_mean;
+
+            numerator += left_diff * right_diff;
+            left_variance += left_diff * left_diff;
+            right_variance += right_diff * right_diff;
+        }
+
+        let denominator = (left_variance * right_variance).sqrt();
+
+        self.correlation = if denominator > 0.0 {
+            (numerator / denominator).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// Get the current phase correlation value.
+    ///
+    /// Returns a value from -1 (completely out of phase) to +1 (completely in phase).
+    pub fn correlation(&self) -> f64 {
+        self.correlation
+    }
+
+    /// Check if the signal is mono (correlation near +1).
+    pub fn is_mono(&self) -> bool {
+        self.correlation > 0.95
+    }
+
+    /// Check if the signal has phase issues (correlation < 0).
+    pub fn has_phase_issues(&self) -> bool {
+        self.correlation < 0.0
+    }
+
+    /// Reset the meter.
+    pub fn reset(&mut self) {
+        self.left_buffer.clear();
+        self.right_buffer.clear();
+        self.correlation = 0.0;
+    }
+}
+
+/// Goniometer point for Lissajous display.
+#[derive(Clone, Debug)]
+pub struct GoniometerPoint {
+    /// Mid (M = L + R) component.
+    pub mid: f64,
+    /// Side (S = L - R) component.
+    pub side: f64,
+}
+
+/// Goniometer for stereo field visualization.
+///
+/// Provides data for a Lissajous display showing the stereo image.
+pub struct Goniometer {
+    sample_rate: f64,
+    history_size: usize,
+    points: VecDeque<GoniometerPoint>,
+}
+
+impl Goniometer {
+    /// Create a new goniometer.
+    ///
+    /// # Arguments
+    ///
+    /// * `sample_rate` - Sample rate in Hz
+    /// * `history_duration` - History duration in seconds
+    pub fn new(sample_rate: f64, history_duration: f64) -> Self {
+        let history_size = (sample_rate * history_duration) as usize;
+
+        Self {
+            sample_rate,
+            history_size,
+            points: VecDeque::with_capacity(history_size),
+        }
+    }
+
+    /// Process a stereo sample pair.
+    ///
+    /// # Arguments
+    ///
+    /// * `left` - Left channel sample
+    /// * `right` - Right channel sample
+    pub fn process(&mut self, left: f64, right: f64) {
+        // Convert to Mid/Side
+        let mid = (left + right) / 2.0;
+        let side = (left - right) / 2.0;
+
+        if self.points.len() >= self.history_size {
+            self.points.pop_front();
+        }
+
+        self.points.push_back(GoniometerPoint { mid, side });
+    }
+
+    /// Process interleaved stereo samples.
+    pub fn process_interleaved(&mut self, samples: &[f64]) {
+        for chunk in samples.chunks_exact(2) {
+            self.process(chunk[0], chunk[1]);
+        }
+    }
+
+    /// Get the goniometer points for display.
+    pub fn points(&self) -> &VecDeque<GoniometerPoint> {
+        &self.points
+    }
+
+    /// Reset the goniometer.
+    pub fn reset(&mut self) {
+        self.points.clear();
+    }
+}
+
+/// Stereo width analyzer.
+pub struct StereoWidthAnalyzer {
+    sample_rate: f64,
+    correlation_meter: PhaseCorrelationMeter,
+    mid_energy: f64,
+    side_energy: f64,
+    smoothing_factor: f64,
+}
+
+impl StereoWidthAnalyzer {
+    /// Create a new stereo width analyzer.
+    ///
+    /// # Arguments
+    ///
+    /// * `sample_rate` - Sample rate in Hz
+    ///
+    /// # Errors
+    ///
+    /// Returns error if configuration is invalid.
+    pub fn new(sample_rate: f64) -> MeteringResult<Self> {
+        let correlation_meter = PhaseCorrelationMeter::new(sample_rate, 0.4)?;
+
+        Ok(Self {
+            sample_rate,
+            correlation_meter,
+            mid_energy: 0.0,
+            side_energy: 0.0,
+            smoothing_factor: 0.99, // Smoothing coefficient
+        })
+    }
+
+    /// Process a stereo sample pair.
+    pub fn process(&mut self, left: f64, right: f64) {
+        // Update correlation
+        self.correlation_meter.process(left, right);
+
+        // Calculate Mid/Side
+        let mid = (left + right) / 2.0;
+        let side = (left - right) / 2.0;
+
+        // Update energies with smoothing
+        self.mid_energy =
+            self.smoothing_factor * self.mid_energy + (1.0 - self.smoothing_factor) * (mid * mid);
+        self.side_energy = self.smoothing_factor * self.side_energy
+            + (1.0 - self.smoothing_factor) * (side * side);
+    }
+
+    /// Process interleaved stereo samples.
+    pub fn process_interleaved(&mut self, samples: &[f64]) {
+        for chunk in samples.chunks_exact(2) {
+            self.process(chunk[0], chunk[1]);
+        }
+    }
+
+    /// Get the stereo width percentage (0-200%).
+    ///
+    /// - 0%: mono signal
+    /// - 100%: normal stereo
+    /// - 200%: maximum stereo width
+    pub fn width_percentage(&self) -> f64 {
+        let total_energy = self.mid_energy + self.side_energy;
+
+        if total_energy > 0.0 {
+            let side_ratio = self.side_energy / total_energy;
+            side_ratio * 200.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Get the phase correlation.
+    pub fn correlation(&self) -> f64 {
+        self.correlation_meter.correlation()
+    }
+
+    /// Get the Mid energy level in dB.
+    pub fn mid_level_db(&self) -> f64 {
+        if self.mid_energy > 0.0 {
+            10.0 * self.mid_energy.log10()
+        } else {
+            f64::NEG_INFINITY
+        }
+    }
+
+    /// Get the Side energy level in dB.
+    pub fn side_level_db(&self) -> f64 {
+        if self.side_energy > 0.0 {
+            10.0 * self.side_energy.log10()
+        } else {
+            f64::NEG_INFINITY
+        }
+    }
+
+    /// Reset the analyzer.
+    pub fn reset(&mut self) {
+        self.correlation_meter.reset();
+        self.mid_energy = 0.0;
+        self.side_energy = 0.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_phase_correlation_mono() {
+        // Use a short integration window (0.01 s at 1000 Hz) so buffer_size = 10
+        // and we only need ~10 samples to fill it — keeping O(N*buffer_size) tiny.
+        let mut meter = PhaseCorrelationMeter::new(1000.0, 0.01).expect("test expectation failed");
+
+        // Feed identical varying signals (mono) - use sine wave; 200 samples is plenty.
+        for i in 0..200 {
+            let t = i as f64 / 1000.0;
+            let signal = (2.0 * std::f64::consts::PI * 100.0 * t).sin() * 0.5;
+            meter.process(signal, signal);
+        }
+
+        // Should be perfectly correlated
+        let corr = meter.correlation();
+        assert!(
+            corr > 0.95,
+            "Correlation {:.3} should be > 0.95 for mono signal",
+            corr
+        );
+        assert!(meter.is_mono());
+    }
+
+    #[test]
+    fn test_phase_correlation_out_of_phase() {
+        // Use a short integration window (0.01 s at 1000 Hz) so buffer_size = 10.
+        let mut meter = PhaseCorrelationMeter::new(1000.0, 0.01).expect("test expectation failed");
+
+        // Feed inverted varying signals (out of phase) - use sine wave; 200 samples is plenty.
+        for i in 0..200 {
+            let t = i as f64 / 1000.0;
+            let signal = (2.0 * std::f64::consts::PI * 100.0 * t).sin() * 0.5;
+            meter.process(signal, -signal);
+        }
+
+        // Should be negatively correlated
+        let corr = meter.correlation();
+        assert!(
+            corr < -0.95,
+            "Correlation {:.3} should be < -0.95 for out-of-phase signal",
+            corr
+        );
+        assert!(meter.has_phase_issues());
+    }
+
+    #[test]
+    fn test_phase_correlation_stereo() {
+        let mut meter = PhaseCorrelationMeter::new(48000.0, 0.1).expect("test expectation failed");
+
+        // Feed uncorrelated signals
+        for i in 0..5000 {
+            let t = i as f64 / 48000.0;
+            let left = (2.0 * std::f64::consts::PI * 1000.0 * t).sin();
+            let right = (2.0 * std::f64::consts::PI * 1500.0 * t).sin();
+            meter.process(left, right);
+        }
+
+        // Should have low correlation
+        assert!(meter.correlation().abs() < 0.5);
+    }
+
+    #[test]
+    fn test_goniometer() {
+        let mut goniometer = Goniometer::new(48000.0, 0.1);
+
+        // Process some samples
+        for i in 0..100 {
+            let t = i as f64 / 100.0;
+            goniometer.process(t, -t);
+        }
+
+        assert_eq!(goniometer.points().len(), 100);
+    }
+
+    #[test]
+    fn test_stereo_width_mono() {
+        let mut analyzer = StereoWidthAnalyzer::new(48000.0).expect("test expectation failed");
+
+        // Feed mono signal
+        for _ in 0..5000 {
+            analyzer.process(0.5, 0.5);
+        }
+
+        // Width should be near 0% for mono
+        assert!(analyzer.width_percentage() < 10.0);
+    }
+
+    #[test]
+    fn test_stereo_width_stereo() {
+        let mut analyzer = StereoWidthAnalyzer::new(48000.0).expect("test expectation failed");
+
+        // Feed pure side signal (maximum stereo)
+        for _ in 0..5000 {
+            analyzer.process(0.5, -0.5);
+        }
+
+        // Width should be high for wide stereo
+        assert!(analyzer.width_percentage() > 150.0);
+    }
+
+    #[test]
+    fn test_phase_meter_reset() {
+        let mut meter = PhaseCorrelationMeter::new(48000.0, 0.1).expect("test expectation failed");
+
+        for _ in 0..1000 {
+            meter.process(0.5, 0.5);
+        }
+
+        meter.reset();
+
+        assert_eq!(meter.correlation(), 0.0);
+    }
+}
+
+// ── Types merged from phase_analysis module ──────────────────────────────────
+
+/// Result of a per-block phase analysis operation.
+#[derive(Clone, Debug)]
+pub struct PhaseResult {
+    /// Pearson correlation coefficient between L and R (-1.0 to +1.0).
+    pub correlation: f64,
+    /// Goniometer (M/S rotated) scatter points for display.
+    pub goniometer_points: Vec<(f64, f64)>,
+    /// True if correlation > 0 (channels are in phase).
+    pub is_in_phase: bool,
+    /// Mono compatibility score (0.0 = completely out of phase, 1.0 = fully mono-compatible).
+    pub mono_compatibility: f64,
+}
+
+/// Compute the Pearson correlation coefficient between two channels.
+///
+/// Returns a value in [-1.0, +1.0].
+#[must_use]
+pub fn compute_phase_correlation(left: &[f64], right: &[f64]) -> f64 {
+    let n = left.len().min(right.len());
+    if n == 0 {
+        return 0.0;
+    }
+
+    let mut sum_l = 0.0f64;
+    let mut sum_r = 0.0f64;
+
+    for i in 0..n {
+        sum_l += left[i];
+        sum_r += right[i];
+    }
+
+    let nf = n as f64;
+    let mean_l = sum_l / nf;
+    let mean_r = sum_r / nf;
+
+    let mut cov = 0.0f64;
+    let mut var_l = 0.0f64;
+    let mut var_r = 0.0f64;
+
+    for i in 0..n {
+        let dl = left[i] - mean_l;
+        let dr = right[i] - mean_r;
+        cov += dl * dr;
+        var_l += dl * dl;
+        var_r += dr * dr;
+    }
+
+    let denom = (var_l * var_r).sqrt();
+    if denom < 1e-15 {
+        if var_l < 1e-15 && var_r < 1e-15 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        (cov / denom).clamp(-1.0, 1.0)
+    }
+}
+
+/// Compute a mono compatibility score.
+///
+/// Measures the ratio of mono sum energy to stereo difference energy.
+/// A score of 1.0 indicates perfect mono compatibility; 0.0 indicates
+/// complete phase cancellation.
+#[must_use]
+pub fn mono_compatibility_score(left: &[f64], right: &[f64]) -> f64 {
+    let n = left.len().min(right.len());
+    if n == 0 {
+        return 1.0;
+    }
+
+    let mut sum_energy = 0.0f64;
+    let mut diff_energy = 0.0f64;
+
+    for i in 0..n {
+        let sum = left[i] + right[i];
+        let diff = left[i] - right[i];
+        sum_energy += sum * sum;
+        diff_energy += diff * diff;
+    }
+
+    let total = sum_energy + diff_energy;
+    if total < 1e-15 {
+        return 1.0;
+    }
+    sum_energy / total
+}
+
+/// Convert a stereo L/R sample pair to M/S coordinates for goniometer display.
+///
+/// Rotates by 45 degrees: M = (L + R) / sqrt(2), S = (L - R) / sqrt(2).
+#[must_use]
+pub fn goniometer_sample(left: f64, right: f64) -> (f64, f64) {
+    let mid = (left + right) / std::f64::consts::SQRT_2;
+    let side = (left - right) / std::f64::consts::SQRT_2;
+    (mid, side)
+}
+
+/// Compute the stereo width of a stereo signal.
+///
+/// Returns 0.0 for pure mono, 1.0 for normal stereo, >1.0 for super-wide.
+#[must_use]
+pub fn stereo_width(left: &[f64], right: &[f64]) -> f64 {
+    let n = left.len().min(right.len());
+    if n == 0 {
+        return 0.0;
+    }
+
+    let mut mid_energy = 0.0f64;
+    let mut side_energy = 0.0f64;
+
+    for i in 0..n {
+        let mid = (left[i] + right[i]) / 2.0;
+        let side = (left[i] - right[i]) / 2.0;
+        mid_energy += mid * mid;
+        side_energy += side * side;
+    }
+
+    let total = mid_energy + side_energy;
+    if total < 1e-15 {
+        return 0.0;
+    }
+    if mid_energy < 1e-15 {
+        return 4.0;
+    }
+    (side_energy / mid_energy).sqrt().min(4.0)
+}
+
+/// Detect if the right channel appears to be a polarity-inverted copy of the left.
+///
+/// Returns true if the correlation is strongly negative (< -0.8).
+#[must_use]
+pub fn detect_polarity_inversion(left: &[f64], right: &[f64]) -> bool {
+    compute_phase_correlation(left, right) < -0.8
+}
+
+/// Streaming phase analyzer with windowed history.
+pub struct PhaseAnalyzer {
+    /// Window size in samples.
+    pub window_size: usize,
+    /// History of correlation values.
+    pub history: Vec<f64>,
+}
+
+impl PhaseAnalyzer {
+    /// Create a new phase analyzer.
+    #[must_use]
+    pub fn new(window_size: usize) -> Self {
+        let size = window_size.max(1);
+        Self {
+            window_size: size,
+            history: Vec::new(),
+        }
+    }
+
+    /// Update the analyzer with a new block of stereo samples and return a [`PhaseResult`].
+    pub fn update(&mut self, left: &[f64], right: &[f64]) -> PhaseResult {
+        let correlation = compute_phase_correlation(left, right);
+        self.history.push(correlation);
+        if self.history.len() > 100 {
+            self.history.remove(0);
+        }
+
+        let n = left.len().min(right.len());
+        let goniometer_points: Vec<(f64, f64)> = (0..n.min(256))
+            .map(|i| goniometer_sample(left[i], right[i]))
+            .collect();
+
+        let mono_compat = mono_compatibility_score(left, right);
+
+        PhaseResult {
+            correlation,
+            goniometer_points,
+            is_in_phase: correlation >= 0.0,
+            mono_compatibility: mono_compat,
+        }
+    }
+
+    /// Get the average correlation over all history.
+    #[must_use]
+    pub fn average_correlation(&self) -> f64 {
+        if self.history.is_empty() {
+            return 0.0;
+        }
+        self.history.iter().sum::<f64>() / self.history.len() as f64
+    }
+}
+
+#[cfg(test)]
+mod phase_analysis_tests {
+    use super::*;
+
+    fn sine_wave_f64(freq: f64, sample_rate: f64, n: usize, phase_offset: f64) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / sample_rate;
+                (2.0 * std::f64::consts::PI * freq * t + phase_offset).sin()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_phase_correlation_identical() {
+        let left = sine_wave_f64(440.0, 48000.0, 4800, 0.0);
+        let right = left.clone();
+        let corr = compute_phase_correlation(&left, &right);
+        assert!((corr - 1.0).abs() < 1e-6, "corr = {corr}");
+    }
+
+    #[test]
+    fn test_phase_correlation_inverted() {
+        let left = sine_wave_f64(440.0, 48000.0, 4800, 0.0);
+        let right: Vec<f64> = left.iter().map(|&x| -x).collect();
+        let corr = compute_phase_correlation(&left, &right);
+        assert!((corr + 1.0).abs() < 1e-6, "corr = {corr}");
+    }
+
+    #[test]
+    fn test_phase_correlation_empty() {
+        assert_eq!(compute_phase_correlation(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn test_mono_compatibility_mono_signal() {
+        let signal: Vec<f64> = (0..480).map(|i| (i as f64 / 480.0).sin()).collect();
+        let score = mono_compatibility_score(&signal, &signal);
+        assert!((score - 1.0).abs() < 1e-6, "score = {score}");
+    }
+
+    #[test]
+    fn test_mono_compatibility_inverted() {
+        let signal: Vec<f64> = (0..480).map(|i| (i as f64 * 0.1).sin()).collect();
+        let inverted: Vec<f64> = signal.iter().map(|&x| -x).collect();
+        let score = mono_compatibility_score(&signal, &inverted);
+        assert!(score < 0.01, "score = {score}");
+    }
+
+    #[test]
+    fn test_goniometer_sample_mono() {
+        let (mid, side) = goniometer_sample(0.5, 0.5);
+        assert!((mid - 0.5 * std::f64::consts::SQRT_2).abs() < 1e-10);
+        assert!(side.abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_stereo_width_mono_is_zero() {
+        let signal: Vec<f64> = (0..480).map(|i| (i as f64 * 0.01).sin()).collect();
+        let width = stereo_width(&signal, &signal);
+        assert!(width < 0.01, "width = {width}");
+    }
+
+    #[test]
+    fn test_stereo_width_empty() {
+        assert_eq!(stereo_width(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn test_detect_polarity_inversion_true() {
+        let left = sine_wave_f64(1000.0, 48000.0, 4800, 0.0);
+        let right: Vec<f64> = left.iter().map(|&x| -x).collect();
+        assert!(detect_polarity_inversion(&left, &right));
+    }
+
+    #[test]
+    fn test_detect_polarity_inversion_false() {
+        let left = sine_wave_f64(1000.0, 48000.0, 4800, 0.0);
+        let right = left.clone();
+        assert!(!detect_polarity_inversion(&left, &right));
+    }
+
+    #[test]
+    fn test_phase_analyzer_update() {
+        let mut analyzer = PhaseAnalyzer::new(4800);
+        let left = sine_wave_f64(440.0, 48000.0, 4800, 0.0);
+        let right = left.clone();
+        let result = analyzer.update(&left, &right);
+        assert!((result.correlation - 1.0).abs() < 1e-6);
+        assert!(result.is_in_phase);
+        assert!(!result.goniometer_points.is_empty());
+    }
+
+    #[test]
+    fn test_phase_analyzer_history() {
+        let mut analyzer = PhaseAnalyzer::new(480);
+        let left = sine_wave_f64(440.0, 48000.0, 480, 0.0);
+        let right = left.clone();
+        for _ in 0..5 {
+            analyzer.update(&left, &right);
+        }
+        assert_eq!(analyzer.history.len(), 5);
+        let avg = analyzer.average_correlation();
+        assert!((avg - 1.0).abs() < 1e-6);
+    }
+}

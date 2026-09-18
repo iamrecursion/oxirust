@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><catalog xmlns:p="urn:example:parts" xmlns="urn:example:catalog" id="7"><item p:sku="A-1" qty="2" note="a &amp; b">Widget Co</item><item p:sku="B-2" /><notes><![CDATA[raw <text> & more]]></notes><!--trailing comment--><?render mode="fast"?></catalog>

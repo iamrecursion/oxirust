@@ -1,0 +1,28 @@
+# Title: Sample Scientific Experiment Data
+# Author: SciRS2 Team
+# Date: 2025-04-10
+# Description: Temperature measurements across different materials
+# Units:
+#   Time: seconds (s)
+#   Temperature: Celsius (°C)
+#   Pressure: kilopascals (kPa)
+#   Concentration: moles per liter (mol/L)
+#   Energy: joules (J)
+# Experiment ID: EXP-20250410-001
+# Instrument: HighPrecThermometer-5000
+Time,Temperature,Pressure,Concentration,Energy,Material,Valid
+0.0,25.0,101.3,0.5,0.0,"Aluminum",true
+0.5,26.2,101.4,0.48,125.5,"Aluminum",true
+1.0,27.5,101.6,0.45,250.0,"Aluminum",true
+1.5,28.7,101.7,0.43,374.5,"Aluminum",true
+2.0,30.0,101.9,0.40,500.0,"Aluminum",true
+0.0,25.0,101.3,0.5,0.0,"Copper",true
+0.5,28.1,101.4,0.47,225.5,"Copper",true
+1.0,32.5,101.6,0.42,450.0,"Copper",true
+1.5,36.7,101.7,0.38,674.5,"Copper",true
+2.0,40.0,101.9,0.35,900.0,"Copper",true
+0.0,25.0,101.3,0.5,0.0,"Glass",true
+0.5,25.3,101.4,0.49,75.5,"Glass",true
+1.0,25.8,101.6,0.48,150.0,"Glass",true
+1.5,26.2,101.7,0.47,224.5,"Glass",true
+2.0,26.5,101.9,0.46,300.0,"Glass",true

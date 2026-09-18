@@ -1,0 +1,173 @@
+name: CI/CD Issue
+description: Report issues with CI/CD workflows, builds, or testing
+title: "[CI/CD] "
+labels: ["ci/cd", "infrastructure"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a CI/CD issue! Please provide as much detail as possible to help us diagnose and fix the problem.
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: Issue Type
+      description: What type of CI/CD issue are you experiencing?
+      options:
+        - Build failure
+        - Test failure
+        - Workflow error
+        - Performance regression
+        - Security audit failure
+        - Documentation generation
+        - Release process
+        - Cross-platform issue
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected_workflows
+    attributes:
+      label: Affected Workflows
+      description: Which workflows are affected? (Select all that apply)
+      multiple: true
+      options:
+        - workspace_ci.yml
+        - nightly.yml
+        - Module-specific workflows
+        - Release workflows
+        - Documentation workflows
+        - Security workflows
+        - Performance workflows
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Which platform(s) are affected?
+      multiple: true
+      options:
+        - Linux (Ubuntu)
+        - macOS
+        - Windows
+        - WebAssembly
+        - Cross-compilation targets
+        - All platforms
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Detailed description of the issue
+      placeholder: |
+        Please describe:
+        - What you expected to happen
+        - What actually happened
+        - When the issue started occurring
+        - Any error messages or logs
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction Steps
+      description: Steps to reproduce the issue
+      placeholder: |
+        1. Go to workflow run...
+        2. Check step...
+        3. See error...
+      value: |
+        1. 
+        2. 
+        3. 
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Include relevant workflow logs, error messages, or build output
+      render: text
+      placeholder: |
+        Paste relevant logs here. Please include:
+        - Workflow run URL
+        - Error messages
+        - Build output
+        - Test failures
+
+  - type: input
+    id: workflow_run
+    attributes:
+      label: Workflow Run URL
+      description: Link to the failing workflow run (if applicable)
+      placeholder: https://github.com/org/repo/actions/runs/123456789
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: Frequency
+      description: How often does this issue occur?
+      options:
+        - Always (100%)
+        - Often (75-99%)
+        - Sometimes (25-74%)
+        - Rarely (1-24%)
+        - First time seeing this
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How urgent is this issue?
+      options:
+        - Critical (blocks releases)
+        - High (impacts development)
+        - Medium (minor inconvenience)
+        - Low (cosmetic/nice to have)
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment Details
+      description: Additional environment information (if relevant)
+      placeholder: |
+        - Rust version:
+        - Specific feature flags:
+        - Dependencies versions:
+        - System configuration:
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround
+      description: Any temporary workarounds you've found
+      placeholder: Describe any workarounds that temporarily resolve the issue
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Any other context that might be helpful
+      placeholder: |
+        - Related issues or PRs
+        - Recent changes that might be related
+        - Impact on other systems
+        - Suggestions for fixes
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      description: Please confirm you have done the following
+      options:
+        - label: I have searched for similar issues
+          required: true
+        - label: I have included relevant logs and error messages
+          required: true
+        - label: I have specified the affected platform(s)
+          required: true
+        - label: I have provided a clear description of the issue
+          required: true

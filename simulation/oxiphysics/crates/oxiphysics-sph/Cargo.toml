@@ -1,0 +1,37 @@
+[package]
+name = "oxiphysics-sph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "Smoothed-particle hydrodynamics for the OxiPhysics engine"
+readme = "README.md"
+categories = ["science", "simulation"]
+keywords = ["sph", "fluid-dynamics", "smoothed-particle", "physics", "simulation"]
+
+[features]
+default = []
+# Evaluate the per-particle gather loops of the weakly-compressible SPH pipeline
+# (density summation, pressure / viscosity / surface-tension forces, XSPH, ...) on the
+# rayon thread pool. Pure Rust and off by default; every particle still sums its own
+# neighbours in list order, so the results are bitwise identical to the serial loops.
+parallel = ["dep:rayon"]
+
+[dependencies]
+rand = { workspace = true }
+rayon = { workspace = true, optional = true }
+thiserror = { workspace = true }
+oxiphysics-core = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "wcsph_scaling"
+harness = false
+
+[[bench]]
+name = "wcsph_parallel"
+harness = false
+required-features = ["parallel"]

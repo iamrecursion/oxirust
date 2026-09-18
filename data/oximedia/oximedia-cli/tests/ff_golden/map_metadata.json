@@ -1,0 +1,9 @@
+{
+  "name": "map_metadata",
+  "args": ["-i", "in.mkv", "-map_metadata", "0", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "map_metadata": 1
+  }
+}

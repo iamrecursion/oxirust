@@ -1,0 +1,268 @@
+name: Python (Maturin) Check
+
+on:
+  push:
+    branches:
+      - master
+      - main
+      - "0.[0-9]+.[0-9]+"
+    paths:
+      - "scirs2-python/**"
+      - "scirs2-core/**"
+      - ".github/workflows/python-check.yml"
+  pull_request:
+    branches:
+      - master
+      - main
+      - "0.[0-9]+.[0-9]+"
+    paths:
+      - "scirs2-python/**"
+      - "scirs2-core/**"
+      - ".github/workflows/python-check.yml"
+  # Allow manual runs so the full tri-platform matrix can be exercised on demand
+  # without waiting for a release tag.
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: 'Python version to test (default: 3.11)'
+        required: false
+        default: '3.11'
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build Python wheels via maturin across Linux / macOS / Windows
+  # ---------------------------------------------------------------------------
+  build-wheels:
+    name: Build Wheels (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux and macOS are always in scope; Windows is only included when the
+        # workflow is dispatched manually or triggered by a push/PR — we keep
+        # Windows in the matrix unconditionally so CI coverage is symmetric.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-python-${{ matrix.os }}-py${{ matrix.python }}"
+
+      - name: Install maturin
+        run: pip install "maturin>=1.4,<2"
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          cd scirs2-python
+          maturin build --release --out dist
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python }}
+          path: scirs2-python/dist/*.whl
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Verify the built wheel installs and imports correctly on each platform
+  # ---------------------------------------------------------------------------
+  test-wheel:
+    name: Test Wheel Install (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    needs: build-wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python }}
+          path: dist/
+
+      - name: Install wheel (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: pip install dist/*.whl
+
+      - name: Install wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pip install (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+
+      - name: Import and version check
+        shell: bash
+        run: |
+          python -c "
+          import scirs2
+          version = scirs2.__version__
+          print('scirs2 version:', version)
+          assert version, 'Expected non-empty version string'
+          print('Import check PASSED')
+          "
+
+      - name: Submodule import check
+        shell: bash
+        run: |
+          python -c "
+          import scirs2.linalg as la
+          import scirs2.stats
+          import scirs2.fft
+          import scirs2.optimize
+          import scirs2.special
+          import scirs2.cluster
+          print('All submodule imports PASSED')
+          "
+
+  # ---------------------------------------------------------------------------
+  # Cargo check for the Python extension crate (fast compile-only check)
+  # ---------------------------------------------------------------------------
+  cargo-check-python:
+    name: Cargo check (scirs2-python)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install maturin
+        run: pip install "maturin>=1.4,<2"
+
+      - name: Cargo check scirs2-python
+        run: cargo check -p scirs2-python --all-features
+
+  # ---------------------------------------------------------------------------
+  # Verify the Python package structure is consistent (type stubs, pyproject)
+  # ---------------------------------------------------------------------------
+  verify-package-metadata:
+    name: Verify Package Metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pyproject validation tools
+        run: pip install "maturin>=1.4,<2" tomli
+
+      - name: Validate pyproject.toml
+        working-directory: scirs2-python
+        run: |
+          python -c "
+          import tomllib, sys, pathlib
+          data = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
+          project = data['project']
+          maturin = data['tool']['maturin']
+
+          assert project['name'] == 'scirs2', 'project name must be scirs2'
+          assert 'maturin' in data['build-system']['requires'][0], 'maturin must be build backend'
+          assert maturin.get('module-name') == 'scirs2', 'module-name must be scirs2'
+          assert maturin.get('python-source') == 'python', 'python-source must point to python/'
+          assert maturin.get('strip') is True, 'strip must be true for release wheels'
+          assert 'pyo3/extension-module' in maturin.get('features', []), 'pyo3/extension-module feature required'
+
+          print('pyproject.toml validation PASSED')
+          print('  name:', project['name'])
+          print('  version:', project['version'])
+          print('  module-name:', maturin['module-name'])
+          print('  python-source:', maturin['python-source'])
+          print('  strip:', maturin['strip'])
+          "
+
+      - name: Verify Python package structure
+        working-directory: scirs2-python
+        run: |
+          python -c "
+          import pathlib
+          pkg = pathlib.Path('python/scirs2')
+          init = pkg / '__init__.py'
+          assert pkg.is_dir(), 'python/scirs2/ directory must exist'
+          assert init.exists(), 'python/scirs2/__init__.py must exist'
+
+          # Check expected submodule files
+          required_modules = ['linalg', 'stats', 'fft', 'optimize', 'special',
+                              'integrate', 'signal', 'sparse', 'ndimage', 'cluster']
+          for mod in required_modules:
+              f = pkg / f'{mod}.py'
+              assert f.exists(), f'python/scirs2/{mod}.py must exist'
+              print(f'  Found: python/scirs2/{mod}.py')
+
+          print('Python package structure verification PASSED')
+          "
+
+  # ---------------------------------------------------------------------------
+  # Summary gate — fails if any job above did not succeed
+  # ---------------------------------------------------------------------------
+  python-success:
+    name: Python Check Success
+    runs-on: ubuntu-latest
+    needs:
+      - build-wheels
+      - test-wheel
+      - cargo-check-python
+      - verify-package-metadata
+    if: always()
+
+    steps:
+      - name: Verify all Python jobs passed
+        shell: bash
+        run: |
+          results=(
+            "${{ needs.build-wheels.result }}"
+            "${{ needs.test-wheel.result }}"
+            "${{ needs.cargo-check-python.result }}"
+            "${{ needs.verify-package-metadata.result }}"
+          )
+          labels=(
+            "build-wheels"
+            "test-wheel"
+            "cargo-check-python"
+            "verify-package-metadata"
+          )
+          FAILED=0
+          for i in "${!results[@]}"; do
+            if [[ "${results[$i]}" != "success" ]]; then
+              echo "FAILED: ${labels[$i]} (result: ${results[$i]})"
+              FAILED=$((FAILED+1))
+            fi
+          done
+          if [ "$FAILED" -gt 0 ]; then
+            echo ""
+            echo "ERROR: $FAILED Python check job(s) did not pass."
+            exit 1
+          fi
+          echo "All Python checks passed."

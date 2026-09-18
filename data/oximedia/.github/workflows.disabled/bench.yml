@@ -1,0 +1,220 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout base branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.base_ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Install critcmp
+        run: cargo install critcmp --locked
+
+      - name: Run benchmarks on HEAD
+        run: |
+          cargo bench --manifest-path benches/Cargo.toml --bench container_bench -- --save-baseline head
+          cargo bench --manifest-path benches/Cargo.toml --bench codec_bench -- --save-baseline head
+          cargo bench --manifest-path benches/Cargo.toml --bench audio_bench -- --save-baseline head
+          cargo bench --manifest-path benches/Cargo.toml --bench cv_bench -- --save-baseline head
+
+      - name: Run benchmarks on base (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          git checkout ${{ github.event.pull_request.base.sha }}
+          cargo bench --manifest-path benches/Cargo.toml --bench container_bench -- --save-baseline base
+          cargo bench --manifest-path benches/Cargo.toml --bench codec_bench -- --save-baseline base
+          cargo bench --manifest-path benches/Cargo.toml --bench audio_bench -- --save-baseline base
+          cargo bench --manifest-path benches/Cargo.toml --bench cv_bench -- --save-baseline base
+          git checkout -
+
+      - name: Compare benchmarks (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "# Benchmark Comparison" > comparison.md
+          echo "" >> comparison.md
+          echo "Comparing HEAD vs base branch (${{ github.base_ref }})" >> comparison.md
+          echo "" >> comparison.md
+
+          # Compare each benchmark suite
+          for bench in container_bench codec_bench audio_bench cv_bench; do
+            echo "## $bench" >> comparison.md
+            critcmp base head --export comparison_${bench}.md || true
+            if [ -f comparison_${bench}.md ]; then
+              cat comparison_${bench}.md >> comparison.md
+              echo "" >> comparison.md
+            fi
+          done
+
+      - name: Post comparison as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (fs.existsSync('comparison.md')) {
+              const comparison = fs.readFileSync('comparison.md', 'utf8');
+
+              // Find existing comment
+              const comments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+
+              const botComment = comments.data.find(comment =>
+                comment.user.type === 'Bot' &&
+                comment.body.includes('Benchmark Comparison')
+              );
+
+              const body = `${comparison}\n\n---\n*Updated at ${new Date().toISOString()}*`;
+
+              if (botComment) {
+                // Update existing comment
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: botComment.id,
+                  body: body
+                });
+              } else {
+                // Create new comment
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: body
+                });
+              }
+            }
+
+      - name: Check for performance regressions
+        if: github.event_name == 'pull_request'
+        run: |
+          # Parse comparison and check for significant regressions (>10%)
+          if grep -q "performance regression" comparison.md 2>/dev/null; then
+            echo "::warning::Performance regressions detected. Please review the benchmark comparison."
+          fi
+
+      - name: Store benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # Store results for historical tracking
+          mkdir -p benchmark-history
+          cp -r target/criterion benchmark-history/$(date +%Y%m%d_%H%M%S)
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            target/criterion
+            comparison.md
+          retention-days: 30
+
+  # Quick benchmark check for PRs
+  benchmark-quick:
+    name: Quick Benchmark Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-quick
+          cache-on-failure: true
+
+      - name: Run quick benchmarks
+        run: |
+          # Run only the fastest benchmarks to catch obvious performance issues
+          cargo bench --manifest-path benches/Cargo.toml --bench container_bench -- --quick 2>&1 | tee quick_bench.txt || true
+
+      - name: Check results
+        run: |
+          echo "Quick benchmark check completed"
+          cat quick_bench.txt
+
+  # Flamegraph profiling
+  profile:
+    name: Profile with Flamegraph
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: profile
+          cache-on-failure: true
+
+      - name: Install flamegraph
+        run: |
+          cargo install flamegraph --locked
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common linux-tools-generic linux-tools-$(uname -r)
+
+      - name: Enable perf
+        run: |
+          echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+          echo 0 | sudo tee /proc/sys/kernel/kptr_restrict
+
+      - name: Generate flamegraphs
+        run: |
+          mkdir -p flamegraphs
+
+          # Profile key benchmarks
+          sudo -E cargo flamegraph --bench container_bench --output flamegraphs/container.svg -- --bench || true
+          sudo -E cargo flamegraph --bench codec_bench --output flamegraphs/codec.svg -- --bench || true
+
+      - name: Upload flamegraphs
+        uses: actions/upload-artifact@v4
+        with:
+          name: flamegraphs
+          path: flamegraphs/*.svg
+          retention-days: 30

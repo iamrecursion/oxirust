@@ -1,0 +1,174 @@
+# oxicuda-dist-infer TODO
+
+Distributed multi-GPU inference engine with three orthogonal parallelism axes (TP x SP x EP = world_size), distributed KV-cache management, and affinity-aware request routing. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda) (Vol.12).
+
+(C) 2026 COOLJAPAN OU (Team KitaSan) -- Pure Rust, no C/Fortran, no CUDA SDK, no nvcc.
+
+## Implementation Status
+
+**Actual: 7,735 SLoC across 26 files (includes Markdown doc-comments) / 3,279 pure Rust SLoC**
+
+Production-grade distributed inference infrastructure for OxiCUDA. Implements three orthogonal
+parallelism strategies and the distributed KV-cache / request-routing infrastructure needed to
+serve LLMs across GPU clusters.
+
+| Axis | Degree | Description |
+|------|--------|-------------|
+| TP | `tp` | Tensor parallelism -- shard weight matrices column- or row-wise |
+| SP | `sp` | Sequence parallelism -- partition the token sequence |
+| EP | `ep` | Expert parallelism -- partition MoE experts across GPUs |
+
+The three degrees multiply to `world_size = tp * sp * ep`.
+
+### Completed
+
+#### Core Infrastructure
+- [x] `error.rs` -- `DistInferError` (27 variants): InvalidWorldSize, RankOutOfRange, TooFewRanks, TpFeaturesMisaligned, TpInputMisaligned, ShardShapeMismatch, SpSeqLenMisaligned, EmptyChunk, EpExpertsMisaligned, EmptyExpertBatch, SequenceNotOwned, MigrationTargetInvalid, BlockPoolExhausted, AllRanksAtCapacity, EmptyTokenSequence, NoPrefixAffinity, DimensionMismatch, Internal, ...
+- [x] `handle.rs` -- `ParallelismConfig { tp, sp, ep }` 3-way decomposition with `world_size()`, `validate()`; `RankCoordinates` 3-D tp/sp/ep coords from flat global rank; `peer_tp/sp/ep()` for ring lookups; `DistInferHandle` lightweight descriptor with device, SM version, config, coords; `single_rank()` for tests
+- [x] `lib.rs` -- module declarations, re-exports, 6 E2E integration tests
+
+#### PTX Kernel Sources
+- [x] `ptx_kernels.rs` -- 5 GPU-side collective kernels
+  - `tp_col_scatter_ptx` -- column-parallel linear scatter: write strided shard into full output buffer
+  - `tp_row_all_reduce_ptx` -- row-parallel linear all-reduce: ring partial-sum accumulation
+  - `sp_seq_chunk_copy_ptx` -- sequence chunk copy: extract/insert contiguous token slice (direction=0/1)
+  - `ep_token_scatter_ptx` -- expert-parallel token scatter: route tokens to expert-local input buffers
+  - `ep_token_gather_ptx` -- expert-parallel token gather: collect expert outputs back to original order
+
+#### Tensor Parallelism (`tensor_parallel/`)
+- [x] `tensor_parallel/mod.rs` -- module organization
+- [x] `tensor_parallel/column_parallel.rs` -- `ColumnLinearShard` weight shard `[local_out x in]`; `forward()` local GEMM; `validate()`; `ColumnLinear` `from_full_weight()` slices rows; `local_forward()`; `all_gather()` simulates collective
+- [x] `tensor_parallel/row_parallel.rs` -- `RowLinearShard` weight shard `[out x local_in]`; `forward_partial()` local GEMM; bias only on rank 0; `RowLinear` `from_full_weight()` slices columns; `slice_input()`; `all_reduce()` simulates ring reduce
+
+#### Sequence Parallelism (`sequence_parallel/`)
+- [x] `sequence_parallel/mod.rs` -- module organization
+- [x] `sequence_parallel/splitter.rs` -- `SeqSplitter` -- `extract_chunk()`, `insert_chunk()`, `all_gather()`, `reduce_scatter()`; validates divisibility; `ChunkInfo` describes rank's token window (start, len, total_tokens, hidden_dim)
+- [x] `sequence_parallel/boundary.rs` -- `BoundaryExchange` -- pre-attention all-gather of K/V; post-attention reduce-scatter of outputs; `local_attention()` with causal masking and GQA-compatible head indexing
+
+#### Expert Parallelism (`expert_parallel/`)
+- [x] `expert_parallel/mod.rs` -- module organization
+- [x] `expert_parallel/router.rs` -- `TopKRouter` top-K selection from gating logits + softmax weight normalisation; `RoutingPlan` with expert_load; `load_balance_cv()` metric; `RoutingEntry` / `RoutingPlan` per-(token, expert) assignment with routing weight
+- [x] `expert_parallel/dispatch.rs` -- `LocalExpertBatch` dispatched token batch per expert with token_indices and weights; `ExpertDispatcher` -- `scatter()` -> local expert buffers; `gather()` -> weighted output sum; `dispatch_and_gather()` end-to-end
+
+#### Distributed KV Cache (`distributed_cache/`)
+- [x] `distributed_cache/mod.rs` -- module organization
+- [x] `distributed_cache/partition.rs` -- `SeqOwnership` / `RankCacheStats` per-sequence owner rank + block count; per-rank utilization stats; `CachePartition` -- least-loaded assignment; `grow()`, `release()`; `rebalance_suggestions()` (utilization-threshold migration hints); `apply_migration()`
+- [x] `distributed_cache/migration.rs` -- `BlockData` serialized KV block `[n_layers x 2 x block_size x kv_dim]`; `key_slice(l)` / `value_slice(l)`; `validate()`; `MigrationRequest` / `MigrationStats` cross-rank block transfer descriptor + statistics; `BlockMigrator` -- `receive_block()` -> local staging id; `take_block()`; `validate_target()`
+
+#### Request Routing (`router/`)
+- [x] `router/mod.rs` -- module organization
+- [x] `router/request.rs` -- `Request` -- token_ids, max_new_tokens, priority; `prefix_hash(len)` FNV-1a for affinity lookup; `RoutingDecision` / `DispatchPolicy` selected rank + policy tag + prefix_hit flag
+- [x] `router/policy.rs` -- `RankLoad` (free_blocks, total_blocks, in_flight); `utilization()`; `RouterMetrics` per-policy request counts, total_routed, prefix_hits, `prefix_hit_rate()`; `RoutingPolicy` -- three modes: RoundRobin, LeastLoaded, PrefixAffinity (with fallback + registration)
+
+#### Integration Tests
+- [x] 6 E2E tests in `lib.rs`:
+  - `e2e_tp_column_row_roundtrip` -- tp=4 column-parallel + all-gather + row-parallel + all-reduce = identity
+  - `e2e_sp_attention_pipeline` -- sp=2 extract chunks + all-gather + local_attention (uniform QKV -> output=1.0)
+  - `e2e_ep_moe_dispatch_gather` -- ep=2, 4 experts, 4 tokens, top-1 routing + identity experts + gather
+  - `e2e_cache_partition_lifecycle` -- 4 ranks, 8 sequences, assign/grow/release lifecycle
+  - `e2e_routing_prefix_affinity_pipeline` -- first request misses, second with same prefix hits same rank
+  - `e2e_ptx_kernels_all_sm_versions` -- all 5 kernels x 5 SM versions produce valid PTX headers
+
+### Future Enhancements
+
+#### P0 -- Critical (Parallelism Axes)
+- [x] Tensor parallelism column + row variants (`tensor_parallel/`)
+- [x] Sequence parallelism with K/V boundary exchange (`sequence_parallel/`)
+- [x] Expert parallelism top-K router + dispatcher (`expert_parallel/`)
+- [x] Per-rank ParallelismConfig validation (`handle.rs`)
+
+#### P1 -- Important (Cache + Routing)
+- [x] Distributed KV-cache partition with least-loaded assignment (`distributed_cache/partition.rs`)
+- [x] Block migration with staging IDs (`distributed_cache/migration.rs`)
+- [x] Three routing policies (RoundRobin / LeastLoaded / PrefixAffinity) (`router/policy.rs`)
+- [x] FNV-1a prefix hashing for affinity routing (`router/request.rs`)
+
+#### P2 -- Nice-to-Have (Scaling / Observability)
+- [x] Load-balance CV metric for MoE router (`expert_parallel/router.rs::load_balance_cv`)
+- [x] Medusa speculative decoding (`speculative/medusa.rs`) — Cai 2024: multiple decoding heads predicting k future tokens simultaneously with tree-structured candidate verification; `MedusaDecoder`
+- [x] Radix-tree prefix-sharing KV cache (`distributed_cache/radix_cache.rs`) — Zheng 2023 vLLM: radix-tree (trie) structure for sharing common prefix KV blocks across requests with LRU eviction; `RadixCache`
+- [x] FP8 inference quantisation (`quantisation/fp8_infer.rs`) — Micikevicius 2022: per-tensor E4M3/E5M2 scaling factors with delayed-scaling recipe for transformer weight + activation quantisation; `Fp8InferQuantiser`
+- [x] Disaggregated prefill-decode (`scheduler/disagg_pd.rs`) — Zhong 2024 SOSP/OSDI: separate prefill and decode worker pools with least-loaded assignment + planned KV-cache hand-off (`PrefillHandoff` block-count + worker pair feeds `BlockMigrator`); `DisaggPdScheduler`, `PdPhase`, `PdStats`. (KV-block *transfer execution* over the real interconnect is still hardware-gated; the scheduler plans it.)
+- [x] Per-policy router metrics with prefix hit-rate (`router/policy.rs::RouterMetrics`)
+- [x] Pipeline parallelism (PP) axis — *schedule generators & partition planner* (`pipeline_parallel/`): balanced + cost-aware layer→stage partition (`partition.rs::LayerPartition`); GPipe / 1F1B / interleaved-1F1B schedule generators with event-driven hazard verification + bubble accounting (`schedule.rs::PipelineSchedule`, `gpipe_schedule`, `one_f_one_b_schedule`, `interleaved_1f1b_schedule`). Pure CPU scheduling logic with exact oracles (`(p−1)/m` bubble, hazard-freeness). On-device execution of the stages still needs multi-GPU hardware.
+- [x] Collective-communication *step schedules* (`collective/`): ring all-reduce / reduce-scatter / all-gather (`ring.rs::RingCollective` + `execute_ring_*`, Baidu/NCCL ring) and recursive-halving all-reduce / recursive-doubling all-gather (`tree.rs`, MPICH). In-memory executors are bit-exact oracles for the schedule (sum / concatenation correctness). The PTX device kernels live in `ptx_kernels.rs`.
+- [x] Continuous (iteration-level) batching scheduler (`scheduler/continuous_batch.rs`) — Orca/vLLM: waiting/running queues, paged-KV block budget, priority+FCFS admission control, per-iteration decode advance, block-boundary growth, OOM preemption + requeue; `ContinuousBatcher`, `BatchPlan`, `SeqState`.
+- [x] Autonomous rebalancing trigger (`scheduler/rebalance.rs`) — `RebalanceMonitor` watches `CachePartition::utilization_imbalance()` and the MoE `load_balance_cv()`; on threshold crossing synthesises a conservation-checked `MigrationPlan` (ordered `MigrationMove`s) that strictly reduces the spread; `evaluate`, `evaluate_with_moe`, `apply_plan`.
+- [x] Elastic per-rank scaling planner (`scheduler/elastic.rs`) — `ElasticScaler` adds/removes a rank along an `ElasticAxis`, recomputes the TP×SP×EP grid + per-rank `RankCoordinates`, and emits an `ElasticPlan` (`ExpertMove`s + cache `MigrationMove`s) that conserves total expert + cache assignment; `plan_add_rank`, `plan_remove_rank`, `apply_cache_moves`. Planning only.
+- [ ] (P2) Real NCCL-equivalent collective backend — *executes* the ring/tree step schedules above over actual NVLink/PCIe (requires GPU/multi-GPU hardware)
+- [x] (P2) Dynamic rebalancing trigger on load imbalance (`scheduler/rebalance.rs::RebalanceMonitor` -- autonomous host-side trigger: `evaluate()` fires when `CachePartition::utilization_imbalance()` (added: `partition.rs::utilization_imbalance`) reaches a configurable threshold, then `build_plan()` greedily projects smallest-sequence hot→cold moves onto a working copy of the rank stats to synthesise a conservation-checked `MigrationPlan` that strictly reduces the spread; `evaluate_with_moe()` couples in the MoE `load_balance_cv()` signal; `apply_plan()` executes it via `CachePartition::apply_migration`. Tests: `skewed_partition_triggers_and_reduces_imbalance`, `balanced_partition_does_not_trigger`, `plan_conserves_total_blocks`, `plan_application_actually_levels_the_partition`.)
+
+## Dependencies
+
+| Dependency | Purpose | Pure Rust? |
+|------------|---------|------------|
+| thiserror | Error derive macros | Yes |
+
+(No CUDA crate deps -- `oxicuda-dist-infer` is a pure orchestration layer; collective kernels are emitted as PTX strings and executed by downstream callers via `oxicuda-driver`/`oxicuda-launch`. Real collectives require user-supplied NCCL-equivalent backend.)
+
+## Quality Status
+
+- Warnings: 0 (clippy clean, `-D warnings` across `--all-targets --all-features`)
+- Tests: 239 passing (was 209; +21 for `scheduler/rebalance.rs` autonomous-trigger / MoE-stress + `scheduler/elastic.rs` add/remove-rank planner, +3 for new `partition.rs` accessors)
+- unwrap() calls: 0 (production code; test helpers use `.unwrap()`/`.expect()` on infallible construction)
+- GPU tests behind `#[cfg(feature = "gpu-tests")]`
+- macOS: compiles, all CPU reference simulations work; runtime collective backend returns `UnsupportedPlatform`
+
+## Performance Targets
+
+| Operation | Target |
+|-----------|--------|
+| `tp_col_scatter_ptx` -- 4096-hidden scatter on tp=8 | >= 90% bandwidth-limited peak on sm_80+ |
+| `tp_row_all_reduce_ptx` -- 4096-hidden reduce on tp=8 | >= 80% of NCCL `ncclAllReduce` |
+| `sp_seq_chunk_copy_ptx` -- 4096-token chunk copy | >= 95% bandwidth-limited peak |
+| `ep_token_scatter_ptx` -- 256-token, 8-expert dispatch | >= 85% bandwidth-limited peak |
+| `CachePartition::assign` -- 1k sequences, 16 ranks | < 10 us per assignment |
+| `RoutingPolicy::route` -- PrefixAffinity, 1M-token cache | sub-microsecond lookup |
+
+## Architecture-Specific Deepening Opportunities
+
+### Ampere (sm_80 / sm_86 / sm_89)
+- [x] PTX header selection emits `.target sm_80` for cp.async-capable collective kernels
+- [ ] cp.async-driven cross-rank K/V boundary exchange (deferred -- requires multi-GPU NCCL bring-up)
+
+### Hopper (sm_90 / sm_90a)
+- [x] PTX header selection emits `.target sm_90`
+- [ ] TMA-driven multi-CTA all-reduce ring (deferred)
+- [ ] Warp-specialized MoE dispatch with overlapped compute/transfer (deferred)
+
+### NVLink / PCIe Bandwidth
+- All collective kernels are designed to interoperate with downstream NCCL or UCX backends -- no in-crate NIC code.
+- `CachePartition::rebalance_suggestions()` uses utilization-threshold heuristics that map directly to NVLink topology when available.
+
+## Deepening Opportunities
+
+### Verification Gaps
+- [x] TP roundtrip identity verified (column-parallel + all-gather + row-parallel + all-reduce)
+- [x] SP attention pipeline preserves uniform softmax output
+- [x] EP MoE dispatch + gather is round-trip identity for top-1 routing + identity experts
+- [x] PTX kernels validated for all 5 SM versions (sm_75 / sm_80 / sm_90 / sm_100 / sm_120)
+- [x] Prefix-affinity routing exhibits >0 hit rate after registration
+- [x] Ring all-reduce step schedule converges to the exact element-wise sum (`collective/ring.rs`); equals the row-parallel TP all-reduce oracle (`lib.rs::e2e_ring_all_reduce_matches_tp_all_reduce`)
+- [x] Recursive-halving all-reduce / recursive-doubling all-gather converge to the exact sum/concatenation (`collective/tree.rs`)
+- [x] 1F1B / GPipe / interleaved-1F1B schedules are hazard-free (event-driven simulator) with the analytic `2(p−1)` bubble; interleaving strictly shrinks the bubble (`pipeline_parallel/schedule.rs`)
+- [x] Continuous batcher never exceeds block capacity, frees blocks on finish, preempts on OOM, and reports impossible requests as a deadlock (`scheduler/continuous_batch.rs`)
+- [ ] Multi-rank end-to-end roundtrip on actual NVLink hardware (requires GPU/multi-GPU hardware -- single-process simulation only)
+- [x] Load-imbalance MoE stress (skewed expert load) verifies `load_balance_cv()` triggers rebalancing (`scheduler/rebalance.rs::tests::moe_skew_triggers_via_cv_signal` -- routes all 16 tokens to expert 0, asserts `expert_load == [16,0,0,0]` and `load_balance_cv ≈ 1.73`, then verifies `RebalanceMonitor::with_moe_cv_threshold` fires `moe_should_trigger()` and `evaluate_with_moe()` emits a non-empty imbalance-reducing plan; `balanced_moe_does_not_trigger_moe_signal` is the negative control.)
+
+### Implementation Deepening
+- [x] `RankCoordinates` 3-D tp/sp/ep decomposition with peer lookups
+- [x] `BoundaryExchange::local_attention` supports causal masking and GQA head indexing
+- [x] `ExpertDispatcher::dispatch_and_gather` accepts user-supplied expert closure
+- [x] `BlockMigrator` validates target rank before staging
+- [x] Pipeline parallelism (PP) axis -- partition planner + GPipe/1F1B/interleaved schedule generators with hazard verification & bubble accounting (`pipeline_parallel/`)
+- [x] Ring & tree collective *step-schedule* generators with in-memory bit-exact executors (`collective/`)
+- [x] Continuous (iteration-level) + disaggregated prefill/decode schedulers (`scheduler/`)
+- [ ] NCCL-equivalent collective backend that *executes* the step schedules on device (requires GPU/multi-GPU hardware + real cluster integration)
+- [x] Dynamic per-rank scaling -- elastic add/remove of ranks during serving (`scheduler/elastic.rs::ElasticScaler` -- host-side planner: `plan_add_rank()`/`plan_remove_rank()` recompute the TP×SP×EP grid by adjusting one `ElasticAxis` by ±1, validate every new rank's `RankCoordinates`, diff expert ownership into `ExpertMove`s via `expert_owners()` (contiguous EP-leader partition from `RankCoordinates::to_global`), and re-level/evacuate the cache into `MigrationMove`s with a fair-share greedy redistribution; the resulting `ElasticPlan` is verified to conserve total experts and total cache assignment (`RedistributionNotConserved` on violation). `apply_cache_moves()` executes the cache portion. Tests: `add_rank_conserves_and_levels_experts`, `remove_rank_redistributes_experts_without_loss`, `add_rank_cache_levels_onto_new_rank`, `remove_rank_evacuates_all_its_sequences`, `apply_cache_moves_executes_on_live_partition_scale_down`. Planning only -- no device sync.)
+
+## Notes
+
+- All collective implementations in this crate are *simulations* over in-process buffers. Real multi-GPU execution requires plugging in a NCCL-equivalent collective backend (planned for a future `oxicuda-collective` crate).
+- The PTX kernel strings are deployment-ready and exercise `.visible .entry`, `.target sm_*` headers, and ring-style partial-sum accumulation patterns.
+- No benchmark harness configured (no `criterion` dev-dep) -- the 27-variant `DistInferError` surface and simulation correctness are the primary verification targets.
+- Future integration with `oxicuda-infer` will expose distributed `ContinuousBatcher` via `RoutingDecision` + `CachePartition`.

@@ -1,0 +1,33 @@
+[package]
+name = "oximedia-mixer"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional audio mixer with automation for OxiMedia"
+keywords = ["audio", "mixer", "dsp", "sound", "multimedia"]
+categories = ["multimedia::audio"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-audio.workspace = true
+scirs2-core.workspace = true
+rayon.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

@@ -1,0 +1,47 @@
+[package]
+name = "oxinum-float"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Arbitrary-precision floats for OxiNum (FBig/DBig via dashu-float)"
+documentation = "https://docs.rs/oxinum-float"
+readme = "README.md"
+categories = ["mathematics", "algorithms"]
+keywords = ["bignum", "arbitrary-precision", "float", "cooljapan", "oxinum"]
+
+[features]
+default = []
+serde = ["dep:serde", "dashu-float/serde", "oxinum-int/serde"]
+num-traits = ["dep:num-traits"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+oxinum-core = { workspace = true }
+oxinum-int  = { workspace = true }
+dashu-float = { workspace = true }
+dashu-base  = { workspace = true }
+serde       = { workspace = true, optional = true }
+num-traits  = { workspace = true, optional = true }
+rayon       = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest        = { workspace = true }
+serde_json      = { workspace = true }
+criterion       = { workspace = true }
+oxinum-rational  = { path = "../oxinum-rational", features = ["num-traits"] }
+num-traits       = { workspace = true }
+
+[[bench]]
+name = "constants"
+harness = false
+
+[[bench]]
+name = "transcendentals"
+harness = false
+
+[[bench]]
+name = "alloc_profile"
+harness = false

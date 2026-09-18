@@ -1,0 +1,70 @@
+[package]
+name = "oximedia-distributed"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Distributed encoding coordinator for OxiMedia"
+keywords = ["workflow", "batch", "processing", "multimedia", "pipeline"]
+categories = ["multimedia", "algorithms"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+thiserror.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+
+# Internal dependencies
+oximedia-core.workspace = true
+oximedia-codec = { workspace = true, default-features = true }
+oximedia-io.workspace = true
+
+# gRPC and serialization
+tonic = { workspace = true }
+tonic-prost = "0.14"
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP dependencies for tonic
+http = { workspace = true }
+http-body-util = { workspace = true }
+tower = "0.5"
+hyper = { workspace = true }
+
+# Service discovery
+hickory-resolver = "0.26"
+
+# Time utilities
+chrono = { workspace = true }
+
+# Collections and utilities
+dashmap = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+
+# System information (Pure Rust — no external `cc`/C compilation, unlike sys-info)
+num_cpus = { workspace = true }
+hostname.workspace = true
+sysinfo = { workspace = true }
+
+[features]
+## Enable S3/object-storage integration for distributed segment I/O.
+s3 = []
+## Enable Kubernetes HPA auto-scaling hooks.
+k8s = []
+
+[build-dependencies]
+tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
+# Pure-Rust protobuf compiler (parses .proto files directly; no external
+# `protoc` binary required at build time — replaces protoc-based codegen).
+protox = { workspace = true }

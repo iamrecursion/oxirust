@@ -1,0 +1,146 @@
+[package]
+name = "scirs2-benchmarks"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description = "Comprehensive performance benchmarks for SciRS2 against SciPy"
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+keywords = ["benchmarking", "performance", "testing", "scientific", "scipy"]
+categories = ["development-tools::testing", "science"]
+
+[[bench]]
+name = "linalg_benchmarks"
+path = "linalg_benchmarks.rs"
+harness = false
+
+[[bench]]
+name = "scipy_comparison"
+path = "scipy_comparison.rs"
+harness = false
+
+[[bench]]
+name = "memory_efficiency"
+path = "memory_efficiency.rs"
+harness = false
+
+[[bench]]
+name = "numerical_stability"
+path = "numerical_stability.rs"
+harness = false
+
+# v0.2.0 Comprehensive Benchmark Suite
+[[bench]]
+name = "v020_comprehensive_suite"
+path = "v020_comprehensive_suite.rs"
+harness = false
+
+[[bench]]
+name = "v020_simd_comparison"
+path = "v020_simd_comparison.rs"
+harness = false
+
+[[bench]]
+name = "v020_gpu_comparison"
+path = "v020_gpu_comparison.rs"
+harness = false
+
+[[bench]]
+name = "v020_memory_profiling"
+path = "v020_memory_profiling.rs"
+harness = false
+
+[[bench]]
+name = "v020_scalability"
+path = "v020_scalability.rs"
+harness = false
+
+[[bench]]
+name = "v020_python_comparison"
+path = "v020_python_comparison.rs"
+harness = false
+
+# v0.3.0 Comprehensive Benchmark Suite
+[[bench]]
+name = "v030_comprehensive_suite"
+path = "v030_comprehensive_suite.rs"
+harness = false
+
+[[bench]]
+name = "v030_autograd_benchmarks"
+path = "v030_autograd_benchmarks.rs"
+harness = false
+
+[[bench]]
+name = "v030_series_benchmarks"
+path = "v030_series_benchmarks.rs"
+harness = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# SciRS2 modules
+scirs2-core = { workspace = true, features = ["parallel", "simd", "profiling", "memory_management", "serialization", "array", "random", "array_stats"] }
+scirs2-linalg = { workspace = true, features = ["simd", "parallel"] }
+scirs2-stats = { workspace = true }
+scirs2-fft = { workspace = true, features = ["oxifft"] }
+scirs2-integrate = { workspace = true }
+scirs2-cluster = { workspace = true }
+scirs2-signal = { workspace = true }
+scirs2-special = { workspace = true }
+scirs2-neural = { workspace = true }
+scirs2-autograd = { workspace = true }
+scirs2-optimize = { workspace = true }
+scirs2-series = { workspace = true }
+scirs2-metrics = { workspace = true }
+
+# Benchmarking framework
+criterion = { workspace = true, features = ["html_reports"] }
+
+# Array operations
+ndarray = { workspace = true, default-features = false }
+# `default-features` is intentionally not overridden here: the workspace entries
+# for ndarray-rand / ndarray-stats do not pin `default-features`, so a member
+# override is ignored by Cargo (and warns).  Inherit the workspace defaults.
+ndarray-rand = { workspace = true }
+ndarray-stats = { workspace = true }
+
+# Parallel processing
+rayon = { workspace = true }
+
+# Serialization for results
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Memory profiling
+sysinfo = { workspace = true }
+
+# GPU backends (optional)
+wgpu = { workspace = true, optional = true }
+
+# Platform-specific GPU backends
+[target.'cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))'.dependencies]
+cudarc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { workspace = true, optional = true }
+
+# Optional Python integration for comparison
+pyo3 = { workspace = true, optional = true }
+
+# SIMD
+wide = { workspace = true }
+
+[features]
+default = []
+python-comparison = ["pyo3"]
+gpu = ["cudarc", "wgpu", "metal"]
+cuda = ["cudarc"]
+wgpu-backend = ["wgpu"]
+metal-backend = ["metal"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

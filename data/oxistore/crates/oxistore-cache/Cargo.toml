@@ -1,0 +1,37 @@
+[package]
+name = "oxistore-cache"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiStore cache eviction primitives: Pure-Rust LRU and full ARC (Adaptive Replacement Cache)"
+categories = ["algorithms", "data-structures"]
+keywords = ["lru", "arc", "cache", "eviction", "cooljapan"]
+
+[features]
+default = []
+cache = []
+## Enables `get_or_insert_async_tokio` helper (tokio-based async mutex variant).
+async-helpers = ["dep:tokio"]
+blob = ["dep:oxistore-blob", "dep:bytes", "dep:async-trait", "dep:tokio"]
+## Enables `ColumnarRowGroupCache` — caches hot Parquet row groups from oxistore-columnar.
+columnar = ["dep:oxistore-columnar", "dep:arrow", "dep:parquet"]
+
+[dependencies]
+hashlink = { workspace = true }
+oxistore-core = { workspace = true }
+ahash = { workspace = true }
+oxistore-blob = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+oxistore-columnar = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

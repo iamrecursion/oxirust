@@ -1,0 +1,30 @@
+[package]
+name = "oxixml-fn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "W3C XPath/XQuery Functions and Operators library."
+keywords = ["xpath", "xquery", "xml", "functions", "xdm"]
+categories = ["parser-implementations", "text-processing", "data-structures"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-xsd = { workspace = true }
+oxixml-text = { workspace = true }
+oxixml-regex = { workspace = true }
+oxixml-infoset = { workspace = true }
+oxixml-iri = { workspace = true }
+oxixml-qname = { workspace = true }
+oxixml-unicode = { workspace = true }
+
+[lints]
+workspace = true

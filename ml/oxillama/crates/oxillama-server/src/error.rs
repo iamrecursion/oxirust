@@ -1,0 +1,278 @@
+//! Error types for the HTTP API server.
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use thiserror::Error;
+
+/// Result type alias for server operations.
+pub type ServerResult<T> = Result<T, ServerError>;
+
+/// Errors that can occur in the API server.
+#[derive(Error, Debug)]
+pub enum ServerError {
+    /// Failed to bind to the specified address.
+    #[error("failed to bind to {addr}: {source}")]
+    BindError {
+        /// The address that failed to bind.
+        addr: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// Error from the inference runtime.
+    #[error("runtime error: {0}")]
+    Runtime(#[from] oxillama_runtime::RuntimeError),
+
+    /// JSON serialization/deserialization error.
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    /// Invalid request parameters.
+    #[error("invalid request: {message}")]
+    InvalidRequest {
+        /// Description of what was wrong.
+        message: String,
+    },
+
+    /// Model is not ready for inference.
+    #[error("model not ready")]
+    ModelNotReady,
+
+    /// The inference request queue is full; the server is overloaded.
+    #[error("inference queue is full — server overloaded")]
+    QueueFull,
+
+    /// The inference worker has exited; no new requests can be processed.
+    #[error("inference worker is no longer running")]
+    WorkerDead,
+
+    /// Thread not found in the persistent store.
+    #[error("thread not found: {0}")]
+    ThreadNotFound(String),
+
+    /// Run not found in the persistent store.
+    #[error("run not found: {0}")]
+    RunNotFound(String),
+
+    /// Attempted to transition a run that is already in a terminal state.
+    #[error("run is in terminal state: {0}")]
+    RunInTerminalState(String),
+
+    /// File not found in the persistent files store.
+    #[error("file not found: {0}")]
+    FileNotFound(String),
+
+    /// Uploaded file exceeds the maximum allowed size.
+    #[error("file too large: {0}")]
+    FileTooLarge(String),
+
+    /// Generic file store error.
+    #[error("file store error: {0}")]
+    FileStoreError(String),
+
+    /// Run step not found in the persistent store.
+    #[error("run step not found: {0}")]
+    RunStepNotFound(String),
+
+    /// Generic I/O error with context.
+    #[error("I/O error ({context}): {source}")]
+    IoError {
+        /// Human-readable context describing what operation failed.
+        context: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// Response not found in the in-memory responses store.
+    #[error("response {0} not found")]
+    ResponseNotFound(String),
+
+    /// Previous response not found when chaining with `previous_response_id`.
+    #[error("previous response {0} not found")]
+    PreviousResponseNotFound(String),
+
+    /// Admin listener is bound to a non-loopback address without a bearer
+    /// token configured. Refusing to start rather than serving an
+    /// unauthenticated admin API to the network.
+    #[error("admin listen address '{0}' is non-loopback but no admin bearer_token is configured")]
+    InsecureAdminBinding(String),
+}
+
+impl IntoResponse for ServerError {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            ServerError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
+            ServerError::ModelNotReady => StatusCode::SERVICE_UNAVAILABLE,
+            ServerError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
+            ServerError::WorkerDead => StatusCode::SERVICE_UNAVAILABLE,
+            ServerError::ThreadNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::RunNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::RunInTerminalState(_) => StatusCode::CONFLICT,
+            ServerError::FileNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::FileTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::FileStoreError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::RunStepNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::ResponseNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::PreviousResponseNotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        let error_type = match &self {
+            ServerError::InvalidRequest { .. } => "invalid_request_error",
+            ServerError::ModelNotReady => "service_unavailable",
+            ServerError::QueueFull => "rate_limit_error",
+            ServerError::WorkerDead => "service_unavailable",
+            ServerError::ThreadNotFound(_) => "not_found_error",
+            ServerError::RunNotFound(_) => "not_found_error",
+            ServerError::RunInTerminalState(_) => "conflict_error",
+            ServerError::FileNotFound(_) => "not_found_error",
+            ServerError::FileTooLarge(_) => "payload_too_large",
+            ServerError::FileStoreError(_) => "internal_error",
+            ServerError::RunStepNotFound(_) => "not_found_error",
+            ServerError::ResponseNotFound(_) => "not_found_error",
+            ServerError::PreviousResponseNotFound(_) => "not_found_error",
+            _ => "internal_error",
+        };
+
+        let body = serde_json::json!({
+            "error": {
+                "message": self.to_string(),
+                "type": error_type,
+            }
+        });
+
+        let mut response = (status, axum::Json(body)).into_response();
+        if matches!(self, ServerError::QueueFull) {
+            response
+                .headers_mut()
+                .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+        }
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    fn status_of(err: ServerError) -> StatusCode {
+        let resp = err.into_response();
+        resp.status()
+    }
+
+    #[test]
+    fn test_invalid_request_returns_400() {
+        let err = ServerError::InvalidRequest {
+            message: "bad param".to_string(),
+        };
+        assert_eq!(status_of(err), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_model_not_ready_returns_503() {
+        assert_eq!(
+            status_of(ServerError::ModelNotReady),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_queue_full_returns_429() {
+        assert_eq!(
+            status_of(ServerError::QueueFull),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn test_worker_dead_returns_503() {
+        assert_eq!(
+            status_of(ServerError::WorkerDead),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_serialization_error_returns_500() {
+        // Construct a serde_json::Error via invalid JSON parsing.
+        let json_err = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("parsing invalid JSON should fail");
+        let err = ServerError::Serialization(json_err);
+        assert_eq!(status_of(err), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_error_display_invalid_request() {
+        let err = ServerError::InvalidRequest {
+            message: "missing field".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing field"),
+            "display should contain message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_error_display_model_not_ready() {
+        let msg = ServerError::ModelNotReady.to_string();
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_error_display_queue_full() {
+        let msg = ServerError::QueueFull.to_string();
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_error_display_worker_dead() {
+        let msg = ServerError::WorkerDead.to_string();
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_thread_not_found_returns_404() {
+        assert_eq!(
+            status_of(ServerError::ThreadNotFound("thread_xyz".into())),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_run_not_found_returns_404() {
+        assert_eq!(
+            status_of(ServerError::RunNotFound("run_xyz".into())),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_run_in_terminal_state_returns_409() {
+        assert_eq!(
+            status_of(ServerError::RunInTerminalState(
+                "run_xyz is completed".into()
+            )),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn test_queue_full_carries_retry_after_header() {
+        let resp = ServerError::QueueFull.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("retry-after").map(|v| v.to_str().ok()),
+            Some(Some("1"))
+        );
+    }
+
+    #[test]
+    fn test_insecure_admin_binding_returns_500() {
+        assert_eq!(
+            status_of(ServerError::InsecureAdminBinding("0.0.0.0:8080".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}

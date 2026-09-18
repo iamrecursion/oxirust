@@ -1,0 +1,244 @@
+[package]
+name = "oxirs-fuseki"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SPARQL 1.1/1.2 HTTP protocol server with Fuseki-compatible configuration"
+keywords = ["sparql", "http-server", "fuseki", "rdf-server", "semantic-web"]
+categories = ["web-programming", "database", "network-programming"]
+readme = "README.md"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Core dependencies
+# `gpu` ungates `scirs2_core::gpu` (pure Rust, no extra deps), used unconditionally by
+# `src/gpu_kg_embeddings.rs`. It was previously enabled transitively via
+# oxirs-arq -> scirs2-optimize; declare it explicitly now that scirs2-optimize is gone.
+scirs2-core = { workspace = true, features = ["gpu"] }
+oxirs-core.workspace = true
+oxirs-arq.workspace = true
+oxirs-shacl.workspace = true
+# On-disk TDB2 backend (durable B+Tree persistence + named-graph quad support).
+# Wired in behind the `oxirs_core::Store` trait via `store::tdb_adapter`, so a
+# dataset configured as `StoreType::TDB2` / `dataset_type = "tdb2"` persists to
+# disk. Pure Rust by default (no C-FFI).
+oxirs-tdb.workspace = true
+
+# HTTP server framework
+tokio = { workspace = true, features = ["full"] }
+axum = { workspace = true, features = ["ws", "multipart"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
+tower = { workspace = true, features = ["timeout", "load-shed", "buffer"] }
+tower-http = { workspace = true, features = ["cors", "trace", "timeout", "compression-gzip", "compression-br", "request-id", "sensitive-headers"] }
+
+# TLS/SSL support
+# `rustls` is non-optional so the process-default Pure Rust crypto provider can be
+# installed at startup (needed by reqwest/OAuth even when the `tls` feature is off).
+# `oxitls` supplies that provider.
+rustls = { workspace = true }
+oxitls.workspace = true
+rustls-pemfile = { workspace = true, optional = true }
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
+
+# CLI and configuration
+clap = { workspace = true, features = ["derive", "env"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+config.workspace = true
+figment = { version = "0.10", features = ["toml", "yaml", "env"] }
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Hashing
+md5.workspace = true
+
+# Logging and tracing
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "json", "chrono"] }
+
+# Authentication and security
+uuid.workspace = true
+argon2.workspace = true
+jsonwebtoken = { workspace = true, optional = true }
+bcrypt = { version = "0.19", optional = true }
+sha2.workspace = true
+base64.workspace = true
+
+# Pure-Rust cryptography (replaces `ring` per COOLJAPAN Pure Rust policy)
+oxicrypto-mac.workspace = true
+oxicrypto-hash.workspace = true
+oxicrypto-rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+# Pure-Rust X.509 certificate-chain signature verification (client-cert / mTLS
+# auth path). The `x509-parser` `verify` feature pulls in `ring` (C/assembly),
+# which the COOLJAPAN Pure Rust policy forbids, so signature verification is
+# implemented in-tree (`auth/cert_verify.rs`) on top of these RustCrypto crates.
+rsa = { workspace = true }
+p256 = { workspace = true }
+
+# SAML 2.0 pure-Rust XML parsing (optional). SAML signature verification reuses
+# the base `rsa` dependency declared above (also used for X.509 cert verify).
+quick-xml = { workspace = true, optional = true }
+
+# Time and dates
+chrono.workspace = true
+
+# Metrics and monitoring
+prometheus = { workspace = true, optional = true }
+metrics.workspace = true
+
+# Caching
+lru.workspace = true
+moka.workspace = true
+# Tantivy full-text search engine (optional — gated behind `full-text-search`).
+# Pulls C `zstd-sys` transitively, so it is NOT enabled by default per the
+# COOLJAPAN Pure Rust default policy. The default build uses the pure-Rust
+# `SimpleTextIndex` fallback in `src/search/text_index.rs`.
+tantivy = { workspace = true, optional = true }
+
+# Rate limiting and concurrent data structures
+governor.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+
+# Streaming
+bytes = { workspace = true }
+oxiarc-brotli.workspace = true  # Pure-Rust Brotli (replaces `brotli` per COOLJAPAN policy)
+
+# Validation
+validator = { version = "0.20", features = ["derive"] }
+
+# Random number generation
+# rand functionality now provided by scirs2-core (use scirs2_core::random)
+
+# Regular expressions for query validation
+regex.workspace = true
+
+# Serialization and encoding
+oxicode.workspace = true  # Replaces bincode per COOLJAPAN Policy
+hex.workspace = true
+
+# API surface tracking (syn/quote for AST parsing in api_surface.rs and api_snapshot bin)
+syn = { workspace = true }
+quote = { workspace = true }
+
+# Additional dependencies for MFA and authentication
+base32 = "0.5"
+qrcode = "0.14"
+hmac.workspace = true
+sha1.workspace = true
+oxiarc-deflate.workspace = true  # Pure-Rust DEFLATE/gzip/zlib (replaces `flate2` per COOLJAPAN policy)
+
+# OAuth2 and HTTP client
+reqwest = { workspace = true }
+percent-encoding = "2.3"
+url.workspace = true
+
+# HTTP date handling for static assets
+httpdate = "1.0"
+
+# SAML security (optional)
+# xmlsec has compatibility issues with newer OpenSSL - disabled for now
+# samael = { version = "0.0.19", optional = true, default-features = false }
+
+# System utilities
+sysinfo.workspace = true  # System monitoring
+
+# Kubernetes operator support (optional)
+kube = { workspace = true, default-features = false, features = ["rustls-tls"], optional = true }
+k8s-openapi = { workspace = true, optional = true }
+schemars = { version = "1.2", optional = true }
+
+# Async utilities
+futures.workspace = true
+futures-util.workspace = true
+tokio-stream.workspace = true
+async-trait.workspace = true
+
+# GraphQL
+async-graphql.workspace = true
+# oxirs-gql: RDF-vocabulary-driven GraphQL schema auto-generation (juniper-based,
+# independent of the async-graphql catalog schema in graphql_integration.rs).
+oxirs-gql.workspace = true
+
+# OpenAPI
+utoipa = { version = "5.5", features = ["chrono"] }
+
+# DNS resolution for service discovery (migrated from trust-dns to hickory-dns)
+hickory-resolver = "0.26.1"
+
+# X.509 certificate parsing for client authentication
+x509-parser = "0.18"
+
+# Certificate generation for self-signed certs (optional)
+rcgen = { workspace = true, optional = true }
+
+# File watching for hot reload
+notify = { version = "8.2", optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+axum-test = "21"
+http = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+tempfile.workspace = true
+# X.509 test-certificate generation for auth/cert_verify.rs signature-verification
+# regression tests (dev-only; not shipped).
+rcgen = { workspace = true }
+
+[features]
+default = ["metrics", "auth"]
+# fips: marker feature for FIPS 140-2 validated cryptographic operations.
+# NOT included in default — must be explicitly enabled.
+# When this flag is set, application code in the FIPS boundary (TLS
+# termination, JWT signing, OAuth token validation) must only invoke primitives
+# that are FIPS 140-2 validated (AES-GCM, ECDSA P-256/P-384, RSA, HMAC-SHA-2,
+# SHA-2). See docs/policies/fips-boundary.md (RFC-003).
+fips = []
+metrics = ["prometheus"]
+auth = ["jsonwebtoken", "bcrypt"]
+# Marker features: they gate routes/handlers in src (e.g. src/server/types.rs) that are
+# implemented with in-tree pure-Rust code, so no external dependency is required.
+admin-ui = []
+rate-limit = []
+tls = ["rustls-pemfile", "axum-server"]
+hot-reload = ["notify"]
+ldap = []
+saml = ["dep:quick-xml"]  # SAML authentication support via pure-Rust XML parsing (rsa is now a base dependency for X.509 cert verification)
+# Tantivy-backed full-text search (`TantivyTextIndex`). NOT in default: Tantivy
+# pulls C `zstd-sys`, violating the COOLJAPAN Pure Rust default policy. Without
+# this feature the server falls back to the pure-Rust `SimpleTextIndex`.
+# Fuseki has its own Tantivy index and does not depend on oxirs-tdb, so it only
+# needs `dep:tantivy`; the `oxirs-tdb/full-text-search` gate is propagated by the
+# `oxirs` CLI's `text` feature (which depends on both crates).
+full-text-search = ["dep:tantivy"]
+development = ["admin-ui"]
+production = ["metrics", "auth", "rate-limit", "tls", "ldap"]
+k8s = ["kube", "k8s-openapi", "schemars"]  # Kubernetes operator support
+acme = ["rcgen"]  # ACME/Let's Encrypt certificate automation
+memory_management = []  # SciRS2-Core advanced memory leak detection
+
+[package.metadata.docs.rs]
+# Exclude features requiring system libraries not available on docs.rs
+features = ["metrics", "auth", "admin-ui", "rate-limit", "tls", "hot-reload", "acme"]
+# Exclude: ldap (marker feature), k8s (kube/k8s-openapi)
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bin]]
+name = "oxirs-fuseki"
+path = "src/main.rs"
+
+[[bin]]
+name = "fuseki_api_snapshot"
+path = "src/bin/api_snapshot.rs"
+

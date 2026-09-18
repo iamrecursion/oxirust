@@ -1,0 +1,57 @@
+[package]
+name = "legalis-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Statute registry and version management for Legalis-RS"
+categories = ["database", "caching", "data-structures"]
+keywords = ["legalis", "registry", "versioning", "statute", "fuzzy-search"]
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/legalis-registry"
+
+[dependencies]
+legalis-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+indexmap.workspace = true
+lru.workspace = true
+fuzzy-matcher.workspace = true
+serde_yaml = { workspace = true, optional = true }
+csv = { workspace = true, optional = true }
+oxiarc-deflate = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+async-stream = { version = "0.3", optional = true }
+quick-xml = { workspace = true, optional = true }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres", "chrono", "uuid", "json"], optional = true }
+async-graphql = { workspace = true, optional = true }
+async-graphql-axum = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+sha2.workspace = true
+hex.workspace = true
+
+[features]
+default = []
+async = ["tokio", "futures", "async-stream", "async-trait"]
+akoma-ntoso = ["quick-xml"]
+yaml = ["serde_yaml"]
+csv-export = ["csv"]
+compression = ["oxiarc-deflate"]
+sqlite = ["sqlx", "async", "tokio/rt-multi-thread", "async-trait"]
+postgres = ["sqlx", "async", "tokio/rt-multi-thread", "async-trait"]
+graphql = ["async-graphql", "async-graphql-axum", "async"]
+all-backends = ["sqlite", "postgres"]
+all-formats = ["yaml", "csv-export", "compression", "akoma-ntoso"]
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tokio-test.workspace = true
+
+[[bench]]
+name = "registry_benchmarks"
+harness = false

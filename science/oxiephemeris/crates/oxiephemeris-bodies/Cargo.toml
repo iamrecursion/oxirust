@@ -1,0 +1,33 @@
+[package]
+name = "oxiephemeris-bodies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: IAU 2006 precession/2000A nutation and the apparent-place pipeline (light-time, aberration, deflection) for solar-system bodies and fixed stars"
+keywords = ["ephemeris", "astronomy", "precession", "nutation"]
+categories = ["science", "no-std"]
+
+[features]
+default = []
+# Enables `std`-only conveniences. The crate is `#![no_std]` when this
+# feature is disabled; all float math goes through `libm`.
+std = ["oxiephemeris-core/std", "oxiephemeris-de/std"]
+
+[dependencies]
+libm.workspace = true
+oxiephemeris-core.workspace = true
+oxiephemeris-de.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

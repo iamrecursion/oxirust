@@ -1,0 +1,28 @@
+[package]
+name = "oxixml-xsd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XSD 1.1 datatypes with facets and canonical forms (replaces oxsdatatypes)."
+keywords = ["xsd", "datatype", "xml", "decimal", "datetime"]
+categories = [
+    "data-structures",
+    "parser-implementations",
+    "date-and-time",
+    "encoding",
+    "value-formatting",
+]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[lints]
+workspace = true

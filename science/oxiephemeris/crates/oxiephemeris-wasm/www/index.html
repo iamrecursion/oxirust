@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OxiEphemeris — in-browser astrology</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1a1a1a; --bg:#fafafa; --muted:#666; --line:#ddd; --accent:#6b3fa0; --card:#fff; }
+  @media (prefers-color-scheme: dark){ :root{ --fg:#e8e8e8; --bg:#141414; --muted:#999; --line:#333; --accent:#b98fe0; --card:#1e1e1e; } }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 1.5rem; max-width: 960px; margin-inline: auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); margin: 0 0 1.5rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+  label { display: block; font-size: .8rem; color: var(--muted); margin-bottom: .2rem; }
+  input, select { width: 100%; padding: .5rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .75rem; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: .6rem 1.2rem; font: inherit; font-weight: 600; cursor: pointer; margin-top: 1rem; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; }
+  .R { color: #d1495b; font-weight: 700; }
+  pre { overflow-x: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: .75rem; font-size: .8rem; max-height: 320px; }
+  .status { color: var(--muted); font-size: .85rem; }
+  .err { color: #d1495b; }
+  .pills { display: flex; gap: .5rem; flex-wrap: wrap; margin: .5rem 0 0; }
+  .pill { background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: .15rem .6rem; font-size: .8rem; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>OxiEphemeris</h1>
+<p class="sub">A full Western-astrology chart engine running entirely in your browser — no server, no upload. WebAssembly (Pure Rust), computing signs, houses, aspects, dignities and Linked Open Data from a JPL DE ephemeris.</p>
+
+<div class="card">
+  <label for="de">JPL DE ephemeris file (e.g. <code>de440/linux_p1550p2650.440</code>)</label>
+  <input type="file" id="de" />
+  <p class="status" id="destatus">The file stays in your browser; it is never sent anywhere.</p>
+</div>
+
+<div class="card">
+  <div class="grid">
+    <div><label for="date">Date/time (UTC, ISO 8601)</label><input id="date" value="1970-01-01T00:00:00Z" /></div>
+    <div><label for="lat">Latitude (°N)</label><input id="lat" type="number" step="any" value="51.4779" /></div>
+    <div><label for="lon">Longitude (°E)</label><input id="lon" type="number" step="any" value="0.0" /></div>
+    <div><label for="system">House system</label>
+      <select id="system">
+        <option>placidus</option><option>koch</option><option>whole-sign</option>
+        <option>equal</option><option>porphyry</option><option>regiomontanus</option><option>campanus</option>
+      </select>
+    </div>
+    <div><label for="sidereal">Zodiac</label>
+      <select id="sidereal">
+        <option value="">tropical</option><option value="lahiri">sidereal (Lahiri)</option>
+        <option value="fagan-bradley">sidereal (Fagan/Bradley)</option>
+        <option value="krishnamurti">sidereal (KP)</option><option value="raman">sidereal (Raman)</option>
+      </select>
+    </div>
+  </div>
+  <button id="go" disabled>Compute chart</button>
+  <span class="status" id="status">Loading WebAssembly…</span>
+</div>
+
+<div class="card hidden" id="result">
+  <div class="pills" id="summary"></div>
+  <table>
+    <thead><tr><th>Body</th><th>Position</th><th></th><th>House</th><th>Decl.</th></tr></thead>
+    <tbody id="bodies"></tbody>
+  </table>
+  <h3 style="margin-bottom:.4rem">Aspects</h3>
+  <table><tbody id="aspects"></tbody></table>
+  <h3 style="margin-bottom:.4rem">Linked Open Data (Turtle)</h3>
+  <pre id="turtle"></pre>
+</div>
+
+<script type="module">
+import init, { natal_json, natal_turtle } from '../pkg/oxiephemeris_wasm.js';
+
+const $ = (id) => document.getElementById(id);
+let deBytes = null;
+
+const status = $('status');
+try {
+  await init();
+  status.textContent = 'Ready. Choose a DE file to enable computing.';
+} catch (e) {
+  status.textContent = 'Failed to load WebAssembly: ' + e;
+  status.className = 'status err';
+}
+
+$('de').addEventListener('change', async (ev) => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  deBytes = new Uint8Array(await file.arrayBuffer());
+  $('destatus').textContent = `Loaded ${file.name} (${(deBytes.length/1e6).toFixed(1)} MB).`;
+  $('go').disabled = false;
+});
+
+function fmtDeg(d) {
+  const dd = Math.floor(d), mm = Math.floor((d - dd) * 60), ss = Math.round((((d - dd)*60) - mm)*60);
+  return `${dd}°${String(mm).padStart(2,'0')}'${String(ss).padStart(2,'0')}"`;
+}
+
+$('go').addEventListener('click', () => {
+  if (!deBytes) return;
+  const req = {
+    date: $('date').value, lat: parseFloat($('lat').value), lon: parseFloat($('lon').value),
+    system: $('system').value,
+  };
+  const sid = $('sidereal').value;
+  if (sid) req.sidereal = sid;
+  try {
+    const chart = JSON.parse(natal_json(deBytes, JSON.stringify(req)));
+    const turtle = natal_turtle(deBytes, JSON.stringify(req), undefined);
+    render(chart, turtle);
+    status.textContent = 'Computed in-browser.';
+    status.className = 'status';
+  } catch (e) {
+    status.textContent = 'Error: ' + e;
+    status.className = 'status err';
+  }
+});
+
+function render(chart, turtle) {
+  $('result').classList.remove('hidden');
+  const d = chart.distribution;
+  $('summary').innerHTML = [
+    `<span class="pill">${chart.sect}</span>`,
+    `<span class="pill">Fire ${d.fire} · Earth ${d.earth} · Air ${d.air} · Water ${d.water}</span>`,
+    `<span class="pill">Cardinal ${d.cardinal} · Fixed ${d.fixed} · Mutable ${d.mutable}</span>`,
+    chart.sidereal ? `<span class="pill">sidereal: ${chart.sidereal} (${chart.ayanamsha_deg.toFixed(3)}°)</span>` : `<span class="pill">tropical</span>`,
+  ].join('');
+
+  $('bodies').innerHTML = chart.bodies.map(b => `
+    <tr>
+      <td>${b.body}</td>
+      <td>${fmtDeg(b.sign_degrees)} ${b.sign}</td>
+      <td class="${b.retrograde ? 'R' : ''}">${b.retrograde ? 'R' : ''}</td>
+      <td>${b.house}</td>
+      <td>${b.declination_deg.toFixed(2)}°</td>
+    </tr>`).join('');
+
+  $('aspects').innerHTML = chart.aspects.map(a => `
+    <tr>
+      <td>${a.body1}</td><td>${a.aspect}</td><td>${a.body2}</td>
+      <td style="text-align:right">${a.offset_deg.toFixed(2)}°</td>
+      <td>${a.applying ? 'applying' : 'separating'}</td>
+    </tr>`).join('');
+
+  $('turtle').textContent = turtle;
+}
+</script>
+</body>
+</html>

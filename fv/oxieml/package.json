@@ -1,0 +1,34 @@
+{
+  "name": "@cool-japan/oxieml",
+  "version": "0.1.4",
+  "description": "OxiEML symbolic regression — WASM bindings for browser and Node.js",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cool-japan/oxieml"
+  },
+  "homepage": "https://github.com/cool-japan/oxieml",
+  "keywords": [
+    "symbolic-regression",
+    "elementary-functions",
+    "eml",
+    "wasm",
+    "webassembly"
+  ],
+  "files": [
+    "pkg/"
+  ],
+  "main": "pkg/oxieml.js",
+  "types": "pkg/oxieml.d.ts",
+  "scripts": {
+    "build": "wasm-pack build --target bundler --out-dir pkg --features wasm --no-default-features",
+    "build:node": "wasm-pack build --target nodejs --out-dir pkg-node --features wasm --no-default-features",
+    "build:web": "wasm-pack build --target web --out-dir pkg-web --features wasm --no-default-features",
+    "build:no-modules": "wasm-pack build --target no-modules --out-dir pkg-no-modules --features wasm --no-default-features",
+    "test:wasm": "wasm-pack test --node",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "wasm-pack": "^0.13.1"
+  }
+}

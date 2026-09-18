@@ -1,0 +1,19 @@
+# Cargo configuration for WASM builds
+
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+# Use LLD linker for faster WASM builds
+rustflags = [
+    "-C", "link-arg=-zstack-size=1048576",  # 1MB stack size
+    "--cfg=getrandom_backend=\"wasm_js\"",   # Enable WASM backend for getrandom
+    # Uncomment for SIMD support (requires wasm32-simd128 target)
+    # "-C", "target-feature=+simd128",
+]
+
+# WASM-specific aliases
+[alias]
+wasm-build = "build --target wasm32-unknown-unknown"
+wasm-build-release = "build --target wasm32-unknown-unknown --release"
+wasm-test = "test --target wasm32-unknown-unknown"

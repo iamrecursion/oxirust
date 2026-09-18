@@ -1,0 +1,108 @@
+[package]
+name = "amaters-core"
+description = "Core kernel for AmateRS - Fully Homomorphic Encrypted Database"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["fhe", "database", "encryption", "privacy", "tfhe"]
+categories = ["cryptography", "database-implementations", "algorithms"]
+
+[dependencies]
+# FHE
+tfhe = { workspace = true, features = ["boolean", "shortint", "integer"], optional = true }
+
+# Async
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "io-util", "sync"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+rkyv = { workspace = true }
+oxicode = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Collections
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# Parallelism
+rayon = { workspace = true, optional = true }
+crossbeam = { workspace = true }
+
+# Utilities
+bytemuck = { workspace = true }
+memmap2 = { workspace = true, optional = true }
+crc32fast = { workspace = true }
+oxiarc-lz4 = { workspace = true }
+oxiarc-deflate = { workspace = true }
+blake3 = { workspace = true }
+siphasher = { workspace = true }
+num_cpus = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Serialization (for backup metadata)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# OpenTelemetry (feature-gated)
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+approx = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+criterion = { workspace = true }
+
+[features]
+default = ["storage", "compute"]
+storage = []
+compute = ["tfhe"]
+parallel = ["rayon"]
+mmap = ["memmap2"]
+gpu = []
+cuda = ["gpu"]
+metal = ["gpu"]
+telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:tracing-opentelemetry", "dep:tracing-subscriber"]
+io-uring = ["dep:tokio-uring"]
+
+[lib]
+name = "amaters_core"
+path = "src/lib.rs"
+
+[[bench]]
+name = "core_bench"
+harness = false
+
+[[bench]]
+name = "storage_bench"
+harness = false
+
+[[bench]]
+name = "fhe_benchmarks"
+harness = false
+required-features = ["compute"]
+
+[lints]
+workspace = true

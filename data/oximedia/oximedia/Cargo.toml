@@ -1,0 +1,712 @@
+[package]
+name = "oximedia"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Patent-free multimedia framework for Rust"
+readme = "README.md"
+categories = ["multimedia::video", "multimedia::audio", "multimedia::encoding", "multimedia::images"]
+keywords = ["multimedia", "video", "audio", "codec", "media"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Always-on core crates
+oximedia-core.workspace = true
+oximedia-io.workspace = true
+oximedia-container.workspace = true
+oximedia-cv.workspace = true
+
+# Optional feature-gated crates
+oximedia-audio = { workspace = true, optional = true }
+oximedia-codec = { workspace = true, optional = true }
+oximedia-graph = { workspace = true, optional = true }
+oximedia-effects = { workspace = true, optional = true }
+oximedia-net = { workspace = true, optional = true }
+oximedia-metering = { workspace = true, optional = true }
+oximedia-normalize = { workspace = true, optional = true }
+oximedia-quality = { workspace = true, optional = true }
+oximedia-metadata = { workspace = true, optional = true }
+oximedia-timecode = { workspace = true, optional = true }
+oximedia-workflow = { workspace = true, optional = true, features = ["sqlite"] }
+oximedia-batch = { workspace = true, optional = true }
+oximedia-monitor = { workspace = true, optional = true }
+oximedia-lut = { workspace = true, optional = true }
+oximedia-colormgmt = { workspace = true, optional = true }
+oximedia-transcode = { workspace = true, optional = true }
+oximedia-subtitle = { workspace = true, optional = true }
+oximedia-captions = { workspace = true, optional = true }
+oximedia-archive = { workspace = true, optional = true }
+oximedia-dedup = { workspace = true, optional = true, features = ["sqlite"] }
+oximedia-search = { workspace = true, optional = true }
+oximedia-mam = { workspace = true, optional = true }
+oximedia-scene = { workspace = true, optional = true }
+oximedia-shots = { workspace = true, optional = true }
+oximedia-scopes = { workspace = true, optional = true }
+oximedia-vfx = { workspace = true, optional = true }
+oximedia-image = { workspace = true, optional = true }
+oximedia-watermark = { workspace = true, optional = true }
+oximedia-mir = { workspace = true, optional = true }
+oximedia-recommend = { workspace = true, optional = true }
+oximedia-playlist = { workspace = true, optional = true }
+oximedia-playout = { workspace = true, optional = true }
+oximedia-rights = { workspace = true, optional = true }
+oximedia-review = { workspace = true, optional = true }
+oximedia-restore = { workspace = true, optional = true }
+oximedia-repair = { workspace = true, optional = true }
+oximedia-multicam = { workspace = true, optional = true }
+oximedia-stabilize = { workspace = true, optional = true }
+oximedia-cloud = { workspace = true, optional = true }
+oximedia-edl = { workspace = true, optional = true }
+oximedia-ndi = { workspace = true, optional = true }
+oximedia-imf = { workspace = true, optional = true }
+oximedia-aaf = { workspace = true, optional = true }
+oximedia-timesync = { workspace = true, optional = true }
+oximedia-forensics = { workspace = true, optional = true }
+oximedia-accel = { workspace = true, optional = true }
+oximedia-simd = { workspace = true, optional = true }
+oximedia-switcher = { workspace = true, optional = true }
+oximedia-timeline = { workspace = true, optional = true }
+oximedia-optimize = { workspace = true, optional = true }
+oximedia-profiler = { workspace = true, optional = true }
+oximedia-renderfarm = { workspace = true, optional = true }
+oximedia-storage = { workspace = true, optional = true }
+oximedia-collab = { workspace = true, optional = true }
+oximedia-gaming = { workspace = true, optional = true }
+oximedia-virtual = { workspace = true, optional = true }
+oximedia-access = { workspace = true, optional = true }
+oximedia-conform = { workspace = true, optional = true }
+oximedia-convert = { workspace = true, optional = true }
+oximedia-automation = { workspace = true, optional = true }
+oximedia-clips = { workspace = true, optional = true }
+oximedia-proxy = { workspace = true, optional = true }
+oximedia-presets = { workspace = true, optional = true }
+oximedia-calibrate = { workspace = true, optional = true }
+oximedia-denoise = { workspace = true, optional = true }
+oximedia-align = { workspace = true, optional = true }
+oximedia-analysis = { workspace = true, optional = true }
+oximedia-audiopost = { workspace = true, optional = true }
+oximedia-qc = { workspace = true, optional = true }
+oximedia-jobs = { workspace = true, optional = true }
+oximedia-auto = { workspace = true, optional = true }
+oximedia-edit = { workspace = true, optional = true }
+oximedia-routing = { workspace = true, optional = true }
+oximedia-audio-analysis = { workspace = true, optional = true }
+oximedia-gpu = { workspace = true, optional = true }
+oximedia-packager = { workspace = true, optional = true }
+oximedia-drm = { workspace = true, optional = true }
+oximedia-archive-pro = { workspace = true, optional = true }
+oximedia-distributed = { workspace = true, optional = true }
+oximedia-farm = { workspace = true, optional = true, features = ["sqlite"] }
+oximedia-dolbyvision = { workspace = true, optional = true }
+oximedia-mixer = { workspace = true, optional = true }
+oximedia-scaling = { workspace = true, optional = true }
+oximedia-graphics = { workspace = true, optional = true }
+oximedia-videoip = { workspace = true, optional = true }
+oximedia-compat-ffmpeg = { workspace = true, optional = true }
+oximedia-plugin = { workspace = true, optional = true }
+oximedia-server = { workspace = true, optional = true }
+oximedia-hdr = { workspace = true, optional = true }
+oximedia-spatial = { workspace = true, optional = true }
+oximedia-cache = { workspace = true, optional = true }
+oximedia-stream = { workspace = true, optional = true }
+oximedia-video = { workspace = true, optional = true }
+oximedia-cdn = { workspace = true, optional = true }
+oximedia-neural = { workspace = true, optional = true }
+oximedia-360 = { workspace = true, optional = true }
+oximedia-analytics = { workspace = true, optional = true }
+oximedia-caption-gen = { workspace = true, optional = true }
+oximedia-image-transform = { workspace = true, optional = true }
+oximedia-pipeline = { workspace = true, optional = true }
+oximedia-ml = { workspace = true, optional = true }
+oximedia-capture = { workspace = true, optional = true }
+
+[features]
+default = []
+
+# ── Quick-start preset ────────────────────────────────────────────────────────
+
+## Minimal preset: audio + video + metadata — the smallest useful set for basic
+## decoding (audio and video codecs + extended metadata) without pulling the
+## full feature tree.
+minimal = ["audio", "video", "metadata-ext"]
+
+# ── Category meta-features ────────────────────────────────────────────────────
+
+## Audio production stack: codecs, effects, metering, normalization, analysis, mixer, audiopost.
+audio-stack = ["audio", "effects", "metering", "normalize", "audio-analysis", "mixer", "audiopost"]
+
+## Broadcast production stack: automation, playout, playlist, switcher, routing, graphics, scopes.
+broadcast-stack = ["automation", "playout", "playlist", "switcher", "routing", "graphics", "scopes"]
+
+## Live streaming infrastructure: network, packaging, DRM, stream, CDN, cache, server.
+streaming-stack = ["net", "packager", "drm", "stream", "cdn", "cache", "server"]
+
+# ── Per-crate optional features ───────────────────────────────────────────────
+
+## Enable audio processing (Opus, Vorbis, FLAC, PCM codecs)
+audio = ["dep:oximedia-audio"]
+
+## Enable video codec support (AV1, VP9, VP8)
+##
+## The workspace pins `oximedia-codec` with `default-features = false`, so the
+## facade must forward the codec sub-features explicitly (every other
+## workspace consumer does the same); without this list the feature would
+## compile but reach zero codecs.
+video = ["dep:oximedia-codec", "oximedia-codec/av1", "oximedia-codec/vp9", "oximedia-codec/vp8"]
+
+## Enable filter graph pipeline
+graph = ["dep:oximedia-graph"]
+
+## Enable professional audio effects suite
+effects = ["dep:oximedia-effects"]
+
+## Enable network streaming (HLS, DASH, SRT, RTMP, WebRTC)
+net = ["dep:oximedia-net"]
+
+## Enable broadcast-standard audio loudness metering (EBU R128, ATSC A/85)
+metering = ["dep:oximedia-metering"]
+
+## Enable loudness normalization (EBU R128, streaming platform targets)
+normalize = ["dep:oximedia-normalize", "metering"]
+
+## Enable video quality metrics (PSNR, SSIM, VMAF, NIQE, BRISQUE)
+quality = ["dep:oximedia-quality"]
+
+## Enable extended metadata support (ID3v2, Vorbis, XMP, EXIF, IPTC)
+metadata-ext = ["dep:oximedia-metadata"]
+
+## Enable SMPTE timecode reading/writing (LTC, VITC)
+timecode = ["dep:oximedia-timecode"]
+
+## Enable DAG-based workflow orchestration engine
+workflow = ["dep:oximedia-workflow"]
+
+## Enable batch processing engine with job queuing
+batch = ["dep:oximedia-batch"]
+
+## Enable system monitoring, alerting, and metrics
+monitor = ["dep:oximedia-monitor"]
+
+## Enable 1D/3D LUT processing and HDR pipeline
+lut = ["dep:oximedia-lut"]
+
+## Enable professional color management (ICC, ACES, HDR, gamut mapping)
+colormgmt = ["dep:oximedia-colormgmt"]
+
+## Enable full-featured transcoding pipeline
+transcode = ["dep:oximedia-transcode"]
+
+## Enable subtitle rendering (SRT, ASS, WebVTT)
+subtitle = ["dep:oximedia-subtitle"]
+
+## Enable closed captions support (SRT, WebVTT, SCC, TTML, and more)
+captions = ["dep:oximedia-captions"]
+
+## Enable media archive verification and long-term preservation
+archive = ["dep:oximedia-archive"]
+
+## Enable media deduplication and duplicate detection
+dedup = ["dep:oximedia-dedup"]
+
+## Enable media search and indexing engine
+search = ["dep:oximedia-search"]
+
+## Enable Media Asset Management (MAM) system
+mam = ["dep:oximedia-mam"]
+
+## Enable AI-powered scene understanding and video analysis
+scene = ["dep:oximedia-scene"]
+
+## Enable shot detection, classification, and analysis
+shots = ["dep:oximedia-shots"]
+
+## Enable professional broadcast video scopes (waveform, vectorscope, histogram)
+scopes = ["dep:oximedia-scopes"]
+
+## Enable visual effects and compositing (transitions, keying, particles, generators)
+vfx = ["dep:oximedia-vfx"]
+
+## Enable advanced image processing (DPX, OpenEXR, TIFF, ICC, DNG, XMP, pyramid, tone curves)
+image-ext = ["dep:oximedia-image"]
+
+## Enable perceptual watermark embedding and forensic detection
+watermark = ["dep:oximedia-watermark"]
+
+## Enable Music Information Retrieval (beat tracking, key detection, fingerprinting, MIR features)
+mir = ["dep:oximedia-mir"]
+
+## Enable content recommendation engine with collaborative and content-based filtering
+recommend = ["dep:oximedia-recommend"]
+
+## Enable broadcast playlist management, scheduling, and automation
+playlist = ["dep:oximedia-playlist"]
+
+## Enable broadcast playout server with ad insertion and SCTE-35 scheduling
+playout = ["dep:oximedia-playout"]
+
+## Enable digital rights management and licensing metadata
+rights = ["dep:oximedia-rights"]
+
+## Enable collaborative media review and approval workflow
+review = ["dep:oximedia-review"]
+
+## Enable audio/video restoration (click/crackle removal, telecine correction)
+restore = ["dep:oximedia-restore"]
+
+## Enable media file repair and recovery from corruption
+repair = ["dep:oximedia-repair"]
+
+## Enable multi-camera sync and angle switching
+multicam = ["dep:oximedia-multicam"]
+
+## Enable video stabilization (motion analysis, smoothing, and correction)
+stabilize = ["dep:oximedia-stabilize"]
+
+## Enable cloud storage and processing abstraction (S3, Azure Blob, GCS)
+cloud = ["dep:oximedia-cloud"]
+
+## Enable EDL (Edit Decision List) parsing and generation (CMX 3600, GVG, BVE)
+edl = ["dep:oximedia-edl"]
+
+## Enable NDI (Network Device Interface) protocol support for low-latency IP video
+ndi = ["dep:oximedia-ndi"]
+
+## Enable IMF (Interoperable Master Format) package support (SMPTE ST 2067)
+imf = ["dep:oximedia-imf"]
+
+## Enable AAF (Advanced Authoring Format) interchange (SMPTE ST 377-1)
+aaf = ["dep:oximedia-aaf"]
+
+## Enable PTP/NTP time synchronization for broadcast production
+timesync = ["dep:oximedia-timesync"]
+
+## Enable media forensics analysis and tampering detection
+forensics = ["dep:oximedia-forensics"]
+
+## Enable hardware acceleration (Vulkan GPU compute, CPU fallback)
+accel = ["dep:oximedia-accel"]
+
+## Enable SIMD-optimised media kernels (DCT, SAD, interpolation)
+simd = ["dep:oximedia-simd"]
+
+## Enable professional live video switcher (M/E rows, keyers, DVE, tally)
+switcher = ["dep:oximedia-switcher"]
+
+## Enable multi-track timeline editor with frame-accurate editing
+timeline = ["dep:oximedia-timeline"]
+
+## Enable codec optimisation suite (RDO, psychovisual, AQ, motion search)
+optimize = ["dep:oximedia-optimize"]
+
+## Enable performance profiling tools (CPU/GPU/memory/frame timing)
+profiler = ["dep:oximedia-profiler"]
+
+## Enable distributed render farm coordinator
+renderfarm = ["dep:oximedia-renderfarm"]
+
+## Enable cloud-agnostic object storage abstraction (S3, Azure, GCS, local)
+storage = ["dep:oximedia-storage"]
+
+## Enable real-time CRDT-based collaborative editing
+collab = ["dep:oximedia-collab"]
+
+## Enable game streaming and screen capture optimisation
+gaming = ["dep:oximedia-gaming"]
+
+## Enable virtual production and LED wall tools
+virtual-prod = ["dep:oximedia-virtual"]
+
+## Enable accessibility tools (audio description, captions, compliance)
+access = ["dep:oximedia-access"]
+
+## Enable media conforming (EDL/XML/AAF timeline-to-media matching)
+conform = ["dep:oximedia-conform"]
+
+## Enable media format conversion utilities
+convert = ["dep:oximedia-convert"]
+
+## Enable broadcast automation and master control system
+automation = ["dep:oximedia-automation"]
+
+## Enable professional clip management and logging
+clips = ["dep:oximedia-clips"]
+
+## Enable proxy and offline editing workflow system
+proxy = ["dep:oximedia-proxy"]
+
+## Enable encoding preset library (200+ platform/broadcast presets)
+presets = ["dep:oximedia-presets"]
+
+## Enable professional color calibration and matching tools
+calibrate = ["dep:oximedia-calibrate"]
+
+## Enable spatial and temporal video denoising
+denoise = ["dep:oximedia-denoise"]
+
+## Enable video alignment and registration (temporal, spatial, feature)
+align = ["dep:oximedia-align"]
+
+## Enable comprehensive media analysis and quality assessment
+analysis = ["dep:oximedia-analysis"]
+
+## Enable professional audio post-production (ADR, Foley, mixing, stems)
+audiopost = ["dep:oximedia-audiopost"]
+
+## Enable broadcast-grade quality control and delivery validation
+qc = ["dep:oximedia-qc"]
+
+## Enable job queue and worker management for media transcoding
+jobs = ["dep:oximedia-jobs"]
+
+## Enable automated video editing (highlight detection, smart cutting, assembly)
+auto = ["dep:oximedia-auto"]
+
+## Enable video timeline editor with effects, transitions, and rendering
+edit = ["dep:oximedia-edit"]
+
+## Enable signal routing, NMOS IS-04/IS-05/IS-07, matrix crosspoints
+routing = ["dep:oximedia-routing"]
+
+## Enable advanced audio analysis: spectral, voice, music, forensics, pitch, formant
+audio-analysis = ["dep:oximedia-audio-analysis"]
+
+## Enable GPU compute pipeline (WGPU: Vulkan, Metal, DX12, WebGPU) for media acceleration
+gpu = ["dep:oximedia-gpu"]
+
+## Enable HLS/DASH adaptive streaming packaging (manifests, segments, encryption)
+packager = ["dep:oximedia-packager"]
+
+## Enable CENC DRM, Widevine, PlayReady, FairPlay, Clear Key content protection
+drm = ["dep:oximedia-drm"]
+
+## Enable professional digital preservation (BagIt, OAIS, PREMIS, METS, fixity)
+archive-pro = ["dep:oximedia-archive-pro"]
+
+## Enable distributed encoding coordinator (multi-node, load balancing, fault tolerance)
+distributed = ["dep:oximedia-distributed"]
+
+## Enable render farm coordinator (gRPC, priority scheduling, SQLite persistence)
+farm = ["dep:oximedia-farm"]
+
+## Enable Dolby Vision RPU metadata parser/writer (Profiles 5/7/8/8.1/8.4)
+dolbyvision = ["dep:oximedia-dolbyvision"]
+
+## Enable professional digital audio mixer (100+ channels, automation, effects buses)
+mixer = ["dep:oximedia-mixer"]
+
+## Enable high-quality video scaling (bilinear, bicubic, Lanczos, super-resolution)
+scaling = ["dep:oximedia-scaling"]
+
+## Enable broadcast graphics engine (lower thirds, tickers, keyframe animation)
+graphics = ["dep:oximedia-graphics"]
+
+## Enable patent-free video-over-IP transport (VP9/AV1, mDNS discovery, FEC)
+videoip = ["dep:oximedia-videoip"]
+
+## Enable FFmpeg CLI argument compatibility layer (argument translation to OxiMedia)
+compat-ffmpeg = ["dep:oximedia-compat-ffmpeg"]
+
+## Enable dynamic and static codec plugin system
+plugin = ["dep:oximedia-plugin"]
+
+## Enable RESTful media server (JWT auth, HLS/DASH streaming, WebSocket updates)
+server = ["dep:oximedia-server"]
+
+## Enable HDR video processing (PQ/HLG transfer functions, tone mapping, HDR10+ metadata)
+hdr = ["dep:oximedia-hdr"]
+
+## Enable spatial audio processing (Ambisonics, binaural HRTF, room simulation)
+spatial = ["dep:oximedia-spatial"]
+
+## Enable high-performance caching infrastructure (LRU, tiered cache, predictive warming)
+cache = ["dep:oximedia-cache"]
+
+## Enable adaptive streaming pipeline, segment lifecycle, and stream health monitoring
+stream = ["dep:oximedia-stream"]
+
+## Enable video processing algorithms: scene detection, pulldown detection, temporal denoising, perceptual fingerprinting
+video-proc = ["dep:oximedia-video"]
+
+## Enable CDN edge management, cache invalidation, geographic routing, and origin failover
+cdn = ["dep:oximedia-cdn"]
+
+## Enable lightweight neural network inference for media: tensor ops, conv2d, scene classification
+neural = ["dep:oximedia-neural"]
+
+## Enable 360° VR video processing: equirectangular/cubemap projections, fisheye, stereo 3D
+vr360 = ["dep:oximedia-360"]
+
+## Enable media engagement analytics: session tracking, retention curves, A/B testing, scoring
+analytics = ["dep:oximedia-analytics"]
+
+## Enable advanced caption generation: speech alignment, WCAG compliance, speaker diarization
+caption-gen = ["dep:oximedia-caption-gen"]
+
+## Enable image transformation (resize, crop, rotate, flip, color conversion)
+image-transform = ["dep:oximedia-image-transform"]
+
+## Enable the declarative media processing pipeline DSL (typed filter graph, node composition, execution planning)
+pipeline = ["dep:oximedia-pipeline"]
+
+## Enable Sovereign ML pipelines (Pure-Rust OxiONNX-backed scene classification, shot boundary, aesthetic scoring, object detection, face embedding)
+ml = ["dep:oximedia-ml"]
+## ML pipeline: scene classifier (requires `ml`, `onnx` features on oximedia-ml to actually run inference)
+ml-scene-classifier = ["ml", "oximedia-ml/scene-classifier"]
+## ML pipeline: shot boundary detector (requires `ml`, `onnx` features for real inference; heuristic fallback is always available)
+ml-shot-boundary = ["ml", "oximedia-ml/shot-boundary"]
+## ML pipeline: NIMA-style aesthetic quality scorer (requires `ml` and implicitly the `onnx` backend)
+ml-aesthetic-score = ["ml", "oximedia-ml/aesthetic-score"]
+## ML pipeline: YOLOv8-compatible object detector (requires `ml` and implicitly the `onnx` backend)
+ml-object-detector = ["ml", "oximedia-ml/object-detector"]
+## ML pipeline: ArcFace/FaceNet-compatible face embedder (requires `ml` and implicitly the `onnx` backend)
+ml-face-embedder = ["ml", "oximedia-ml/face-embedder"]
+## ML runtime: enable the pure-Rust ONNX inference backend
+ml-onnx = ["ml", "oximedia-ml/onnx"]
+
+## Enable Pure-Rust live camera/device capture (AVFoundation on macOS, V4L2 on
+## Linux, Media Foundation on Windows; raw pixel formats + MJPEG passthrough,
+## never an encumbered codec). See `oximedia-capture`'s own README for the
+## per-platform verification status.
+capture = ["dep:oximedia-capture"]
+
+## Enable the Tokio-native async receive path of `capture`
+## (`CaptureStream::into_async`); forwards `oximedia-capture/tokio`.
+capture-tokio = ["capture", "oximedia-capture/tokio"]
+
+## Enable Motion JPEG (MJPEG) intra-frame video codec
+mjpeg = ["dep:oximedia-codec", "oximedia-codec/mjpeg"]
+
+## Enable APV (Advanced Professional Video) intra-frame codec (ISO/IEC 23009-13)
+apv = ["dep:oximedia-codec", "oximedia-codec/apv"]
+
+## Enable all optional features
+full = [
+    "audio",
+    "video",
+    "graph",
+    "effects",
+    "net",
+    "metering",
+    "normalize",
+    "quality",
+    "metadata-ext",
+    "timecode",
+    "workflow",
+    "batch",
+    "monitor",
+    "lut",
+    "colormgmt",
+    "transcode",
+    "subtitle",
+    "captions",
+    "archive",
+    "dedup",
+    "search",
+    "mam",
+    "scene",
+    "shots",
+    "scopes",
+    "vfx",
+    "image-ext",
+    "watermark",
+    "mir",
+    "recommend",
+    "playlist",
+    "playout",
+    "rights",
+    "review",
+    "restore",
+    "repair",
+    "multicam",
+    "stabilize",
+    "cloud",
+    "edl",
+    "ndi",
+    "imf",
+    "aaf",
+    "timesync",
+    "forensics",
+    "accel",
+    "simd",
+    "switcher",
+    "timeline",
+    "optimize",
+    "profiler",
+    "renderfarm",
+    "storage",
+    "collab",
+    "gaming",
+    "virtual-prod",
+    "access",
+    "conform",
+    "convert",
+    "automation",
+    "clips",
+    "proxy",
+    "presets",
+    "calibrate",
+    "denoise",
+    "align",
+    "analysis",
+    "audiopost",
+    "qc",
+    "jobs",
+    "auto",
+    "edit",
+    "routing",
+    "audio-analysis",
+    "gpu",
+    "packager",
+    "drm",
+    "archive-pro",
+    "distributed",
+    "farm",
+    "dolbyvision",
+    "mixer",
+    "scaling",
+    "graphics",
+    "videoip",
+    "compat-ffmpeg",
+    "plugin",
+    "server",
+    "hdr",
+    "spatial",
+    "cache",
+    "stream",
+    "video-proc",
+    "cdn",
+    "neural",
+    "vr360",
+    "analytics",
+    "caption-gen",
+    "image-transform",
+    "pipeline",
+    "ml",
+    "ml-scene-classifier",
+    "ml-shot-boundary",
+    "ml-aesthetic-score",
+    "ml-object-detector",
+    "ml-face-embedder",
+    "capture",
+    "mjpeg",
+    "apv",
+]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+uuid.workspace = true
+toml = { workspace = true }
+
+[[example]]
+name = "probe_file"
+path = "../examples/probe_file.rs"
+
+[[example]]
+name = "corner_detection"
+path = "../examples/corner_detection.rs"
+
+[[example]]
+name = "optical_flow"
+path = "../examples/optical_flow.rs"
+
+[[example]]
+name = "face_detection"
+path = "../examples/face_detection.rs"
+
+[[example]]
+name = "image_processing"
+path = "../examples/image_processing.rs"
+
+[[example]]
+name = "decode_video"
+path = "../examples/decode_video.rs"
+
+[[example]]
+name = "audio_metering"
+path = "../examples/audio_metering.rs"
+required-features = ["metering"]
+
+[[example]]
+name = "quality_assessment"
+path = "../examples/quality_assessment.rs"
+required-features = ["quality"]
+
+[[example]]
+name = "timecode_operations"
+path = "../examples/timecode_operations.rs"
+required-features = ["timecode"]
+
+[[example]]
+name = "dedup_detection"
+path = "../examples/dedup_detection.rs"
+required-features = ["dedup"]
+
+[[example]]
+name = "workflow_pipeline"
+path = "../examples/workflow_pipeline.rs"
+required-features = ["workflow"]
+
+[[example]]
+name = "video_scopes"
+path = "../examples/video_scopes.rs"
+required-features = ["scopes"]
+
+[[example]]
+name = "shot_detection"
+path = "../examples/shot_detection.rs"
+required-features = ["shots"]
+
+[[example]]
+name = "nmos_registry"
+path = "../examples/nmos_registry.rs"
+required-features = ["routing"]
+
+[[example]]
+name = "color_pipeline"
+path = "../examples/color_pipeline.rs"
+required-features = ["colormgmt", "lut"]
+
+[[example]]
+name = "media_pipeline"
+path = "../examples/media_pipeline.rs"
+required-features = ["quality", "metering", "transcode", "timecode", "workflow", "archive"]
+
+[[example]]
+name = "nmos_server_demo"
+path = "../examples/nmos_server_demo.rs"
+required-features = ["routing"]
+
+[[example]]
+name = "ml_scene_classify"
+path = "../examples/ml_scene_classify.rs"
+required-features = ["ml", "ml-scene-classifier"]
+
+[[example]]
+name = "ml_auto_caption"
+path = "../examples/ml_auto_caption.rs"
+required-features = ["ml"]
+
+[[example]]
+name = "ml_model_zoo"
+path = "../examples/ml_model_zoo.rs"
+required-features = ["ml"]
+
+# NOTE: unlike the examples above (which live in the workspace-root
+# `examples/` directory shared with other tooling), this example lives in
+# `oximedia/examples/` — inside this crate's own directory — since it was
+# added standalone without touching shared, cross-crate files.
+[[example]]
+name = "ffmpeg_translate_demo"
+path = "examples/ffmpeg_translate_demo.rs"
+required-features = ["compat-ffmpeg"]

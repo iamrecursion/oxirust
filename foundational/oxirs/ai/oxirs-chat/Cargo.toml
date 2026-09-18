@@ -1,0 +1,113 @@
+[package]
+name = "oxirs-chat"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "RAG chat API with LLM integration and natural language to SPARQL translation"
+keywords = ["rag", "chat", "llm", "ai", "semantic-search"]
+categories = ["science", "algorithms", "web-programming"]
+readme = "README.md"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxirs-core.workspace = true
+oxirs-vec.workspace = true
+oxirs-embed.workspace = true
+
+# SciRS2 dependencies for AI chat and NLP
+scirs2-core = { workspace = true, features = ["random"] }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { workspace = true, features = ["derive"] }
+chrono.workspace = true
+
+# HTTP Server and WebSocket
+axum = { workspace = true, features = ["ws"] }
+tower.workspace = true
+tower-http.workspace = true
+futures-util.workspace = true
+
+# LLM Integration
+reqwest = { workspace = true, features = ["stream"] }
+# async-openai forces `reqwest/rustls` (= aws-lc-rs, C/C++) and has no
+# no-provider variant, so feature-unification would poison the whole graph with
+# aws-lc-sys. It is therefore opt-in behind the non-default `openai` feature.
+async-openai = { version = "0.41", default-features = false, features = ["chat-completion", "audio"], optional = true }
+# anthropic-sdk = "0.1" # Add when available
+
+# Storage and Caching
+uuid.workspace = true
+
+# Configuration
+config.workspace = true
+toml.workspace = true
+serde_yaml.workspace = true
+
+# Metrics and Monitoring
+metrics.workspace = true
+
+# Template Engine for SPARQL
+handlebars.workspace = true
+regex.workspace = true
+
+# XML parsing for SAML response processing
+quick-xml.workspace = true
+
+# Async traits
+async-trait.workspace = true
+
+# Cryptographic functions for webhooks
+hmac.workspace = true
+sha2.workspace = true
+
+# JWT / SAML signature verification for Enterprise SSO (Pure Rust)
+rsa.workspace = true    # RS256 (RSASSA-PKCS1-v1_5) + X.509/SPKI key loading
+p256.workspace = true   # ES256 (ECDSA over P-256)
+
+# Session persistence and state management
+oxicode.workspace = true  # Replaces bincode per COOLJAPAN Policy
+oxiarc-zstd.workspace = true
+oxiarc-deflate.workspace = true  # Pure Rust gzip compression for memory_optimization
+oxiarc-lz4.workspace = true  # LZ4 compression for memory_optimization
+
+# Encryption
+aes-gcm.workspace = true
+base64.workspace = true
+
+# Random number generation removed - use scirs2-core::random instead
+fastrand.workspace = true
+
+# Excel export (feature-gated for Pure Rust policy)
+rust_xlsxwriter = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+llm-integration = []
+nl2sparql = []
+excel-export = ["rust_xlsxwriter"]
+# OpenAI provider (chat + Whisper STT/TTS) via async-openai. NOT in `default`
+# because async-openai's HTTP path would otherwise pull `aws-lc-rs` (C/C++) into
+# the whole workspace through feature unification. The crate's own reqwest is
+# `default-features = false`, so it rides the workspace's pure rustls-no-provider
+# backend (process-default Pure Rust provider) once enabled.
+openai = ["dep:async-openai"]
+
+[[bin]]
+name = "oxirs-chat"
+path = "src/main.rs"

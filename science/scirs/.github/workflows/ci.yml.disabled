@@ -1,0 +1,395 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+      - "0.[0-9]+.[0-9]+"
+  pull_request:
+    branches:
+      - master
+      - main
+      - "0.[0-9]+.[0-9]+"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable]
+        include:
+          - os: ubuntu-latest
+            rust: beta
+
+    env:
+      # Limit parallel jobs on Windows to avoid OOM on GitHub-hosted runners
+      CARGO_BUILD_JOBS: ${{ matrix.os == 'windows-latest' && '2' || '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-${{ matrix.os }}-${{ matrix.rust }}"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build workspace
+        shell: bash
+        run: |
+          cargo build \
+            --workspace \
+            --all-features \
+            --exclude scirs2-python \
+            --exclude scirs2-datasets \
+            --exclude scirs2-numpy
+
+      - name: Run tests with nextest
+        shell: bash
+        run: |
+          # On Windows, use fewer test threads to avoid resource exhaustion
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            TEST_THREADS=2
+          else
+            TEST_THREADS=4
+          fi
+          cargo nextest run \
+            --workspace \
+            --all-features \
+            --exclude scirs2-python \
+            --exclude scirs2-datasets \
+            --exclude scirs2-numpy \
+            --no-fail-fast \
+            --test-threads=$TEST_THREADS
+        timeout-minutes: 90
+
+      - name: Run doctests
+        shell: bash
+        run: |
+          cargo test --doc \
+            --workspace \
+            --all-features \
+            --exclude scirs2-python \
+            --exclude scirs2-datasets \
+            --exclude scirs2-numpy
+        timeout-minutes: 30
+
+  check:
+    name: Format + Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: |
+          cargo clippy \
+            --workspace \
+            --all-features \
+            --exclude scirs2-python \
+            -- \
+            -D warnings
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links"
+        run: |
+          cargo doc \
+            --workspace \
+            --all-features \
+            --no-deps \
+            --exclude scirs2-python
+
+  minimal-build:
+    name: Minimal Build (no default features)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build core crates with no default features
+        shell: bash
+        run: |
+          for crate in scirs2-core scirs2-linalg scirs2-fft scirs2-signal \
+                       scirs2-integrate scirs2-stats scirs2-special \
+                       scirs2-sparse scirs2-ndimage; do
+            if [ -d "$crate" ]; then
+              echo "Building $crate --no-default-features..."
+              cargo build -p "$crate" --no-default-features
+            fi
+          done
+
+  msrv:
+    name: MSRV Check (Rust 1.87)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.87
+        uses: dtolnay/rust-toolchain@1.87
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-msrv-1.87"
+
+      - name: Check MSRV compatibility
+        run: |
+          cargo check \
+            --workspace \
+            --all-features \
+            --exclude scirs2-python
+
+  miri:
+    name: Miri (Undefined Behavior Detection — scirs2-core concurrent)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-miri-nightly"
+
+      - name: Setup Miri
+        run: cargo +nightly miri setup
+
+      - name: Run Miri on scirs2-core concurrent module
+        run: |
+          cargo +nightly miri test \
+            -p scirs2-core \
+            --lib concurrent \
+            -Zmiri-disable-isolation
+        timeout-minutes: 30
+        # Miri is slow; allow individual test failures without blocking CI
+        continue-on-error: true
+
+  pure-rust-policy:
+    name: Pure Rust Policy Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify Pure Rust Policy (COOLJAPAN Ecosystem)
+        shell: bash
+        run: |
+          VIOLATIONS=0
+
+          # No openblas (use OxiBLAS)
+          if cargo tree --all-features 2>/dev/null | grep -i "\bopenblas\b"; then
+            echo "VIOLATION: openblas found — use OxiBLAS (oxiblas)"
+            VIOLATIONS=$((VIOLATIONS+1))
+          fi
+
+          # No bincode (use oxicode)
+          if cargo tree --all-features 2>/dev/null | grep -w "bincode"; then
+            echo "VIOLATION: bincode found — use oxicode"
+            VIOLATIONS=$((VIOLATIONS+1))
+          fi
+
+          # No zip crate (use oxiarc-archive)
+          if cargo tree --all-features 2>/dev/null | grep -w "^zip "; then
+            echo "VIOLATION: zip crate found — use oxiarc-archive"
+            VIOLATIONS=$((VIOLATIONS+1))
+          fi
+
+          # No rustfft (use OxiFFT), only as a direct (non-optional) dep
+          if cargo tree --all-features 2>/dev/null | grep -w "^rustfft "; then
+            echo "VIOLATION: rustfft found as direct dep — use OxiFFT"
+            VIOLATIONS=$((VIOLATIONS+1))
+          fi
+
+          if [ "$VIOLATIONS" -gt 0 ]; then
+            echo ""
+            echo "ERROR: $VIOLATIONS Pure Rust Policy violation(s) found"
+            exit 1
+          fi
+
+          echo "Pure Rust Policy: ALL CHECKS PASSED"
+
+  # ---------------------------------------------------------------------------
+  # API Stability Tests — targeted run on the three crates with stability tests
+  # These compile-fail tests catch accidental removal of stabilised public items.
+  # ---------------------------------------------------------------------------
+  api-stability:
+    name: API Stability Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-api-stability"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run API stability tests (scirs2-core)
+        run: |
+          cargo nextest run \
+            -p scirs2-core \
+            --test api_stability \
+            --no-fail-fast
+        timeout-minutes: 15
+
+      - name: Run API stability tests (scirs2-linalg)
+        run: |
+          cargo nextest run \
+            -p scirs2-linalg \
+            --test api_stability \
+            --no-fail-fast
+        timeout-minutes: 15
+
+      - name: Run API stability tests (scirs2-stats)
+        run: |
+          cargo nextest run \
+            -p scirs2-stats \
+            --test api_stability \
+            --no-fail-fast
+        timeout-minutes: 20
+
+  # ---------------------------------------------------------------------------
+  # Cross-platform ARM64 check (ubuntu-24.04-arm available on GitHub runners)
+  # ---------------------------------------------------------------------------
+  cross-platform-arm64:
+    name: Cross-platform ARM64 Check
+    runs-on: ubuntu-24.04-arm
+    # Only run on push to main/release branches to avoid burning minutes on PRs
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-arm64"
+
+      - name: Build and check (ARM64)
+        run: |
+          cargo check \
+            --workspace \
+            --all-features \
+            --exclude scirs2-python \
+            --exclude scirs2-datasets
+
+      - name: Run core tests (ARM64)
+        run: |
+          cargo test \
+            -p scirs2-core \
+            -p scirs2-linalg \
+            -p scirs2-stats \
+            --all-features \
+            --no-fail-fast
+        timeout-minutes: 30
+
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - check
+      - docs
+      - minimal-build
+      - msrv
+      - pure-rust-policy
+      - api-stability
+    if: always()
+
+    steps:
+      - name: Check all mandatory jobs passed
+        shell: bash
+        run: |
+          results=(
+            "${{ needs.test.result }}"
+            "${{ needs.check.result }}"
+            "${{ needs.docs.result }}"
+            "${{ needs.minimal-build.result }}"
+            "${{ needs.msrv.result }}"
+            "${{ needs.pure-rust-policy.result }}"
+            "${{ needs.api-stability.result }}"
+          )
+          labels=(
+            "test"
+            "check"
+            "docs"
+            "minimal-build"
+            "msrv"
+            "pure-rust-policy"
+            "api-stability"
+          )
+          FAILED=0
+          for i in "${!results[@]}"; do
+            if [[ "${results[$i]}" != "success" ]]; then
+              echo "FAILED: ${labels[$i]} (result: ${results[$i]})"
+              FAILED=$((FAILED+1))
+            fi
+          done
+          if [ "$FAILED" -gt 0 ]; then
+            echo ""
+            echo "ERROR: $FAILED CI job(s) did not pass."
+            exit 1
+          fi
+          echo "All CI checks passed."

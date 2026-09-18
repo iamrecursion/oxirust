@@ -1,0 +1,713 @@
+//! Tests for the Metal graph dispatch engine.
+//!
+//! Core single-op / batched dispatch correctness (creation, weight upload,
+//! singleton, residual-add, Q1 GEMM/GEMV, SwiGLU, RMSNorm). The larger
+//! ternary-GEMM, f32-GEMM, GEMV-TQ2, and VAE parity suites live in the
+//! sibling `tests_gemm_tq2`, `tests_gemm_f32`, `tests_gemv_tq2`, and
+//! `tests_vae` modules.
+
+use metal::{Device, MTLResourceOptions};
+use std::sync::Arc;
+
+use super::buffers::{alloc_buf, download_f32, upload_f32};
+use super::graph::MetalGraph;
+
+/// Smoke test: verify MetalGraph can be created on a Metal-capable system.
+#[test]
+fn test_metal_graph_creation() {
+    // Skip if no Metal device (e.g. CI linux).
+    if Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new();
+    assert!(graph.is_ok(), "MetalGraph::new() failed: {:?}", graph.err());
+}
+
+/// Test weight upload round-trip.
+#[test]
+fn test_weight_upload() {
+    if Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new().expect("failed to create MetalGraph");
+    let data = vec![0u8; 1024];
+    let handle = graph.upload_weight(&data);
+    assert!(handle.is_ok());
+    let handle = handle.expect("upload_weight failed");
+    assert_eq!(handle.byte_len(), 1024);
+}
+
+/// Test the process-default session accessor (`MetalGraph::global()` on an
+/// unbound thread resolves to one session, every time).
+#[test]
+fn test_global_singleton() {
+    if Device::system_default().is_none() {
+        return;
+    }
+    let g1 = MetalGraph::global();
+    assert!(g1.is_ok());
+    let g2 = MetalGraph::global();
+    assert!(g2.is_ok());
+    // Both should point to the same allocation.
+    let g1 = g1.expect("global failed");
+    let g2 = g2.expect("global failed");
+    assert!(Arc::ptr_eq(&g1, &g2));
+}
+
+/// Test residual_add via a minimal single-op dispatch.
+#[test]
+fn test_residual_add_single() {
+    if Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new().expect("failed to create MetalGraph");
+    let n = 256usize;
+    let opts = MTLResourceOptions::StorageModeShared;
+
+    let a_buf = alloc_buf(&graph.device, (n * 4) as u64, opts).expect("alloc a_buf");
+    let b_buf = alloc_buf(&graph.device, (n * 4) as u64, opts).expect("alloc b_buf");
+
+    // a = [1.0; 256], b = [2.0; 256]
+    let a_data: Vec<f32> = vec![1.0; n];
+    let b_data: Vec<f32> = vec![2.0; n];
+    unsafe {
+        upload_f32(&a_buf, &a_data);
+        upload_f32(&b_buf, &b_data);
+    }
+
+    let cmd_buf = graph.command_queue.new_command_buffer();
+    let encoder = cmd_buf.new_compute_command_encoder();
+    graph.dispatch_residual_add(encoder, &a_buf, &b_buf, n as u32);
+    encoder.end_encoding();
+    cmd_buf.commit();
+    cmd_buf.wait_until_completed();
+
+    let mut result = vec![0.0f32; n];
+    unsafe { download_f32(&a_buf, &mut result) };
+
+    for (i, &v) in result.iter().enumerate() {
+        assert!(
+            (v - 3.0).abs() < 1e-6,
+            "residual_add mismatch at index {i}: expected 3.0, got {v}"
+        );
+    }
+}
+
+/// Test GEMM Q1 dispatch: batch_size=4, verifies output matches expected values.
+///
+/// Uses a trivial weight matrix (all-ones signs, scale=1.0h) so that
+/// each output element equals the sum of the corresponding input column.
+#[test]
+fn test_gemm_q1_batch4() {
+    if Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new().expect("failed to create MetalGraph");
+    let opts = MTLResourceOptions::StorageModeShared;
+
+    let n_rows: u32 = 8;
+    let k: u32 = 128;
+    let batch_size: u32 = 4;
+    let blocks_per_row = (k / 128) as usize;
+
+    // Build Q1_g128 weight buffer in SoA layout:
+    // [scales: total_blocks × 2B][data: total_blocks × 16B]
+    // All signs = 1 (bit set), scale = 1.0h = 0x3C00 LE → [0x00, 0x3C]
+    let total_blocks = n_rows as usize * blocks_per_row;
+    let total_weight_bytes = total_blocks * 2 + total_blocks * 16;
+    let data_section = total_blocks * 2;
+    let mut weight_data = vec![0u8; total_weight_bytes];
+    for row in 0..n_rows as usize {
+        for b in 0..blocks_per_row {
+            let block_idx = row * blocks_per_row + b;
+            // f16 1.0 in little-endian at scale position
+            weight_data[block_idx * 2] = 0x00;
+            weight_data[block_idx * 2 + 1] = 0x3C;
+            // All 128 sign bits = 1 (all +1) at data position
+            let d = data_section + block_idx * 16;
+            for j in 0..16 {
+                weight_data[d + j] = 0xFF;
+            }
+        }
+    }
+
+    let weight_buf =
+        alloc_buf(&graph.device, total_weight_bytes as u64, opts).expect("alloc weight_buf");
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            weight_data.as_ptr(),
+            weight_buf.contents() as *mut u8,
+            total_weight_bytes,
+        );
+    }
+
+    // Input: 4 columns of k=128 floats (column-major: input[col * k + i])
+    // col 0 = all 1.0, col 1 = all 2.0, col 2 = all 0.5, col 3 = all -1.0
+    let col_values = [1.0f32, 2.0, 0.5, -1.0];
+    let input_floats = batch_size as usize * k as usize;
+    let mut input_data = vec![0.0f32; input_floats];
+    for col in 0..batch_size as usize {
+        for i in 0..k as usize {
+            input_data[col * k as usize + i] = col_values[col];
+        }
+    }
+
+    let input_buf =
+        alloc_buf(&graph.device, (input_floats * 4) as u64, opts).expect("alloc input_buf");
+    unsafe {
+        upload_f32(&input_buf, &input_data);
+    }
+
+    // Output: batch_size columns of n_rows floats (column-major)
+    let output_floats = batch_size as usize * n_rows as usize;
+    let output_buf =
+        alloc_buf(&graph.device, (output_floats * 4) as u64, opts).expect("alloc output_buf");
+
+    // Dispatch GEMM
+    let cmd_buf = graph.command_queue.new_command_buffer();
+    let encoder = cmd_buf.new_compute_command_encoder();
+    graph.dispatch_gemm_q1_v7(
+        encoder,
+        &weight_buf,
+        &input_buf,
+        &output_buf,
+        n_rows,
+        k,
+        batch_size,
+    );
+    encoder.end_encoding();
+    cmd_buf.commit();
+    cmd_buf.wait_until_completed();
+
+    // Read back and verify
+    let mut result = vec![0.0f32; output_floats];
+    unsafe {
+        download_f32(&output_buf, &mut result);
+    }
+
+    // Expected: each row for col c = scale * (sum of 128 signs * col_value)
+    // With all signs = +1 and scale = 1.0:
+    //   col 0: 1.0 * 128 * 1.0 = 128.0
+    //   col 1: 1.0 * 128 * 2.0 = 256.0
+    //   col 2: 1.0 * 128 * 0.5 = 64.0
+    //   col 3: 1.0 * 128 * -1.0 = -128.0
+    let expected_col_sums = [128.0f32, 256.0, 64.0, -128.0];
+    for (col, expected) in expected_col_sums.iter().enumerate() {
+        for row in 0..n_rows as usize {
+            let idx = col * n_rows as usize + row;
+            assert!(
+                (result[idx] - expected).abs() < 0.1,
+                "GEMM mismatch at col={col} row={row}: expected {expected}, got {}",
+                result[idx]
+            );
+        }
+    }
+}
+
+/// Test GEMM Q1 vs independent GEMVs: batch GEMM should match individual GEMV results.
+#[test]
+fn test_gemm_matches_gemv() {
+    if Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new().expect("failed to create MetalGraph");
+    let opts = MTLResourceOptions::StorageModeShared;
+
+    let n_rows: u32 = 16;
+    let k: u32 = 256; // 2 blocks per row
+    let batch_size: u32 = 4;
+    let blocks_per_row = (k / 128) as usize;
+    let total_blocks = n_rows as usize * blocks_per_row;
+    let total_weight_bytes = total_blocks * 2 + total_blocks * 16;
+
+    // Build weight in SoA layout with alternating signs: block 0 all +1, block 1 all -1
+    let data_section = total_blocks * 2;
+    let mut weight_data = vec![0u8; total_weight_bytes];
+    for row in 0..n_rows as usize {
+        for b in 0..blocks_per_row {
+            let block_idx = row * blocks_per_row + b;
+            weight_data[block_idx * 2] = 0x00; // f16 1.0 LE
+            weight_data[block_idx * 2 + 1] = 0x3C;
+            let fill = if b % 2 == 0 { 0xFF } else { 0x00 }; // +1 or -1
+            let d = data_section + block_idx * 16;
+            for j in 0..16 {
+                weight_data[d + j] = fill;
+            }
+        }
+    }
+
+    let weight_buf =
+        alloc_buf(&graph.device, total_weight_bytes as u64, opts).expect("alloc weight_buf");
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            weight_data.as_ptr(),
+            weight_buf.contents() as *mut u8,
+            total_weight_bytes,
+        );
+    }
+
+    // Input: varied per column
+    let input_floats = batch_size as usize * k as usize;
+    let mut input_data = vec![0.0f32; input_floats];
+    for col in 0..batch_size as usize {
+        for i in 0..k as usize {
+            input_data[col * k as usize + i] = (col as f32 + 1.0) * 0.1;
+        }
+    }
+
+    let input_buf =
+        alloc_buf(&graph.device, (input_floats * 4) as u64, opts).expect("alloc input_buf");
+    unsafe {
+        upload_f32(&input_buf, &input_data);
+    }
+
+    // GEMM output
+    let output_floats = batch_size as usize * n_rows as usize;
+    let gemm_out_buf =
+        alloc_buf(&graph.device, (output_floats * 4) as u64, opts).expect("alloc gemm_out_buf");
+
+    {
+        let cmd = graph.command_queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        graph.dispatch_gemm_q1_v7(
+            enc,
+            &weight_buf,
+            &input_buf,
+            &gemm_out_buf,
+            n_rows,
+            k,
+            batch_size,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+
+    let mut gemm_result = vec![0.0f32; output_floats];
+    unsafe {
+        download_f32(&gemm_out_buf, &mut gemm_result);
+    }
+
+    // Now run individual GEMVs and compare
+    for col in 0..batch_size as usize {
+        // Upload this column's input into a separate buffer
+        let col_input = &input_data[col * k as usize..(col + 1) * k as usize];
+        let col_in_buf =
+            alloc_buf(&graph.device, (k as usize * 4) as u64, opts).expect("alloc col_in_buf");
+        unsafe {
+            upload_f32(&col_in_buf, col_input);
+        }
+
+        let col_out_buf = alloc_buf(&graph.device, (n_rows as usize * 4) as u64, opts)
+            .expect("alloc col_out_buf");
+
+        let cmd = graph.command_queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        graph.dispatch_gemv_q1(enc, &weight_buf, &col_in_buf, &col_out_buf, n_rows, k);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut gemv_result = vec![0.0f32; n_rows as usize];
+        unsafe {
+            download_f32(&col_out_buf, &mut gemv_result);
+        }
+
+        for row in 0..n_rows as usize {
+            let gemm_val = gemm_result[col * n_rows as usize + row];
+            let gemv_val = gemv_result[row];
+            assert!(
+                (gemm_val - gemv_val).abs() < 1e-3,
+                "GEMM/GEMV mismatch col={col} row={row}: gemm={gemm_val}, gemv={gemv_val}"
+            );
+        }
+    }
+}
+
+/// Test batched SwiGLU dispatch.
+#[test]
+fn test_batched_swiglu() {
+    if Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new().expect("failed to create MetalGraph");
+    let opts = MTLResourceOptions::StorageModeShared;
+
+    let inter: u32 = 64;
+    let batch_size: u32 = 3;
+
+    // gate_up: [batch_size × inter × 2] floats
+    // For each batch b and element e:
+    //   gate = gate_up[b * inter * 2 + e]
+    //   up   = gate_up[b * inter * 2 + inter + e]
+    let gate_up_len = batch_size as usize * inter as usize * 2;
+    let mut gate_up_data = vec![0.0f32; gate_up_len];
+    for b in 0..batch_size as usize {
+        for e in 0..inter as usize {
+            let base = b * inter as usize * 2;
+            gate_up_data[base + e] = (b as f32 + 1.0) * 0.5; // gate
+            gate_up_data[base + inter as usize + e] = (e as f32) * 0.1; // up
+        }
+    }
+
+    let gate_up_buf =
+        alloc_buf(&graph.device, (gate_up_len * 4) as u64, opts).expect("alloc gate_up_buf");
+    unsafe {
+        upload_f32(&gate_up_buf, &gate_up_data);
+    }
+
+    let output_len = batch_size as usize * inter as usize;
+    let output_buf =
+        alloc_buf(&graph.device, (output_len * 4) as u64, opts).expect("alloc output_buf");
+
+    let cmd = graph.command_queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    graph.dispatch_batched_swiglu(enc, &gate_up_buf, &output_buf, inter, batch_size);
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let mut result = vec![0.0f32; output_len];
+    unsafe {
+        download_f32(&output_buf, &mut result);
+    }
+
+    // Verify: output[b * inter + e] = silu(gate) * up
+    for b in 0..batch_size as usize {
+        for e in 0..inter as usize {
+            let g = (b as f32 + 1.0) * 0.5;
+            let u = (e as f32) * 0.1;
+            let silu_g = g / (1.0 + (-g).exp());
+            let expected = silu_g * u;
+            let actual = result[b * inter as usize + e];
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "batched_swiglu mismatch b={b} e={e}: expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+/// Test batched RMSNorm dispatch.
+#[test]
+fn test_batched_rmsnorm() {
+    if Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new().expect("failed to create MetalGraph");
+    let opts = MTLResourceOptions::StorageModeShared;
+
+    let dim: u32 = 64;
+    let batch_size: u32 = 3;
+    let eps: f32 = 1e-5;
+
+    // Input: batch_size vectors of dim floats
+    let input_len = batch_size as usize * dim as usize;
+    let mut input_data = vec![0.0f32; input_len];
+    for b in 0..batch_size as usize {
+        for i in 0..dim as usize {
+            input_data[b * dim as usize + i] = (b as f32 + 1.0) * (i as f32 + 1.0) * 0.01;
+        }
+    }
+
+    // Weight: all 1.0 (identity scaling)
+    let weight_data = vec![1.0f32; dim as usize];
+
+    let input_buf =
+        alloc_buf(&graph.device, (input_len * 4) as u64, opts).expect("alloc input_buf");
+    let weight_buf =
+        alloc_buf(&graph.device, (dim as usize * 4) as u64, opts).expect("alloc weight_buf");
+    let output_buf =
+        alloc_buf(&graph.device, (input_len * 4) as u64, opts).expect("alloc output_buf");
+
+    unsafe {
+        upload_f32(&input_buf, &input_data);
+        upload_f32(&weight_buf, &weight_data);
+    }
+
+    let cmd = graph.command_queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    graph.dispatch_batched_rmsnorm(
+        enc,
+        &input_buf,
+        &weight_buf,
+        &output_buf,
+        eps,
+        dim,
+        batch_size,
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let mut result = vec![0.0f32; input_len];
+    unsafe {
+        download_f32(&output_buf, &mut result);
+    }
+
+    // Verify: for each batch, check RMS normalization
+    for b in 0..batch_size as usize {
+        let offset = b * dim as usize;
+        let slice = &input_data[offset..offset + dim as usize];
+
+        // Compute expected RMS
+        let sq_sum: f32 = slice.iter().map(|x| x * x).sum();
+        let rms_inv = 1.0 / (sq_sum / dim as f32 + eps).sqrt();
+
+        for i in 0..dim as usize {
+            let expected = slice[i] * rms_inv; // weight = 1.0
+            let actual = result[offset + i];
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "batched_rmsnorm mismatch b={b} i={i}: expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+/// Test that `weight_upload_count` increments on a new key and that
+/// `evict_f32_weight` removes the entry (enabling safe key reuse for
+/// non-resident callers).
+///
+/// Runs on an **isolated** graph ([`MetalGraph::new`]): its own weight cache
+/// and upload counters, which no other test in this process can move, so the
+/// exact `+1` deltas below hold under the parallel test runner. (On the
+/// process-shared device's session the counters are process-global state
+/// that every concurrently running GPU test increments.) Self-skips without
+/// a Metal device, like its siblings.
+#[test]
+fn test_weight_upload_count_increments_on_new_key() {
+    if metal::Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new()
+        .unwrap_or_else(|e| panic!("the combined Metal library must build on this device: {e}"));
+    let before = graph.weight_upload_count();
+    let data = vec![1.0f32; 16];
+    // Use an address offset unlikely to collide with any live weight.
+    let key = data.as_ptr() as u64 ^ 0xDEAD_BEEF_0000_0001;
+    // Ensure the key is not already cached (clean slate).
+    graph
+        .evict_f32_weight(key)
+        .expect("evict_f32_weight failed");
+    graph
+        .get_or_upload_f32_weight(key, &data)
+        .expect("upload failed");
+    let after = graph.weight_upload_count();
+    assert_eq!(
+        after,
+        before + 1,
+        "upload count must increment on first upload of a new key"
+    );
+    // A second upload of the same key must be a cache hit (no increment).
+    graph
+        .get_or_upload_f32_weight(key, &data)
+        .expect("second upload failed");
+    assert_eq!(
+        graph.weight_upload_count(),
+        before + 1,
+        "upload count must NOT increment on a cache hit"
+    );
+    // Cleanup: evict so the test leaves no residue in the shared weight cache.
+    graph.evict_f32_weight(key).expect("cleanup evict failed");
+}
+
+/// The lines of `src` above its test module: a file's own `#[cfg(test)]`
+/// module (always last) builds throwaway command buffers of its own, so
+/// only the dispatch code above it is pinned.
+fn dispatch_lines(src: &str) -> Vec<&str> {
+    let lines: Vec<&str> = src.lines().collect();
+    let end = lines
+        .iter()
+        .position(|line| {
+            let code = line.trim_start();
+            code.starts_with("#[cfg(test)]") || code.starts_with("#[cfg(all(test")
+        })
+        .unwrap_or(lines.len());
+    lines[..end].to_vec()
+}
+
+/// Whether `line` (code, not a comment) creates a command buffer.
+fn creates_command_buffer(line: &str) -> bool {
+    let code = line.trim_start();
+    !code.starts_with("//") && code.contains(".new_command_buffer()")
+}
+
+/// Every command buffer these dispatch sources create lives inside an
+/// Objective-C autorelease pool.
+///
+/// `-[MTLCommandQueue commandBuffer]` and
+/// `-[MTLCommandBuffer computeCommandEncoder]` return autoreleased objects,
+/// which a thread without a pool keeps until it exits (~1.8 KiB per
+/// dispatch). The model crate's
+/// `metal_dense_forwards_do_not_grow_the_process_footprint` measures the
+/// routes a model drives; this pins the structural half for every dispatch
+/// site here, including the ones no model route reaches (the DiT GEMM and
+/// joint-attention entry points, the VAE kernels, the FP8 / K-quant /
+/// standard-quant GEMVs and the resident-logits top-k): in the function
+/// that creates a command buffer, an `autoreleasepool(` scope opens before
+/// the buffer is created.
+///
+/// Each file must still show the sites it is known to have (a scan cut
+/// short — say by a `#[cfg(test)]` item moved above a dispatch function —
+/// fails here rather than passing on fewer sites), and every non-test
+/// source under `gpu_backend/` that creates a command buffer must be
+/// scanned, here or by `metal_vision::tests::
+/// qwen35_and_vision_command_buffers_are_created_inside_autorelease_pools`
+/// (the hybrid runner's `metal_full_layer/qwen35*.rs` and the vision
+/// tower's `metal_vision/`).
+#[test]
+fn metal_command_buffers_are_created_inside_autorelease_pools() {
+    // (file, source, command-buffer sites it is known to have)
+    let sources: [(&str, &str, usize); 14] = [
+        ("metal_graph/graph.rs", include_str!("graph.rs"), 8),
+        ("metal_graph/buffers.rs", include_str!("buffers.rs"), 0),
+        ("metal_graph/session.rs", include_str!("session.rs"), 0),
+        ("metal_graph/vae.rs", include_str!("vae.rs"), 5),
+        (
+            "metal_prefill/functions.rs",
+            include_str!("../metal_prefill/functions.rs"),
+            1,
+        ),
+        (
+            "metal_prefill/functions_2.rs",
+            include_str!("../metal_prefill/functions_2.rs"),
+            0,
+        ),
+        (
+            "metal_prefill/hidden.rs",
+            include_str!("../metal_prefill/hidden.rs"),
+            0,
+        ),
+        (
+            "metal_prefill/attention.rs",
+            include_str!("../metal_prefill/attention.rs"),
+            0,
+        ),
+        (
+            "metal_full_layer/functions_2.rs",
+            include_str!("../metal_full_layer/functions_2.rs"),
+            8,
+        ),
+        (
+            "metal_fp8_kernels.rs",
+            include_str!("../metal_fp8_kernels.rs"),
+            1,
+        ),
+        (
+            "metal_fp8_prefill.rs",
+            include_str!("../metal_fp8_prefill.rs"),
+            2,
+        ),
+        (
+            "metal_k_quant_kernels.rs",
+            include_str!("../metal_k_quant_kernels.rs"),
+            1,
+        ),
+        (
+            "metal_q_std_kernels.rs",
+            include_str!("../metal_q_std_kernels.rs"),
+            1,
+        ),
+        (
+            "resident_logits.rs",
+            include_str!("../resident_logits.rs"),
+            1,
+        ),
+    ];
+    let is_fn_start = |line: &str| {
+        let code = line.trim_start();
+        [
+            "fn ",
+            "pub fn ",
+            "pub(crate) fn ",
+            "pub(super) fn ",
+            "unsafe fn ",
+            "pub unsafe fn ",
+            "pub(crate) unsafe fn ",
+            "pub(super) unsafe fn ",
+        ]
+        .iter()
+        .any(|prefix| code.starts_with(prefix))
+    };
+    let mut sites = 0usize;
+    for (file, src, known) in sources {
+        let lines = dispatch_lines(src);
+        let mut found = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if !creates_command_buffer(line) {
+                continue;
+            }
+            found += 1;
+            let fn_start = lines[..i].iter().rposition(|l| is_fn_start(l)).unwrap_or(0);
+            assert!(
+                lines[fn_start..i]
+                    .iter()
+                    .any(|l| l.contains("autoreleasepool(")),
+                "{file}:{}: command buffer created outside an autoreleasepool scope",
+                i + 1
+            );
+        }
+        // `>=`: a dispatch site added later is pinned too.
+        assert!(
+            found >= known,
+            "{file}: expected at least its {known} known command-buffer sites, found {found}"
+        );
+        sites += found;
+    }
+    assert!(
+        sites >= 28,
+        "expected at least the 28 known command-buffer sites, found {sites}"
+    );
+
+    // Every non-test source under `gpu_backend/` that creates a command
+    // buffer is scanned here or by the runner / tower test.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gpu_backend");
+    let scanned_here: Vec<&str> = sources.iter().map(|(file, _, _)| *file).collect();
+    let mut pending = vec![root.clone()];
+    let mut dispatch_files = 0usize;
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir).expect("the source directory lists");
+        for entry in entries {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let is_test =
+                name == "tests.rs" || name.ends_with("_tests.rs") || name.starts_with("tests_");
+            if !name.ends_with(".rs") || is_test {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a source file reads");
+            if !dispatch_lines(&src)
+                .iter()
+                .any(|l| creates_command_buffer(l))
+            {
+                continue;
+            }
+            dispatch_files += 1;
+            let relative = path
+                .strip_prefix(&root)
+                .expect("under gpu_backend/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let runner_or_tower = relative.starts_with("metal_full_layer/qwen35")
+                || relative.starts_with("metal_vision/");
+            assert!(
+                scanned_here.contains(&relative.as_str()) || runner_or_tower,
+                "{relative} creates command buffers but no structural pool test scans it"
+            );
+        }
+    }
+    // The nine files above with sites, `qwen35.rs`, `qwen35_rows.rs` and
+    // the tower's `encode.rs`.
+    assert!(
+        dispatch_files >= 12,
+        "expected at least the 12 known dispatch sources, found {dispatch_files}"
+    );
+}

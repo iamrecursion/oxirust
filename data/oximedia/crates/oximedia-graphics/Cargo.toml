@@ -1,0 +1,62 @@
+[package]
+name = "oximedia-graphics"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Broadcast graphics engine for OxiMedia"
+keywords = ["graphics", "rendering", "compositing", "video", "multimedia"]
+categories = ["graphics", "multimedia"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+rand.workspace = true
+oximedia-core.workspace = true
+oximedia-image.workspace = true
+
+# Graphics rendering
+tiny-skia = "0.12"
+fontdue.workspace = true
+ab_glyph.workspace = true
+kurbo = "0.13"
+palette = "0.7"
+
+# GPU rendering
+wgpu = { workspace = true, optional = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true, optional = true }
+
+# SVG rendering
+resvg = "0.47"
+
+# Template and control
+tera = "2"
+
+# getrandom v0.2 (via palette -> phf -> rand 0.8) requires "js" feature on wasm32
+# getrandom v0.4 (via rand 0.10) requires "wasm_js" feature on wasm32
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom02 = { workspace = true }
+getrandom = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, optional = true, features = ["full"] }
+axum = { workspace = true, optional = true }
+
+[features]
+default = ["gpu", "server"]
+gpu = ["dep:wgpu", "dep:pollster"]
+server = ["dep:tokio", "dep:axum"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile.workspace = true

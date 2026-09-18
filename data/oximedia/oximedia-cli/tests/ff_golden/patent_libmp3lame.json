@@ -1,0 +1,10 @@
+{
+  "name": "patent_libmp3lame",
+  "args": ["-i", "in.mp4", "-c:a", "libmp3lame", "out.mkv"],
+  "expect": {
+    "contains_diagnostic_kinds": ["PatentCodecSubstituted"],
+    "contains_diagnostic_messages": ["libmp3lame", "opus"],
+    "jobs": 1,
+    "audio_codec": "opus"
+  }
+}

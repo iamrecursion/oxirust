@@ -1,0 +1,116 @@
+//! # OxiArc Deflate
+//!
+//! Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
+//!
+//! This crate provides compression and decompression of DEFLATE data, which
+//! is the basis for ZIP, GZIP, and PNG formats.
+//!
+//! ## Features
+//!
+//! - **Decompression**: Full support for all DEFLATE block types
+//!   - Stored (uncompressed) blocks
+//!   - Fixed Huffman codes
+//!   - Dynamic Huffman codes
+//! - **Compression**: LZ77 + Huffman encoding
+//!   - Multiple compression levels (0-9)
+//!   - Fixed Huffman codes
+//!
+//! ## Example
+//!
+//! ```rust
+//! use oxiarc_deflate::{deflate, inflate};
+//!
+//! // Compress data
+//! let original = b"Hello, World! Hello, World!";
+//! let compressed = deflate(original, 6).expect("deflate");
+//!
+//! // Decompress data
+//! let decompressed = inflate(&compressed).expect("inflate");
+//! assert_eq!(&decompressed, original);
+//! ```
+//!
+//! ## Compression Levels
+//!
+//! - Level 0: No compression (stored blocks)
+//! - Level 1-3: Fast compression
+//! - Level 4-6: Balanced (default is 6)
+//! - Level 7-9: Best compression (slower)
+//!
+//! ## Naming Convention
+//!
+//! This crate exposes [`deflate()`]/[`inflate()`] rather than the workspace-wide
+//! `compress`/`decompress` naming used by sibling codec crates (e.g.
+//! `oxiarc_lz4::{compress, decompress}`, `oxiarc_brotli::{compress, decompress}`).
+//! This is intentional: `deflate`/`inflate` are the algorithm's own established
+//! names (RFC 1951 itself defines "the deflate format" and describes
+//! decompression as "inflating"), and callers frequently need to distinguish
+//! raw DEFLATE from the [`gzip`] and [`zlib`] container formats built on top of
+//! it, so a distinct verb pair avoids ambiguity. [`GzipEncoder`]/[`GzipDecoder`]
+//! and [`ZlibCompressor`]/[`ZlibDecompressor`] instead follow the generic
+//! `compress`/`decompress` convention for their function-style entry points
+//! ([`gzip_compress`]/[`gzip_decompress`], [`zlib_compress`]/[`zlib_decompress`]).
+
+#![warn(missing_docs)]
+#![warn(clippy::all)]
+#![allow(clippy::module_name_repetitions)]
+
+pub(crate) mod decode_table;
+pub mod deflate;
+mod encoder;
+pub mod gzip;
+pub mod huffman;
+pub mod inflate;
+pub(crate) mod inflate_core;
+pub mod lz77;
+pub mod optimal;
+pub mod pool;
+pub mod reader;
+pub(crate) mod sink;
+pub mod stream;
+pub mod streaming;
+pub mod tables;
+mod window;
+pub mod wrapper;
+pub mod zlib;
+
+#[cfg(feature = "async-io")]
+pub mod async_deflate;
+
+#[cfg(feature = "async-io")]
+pub mod async_reader;
+
+#[cfg(feature = "async-io")]
+pub mod raw_stream;
+
+#[cfg(feature = "parallel")]
+pub mod parallel;
+
+#[cfg(feature = "async-io")]
+pub use async_reader::AsyncInflateReader;
+
+#[cfg(feature = "async-io")]
+pub use raw_stream::{RawDeflateWriter, RawInflateReader};
+
+#[cfg(feature = "parallel")]
+pub use parallel::{
+    DEFAULT_PARALLEL_CHUNK_SIZE, ParallelGzipEncoder, compress_deflate_parallel,
+    compress_gzip_parallel, gzip_compress_parallel,
+};
+
+// Re-exports
+pub use deflate::{Deflater, MAX_DICTIONARY_SIZE, deflate};
+pub use encoder::{LevelConfig, Strategy};
+pub use gzip::{GzipDecoder, GzipEncoder, gzip_compress, gzip_decompress};
+pub use huffman::{HuffmanBuilder, HuffmanTree};
+pub use inflate::{Inflater, MAX_OUTPUT_CAPACITY_HINT, inflate, inflate_into};
+pub use lz77::{Lz77Encoder, Lz77Params, Lz77Preset, Lz77Token};
+pub use optimal::OptimalParser;
+pub use pool::{DeflatePool, PoolStats};
+pub use reader::InflateReader;
+pub use stream::{InflateProgress, InflateStatus, InflateStream};
+pub use streaming::{GzipStreamDecoder, GzipStreamEncoder, ZlibStreamDecoder, ZlibStreamEncoder};
+pub use wrapper::{GzipHeaderInfo, InflateWrapper, TrailingPolicy, WrappedInflate};
+pub use zlib::{
+    Adler32, ZlibCompressor, ZlibDecompressor, zlib_compress, zlib_compress_with_dict,
+    zlib_decompress, zlib_decompress_into, zlib_decompress_with_dict, zlib_requires_dictionary,
+};

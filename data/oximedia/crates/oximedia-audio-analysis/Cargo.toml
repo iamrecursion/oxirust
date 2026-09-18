@@ -1,0 +1,32 @@
+[package]
+name = "oximedia-audio-analysis"
+description = "Audio analysis tools for media including loudness, spectrum, and speech detection"
+keywords = ["audio", "loudness", "spectrum", "analysis", "multimedia"]
+categories = ["multimedia::audio"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-audio = { workspace = true }
+oximedia-mir = { workspace = true }
+thiserror = { workspace = true }
+oxifft = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+rayon = { workspace = true }
+
+[dev-dependencies]
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

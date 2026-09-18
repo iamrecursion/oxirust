@@ -1,0 +1,1647 @@
+//! Distributed optimization using MPI for large-scale parallel computation
+//!
+//! This module provides distributed optimization algorithms that can scale across
+//! multiple nodes using Message Passing Interface (MPI), enabling optimization
+//! of computationally expensive problems across compute clusters.
+
+use crate::error::{ScirsError, ScirsResult};
+use scirs2_core::ndarray::{Array1, Array2, ArrayView1};
+use scirs2_core::random::RngExt;
+use scirs2_core::Rng;
+use statrs::statistics::Statistics;
+use std::any::Any;
+use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::thread;
+
+/// MPI interface abstraction for distributed optimization
+///
+/// Generic methods require `T: 'static` (in addition to the obvious
+/// `Clone + Send + Sync`) so that implementations backed by real threads
+/// (see [`ThreadRankMpi`]) can move data between ranks via `Box<dyn Any +
+/// Send>` type erasure. Every real caller in this module only ever
+/// instantiates `T = f64`, so this is not a practical restriction.
+pub trait MPIInterface {
+    /// Get the rank of this process
+    fn rank(&self) -> i32;
+
+    /// Get the total number of processes
+    fn size(&self) -> i32;
+
+    /// Broadcast data from root to all processes
+    fn broadcast<T>(&self, data: &mut [T], root: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static;
+
+    /// Gather data from all processes to root
+    fn gather<T>(&self, send_data: &[T], recv_data: Option<&mut [T]>, root: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static;
+
+    /// All-to-all reduction operation
+    fn allreduce<T>(
+        &self,
+        send_data: &[T],
+        recv_data: &mut [T],
+        op: ReductionOp,
+    ) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static + std::ops::Add<Output = T> + PartialOrd;
+
+    /// Barrier synchronization
+    fn barrier(&self) -> ScirsResult<()>;
+
+    /// Send data to specific process
+    fn send<T>(&self, data: &[T], dest: i32, tag: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static;
+
+    /// Receive data from specific process
+    fn recv<T>(&self, data: &mut [T], source: i32, tag: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static;
+}
+
+/// Reduction operations for MPI
+#[derive(Debug, Clone, Copy)]
+pub enum ReductionOp {
+    Sum,
+    Min,
+    Max,
+    Prod,
+}
+
+/// Configuration for distributed optimization
+#[derive(Debug, Clone)]
+pub struct DistributedConfig {
+    /// Strategy for distributing work
+    pub distribution_strategy: DistributionStrategy,
+    /// Load balancing configuration
+    pub load_balancing: LoadBalancingConfig,
+    /// Communication optimization settings
+    pub communication: CommunicationConfig,
+    /// Fault tolerance configuration
+    pub fault_tolerance: FaultToleranceConfig,
+}
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        Self {
+            distribution_strategy: DistributionStrategy::DataParallel,
+            load_balancing: LoadBalancingConfig::default(),
+            communication: CommunicationConfig::default(),
+            fault_tolerance: FaultToleranceConfig::default(),
+        }
+    }
+}
+
+/// Work distribution strategies
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DistributionStrategy {
+    /// Distribute data across processes
+    DataParallel,
+    /// Distribute parameters across processes
+    ModelParallel,
+    /// Hybrid data and model parallelism
+    Hybrid,
+    /// Master-worker with dynamic task assignment
+    MasterWorker,
+}
+
+/// Load balancing configuration
+#[derive(Debug, Clone)]
+pub struct LoadBalancingConfig {
+    /// Whether to enable dynamic load balancing
+    pub dynamic: bool,
+    /// Threshold for load imbalance (0.0 to 1.0)
+    pub imbalance_threshold: f64,
+    /// Rebalancing interval (in iterations)
+    pub rebalance_interval: usize,
+}
+
+impl Default for LoadBalancingConfig {
+    fn default() -> Self {
+        Self {
+            dynamic: true,
+            imbalance_threshold: 0.2,
+            rebalance_interval: 100,
+        }
+    }
+}
+
+/// Communication optimization configuration
+#[derive(Debug, Clone)]
+pub struct CommunicationConfig {
+    /// Whether to use asynchronous communication
+    pub async_communication: bool,
+    /// Communication buffer size
+    pub buffer_size: usize,
+    /// Compression for large data transfers
+    pub use_compression: bool,
+    /// Overlap computation with communication
+    pub overlap_computation: bool,
+}
+
+impl Default for CommunicationConfig {
+    fn default() -> Self {
+        Self {
+            async_communication: true,
+            buffer_size: 1024 * 1024, // 1MB
+            use_compression: false,
+            overlap_computation: true,
+        }
+    }
+}
+
+/// Fault tolerance configuration
+#[derive(Debug, Clone)]
+pub struct FaultToleranceConfig {
+    /// Enable checkpointing
+    pub checkpointing: bool,
+    /// Checkpoint interval (in iterations)
+    pub checkpoint_interval: usize,
+    /// Maximum number of retries for failed operations
+    pub max_retries: usize,
+    /// Timeout for MPI operations (in seconds)
+    pub timeout: f64,
+}
+
+impl Default for FaultToleranceConfig {
+    fn default() -> Self {
+        Self {
+            checkpointing: false,
+            checkpoint_interval: 1000,
+            max_retries: 3,
+            timeout: 30.0,
+        }
+    }
+}
+
+/// Distributed optimization context
+pub struct DistributedOptimizationContext<M: MPIInterface> {
+    mpi: M,
+    config: DistributedConfig,
+    rank: i32,
+    size: i32,
+    work_distribution: WorkDistribution,
+    performance_stats: DistributedStats,
+}
+
+impl<M: MPIInterface> DistributedOptimizationContext<M> {
+    /// Create a new distributed optimization context
+    pub fn new(mpi: M, config: DistributedConfig) -> Self {
+        let rank = mpi.rank();
+        let size = mpi.size();
+        let work_distribution = WorkDistribution::new(rank, size, config.distribution_strategy);
+
+        Self {
+            mpi,
+            config,
+            rank,
+            size,
+            work_distribution,
+            performance_stats: DistributedStats::new(),
+        }
+    }
+
+    /// Get the MPI rank of this process
+    pub fn rank(&self) -> i32 {
+        self.rank
+    }
+
+    /// Get the total number of MPI processes
+    pub fn size(&self) -> i32 {
+        self.size
+    }
+
+    /// Check if this is the master process
+    pub fn is_master(&self) -> bool {
+        self.rank == 0
+    }
+
+    /// Distribute work among processes
+    pub fn distribute_work(&mut self, total_work: usize) -> WorkAssignment {
+        self.work_distribution.assign_work(total_work)
+    }
+
+    /// Synchronize all processes
+    pub fn synchronize(&self) -> ScirsResult<()> {
+        self.mpi.barrier()
+    }
+
+    /// Broadcast parameters from master to all workers
+    pub fn broadcast_parameters(&self, params: &mut Array1<f64>) -> ScirsResult<()> {
+        let data = params.as_slice_mut().expect("Operation failed");
+        self.mpi.broadcast(data, 0)
+    }
+
+    /// Gather results from all workers to master
+    pub fn gather_results(&self, local_result: &Array1<f64>) -> ScirsResult<Option<Array2<f64>>> {
+        if self.is_master() {
+            let total_size = local_result.len() * self.size as usize;
+            let mut gathered_data = vec![0.0; total_size];
+            self.mpi.gather(
+                local_result.as_slice().expect("Operation failed"),
+                Some(&mut gathered_data),
+                0,
+            )?;
+
+            // Reshape into 2D array
+            let result =
+                Array2::from_shape_vec((self.size as usize, local_result.len()), gathered_data)
+                    .map_err(|e| {
+                        ScirsError::InvalidInput(scirs2_core::error::ErrorContext::new(format!(
+                            "Failed to reshape gathered data: {}",
+                            e
+                        )))
+                    })?;
+            Ok(Some(result))
+        } else {
+            self.mpi
+                .gather(local_result.as_slice().expect("Operation failed"), None, 0)?;
+            Ok(None)
+        }
+    }
+
+    /// Perform all-reduce operation (sum)
+    pub fn allreduce_sum(&self, local_data: &Array1<f64>) -> ScirsResult<Array1<f64>> {
+        let mut result = Array1::zeros(local_data.len());
+        self.mpi.allreduce(
+            local_data.as_slice().expect("Operation failed"),
+            result.as_slice_mut().expect("Operation failed"),
+            ReductionOp::Sum,
+        )?;
+        Ok(result)
+    }
+
+    /// Perform all-reduce operation (element-wise minimum)
+    pub fn allreduce_min(&self, local_data: &Array1<f64>) -> ScirsResult<Array1<f64>> {
+        let mut result = Array1::zeros(local_data.len());
+        self.mpi.allreduce(
+            local_data.as_slice().expect("Operation failed"),
+            result.as_slice_mut().expect("Operation failed"),
+            ReductionOp::Min,
+        )?;
+        Ok(result)
+    }
+
+    /// Perform all-reduce operation (element-wise maximum)
+    pub fn allreduce_max(&self, local_data: &Array1<f64>) -> ScirsResult<Array1<f64>> {
+        let mut result = Array1::zeros(local_data.len());
+        self.mpi.allreduce(
+            local_data.as_slice().expect("Operation failed"),
+            result.as_slice_mut().expect("Operation failed"),
+            ReductionOp::Max,
+        )?;
+        Ok(result)
+    }
+
+    /// Broadcast a vector from an arbitrary root rank to all processes
+    pub fn broadcast_from(&self, params: &mut Array1<f64>, root: i32) -> ScirsResult<()> {
+        let data = params.as_slice_mut().expect("Operation failed");
+        self.mpi.broadcast(data, root)
+    }
+
+    /// Select the globally-best candidate across the whole communicator.
+    ///
+    /// Given each process's local best point and its objective value, returns
+    /// the best `(point, value)` pair over all processes. The global-best value
+    /// is obtained with a `Min` all-reduce; the owning rank (lowest rank on
+    /// ties) is identified by a second `Min` all-reduce over rank indices, and
+    /// its point is broadcast so every process agrees on the winning candidate.
+    pub fn select_global_best(
+        &self,
+        local_best: &Array1<f64>,
+        local_value: f64,
+    ) -> ScirsResult<(Array1<f64>, f64)> {
+        if self.size <= 1 {
+            return Ok((local_best.to_owned(), local_value));
+        }
+
+        // Global-best objective value.
+        let value_buf = Array1::from_elem(1, local_value);
+        let global_value = self.allreduce_min(&value_buf)?[0];
+
+        // Identify the owning rank: holders of the global-best value propose
+        // their own rank, everyone else proposes a sentinel larger than any
+        // valid rank. The minimum proposal is the lowest rank holding the best.
+        let owner_proposal = if local_value <= global_value {
+            self.rank as f64
+        } else {
+            self.size as f64
+        };
+        let owner_buf = Array1::from_elem(1, owner_proposal);
+        let owner_rank = self.allreduce_min(&owner_buf)?[0] as i32;
+
+        // Broadcast the winning point from its owner to all processes.
+        let mut winner = local_best.to_owned();
+        self.broadcast_from(&mut winner, owner_rank)?;
+
+        Ok((winner, global_value))
+    }
+
+    /// Exchange a vector around a unidirectional process ring.
+    ///
+    /// Sends `outgoing` to rank `(rank + 1) % size` and returns the vector
+    /// received from rank `(rank - 1 + size) % size`. A deadlock-free ordering
+    /// is used (rank 0 receives before sending, every other rank sends before
+    /// receiving), so it is safe with blocking point-to-point primitives for any
+    /// communicator size. Returns `None` when there is only a single process.
+    pub fn ring_exchange(&self, outgoing: &Array1<f64>) -> ScirsResult<Option<Array1<f64>>> {
+        if self.size <= 1 {
+            return Ok(None);
+        }
+
+        let next = (self.rank + 1).rem_euclid(self.size);
+        let prev = (self.rank - 1).rem_euclid(self.size);
+        let tag = 0;
+        let send = outgoing.as_slice().expect("Operation failed");
+        let mut incoming = vec![0.0_f64; outgoing.len()];
+
+        if self.rank == 0 {
+            // Rank 0 receives first to break the cyclic dependency.
+            self.mpi.recv(&mut incoming, prev, tag)?;
+            self.mpi.send(send, next, tag)?;
+        } else {
+            self.mpi.send(send, next, tag)?;
+            self.mpi.recv(&mut incoming, prev, tag)?;
+        }
+
+        Ok(Some(Array1::from_vec(incoming)))
+    }
+
+    /// Get performance statistics
+    pub fn stats(&self) -> &DistributedStats {
+        &self.performance_stats
+    }
+}
+
+/// Work distribution manager
+struct WorkDistribution {
+    rank: i32,
+    size: i32,
+    strategy: DistributionStrategy,
+}
+
+impl WorkDistribution {
+    fn new(rank: i32, size: i32, strategy: DistributionStrategy) -> Self {
+        Self {
+            rank,
+            size,
+            strategy,
+        }
+    }
+
+    fn assign_work(&self, total_work: usize) -> WorkAssignment {
+        match self.strategy {
+            DistributionStrategy::DataParallel => self.data_parallel_assignment(total_work),
+            DistributionStrategy::ModelParallel => self.model_parallel_assignment(total_work),
+            DistributionStrategy::Hybrid => self.hybrid_assignment(total_work),
+            DistributionStrategy::MasterWorker => self.master_worker_assignment(total_work),
+        }
+    }
+
+    fn data_parallel_assignment(&self, total_work: usize) -> WorkAssignment {
+        let work_per_process = total_work / self.size as usize;
+        let remainder = total_work % self.size as usize;
+
+        let start = self.rank as usize * work_per_process + (self.rank as usize).min(remainder);
+        let extra = if (self.rank as usize) < remainder {
+            1
+        } else {
+            0
+        };
+        let count = work_per_process + extra;
+
+        WorkAssignment {
+            start_index: start,
+            count,
+            strategy: DistributionStrategy::DataParallel,
+        }
+    }
+
+    fn model_parallel_assignment(&self, total_work: usize) -> WorkAssignment {
+        // For model parallelism, each process handles different parameters
+        WorkAssignment {
+            start_index: 0,
+            count: total_work, // Each process sees all data but handles different parameters
+            strategy: DistributionStrategy::ModelParallel,
+        }
+    }
+
+    fn hybrid_assignment(&self, total_work: usize) -> WorkAssignment {
+        // Hybrid data/model parallelism: arrange the processes into a 2-D grid
+        // of `data_groups` x `model_groups`. The data dimension partitions the
+        // work range (as in data parallelism), while processes that share a
+        // data range form a model-parallel group splitting the parameter space.
+        //
+        // For a single process, or a communicator that cannot be factored into
+        // more than one model group (e.g. a prime size), this reduces exactly
+        // to data parallelism over all processes.
+        let size = (self.size.max(1)) as usize;
+
+        // Choose the number of model-parallel groups as the largest divisor of
+        // `size` not exceeding sqrt(size); this yields a balanced process grid.
+        let mut model_groups = 1usize;
+        let mut divisor = 2usize;
+        while divisor * divisor <= size {
+            if size % divisor == 0 {
+                model_groups = divisor;
+            }
+            divisor += 1;
+        }
+        let data_groups = size / model_groups;
+
+        // Coordinate of this process along the data dimension of the grid.
+        let rank = (self.rank.max(0)) as usize;
+        let data_coord = (rank / model_groups).min(data_groups.saturating_sub(1));
+
+        // Partition the work range across the data groups.
+        let work_per_group = total_work / data_groups;
+        let remainder = total_work % data_groups;
+        let start = data_coord * work_per_group + data_coord.min(remainder);
+        let extra = if data_coord < remainder { 1 } else { 0 };
+        let count = work_per_group + extra;
+
+        WorkAssignment {
+            start_index: start,
+            count,
+            strategy: DistributionStrategy::Hybrid,
+        }
+    }
+
+    fn master_worker_assignment(&self, total_work: usize) -> WorkAssignment {
+        if self.rank == 0 {
+            // Master coordinates but may not do computation
+            WorkAssignment {
+                start_index: 0,
+                count: 0,
+                strategy: DistributionStrategy::MasterWorker,
+            }
+        } else {
+            // Workers split the work
+            let worker_count = self.size - 1;
+            let work_per_worker = total_work / worker_count as usize;
+            let remainder = total_work % worker_count as usize;
+            let worker_rank = self.rank - 1;
+
+            let start =
+                worker_rank as usize * work_per_worker + (worker_rank as usize).min(remainder);
+            let extra = if (worker_rank as usize) < remainder {
+                1
+            } else {
+                0
+            };
+            let count = work_per_worker + extra;
+
+            WorkAssignment {
+                start_index: start,
+                count,
+                strategy: DistributionStrategy::MasterWorker,
+            }
+        }
+    }
+}
+
+/// Work assignment for a process
+#[derive(Debug, Clone)]
+pub struct WorkAssignment {
+    /// Starting index for this process
+    pub start_index: usize,
+    /// Number of work items for this process
+    pub count: usize,
+    /// Distribution strategy used
+    pub strategy: DistributionStrategy,
+}
+
+impl WorkAssignment {
+    /// Get the range of indices assigned to this process
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start_index..(self.start_index + self.count)
+    }
+
+    /// Check if this assignment is empty
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// Distributed optimization algorithms
+pub mod algorithms {
+    use super::*;
+    use crate::result::OptimizeResults;
+
+    /// Distributed differential evolution
+    pub struct DistributedDifferentialEvolution<M: MPIInterface> {
+        context: DistributedOptimizationContext<M>,
+        population_size: usize,
+        max_nit: usize,
+        f_scale: f64,
+        crossover_rate: f64,
+    }
+
+    impl<M: MPIInterface> DistributedDifferentialEvolution<M> {
+        /// Create a new distributed differential evolution optimizer
+        pub fn new(
+            context: DistributedOptimizationContext<M>,
+            population_size: usize,
+            max_nit: usize,
+        ) -> Self {
+            Self {
+                context,
+                population_size,
+                max_nit,
+                f_scale: 0.8,
+                crossover_rate: 0.7,
+            }
+        }
+
+        /// Set mutation parameters
+        pub fn with_parameters(mut self, f_scale: f64, crossover_rate: f64) -> Self {
+            self.f_scale = f_scale;
+            self.crossover_rate = crossover_rate;
+            self
+        }
+
+        /// Optimize function using distributed differential evolution
+        pub fn optimize<F>(
+            &mut self,
+            function: F,
+            bounds: &[(f64, f64)],
+        ) -> ScirsResult<OptimizeResults<f64>>
+        where
+            F: Fn(&ArrayView1<f64>) -> f64 + Clone + Send + Sync,
+        {
+            let dims = bounds.len();
+
+            // Initialize local population
+            let local_pop_size = self.population_size / self.context.size() as usize;
+            let mut local_population = self.initialize_local_population(local_pop_size, bounds)?;
+            let mut local_fitness = self.evaluate_local_population(&function, &local_population)?;
+
+            // Find global best across all processes
+            let mut global_best = self.find_global_best(&local_population, &local_fitness)?;
+            let mut global_best_fitness = global_best.1;
+
+            let mut total_evaluations = self.population_size;
+
+            for iteration in 0..self.max_nit {
+                // Generate trial population
+                let trial_population = self.generate_trial_population(&local_population)?;
+                let trial_fitness = self.evaluate_local_population(&function, &trial_population)?;
+
+                // Selection
+                self.selection(
+                    &mut local_population,
+                    &mut local_fitness,
+                    &trial_population,
+                    &trial_fitness,
+                );
+
+                total_evaluations += local_pop_size;
+
+                // Exchange information between processes
+                if iteration % 10 == 0 {
+                    let new_global_best =
+                        self.find_global_best(&local_population, &local_fitness)?;
+                    if new_global_best.1 < global_best_fitness {
+                        global_best = new_global_best;
+                        global_best_fitness = global_best.1;
+                    }
+
+                    // Migration between processes
+                    self.migrate_individuals(&mut local_population, &mut local_fitness)?;
+                }
+
+                // Convergence check (simplified)
+                if iteration % 50 == 0 {
+                    let convergence = self.check_convergence(&local_fitness)?;
+                    if convergence {
+                        break;
+                    }
+                }
+            }
+
+            // Final global best search
+            let final_best = self.find_global_best(&local_population, &local_fitness)?;
+            if final_best.1 < global_best_fitness {
+                global_best = final_best.clone();
+                global_best_fitness = final_best.1;
+            }
+
+            Ok(OptimizeResults::<f64> {
+                x: global_best.0,
+                fun: global_best_fitness,
+                success: true,
+                message: "Distributed differential evolution completed".to_string(),
+                nit: self.max_nit,
+                nfev: total_evaluations,
+                ..OptimizeResults::default()
+            })
+        }
+
+        fn initialize_local_population(
+            &self,
+            local_size: usize,
+            bounds: &[(f64, f64)],
+        ) -> ScirsResult<Array2<f64>> {
+            let mut rng = scirs2_core::random::rng();
+
+            let dims = bounds.len();
+            let mut population = Array2::zeros((local_size, dims));
+
+            for i in 0..local_size {
+                for j in 0..dims {
+                    let (low, high) = bounds[j];
+                    population[[i, j]] = rng.random_range(low..=high);
+                }
+            }
+
+            Ok(population)
+        }
+
+        fn evaluate_local_population<F>(
+            &self,
+            function: &F,
+            population: &Array2<f64>,
+        ) -> ScirsResult<Array1<f64>>
+        where
+            F: Fn(&ArrayView1<f64>) -> f64,
+        {
+            let mut fitness = Array1::zeros(population.nrows());
+
+            for i in 0..population.nrows() {
+                let individual = population.row(i);
+                fitness[i] = function(&individual);
+            }
+
+            Ok(fitness)
+        }
+
+        fn find_global_best(
+            &mut self,
+            local_population: &Array2<f64>,
+            local_fitness: &Array1<f64>,
+        ) -> ScirsResult<(Array1<f64>, f64)> {
+            // Find local best
+            let mut best_idx = 0;
+            let mut best_fitness = local_fitness[0];
+            for (i, &fitness) in local_fitness.iter().enumerate() {
+                if fitness < best_fitness {
+                    best_fitness = fitness;
+                    best_idx = i;
+                }
+            }
+
+            let local_best = local_population.row(best_idx).to_owned();
+
+            // Reduce to the true global best across all processes: the global
+            // minimum fitness and a broadcast of the individual that owns it.
+            self.context.select_global_best(&local_best, best_fitness)
+        }
+
+        fn generate_trial_population(&self, population: &Array2<f64>) -> ScirsResult<Array2<f64>> {
+            let mut rng = scirs2_core::random::rng();
+
+            let (pop_size, dims) = population.dim();
+            let mut trial_population = Array2::zeros((pop_size, dims));
+
+            for i in 0..pop_size {
+                // Select three random individuals
+                let mut indices = Vec::new();
+                while indices.len() < 3 {
+                    let idx = rng.random_range(0..pop_size);
+                    if idx != i && !indices.contains(&idx) {
+                        indices.push(idx);
+                    }
+                }
+
+                let a = indices[0];
+                let b = indices[1];
+                let c = indices[2];
+
+                // Mutation and crossover
+                let j_rand = rng.random_range(0..dims);
+                for j in 0..dims {
+                    if rng.random::<f64>() < self.crossover_rate || j == j_rand {
+                        trial_population[[i, j]] = population[[a, j]]
+                            + self.f_scale * (population[[b, j]] - population[[c, j]]);
+                    } else {
+                        trial_population[[i, j]] = population[[i, j]];
+                    }
+                }
+            }
+
+            Ok(trial_population)
+        }
+
+        fn selection(
+            &self,
+            population: &mut Array2<f64>,
+            fitness: &mut Array1<f64>,
+            trial_population: &Array2<f64>,
+            trial_fitness: &Array1<f64>,
+        ) {
+            for i in 0..population.nrows() {
+                if trial_fitness[i] <= fitness[i] {
+                    for j in 0..population.ncols() {
+                        population[[i, j]] = trial_population[[i, j]];
+                    }
+                    fitness[i] = trial_fitness[i];
+                }
+            }
+        }
+
+        fn migrate_individuals(
+            &mut self,
+            population: &mut Array2<f64>,
+            fitness: &mut Array1<f64>,
+        ) -> ScirsResult<()> {
+            // Island-model migration around a unidirectional process ring: send
+            // this island's best individual to the next process and adopt the
+            // migrant received from the previous process if it improves on the
+            // local worst individual.
+            if self.context.size() <= 1 {
+                return Ok(());
+            }
+
+            let best_idx = fitness
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("Operation failed"))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+
+            // Pack the best individual together with its fitness so the migrant
+            // arrives with a valid objective value (the islands share the same
+            // objective, so the value transfers without re-evaluation).
+            let dims = population.ncols();
+            let mut payload = population.row(best_idx).to_vec();
+            payload.push(fitness[best_idx]);
+            let payload = Array1::from_vec(payload);
+
+            if let Some(received) = self.context.ring_exchange(&payload)? {
+                let migrant_fitness = received[dims];
+
+                // Replace the local worst individual when the migrant is better.
+                let worst_idx = fitness
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).expect("Operation failed"))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+
+                if migrant_fitness < fitness[worst_idx] {
+                    for j in 0..dims {
+                        population[[worst_idx, j]] = received[j];
+                    }
+                    fitness[worst_idx] = migrant_fitness;
+                }
+            }
+
+            Ok(())
+        }
+
+        fn check_convergence(&mut self, local_fitness: &Array1<f64>) -> ScirsResult<bool> {
+            let mean = local_fitness.view().mean();
+            let variance = local_fitness
+                .iter()
+                .map(|&x| (x - mean).powi(2))
+                .sum::<f64>()
+                / local_fitness.len() as f64;
+
+            let std_dev = variance.sqrt();
+
+            // The stop decision must be identical on every rank: each rank's
+            // local population is independently randomly initialized, so
+            // local std_dev can cross the threshold on some ranks well before
+            // others. If ranks disagreed here, one would `break` out of the
+            // main loop while others kept calling `find_global_best`/
+            // `migrate_individuals` every 10 iterations — permanently
+            // desynchronizing the collective call sequence and deadlocking
+            // every remaining rank on its next barrier wait. Agreeing on the
+            // worst (largest) std_dev across all ranks keeps the decision,
+            // and therefore the collective call count, identical everywhere.
+            let global_max_std_dev = self.context.allreduce_max(&Array1::from_elem(1, std_dev))?[0];
+
+            Ok(global_max_std_dev < 1e-12)
+        }
+    }
+
+    /// Distributed particle swarm optimization
+    pub struct DistributedParticleSwarm<M: MPIInterface> {
+        context: DistributedOptimizationContext<M>,
+        swarm_size: usize,
+        max_nit: usize,
+        w: f64,  // Inertia weight
+        c1: f64, // Cognitive parameter
+        c2: f64, // Social parameter
+    }
+
+    impl<M: MPIInterface> DistributedParticleSwarm<M> {
+        /// Create a new distributed particle swarm optimizer
+        pub fn new(
+            context: DistributedOptimizationContext<M>,
+            swarm_size: usize,
+            max_nit: usize,
+        ) -> Self {
+            Self {
+                context,
+                swarm_size,
+                max_nit,
+                w: 0.729,
+                c1: 1.49445,
+                c2: 1.49445,
+            }
+        }
+
+        /// Set PSO parameters
+        pub fn with_parameters(mut self, w: f64, c1: f64, c2: f64) -> Self {
+            self.w = w;
+            self.c1 = c1;
+            self.c2 = c2;
+            self
+        }
+
+        /// Optimize function using distributed particle swarm optimization
+        pub fn optimize<F>(
+            &mut self,
+            function: F,
+            bounds: &[(f64, f64)],
+        ) -> ScirsResult<OptimizeResults<f64>>
+        where
+            F: Fn(&ArrayView1<f64>) -> f64 + Clone + Send + Sync,
+        {
+            let dims = bounds.len();
+            let local_swarm_size = self.swarm_size / self.context.size() as usize;
+
+            // Initialize local swarm
+            let mut positions = self.initialize_positions(local_swarm_size, bounds)?;
+            let mut velocities = Array2::zeros((local_swarm_size, dims));
+            let mut personal_best = positions.clone();
+            let mut personal_best_fitness = self.evaluate_swarm(&function, &positions)?;
+
+            // Find global best
+            let mut global_best = self.find_global_best(&personal_best, &personal_best_fitness)?;
+            let mut global_best_fitness = global_best.1;
+
+            let mut function_evaluations = local_swarm_size;
+
+            for iteration in 0..self.max_nit {
+                // Update swarm
+                self.update_swarm(
+                    &mut positions,
+                    &mut velocities,
+                    &personal_best,
+                    &global_best.0,
+                    bounds,
+                )?;
+
+                // Evaluate new positions
+                let fitness = self.evaluate_swarm(&function, &positions)?;
+                function_evaluations += local_swarm_size;
+
+                // Update personal bests
+                for i in 0..local_swarm_size {
+                    if fitness[i] < personal_best_fitness[i] {
+                        personal_best_fitness[i] = fitness[i];
+                        for j in 0..dims {
+                            personal_best[[i, j]] = positions[[i, j]];
+                        }
+                    }
+                }
+
+                // Update global best
+                if iteration % 10 == 0 {
+                    let new_global_best =
+                        self.find_global_best(&personal_best, &personal_best_fitness)?;
+                    if new_global_best.1 < global_best_fitness {
+                        global_best = new_global_best;
+                        global_best_fitness = global_best.1;
+                    }
+                }
+            }
+
+            Ok(OptimizeResults::<f64> {
+                x: global_best.0,
+                fun: global_best_fitness,
+                success: true,
+                message: "Distributed particle swarm optimization completed".to_string(),
+                nit: self.max_nit,
+                nfev: function_evaluations,
+                ..OptimizeResults::default()
+            })
+        }
+
+        fn initialize_positions(
+            &self,
+            local_size: usize,
+            bounds: &[(f64, f64)],
+        ) -> ScirsResult<Array2<f64>> {
+            let mut rng = scirs2_core::random::rng();
+
+            let dims = bounds.len();
+            let mut positions = Array2::zeros((local_size, dims));
+
+            for i in 0..local_size {
+                for j in 0..dims {
+                    let (low, high) = bounds[j];
+                    positions[[i, j]] = rng.random_range(low..=high);
+                }
+            }
+
+            Ok(positions)
+        }
+
+        fn evaluate_swarm<F>(
+            &self,
+            function: &F,
+            positions: &Array2<f64>,
+        ) -> ScirsResult<Array1<f64>>
+        where
+            F: Fn(&ArrayView1<f64>) -> f64,
+        {
+            let mut fitness = Array1::zeros(positions.nrows());
+
+            for i in 0..positions.nrows() {
+                let particle = positions.row(i);
+                fitness[i] = function(&particle);
+            }
+
+            Ok(fitness)
+        }
+
+        fn find_global_best(
+            &mut self,
+            positions: &Array2<f64>,
+            fitness: &Array1<f64>,
+        ) -> ScirsResult<(Array1<f64>, f64)> {
+            // Find local best
+            let mut best_idx = 0;
+            let mut best_fitness = fitness[0];
+            for (i, &f) in fitness.iter().enumerate() {
+                if f < best_fitness {
+                    best_fitness = f;
+                    best_idx = i;
+                }
+            }
+
+            let local_best = positions.row(best_idx).to_owned();
+
+            // Reduce to the true global best across all processes: the global
+            // minimum fitness and a broadcast of the particle that owns it.
+            self.context.select_global_best(&local_best, best_fitness)
+        }
+
+        fn update_swarm(
+            &self,
+            positions: &mut Array2<f64>,
+            velocities: &mut Array2<f64>,
+            personal_best: &Array2<f64>,
+            global_best: &Array1<f64>,
+            bounds: &[(f64, f64)],
+        ) -> ScirsResult<()> {
+            let mut rng = scirs2_core::random::rng();
+
+            let (swarm_size, dims) = positions.dim();
+
+            for i in 0..swarm_size {
+                for j in 0..dims {
+                    let r1: f64 = rng.random();
+                    let r2: f64 = rng.random();
+
+                    // Update velocity
+                    velocities[[i, j]] = self.w * velocities[[i, j]]
+                        + self.c1 * r1 * (personal_best[[i, j]] - positions[[i, j]])
+                        + self.c2 * r2 * (global_best[j] - positions[[i, j]]);
+
+                    // Update position
+                    positions[[i, j]] += velocities[[i, j]];
+
+                    // Apply bounds
+                    let (low, high) = bounds[j];
+                    if positions[[i, j]] < low {
+                        positions[[i, j]] = low;
+                        velocities[[i, j]] = 0.0;
+                    } else if positions[[i, j]] > high {
+                        positions[[i, j]] = high;
+                        velocities[[i, j]] = 0.0;
+                    }
+                }
+            }
+
+            Ok(())
+        }
+    }
+}
+
+/// Performance statistics for distributed optimization
+#[derive(Debug, Clone)]
+pub struct DistributedStats {
+    /// Communication time statistics
+    pub communication_time: f64,
+    /// Computation time statistics
+    pub computation_time: f64,
+    /// Load balancing statistics
+    pub load_balance_ratio: f64,
+    /// Number of synchronization points
+    pub synchronizations: usize,
+    /// Data transfer statistics (bytes)
+    pub bytes_transferred: usize,
+}
+
+impl DistributedStats {
+    fn new() -> Self {
+        Self {
+            communication_time: 0.0,
+            computation_time: 0.0,
+            load_balance_ratio: 1.0,
+            synchronizations: 0,
+            bytes_transferred: 0,
+        }
+    }
+
+    /// Calculate parallel efficiency
+    pub fn parallel_efficiency(&self) -> f64 {
+        if self.communication_time + self.computation_time == 0.0 {
+            1.0
+        } else {
+            self.computation_time / (self.communication_time + self.computation_time)
+        }
+    }
+
+    /// Generate performance report
+    pub fn generate_report(&self) -> String {
+        format!(
+            "Distributed Optimization Performance Report\n\
+             ==========================================\n\
+             Computation Time: {:.3}s\n\
+             Communication Time: {:.3}s\n\
+             Parallel Efficiency: {:.1}%\n\
+             Load Balance Ratio: {:.3}\n\
+             Synchronizations: {}\n\
+             Data Transferred: {} bytes\n",
+            self.computation_time,
+            self.communication_time,
+            self.parallel_efficiency() * 100.0,
+            self.load_balance_ratio,
+            self.synchronizations,
+            self.bytes_transferred
+        )
+    }
+}
+
+/// Minimal rank/size-only stub, for tests of logic that only reads
+/// [`MPIInterface::rank`]/[`MPIInterface::size`] (e.g. the crate-private
+/// `WorkDistribution`) and never actually exercises cross-rank communication.
+///
+/// Its collective methods are deliberately no-ops (`broadcast`/`gather` leave
+/// `data` untouched; `send`/`recv` never actually transfer anything) — with
+/// only one instance in existence there is no "other side" to communicate
+/// with, so pretending otherwise would silently fabricate results. Using
+/// this with `size > 1` to drive an actual algorithm (e.g.
+/// [`algorithms::DistributedDifferentialEvolution`]) will silently skip all
+/// cross-rank exchange. For real multi-rank end-to-end testing, use
+/// [`ThreadRankMpi`], which backs every collective with genuine
+/// cross-thread synchronization.
+pub struct MockMPI {
+    rank: i32,
+    size: i32,
+}
+
+impl MockMPI {
+    pub fn new(rank: i32, size: i32) -> Self {
+        Self { rank, size }
+    }
+}
+
+impl MPIInterface for MockMPI {
+    fn rank(&self) -> i32 {
+        self.rank
+    }
+    fn size(&self) -> i32 {
+        self.size
+    }
+
+    fn broadcast<T>(&self, _data: &mut [T], _root: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Ok(())
+    }
+
+    fn gather<T>(
+        &self,
+        _send_data: &[T],
+        _recv_data: Option<&mut [T]>,
+        _root: i32,
+    ) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Ok(())
+    }
+
+    fn allreduce<T>(
+        &self,
+        send_data: &[T],
+        recv_data: &mut [T],
+        _op: ReductionOp,
+    ) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static + std::ops::Add<Output = T> + PartialOrd,
+    {
+        // Single simulated rank: the "reduction" over one contribution is
+        // itself, regardless of op (sum/min/max of one value is that value).
+        for (i, item) in send_data.iter().enumerate() {
+            if i < recv_data.len() {
+                recv_data[i] = item.clone();
+            }
+        }
+        Ok(())
+    }
+
+    fn barrier(&self) -> ScirsResult<()> {
+        Ok(())
+    }
+    fn send<T>(&self, _data: &[T], _dest: i32, _tag: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Ok(())
+    }
+    fn recv<T>(&self, _data: &mut [T], _source: i32, _tag: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Thread-simulated multi-rank MPI (no MPI runtime / process spawning needed)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Per-communicator state shared by every [`ThreadRankMpi`] handle in the
+/// same simulated communicator. Collectives rendezvous through `slots`
+/// (one entry per rank) guarded by a pair of reusable barriers; point-to-
+/// point `send`/`recv` rendezvous through per-destination `mailboxes`.
+struct ThreadMpiShared {
+    size: i32,
+    slots: Mutex<Vec<Option<Box<dyn Any + Send>>>>,
+    deposited: Barrier,
+    consumed: Barrier,
+    explicit_barrier: Barrier,
+    mailboxes: Mutex<Vec<Vec<(i32, i32, Box<dyn Any + Send>)>>>,
+    mail_cv: Condvar,
+}
+
+/// An [`MPIInterface`] implementation that simulates `size` MPI ranks using
+/// real OS threads within a single process, so distributed algorithms
+/// ([`algorithms::DistributedDifferentialEvolution`],
+/// [`algorithms::DistributedParticleSwarm`]) can be exercised end-to-end —
+/// with genuine cross-rank broadcast/gather/allreduce/send/recv — without an
+/// actual MPI runtime or multi-process setup. See [`spawn_ranks`] to
+/// construct and drive a full communicator.
+///
+/// Every generic method requires `T: 'static` (per [`MPIInterface`]) because
+/// values cross the simulated thread boundary via `Box<dyn Any + Send>`.
+pub struct ThreadRankMpi {
+    rank: i32,
+    shared: Arc<ThreadMpiShared>,
+}
+
+impl ThreadRankMpi {
+    /// Clone the `Vec<T>` behind a type-erased slot without consuming it —
+    /// collectives where multiple ranks all read the same slot (broadcast,
+    /// allreduce) must not `.take()` it, or only the first rank to acquire
+    /// the lock would see `Some` and every other rank would panic on `None`.
+    fn clone_from_slot<T: Clone + 'static>(boxed: &Box<dyn Any + Send>) -> Vec<T> {
+        boxed
+            .downcast_ref::<Vec<T>>()
+            .expect("ThreadRankMpi: type mismatch between ranks in the same collective call")
+            .clone()
+    }
+}
+
+/// Build a `size`-rank simulated communicator and run `body` on each
+/// simulated rank in its own thread, returning each rank's result in rank
+/// order. `body` receives a ready-to-use [`ThreadRankMpi`] handle; construct
+/// a [`DistributedOptimizationContext`] from it to drive a real algorithm.
+///
+/// # Panics
+/// Propagates a panic from `body` on any rank (via `JoinHandle::join`'s
+/// `Result::expect`) rather than silently losing a rank's failure.
+pub fn spawn_ranks<F, R>(size: usize, body: F) -> Vec<R>
+where
+    F: Fn(ThreadRankMpi) -> R + Send + Sync + Clone + 'static,
+    R: Send + 'static,
+{
+    let shared = Arc::new(ThreadMpiShared {
+        size: size as i32,
+        slots: Mutex::new((0..size).map(|_| None).collect()),
+        deposited: Barrier::new(size),
+        consumed: Barrier::new(size),
+        explicit_barrier: Barrier::new(size),
+        mailboxes: Mutex::new((0..size).map(|_| Vec::new()).collect()),
+        mail_cv: Condvar::new(),
+    });
+
+    let handles: Vec<_> = (0..size)
+        .map(|rank| {
+            let mpi = ThreadRankMpi {
+                rank: rank as i32,
+                shared: Arc::clone(&shared),
+            };
+            let body = body.clone();
+            thread::spawn(move || body(mpi))
+        })
+        .collect();
+
+    handles
+        .into_iter()
+        .map(|h| h.join().expect("rank thread panicked"))
+        .collect()
+}
+
+impl MPIInterface for ThreadRankMpi {
+    fn rank(&self) -> i32 {
+        self.rank
+    }
+
+    fn size(&self) -> i32 {
+        self.shared.size
+    }
+
+    fn broadcast<T>(&self, data: &mut [T], root: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        if self.rank == root {
+            let mut slots = self.shared.slots.lock().expect("mpi slots lock poisoned");
+            slots[root as usize] = Some(Box::new(data.to_vec()) as Box<dyn Any + Send>);
+        }
+        // Every rank (root included) waits here until root has deposited,
+        // then every rank reads the same slot below via a shared borrow
+        // (`clone_from_slot`) rather than consuming it — otherwise only
+        // whichever rank's thread acquired the lock first would see `Some`
+        // and every other rank would panic on a `None` it raced away.
+        self.shared.deposited.wait();
+        {
+            let slots = self.shared.slots.lock().expect("mpi slots lock poisoned");
+            let boxed = slots[root as usize]
+                .as_ref()
+                .expect("broadcast root did not deposit data");
+            let received: Vec<T> = Self::clone_from_slot(boxed);
+            for (dst, src) in data.iter_mut().zip(received.into_iter()) {
+                *dst = src;
+            }
+        }
+        self.shared.consumed.wait();
+        Ok(())
+    }
+
+    fn gather<T>(&self, send_data: &[T], recv_data: Option<&mut [T]>, root: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        {
+            let mut slots = self.shared.slots.lock().expect("mpi slots lock poisoned");
+            slots[self.rank as usize] = Some(Box::new(send_data.to_vec()) as Box<dyn Any + Send>);
+        }
+        self.shared.deposited.wait();
+
+        if self.rank == root {
+            let recv_data = recv_data.expect("gather root must supply recv_data");
+            let per_rank = send_data.len();
+            let slots = self.shared.slots.lock().expect("mpi slots lock poisoned");
+            for (r, slot) in slots.iter().enumerate().take(self.shared.size as usize) {
+                let boxed = slot.as_ref().expect("gather: rank did not deposit");
+                let v: Vec<T> = Self::clone_from_slot(boxed);
+                let start = r * per_rank;
+                for (i, val) in v.into_iter().enumerate() {
+                    if start + i < recv_data.len() {
+                        recv_data[start + i] = val;
+                    }
+                }
+            }
+        }
+        self.shared.consumed.wait();
+        Ok(())
+    }
+
+    fn allreduce<T>(&self, send_data: &[T], recv_data: &mut [T], op: ReductionOp) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static + std::ops::Add<Output = T> + PartialOrd,
+    {
+        {
+            let mut slots = self.shared.slots.lock().expect("mpi slots lock poisoned");
+            slots[self.rank as usize] = Some(Box::new(send_data.to_vec()) as Box<dyn Any + Send>);
+        }
+        self.shared.deposited.wait();
+
+        // Compute into a local result first — every rank must reach the
+        // `consumed` barrier below regardless of outcome (an early `return`
+        // from inside the reduction, e.g. on an unsupported op, would leave
+        // every other rank blocked on that barrier forever).
+        let result: ScirsResult<()> = (|| {
+            let len = send_data.len();
+            let slots = self.shared.slots.lock().expect("mpi slots lock poisoned");
+            let per_rank: Vec<Vec<T>> = slots
+                .iter()
+                .take(self.shared.size as usize)
+                .map(|slot| {
+                    Self::clone_from_slot::<T>(
+                        slot.as_ref().expect("allreduce: rank did not deposit"),
+                    )
+                })
+                .collect();
+            for i in 0..len {
+                let mut acc = per_rank[0][i].clone();
+                for contribution in per_rank.iter().skip(1) {
+                    let v = contribution[i].clone();
+                    acc = match op {
+                        ReductionOp::Sum => acc + v,
+                        ReductionOp::Min => {
+                            if v < acc {
+                                v
+                            } else {
+                                acc
+                            }
+                        }
+                        ReductionOp::Max => {
+                            if v > acc {
+                                v
+                            } else {
+                                acc
+                            }
+                        }
+                        ReductionOp::Prod => {
+                            return Err(ScirsError::InvalidInput(
+                                scirs2_core::error::ErrorContext::new(
+                                    "ThreadRankMpi::allreduce: ReductionOp::Prod is not \
+                                     supported (MPIInterface's trait bound only provides Add \
+                                     + PartialOrd, not Mul)"
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                    };
+                }
+                recv_data[i] = acc;
+            }
+            Ok(())
+        })();
+        self.shared.consumed.wait();
+        result
+    }
+
+    fn barrier(&self) -> ScirsResult<()> {
+        self.shared.explicit_barrier.wait();
+        Ok(())
+    }
+
+    fn send<T>(&self, data: &[T], dest: i32, tag: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        let mut mailboxes = self.shared.mailboxes.lock().expect("mailbox lock poisoned");
+        mailboxes[dest as usize].push((
+            self.rank,
+            tag,
+            Box::new(data.to_vec()) as Box<dyn Any + Send>,
+        ));
+        self.shared.mail_cv.notify_all();
+        Ok(())
+    }
+
+    fn recv<T>(&self, data: &mut [T], source: i32, tag: i32) -> ScirsResult<()>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        let mut mailboxes = self.shared.mailboxes.lock().expect("mailbox lock poisoned");
+        loop {
+            let inbox = &mut mailboxes[self.rank as usize];
+            if let Some(pos) = inbox
+                .iter()
+                .position(|(src, t, _)| *src == source && *t == tag)
+            {
+                let (_, _, boxed) = inbox.remove(pos);
+                let received: Vec<T> = *boxed
+                    .downcast::<Vec<T>>()
+                    .expect("ThreadRankMpi::recv: type mismatch with matching send");
+                for (dst, src) in data.iter_mut().zip(received.into_iter()) {
+                    *dst = src;
+                }
+                return Ok(());
+            }
+            mailboxes = self
+                .shared
+                .mail_cv
+                .wait(mailboxes)
+                .expect("mailbox condvar wait poisoned");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_work_distribution() {
+        let distribution = WorkDistribution::new(0, 4, DistributionStrategy::DataParallel);
+        let assignment = distribution.assign_work(100);
+
+        assert_eq!(assignment.count, 25);
+        assert_eq!(assignment.start_index, 0);
+        assert_eq!(assignment.range(), 0..25);
+    }
+
+    #[test]
+    fn test_work_assignment_remainder() {
+        let distribution = WorkDistribution::new(3, 4, DistributionStrategy::DataParallel);
+        let assignment = distribution.assign_work(10);
+
+        // 10 items, 4 processes: 2, 3, 3, 2
+        assert_eq!(assignment.count, 2);
+        assert_eq!(assignment.start_index, 8);
+    }
+
+    #[test]
+    fn test_master_worker_distribution() {
+        let master_distribution = WorkDistribution::new(0, 4, DistributionStrategy::MasterWorker);
+        let master_assignment = master_distribution.assign_work(100);
+
+        assert_eq!(master_assignment.count, 0); // Master doesn't do computation
+
+        let worker_distribution = WorkDistribution::new(1, 4, DistributionStrategy::MasterWorker);
+        let worker_assignment = worker_distribution.assign_work(100);
+
+        assert!(worker_assignment.count > 0); // Worker does computation
+    }
+
+    #[test]
+    fn test_distributed_context() {
+        let mpi = MockMPI::new(0, 4);
+        let config = DistributedConfig::default();
+        let context = DistributedOptimizationContext::new(mpi, config);
+
+        assert_eq!(context.rank(), 0);
+        assert_eq!(context.size(), 4);
+        assert!(context.is_master());
+    }
+
+    #[test]
+    fn test_distributed_stats() {
+        let mut stats = DistributedStats::new();
+        stats.computation_time = 80.0;
+        stats.communication_time = 20.0;
+
+        assert_eq!(stats.parallel_efficiency(), 0.8);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ThreadRankMpi: real cross-thread collective semantics
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_thread_rank_mpi_broadcast_allreduce_sendrecv() {
+        let results = spawn_ranks(4, |mpi| {
+            let rank = mpi.rank();
+
+            // Broadcast: root (rank 2) deposits, every rank must see its data.
+            let mut buf = vec![rank as f64; 3];
+            mpi.broadcast(&mut buf, 2).expect("broadcast failed");
+            assert_eq!(buf, vec![2.0, 2.0, 2.0]);
+
+            // Allreduce Sum over one contribution per rank: 0+1+2+3 = 6.
+            let send = vec![rank as f64];
+            let mut sum = vec![0.0];
+            mpi.allreduce(&send, &mut sum, ReductionOp::Sum)
+                .expect("allreduce sum failed");
+            assert_eq!(sum, vec![6.0]);
+
+            // Allreduce Min/Max over the same contributions.
+            let mut min = vec![0.0];
+            mpi.allreduce(&send, &mut min, ReductionOp::Min)
+                .expect("allreduce min failed");
+            assert_eq!(min, vec![0.0]);
+
+            let mut max = vec![0.0];
+            mpi.allreduce(&send, &mut max, ReductionOp::Max)
+                .expect("allreduce max failed");
+            assert_eq!(max, vec![3.0]);
+
+            // Ring send/recv: every rank sends to its successor and receives
+            // from its predecessor. `send` is non-blocking (mailbox deposit),
+            // so this ordering cannot deadlock regardless of thread scheduling.
+            let next = (rank + 1) % 4;
+            let prev = (rank + 3) % 4; // (rank - 1).rem_euclid(4)
+            mpi.send(&[rank as f64], next, 0).expect("send failed");
+            let mut incoming = vec![0.0];
+            mpi.recv(&mut incoming, prev, 0).expect("recv failed");
+            assert_eq!(incoming, vec![prev as f64]);
+
+            mpi.barrier().expect("barrier failed");
+            rank
+        });
+
+        let mut sorted = results;
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_thread_rank_mpi_gather() {
+        let results = spawn_ranks(3, |mpi| {
+            let rank = mpi.rank();
+            let send = vec![rank as f64, (rank * 10) as f64];
+
+            if mpi.rank() == 0 {
+                let mut recv = vec![0.0; 6];
+                mpi.gather(&send, Some(&mut recv), 0)
+                    .expect("gather failed");
+                Some(recv)
+            } else {
+                mpi.gather(&send, None, 0).expect("gather failed");
+                None
+            }
+        });
+
+        let root_result = results.into_iter().flatten().next().expect("root present");
+        assert_eq!(root_result, vec![0.0, 0.0, 1.0, 10.0, 2.0, 20.0]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // End-to-end distributed algorithms driven across simulated ranks
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_distributed_differential_evolution_thread_ranks() {
+        // Sphere function: f(x) = sum(x_i^2), global minimum 0 at the origin.
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+
+        let results = spawn_ranks(4, move |mpi| {
+            let context = DistributedOptimizationContext::new(mpi, DistributedConfig::default());
+            let mut de = algorithms::DistributedDifferentialEvolution::new(context, 40, 300);
+            de.optimize(
+                |x: &ArrayView1<f64>| x.iter().map(|v| v * v).sum::<f64>(),
+                &bounds,
+            )
+            .expect("distributed DE optimize failed")
+        });
+
+        assert_eq!(results.len(), 4);
+        for result in &results {
+            assert!(result.success);
+            assert!(
+                result.fun < 1e-3,
+                "expected convergence near the sphere minimum, got fun={}",
+                result.fun
+            );
+            for &xi in result.x.iter() {
+                assert!(
+                    xi.abs() < 0.5,
+                    "expected x near the origin, got {:?}",
+                    result.x
+                );
+            }
+        }
+        // All ranks must agree on the reduced global best (it is the result
+        // of a `Min` all-reduce followed by a broadcast from the owning rank).
+        for result in &results[1..] {
+            assert_eq!(result.fun, results[0].fun);
+            assert_eq!(result.x, results[0].x);
+        }
+    }
+
+    #[test]
+    fn test_distributed_particle_swarm_thread_ranks() {
+        // Sphere function again, exercised through the PSO algorithm instead.
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0), (-5.0, 5.0)];
+
+        let results = spawn_ranks(3, move |mpi| {
+            let context = DistributedOptimizationContext::new(mpi, DistributedConfig::default());
+            let mut pso = algorithms::DistributedParticleSwarm::new(context, 30, 300);
+            pso.optimize(
+                |x: &ArrayView1<f64>| x.iter().map(|v| v * v).sum::<f64>(),
+                &bounds,
+            )
+            .expect("distributed PSO optimize failed")
+        });
+
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert!(result.success);
+            assert!(
+                result.fun < 1e-1,
+                "expected convergence near the sphere minimum, got fun={}",
+                result.fun
+            );
+        }
+        for result in &results[1..] {
+            assert_eq!(result.fun, results[0].fun);
+            assert_eq!(result.x, results[0].x);
+        }
+    }
+}

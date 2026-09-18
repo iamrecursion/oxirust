@@ -1,0 +1,38 @@
+[package]
+name = "oxitext-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Criterion benchmarks for oxitext: shape, raster, pipeline (dev-only)"
+
+[[bench]]
+name = "shape"
+harness = false
+
+[[bench]]
+name = "raster"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[features]
+default = []
+pango = ["dep:pango-sys"]
+harfbuzz = ["dep:harfbuzz-sys"]
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+oxitext = { path = "../oxitext", features = ["pure"] }
+oxitext-shape = { path = "../oxitext-shape" }
+oxitext-raster = { path = "../oxitext-raster" }
+
+[dependencies]
+pango-sys = { workspace = true, optional = true }
+harfbuzz-sys = { workspace = true, optional = true }
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["pango-sys"]

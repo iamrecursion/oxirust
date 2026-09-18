@@ -1,0 +1,76 @@
+[package]
+name = "phop-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/phop-core"
+description = "Core engine for phop: tensorized EML forests, differentiable topology, and discovery"
+readme = "README.md"
+keywords = ["symbolic-regression", "machine-learning", "differentiable", "equation-discovery", "eml"]
+categories = ["science", "mathematics", "algorithms"]
+
+[dependencies]
+scirs2-autograd.workspace = true
+scirs2-core.workspace = true
+scirs2-optimize.workspace = true
+# `serde` enables (de)serialization of `EmlTree` — the portable model artifact `phop predict` reads.
+oxieml = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+# CUDA GPU backend (Layer A forward eval) via the cool-japan oxicuda stack. Optional: only
+# pulled in when the `gpu-cuda` feature is enabled. Default features (driver, memory, launch)
+# are sufficient — we supply hand-written PTX and load it through the driver JIT, so no NVRTC.
+oxicuda = { version = "0.5.5", optional = true }
+# Apple Metal GPU backend (Layer A forward eval), macOS-only. Optional: only pulled in when the
+# `gpu-metal` feature is enabled. Needs BOTH crates: the `metal.rs` engine calls the inherent
+# `MetalBackend::launch_custom_kernel` plus the `oxicuda_backend::ComputeBackend` alloc/copy/free
+# methods, and that trait is not re-exported by oxicuda-metal — so we depend on oxicuda-backend
+# directly too. Both resolve from crates.io at the published 0.3 line.
+oxicuda-metal = { version = "0.5.5", optional = true }
+oxicuda-backend = { version = "0.5.5", optional = true }
+# Pure-Rust Lean kernel for the proof-carrying tier. Optional: only pulled in with the `lean`
+# feature. We depend on the kernel crate directly (the `oxilean` facade just re-exports it).
+oxilean-kernel = { workspace = true, optional = true }
+# e-graph / equality-saturation canonicalization. Optional: only pulled in with the `egraph`
+# feature, which routes post-discovery LaTeX through scirs2-symbolic's e-graph for stronger forms.
+scirs2-symbolic = { workspace = true, optional = true }
+# Portable WebGPU/Metal/Vulkan forward-eval backend (f32). Optional: only with `gpu-wgpu`. Pinned
+# (in the workspace manifest) to the same wgpu 29 that scirs2-core's `wgpu` feature uses so the
+# device/buffer types unify.
+wgpu = { workspace = true, optional = true }
+# TensorLogic IR for the neuro-symbolic bridge. Optional: only with the `tensorlogic` feature.
+tensorlogic-ir = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+# Enable the CUDA GPU forward-evaluation backend (requires an NVIDIA GPU + driver at runtime).
+gpu-cuda = ["dep:oxicuda"]
+# Enable the Apple Metal GPU forward-evaluation backend (macOS only; requires a Metal-capable GPU at
+# runtime). Pulls both oxicuda-metal (MetalBackend) and oxicuda-backend (the ComputeBackend trait).
+gpu-metal = ["dep:oxicuda-metal", "dep:oxicuda-backend"]
+# Enable SMT-backed verification of discovered laws (the proof tier above numeric certification).
+# Pulls the OxiZ Z3-replacement solver transitively through oxieml's `smt` feature.
+smt = ["oxieml/smt"]
+# Enable the OxiLean proof-carrying tier: export a law property as a Lean proposition and have the
+# pure-Rust Lean kernel machine-check a proof of it. Pulls oxilean-kernel.
+lean = ["dep:oxilean-kernel"]
+# Enable e-graph (equality-saturation) canonicalization of discovered laws via scirs2-symbolic,
+# for stronger canonical LaTeX (e.g. collapsing ln(exp(x)) → x and power forms). Pulls scirs2-symbolic.
+egraph = ["dep:scirs2-symbolic"]
+# Parallelize the enumerate topology sweep across cores (NUMA-aware where the OS supports it) via
+# scirs2-core's parallel map. Order-preserving, so discovery stays deterministic.
+parallel = ["scirs2-core/parallel"]
+# Portable GPU forward via wgpu (WebGPU/Metal/Vulkan/DX12), f32. Supplements the CUDA backend with a
+# cross-platform path; selected by `gpu_backend()` (CUDA → wgpu → CPU). Pulls wgpu + scirs2-core wgpu.
+gpu-wgpu = ["dep:wgpu", "scirs2-core/wgpu"]
+# Neuro-symbolic bridge: map a discovered law to a TensorLogic weighted logic rule via oxieml's
+# tensorlogic IR. Pulls oxieml's `tensorlogic` feature + tensorlogic-ir.
+tensorlogic = ["oxieml/tensorlogic", "dep:tensorlogic-ir"]

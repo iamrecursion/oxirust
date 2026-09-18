@@ -1,0 +1,35 @@
+[package]
+name = "oxixml-xslt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XSLT 1.0/2.0/3.0 processor (replaces Apache Xalan/Saxon XSLT)."
+keywords = ["xslt", "xml", "xpath", "transform", "stylesheet"]
+categories = ["parser-implementations", "text-processing", "template-engine"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-infoset = { workspace = true }
+oxixml-xsd = { workspace = true }
+oxixml-fn = { workspace = true }
+oxixml-xpath = { workspace = true }
+oxixml-xml = { workspace = true }
+oxixml-qname = { workspace = true }
+oxixml-regex = { workspace = true }
+oxixml-iri = { workspace = true }
+oxixml-unicode = { workspace = true }
+
+[dev-dependencies]
+oxixml-regex = { path = "../../support/oxixml-regex" }
+
+[lints]
+workspace = true

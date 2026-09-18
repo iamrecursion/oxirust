@@ -1,0 +1,155 @@
+[package]
+name = "oxirpc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust gRPC facade — client + server + no-protoc codegen"
+keywords = ["grpc", "tonic", "pure-rust", "cooljapan", "oxirpc"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = []
+client      = ["dep:oxirpc-client"]
+server      = ["dep:oxirpc-server", "dep:tower", "dep:http", "dep:axum"]
+native      = ["server", "oxirpc-server/native"]
+tls         = ["oxirpc-core/tls", "dep:rustls", "oxirpc-server?/tls", "oxirpc-client?/tls"]
+reflect     = ["dep:oxirpc-reflect"]
+web         = ["dep:oxirpc-web"]
+health      = ["dep:oxirpc-health"]
+compression = ["oxirpc-core/compression"]
+gzip        = ["oxirpc-core/gzip"]
+zstd        = ["oxirpc-core/zstd"]
+# HTTP/3 (M8): pure-Rust gRPC-over-QUIC client + server (OxiQUIC + `h3`).
+http3       = [
+    "client",
+    "server",
+    "native",
+    "tls",
+    "oxirpc-client/http3",
+    "oxirpc-server/http3",
+    "oxirpc-core/http3",
+]
+# Proto type system integration via OxiProto (path-dep; NOT in full — not on crates.io).
+oxiproto    = ["dep:oxiproto", "oxirpc-core/oxiproto"]
+# Convenience: enable all Pure-Rust sub-features (no FFI).
+full = [
+    "client",
+    "server",
+    "native",
+    "tls",
+    "reflect",
+    "web",
+    "health",
+    "compression",
+    "gzip",
+    "zstd",
+    "http3",
+]
+
+[dependencies]
+oxirpc-core             = { workspace = true }
+oxirpc-client           = { workspace = true, optional = true }
+oxirpc-server           = { workspace = true, optional = true }
+oxirpc-reflect          = { workspace = true, optional = true }
+oxirpc-web              = { workspace = true, optional = true }
+oxirpc-health           = { workspace = true, optional = true }
+oxiproto                = { workspace = true, optional = true }
+tonic          = { workspace = true }
+tonic-prost    = { workspace = true }
+tower          = { workspace = true, optional = true }
+http           = { workspace = true, optional = true }
+axum           = { workspace = true, optional = true }
+
+[dependencies.rustls]
+workspace = true
+optional = true
+
+[build-dependencies]
+oxirpc-build      = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+prost          = { workspace = true }
+tonic          = { workspace = true }
+tonic-prost    = { workspace = true }
+tokio          = { workspace = true }
+tokio-stream   = { workspace = true }
+rustls         = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen          = { workspace = true }
+criterion      = { workspace = true }
+oxirpc-core    = { path = "../oxirpc-core" }
+oxirpc-server  = { path = "../oxirpc-server", features = ["native"] }
+oxirpc-health  = { path = "../oxirpc-health" }
+oxirpc-reflect    = { path = "../oxirpc-reflect" }
+tonic-health      = { workspace = true }
+tonic-reflection  = { workspace = true }
+oxirpc-client  = { path = "../oxirpc-client" }
+rustls-pki-types = { workspace = true }
+futures-util   = { workspace = true }
+http-body      = { workspace = true }
+bytes          = { workspace = true }
+oxitls-rcgen   = { workspace = true }
+
+[[test]]
+name = "native_server_e2e"
+path = "tests/native_server_e2e.rs"
+required-features = ["native", "health"]
+
+[[test]]
+name = "native_e2e"
+path = "tests/native_e2e.rs"
+required-features = ["native", "health"]
+
+[[test]]
+name = "cross_validate"
+path = "tests/cross_validate.rs"
+required-features = ["native", "client", "reflect", "health"]
+
+[[test]]
+name = "load_concurrency"
+path = "tests/load_concurrency.rs"
+required-features = ["native", "health"]
+
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+required-features = ["native", "health"]
+
+[[test]]
+name = "proto_types"
+path = "tests/proto_types.rs"
+required-features = ["oxiproto"]
+
+[[test]]
+name = "h3_e2e"
+path = "tests/h3_e2e.rs"
+required-features = ["http3", "native", "health", "client"]
+
+[[example]]
+name = "client_server_native"
+path = "examples/client_server_native.rs"
+required-features = ["client", "server", "native", "health"]
+
+[[example]]
+name = "http3_client_server"
+path = "examples/http3_client_server.rs"
+required-features = ["http3", "native", "health", "client"]
+
+[[bench]]
+name = "interceptor_chain"
+harness = false
+
+[[bench]]
+name = "roundtrip"
+harness = false
+
+[[bench]]
+name = "facade_reexport_overhead"
+harness = false
+
+[[bench]]
+name = "native_vs_tonic"
+harness = false

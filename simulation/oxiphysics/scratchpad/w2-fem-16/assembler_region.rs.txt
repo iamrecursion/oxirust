@@ -1,0 +1,197 @@
+// ── ParallelAssembler ────────────────────────────────────────────────────────
+
+/// Assembles per-element stiffness contributions into a global CSR matrix.
+///
+/// ## Parallelism and reproducibility
+///
+/// The elements are graph-coloured: no two elements of one colour share a DOF.  The
+/// colours are scattered one after another and the elements of one colour in parallel
+/// (Rayon).  Within a colour no two elements touch the same matrix entry, so neither a
+/// lock nor an atomic read-modify-write is needed, and every entry is accumulated colour
+/// by colour in a fixed order.  The assembled values are therefore **bitwise identical for
+/// every thread count and every run**; the position of an entry in the CSR `values` array
+/// is found by binary search in the sorted columns of its row.
+///
+/// The right-hand side ([`ParallelAssembler::assemble_rhs`]) is summed per DOF in
+/// ascending element order, i.e. exactly like a sequential loop over the elements.
+#[derive(Debug, Default)]
+pub struct ParallelAssembler {
+    /// Total number of global DOFs.
+    pub ndofs: usize,
+}
+
+impl ParallelAssembler {
+    /// Create an assembler for a problem with `ndofs` degrees of freedom.
+    pub fn new(ndofs: usize) -> Self {
+        Self { ndofs }
+    }
+
+    /// Assemble all element stiffness matrices into a global CSR matrix.
+    ///
+    /// The sparsity pattern is the union of all element connectivity patterns, with
+    /// sorted, unique column indices in every row.  The elements are coloured from their
+    /// `global_dofs` and scattered colour by colour; see [`ParallelAssembler`] for the
+    /// reproducibility guarantee and [`crate::solvers::assembly_coloring`] for the
+    /// algorithm.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DofOutOfRange`] if a `global_dof` index is not smaller than `ndofs`;
+    /// [`Error::InvalidInput`] if a local matrix `ke` does not have `ndof * ndof` entries.
+    pub fn try_assemble(&self, tasks: &[AssemblyTask]) -> Result<CsrMatrix> {
+        validate_tasks(self.ndofs, tasks)?;
+        let coloring = color_tasks(tasks);
+        try_assemble_colored_csr(self.ndofs, tasks, &coloring)
+    }
+
+    /// Assemble all element stiffness matrices into a global CSR matrix.
+    ///
+    /// Same as [`ParallelAssembler::try_assemble`] for callers that treat invalid input
+    /// as a programming error.
+    ///
+    /// # Panics
+    ///
+    /// Panics where [`ParallelAssembler::try_assemble`] fails: if any `global_dof` index
+    /// is not smaller than `ndofs`, or a local matrix has the wrong size.
+    pub fn assemble(&self, tasks: &[AssemblyTask]) -> CsrMatrix {
+        match self.try_assemble(tasks) {
+            Ok(matrix) => matrix,
+            Err(error) => panic!("ParallelAssembler::assemble: {error}"),
+        }
+    }
+
+    /// Assemble a load vector (right-hand side) from per-element force vectors.
+    ///
+    /// `element_forces[e]` must have the same DOF count as `element_dofs[e]`.  The force
+    /// contributions of every DOF are gathered in ascending element order and summed per
+    /// DOF, the DOFs in parallel.  The result equals a sequential loop over the elements
+    /// bit for bit, whatever the thread count.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] if `element_dofs` and `element_forces` differ in length or
+    /// an element's DOF list and force list differ in length;
+    /// [`Error::DofOutOfRange`] if a DOF index is not smaller than `ndofs`.
+    pub fn try_assemble_rhs(
+        &self,
+        element_dofs: &[Vec<usize>],
+        element_forces: &[Vec<f64>],
+    ) -> Result<Vec<f64>> {
+        if element_dofs.len() != element_forces.len() {
+            return Err(Error::InvalidInput(format!(
+                "{} element DOF lists but {} element force vectors were given",
+                element_dofs.len(),
+                element_forces.len()
+            )));
+        }
+
+        // `gathered[offsets[d]..offsets[d + 1]]` receives the contributions to DOF `d`.
+        let mut offsets = vec![0usize; self.ndofs + 1];
+        for (e, (dofs, forces)) in element_dofs.iter().zip(element_forces).enumerate() {
+            if dofs.len() != forces.len() {
+                return Err(Error::InvalidInput(format!(
+                    "element {e} has {} DOFs but {} force entries",
+                    dofs.len(),
+                    forces.len()
+                )));
+            }
+            check_dofs(self.ndofs, dofs)?;
+            for &dof in dofs {
+                offsets[dof + 1] += 1;
+            }
+        }
+        for dof in 0..self.ndofs {
+            offsets[dof + 1] += offsets[dof];
+        }
+        let mut next = offsets.clone();
+        let mut gathered = vec![0.0_f64; offsets[self.ndofs]];
+        for (dofs, forces) in element_dofs.iter().zip(element_forces) {
+            for (&dof, &force) in dofs.iter().zip(forces) {
+                gathered[next[dof]] = force;
+                next[dof] += 1;
+            }
+        }
+
+        Ok((0..self.ndofs)
+            .into_par_iter()
+            .map(|dof| {
+                gathered[offsets[dof]..offsets[dof + 1]]
+                    .iter()
+                    .fold(0.0_f64, |sum, &force| sum + force)
+            })
+            .collect())
+    }
+
+    /// Assemble a load vector (right-hand side) from per-element force vectors.
+    ///
+    /// Same as [`ParallelAssembler::try_assemble_rhs`] for callers that treat invalid
+    /// input as a programming error.
+    ///
+    /// # Panics
+    ///
+    /// Panics where [`ParallelAssembler::try_assemble_rhs`] fails.
+    pub fn assemble_rhs(
+        &self,
+        element_dofs: &[Vec<usize>],
+        element_forces: &[Vec<f64>],
+    ) -> Vec<f64> {
+        match self.try_assemble_rhs(element_dofs, element_forces) {
+            Ok(rhs) => rhs,
+            Err(error) => panic!("ParallelAssembler::assemble_rhs: {error}"),
+        }
+    }
+
+    /// Assemble using a graph coloring computed from caller-supplied DOF lists.
+    ///
+    /// `element_dofs[e]` is used to color element `e`.  When it equals
+    /// `tasks[e].global_dofs` the result is identical to [`ParallelAssembler::try_assemble`];
+    /// a coloring that does not match the tasks cannot corrupt the result, because a color
+    /// whose elements share a DOF is always scattered sequentially.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] if `element_dofs` and `tasks` differ in length or a local
+    /// matrix has the wrong size; [`Error::DofOutOfRange`] if a DOF index of the tasks or of
+    /// `element_dofs` is not smaller than `ndofs`.
+    pub fn try_assemble_colored(
+        &self,
+        tasks: &[AssemblyTask],
+        element_dofs: &[Vec<usize>],
+    ) -> Result<CsrMatrix> {
+        if element_dofs.len() != tasks.len() {
+            return Err(Error::InvalidInput(format!(
+                "{} element DOF lists were given for {} assembly tasks",
+                element_dofs.len(),
+                tasks.len()
+            )));
+        }
+        validate_tasks(self.ndofs, tasks)?;
+        for dofs in element_dofs {
+            check_dofs(self.ndofs, dofs)?;
+        }
+        let coloring = color_elements(tasks.len(), element_dofs);
+        try_assemble_colored_csr(self.ndofs, tasks, &coloring)
+    }
+
+    /// Assemble using element graph coloring.
+    ///
+    /// Computes a graph coloring of the elements (no two elements of the same color
+    /// share a DOF) from `element_dofs` and assembles each color group in parallel.  The
+    /// result is identical to [`ParallelAssembler::assemble`] when `element_dofs[e]`
+    /// equals `tasks[e].global_dofs`.
+    ///
+    /// # Panics
+    ///
+    /// Panics where [`ParallelAssembler::try_assemble_colored`] fails.
+    pub fn assemble_colored(
+        &self,
+        tasks: &[AssemblyTask],
+        element_dofs: &[Vec<usize>],
+    ) -> CsrMatrix {
+        match self.try_assemble_colored(tasks, element_dofs) {
+            Ok(matrix) => matrix,
+            Err(error) => panic!("ParallelAssembler::assemble_colored: {error}"),
+        }
+    }
+}
+

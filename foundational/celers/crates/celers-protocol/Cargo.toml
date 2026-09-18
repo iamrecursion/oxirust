@@ -1,0 +1,62 @@
+[package]
+name = "celers-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Celery Protocol v2/v5 implementation for CeleRS"
+readme = "README.md"
+keywords = ["celery", "protocol", "messaging", "serialization", "kombu"]
+categories = ["encoding", "network-programming"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true, optional = true }
+
+# Optional serialization formats
+rmp-serde = { workspace = true, optional = true }  # MessagePack
+serde_yaml_ng = { workspace = true, optional = true }  # YAML (maintained serde_yaml fork)
+
+# Optional compression
+oxiarc-deflate = { workspace = true, optional = true }  # gzip/deflate
+oxiarc-zstd = { workspace = true, optional = true }  # Zstandard (Pure Rust)
+
+# Optional security/crypto
+hmac = { workspace = true, optional = true }  # HMAC for message signing
+sha2 = { workspace = true, optional = true }  # SHA-256 for HMAC
+aes-gcm = { workspace = true, optional = true }  # AES-256-GCM encryption
+
+# Optional serialization formats
+prost = { workspace = true, optional = true }  # Protobuf
+bson = { workspace = true, optional = true }  # BSON
+
+[features]
+default = ["json"]
+json = []
+msgpack = ["rmp-serde"]
+binary = []
+yaml = ["dep:serde_yaml_ng"]
+protobuf = ["prost"]
+bson-format = ["bson"]
+gzip = ["oxiarc-deflate"]
+zlib = ["oxiarc-deflate"]
+zstd-compression = ["oxiarc-zstd"]
+compression = ["gzip", "zlib", "zstd-compression"]
+signing = ["hmac", "sha2", "hex"]
+encryption = ["aes-gcm", "hex"]
+crypto = ["signing", "encryption"]
+all-serializers = ["msgpack", "yaml", "protobuf", "bson-format"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "message_benchmarks"
+harness = false

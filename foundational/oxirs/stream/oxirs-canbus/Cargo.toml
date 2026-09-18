@@ -1,0 +1,46 @@
+[package]
+name = "oxirs-canbus"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "CANbus/J1939 protocol support for OxiRS semantic web platform"
+keywords = ["canbus", "automotive", "j1939", "rdf", "dbc"]
+categories = ["network-programming", "embedded", "database"]
+readme = "README.md"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxirs-core.workspace = true
+oxirs-physics.workspace = true
+
+tokio = { workspace = true, features = ["net", "sync", "time", "rt-multi-thread"] }
+tokio-util.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+async-trait.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan.workspace = true
+
+[features]
+default = []
+j1939 = []
+
+[[bench]]
+name = "canbus_performance"
+harness = false

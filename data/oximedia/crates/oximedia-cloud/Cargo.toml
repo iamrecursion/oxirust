@@ -1,0 +1,103 @@
+[package]
+name = "oximedia-cloud"
+description = "Cloud storage and media services integration for AWS, Azure, and GCP"
+keywords = ["cloud", "aws", "azure", "storage", "multimedia"]
+categories = ["multimedia", "web-programming"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[features]
+# OCI Object Storage backend (reqwest, rsa, base64 are unconditional deps;
+# this feature flag exists for conditional compilation guards and future dep-gating)
+oci = []
+# AWS SDK backend (`S3Storage`, `AwsMediaServices`) via the official aws-sdk-*
+# crates. NON-DEFAULT and NOT Pure Rust: the smithy TLS stack only ships
+# C-based crypto providers (ring / aws-lc / s2n), so enabling this feature
+# compiles `ring` (C + assembly). The default build stays 100% Pure Rust;
+# S3-compatible endpoints remain available by default through
+# `GenericStorage` (reqwest + rustls-rustcrypto).
+aws-sdk = [
+    "dep:aws-config",
+    "dep:aws-sdk-s3",
+    "dep:aws-sdk-mediaconvert",
+    "dep:aws-sdk-medialive",
+    "dep:aws-sdk-mediapackage",
+    "dep:aws-sdk-cloudwatch",
+    "dep:aws-sdk-sts",
+    "dep:aws-sdk-kms",
+    "dep:aws-smithy-types",
+    "dep:aws-smithy-runtime",
+    "dep:aws-smithy-runtime-api",
+]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+# AWS SDK backend — OPT-IN ONLY (non-default feature "aws-sdk").
+# The smithy TLS stack has no Pure-Rust crypto provider (its options are
+# ring / aws-lc / s2n — all C/assembly), so these dependencies must stay
+# out of the default (Pure Rust) build.
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-mediaconvert = { workspace = true, optional = true }
+aws-sdk-medialive = { workspace = true, optional = true }
+aws-sdk-mediapackage = { workspace = true, optional = true }
+aws-sdk-cloudwatch = { workspace = true, optional = true }
+aws-sdk-sts = { workspace = true, optional = true }
+aws-sdk-kms = { workspace = true, optional = true }
+aws-smithy-types = { version = "1.6", optional = true }
+aws-smithy-runtime = { version = "1", features = ["tls-rustls", "client"], optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+
+# NOTE: the Azure Blob Storage backend (src/azure/) is implemented directly
+# against the Azure REST API (Shared Key / SAS auth via reqwest + hmac +
+# sha2) and is 100% Pure Rust. The azure-sdk crates (azure_core,
+# azure_identity, azure_storage_blob) are intentionally NOT dependencies:
+# their default reqwest/rustls wiring pulls in aws-lc-sys (C + assembly).
+
+# Pure-Rust rustls CryptoProvider. The workspace builds reqwest/rustls with
+# "rustls-no-provider", so a provider must be installed at runtime before any
+# TLS connection is opened (see src/tls_provider.rs).
+rustls-rustcrypto = { workspace = true }
+
+# GCP (using reqwest for REST API)
+reqwest = { workspace = true, features = ["stream"] }
+base64 = { workspace = true }
+url = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+rsa = { workspace = true }
+md-5.workspace = true
+hex.workspace = true
+
+# Additional utilities
+futures.workspace = true
+pin-project = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+urlencoding = "2.1"
+rayon = { workspace = true }
+
+[dev-dependencies]
+tokio-test.workspace = true
+mockito = { workspace = true }
+tempfile.workspace = true
+wiremock = "0.6"
+test-case = "3.3"

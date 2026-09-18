@@ -1,0 +1,10 @@
+{
+  "name": "patent_amr_nb",
+  "args": ["-i", "in.amr", "-c:a", "amr_nb", "out.mkv"],
+  "expect": {
+    "contains_diagnostic_kinds": ["PatentCodecSubstituted"],
+    "contains_diagnostic_messages": ["amr_nb", "opus"],
+    "jobs": 1,
+    "audio_codec": "opus"
+  }
+}

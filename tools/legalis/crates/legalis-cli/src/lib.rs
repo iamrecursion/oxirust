@@ -1,0 +1,1050 @@
+//! Legalis-CLI: Command-line interface for Legalis-RS.
+//!
+//! This crate provides a CLI tool for:
+//! - Parsing and validating legal DSL files
+//! - Running verification checks
+//! - Generating visualizations
+//! - Exporting to various formats
+
+pub mod ai;
+pub mod audit_log;
+pub mod batch;
+pub mod cache;
+pub mod central_config;
+pub mod cli_types;
+pub mod cloud;
+pub mod commands;
+pub mod compliance;
+pub mod config;
+pub mod debug;
+pub mod diagnostics;
+pub mod error_suggestions;
+pub mod interactive;
+pub mod offline;
+pub mod parallel;
+pub mod paths;
+pub mod perf;
+pub mod plugin;
+pub mod plugin_security;
+pub mod policy;
+pub mod profile;
+pub mod profiling;
+pub mod progress;
+pub mod recovery;
+pub mod scripting;
+pub mod suggest;
+pub mod team;
+pub mod theme;
+pub mod tui;
+pub mod tutorial;
+pub mod verbosity;
+pub mod workflow;
+
+pub use cli_types::*;
+
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
+use clap_mangen::Man;
+
+/// Legalis-RS Command Line Interface
+#[derive(Parser)]
+#[command(name = "legalis")]
+#[command(author, version, about, long_about = None)]
+pub struct Cli {
+    /// Increase verbosity
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Output format
+    #[arg(short, long, default_value = "text")]
+    pub format: OutputFormat,
+
+    /// Path to config file (defaults to legalis.toml or ~/.config/legalis/config.toml)
+    #[arg(long)]
+    pub config: Option<String>,
+
+    /// Quiet mode (suppress non-error output)
+    #[arg(short, long)]
+    pub quiet: bool,
+
+    /// Interactive mode (guided input)
+    #[arg(short, long)]
+    pub interactive: bool,
+
+    /// Color theme (default, dark, light, monokai, solarized, high-contrast, none)
+    #[arg(long, default_value = "default")]
+    pub theme: ColorTheme,
+
+    /// Explicit output verbosity (overrides -v/--quiet defaults for human output)
+    #[arg(long)]
+    pub verbosity: Option<verbosity::VerbosityArg>,
+
+    /// Enable compliance mode (guards sensitive operations, forces audit logging)
+    #[arg(long)]
+    pub compliance: bool,
+
+    /// Path to an enterprise policy file (overrides discovery)
+    #[arg(long)]
+    pub policy: Option<String>,
+
+    /// Disable emoji in output
+    #[arg(long)]
+    pub no_emoji: bool,
+
+    /// Terminal width for output formatting (auto-detected if not specified)
+    #[arg(long)]
+    pub width: Option<usize>,
+
+    /// Enable pager for long outputs
+    #[arg(long)]
+    pub pager: bool,
+
+    /// Structured logging mode (json, logfmt)
+    #[arg(long)]
+    pub log_format: Option<LogFormat>,
+
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+/// Output format options.
+#[derive(Clone, Debug, Default, clap::ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    Yaml,
+    Toml,
+    Table,
+    Csv,
+    Html,
+}
+
+/// Color theme options.
+#[derive(Clone, Debug, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum ColorTheme {
+    /// Default color scheme
+    #[default]
+    Default,
+    /// Dark background optimized
+    Dark,
+    /// Light background optimized
+    Light,
+    /// Monokai color scheme
+    Monokai,
+    /// Solarized color scheme
+    Solarized,
+    /// High-contrast scheme for accessibility (bold, maximally distinct colors)
+    HighContrast,
+    /// No colors (plain text)
+    None,
+}
+
+impl ColorTheme {
+    /// Whether this theme intentionally disables color output.
+    pub fn is_colorless(&self) -> bool {
+        matches!(self, ColorTheme::None)
+    }
+}
+
+/// Structured logging format options.
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum LogFormat {
+    /// JSON structured logging
+    Json,
+    /// Logfmt key=value format
+    Logfmt,
+    /// Compact format for machines
+    Compact,
+}
+
+/// Available commands.
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Parse a legal DSL file
+    Parse {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Verify statutes for logical consistency
+    Verify {
+        /// Input file(s) to verify
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Fail on warnings
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Generate visualization
+    Viz {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+
+        /// Visualization format (dot, mermaid)
+        #[arg(long, default_value = "mermaid")]
+        viz_format: VizFormat,
+    },
+
+    /// Export statute to different formats
+    Export {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+
+        /// Export format
+        #[arg(long)]
+        export_format: ExportFormat,
+    },
+
+    /// Start the API server
+    Serve {
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to bind to
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+    },
+
+    /// Initialize a new Legalis project
+    Init {
+        /// Project directory
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Dry run (show what would be created without actually creating)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Compare two statute files
+    Diff {
+        /// First statute file
+        #[arg(short, long)]
+        old: String,
+
+        /// Second statute file
+        #[arg(short, long)]
+        new: String,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        diff_format: DiffFormat,
+    },
+
+    /// Run a simulation on a population
+    Simulate {
+        /// Statute file(s)
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Population size
+        #[arg(short, long, default_value = "1000")]
+        population: usize,
+
+        /// Output file for results
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Generate an audit report
+    Audit {
+        /// Input statute files
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Output file for audit report
+        #[arg(short, long)]
+        output: String,
+
+        /// Include complexity analysis
+        #[arg(long)]
+        with_complexity: bool,
+    },
+
+    /// Analyze complexity of statutes
+    Complexity {
+        /// Input statute files
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Port a statute to another jurisdiction
+    Port {
+        /// Input statute file
+        #[arg(short, long)]
+        input: String,
+
+        /// Target jurisdiction code (e.g., "JP", "US-CA", "DE")
+        #[arg(short, long)]
+        target: String,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Output format
+        #[arg(long, default_value = "json")]
+        port_format: PortFormat,
+    },
+
+    /// Import from external legal DSL format (Catala, Stipula, L4, Akoma Ntoso)
+    Import {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+
+        /// Source format (auto-detected if not specified)
+        #[arg(long)]
+        from: Option<LegalDslFormat>,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Output format
+        #[arg(long, default_value = "json")]
+        import_output: ImportOutputFormat,
+    },
+
+    /// Convert between legal DSL formats
+    Convert {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+
+        /// Source format (auto-detected if not specified)
+        #[arg(long)]
+        from: Option<LegalDslFormat>,
+
+        /// Target format
+        #[arg(long)]
+        to: LegalDslFormat,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+
+    /// Generate man pages
+    ManPage {
+        /// Output directory for man pages (generates all if specified, otherwise outputs to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Export statute to Linked Open Data format (RDF/TTL/JSON-LD)
+    Lod {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// RDF output format
+        #[arg(long, default_value = "turtle")]
+        rdf_format: RdfOutputFormat,
+
+        /// Base URI for generated resources
+        #[arg(long, default_value = "https://example.org/legalis/")]
+        base_uri: String,
+    },
+
+    /// Format (pretty-print) a DSL file
+    Format {
+        /// Input file path
+        #[arg(short, long)]
+        input: String,
+
+        /// Output file (defaults to stdout, use --inplace to modify in place)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Modify the file in place
+        #[arg(long)]
+        inplace: bool,
+
+        /// Output style (default, compact, verbose)
+        #[arg(long, default_value = "default")]
+        style: FormatStyle,
+
+        /// Dry run (show what would be written without actually writing)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Lint DSL files for style and best practices
+    Lint {
+        /// Input file(s) to lint
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Fix auto-fixable issues
+        #[arg(long)]
+        fix: bool,
+
+        /// Fail on warnings
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Watch files for changes and re-run commands
+    Watch {
+        /// Input file(s) to watch
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Command to run on changes (verify, lint, test)
+        #[arg(short, long, default_value = "verify")]
+        command: WatchCommand,
+    },
+
+    /// Test statutes with test cases
+    Test {
+        /// Input statute file(s)
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Test specification file
+        #[arg(short, long)]
+        tests: String,
+
+        /// Verbose test output
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Create a new statute from a template
+    New {
+        /// Statute name/ID
+        #[arg(short, long)]
+        name: String,
+
+        /// Statute template type
+        #[arg(short, long, default_value = "basic")]
+        template: StatuteTemplate,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Run diagnostics on the installation
+    Doctor {
+        /// Verbose diagnostic output
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Start an interactive REPL (Read-Eval-Print Loop)
+    Repl {
+        /// Load a file on startup
+        #[arg(short, long)]
+        load: Option<String>,
+
+        /// Disable colored output
+        #[arg(long)]
+        no_color: bool,
+    },
+
+    /// Search for statutes in a registry
+    Search {
+        /// Registry directory path (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        registry: String,
+
+        /// Search query (statute ID, title, or text)
+        #[arg(short, long)]
+        query: String,
+
+        /// Filter by jurisdiction
+        #[arg(short, long)]
+        jurisdiction: Option<String>,
+
+        /// Filter by tags
+        #[arg(short, long)]
+        tags: Vec<String>,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Publish a statute to a registry
+    Publish {
+        /// Input statute file
+        #[arg(short, long)]
+        input: String,
+
+        /// Registry directory path (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        registry: String,
+
+        /// Tags to associate with the statute
+        #[arg(short, long)]
+        tags: Vec<String>,
+
+        /// Dry run (show what would be published without actually publishing)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Validate a legal DSL file for format compliance
+    Validate {
+        /// Input file(s) to validate
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Format to validate against (auto-detected if not specified)
+        #[arg(long)]
+        format: Option<LegalDslFormat>,
+
+        /// Strict validation mode
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Install a statute from a registry
+    Install {
+        /// Statute ID to install
+        #[arg(short, long)]
+        statute_id: String,
+
+        /// Registry directory path (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        registry: String,
+
+        /// Output directory for installed statute
+        #[arg(short, long, default_value = "./statutes")]
+        output: String,
+
+        /// Force reinstall if already installed
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// List installed statutes
+    List {
+        /// Directory containing installed statutes
+        #[arg(short, long, default_value = "./statutes")]
+        directory: String,
+
+        /// Show detailed information
+        #[arg(long)]
+        verbose: bool,
+    },
+
+    /// Add a dependency statute
+    Add {
+        /// Statute ID to add as dependency
+        #[arg(short, long)]
+        statute_id: String,
+
+        /// Registry directory path (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        registry: String,
+
+        /// Project configuration file to update
+        #[arg(long, default_value = "legalis.yaml")]
+        config: String,
+    },
+
+    /// Update installed statutes to latest versions
+    Update {
+        /// Specific statute ID to update (updates all if not specified)
+        #[arg(short, long)]
+        statute_id: Option<String>,
+
+        /// Registry directory path (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        registry: String,
+
+        /// Check for updates without installing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Clean cache and temporary files
+    Clean {
+        /// Remove all cached data
+        #[arg(long)]
+        all: bool,
+
+        /// Remove compilation cache
+        #[arg(long)]
+        cache: bool,
+
+        /// Remove temporary files
+        #[arg(long)]
+        temp: bool,
+
+        /// Show what would be deleted without actually deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Check for outdated statutes
+    Outdated {
+        /// Directory containing installed statutes
+        #[arg(short, long, default_value = "./statutes")]
+        directory: String,
+
+        /// Registry directory path (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        registry: String,
+
+        /// Show all statutes, not just outdated ones
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Uninstall a statute
+    Uninstall {
+        /// Statute ID to uninstall
+        #[arg(short, long)]
+        statute_id: String,
+
+        /// Directory containing installed statutes
+        #[arg(short, long, default_value = "./statutes")]
+        directory: String,
+
+        /// Remove without confirmation
+        #[arg(long)]
+        force: bool,
+
+        /// Dry run (show what would be removed without actually removing)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Interactive tutorials for learning Legalis
+    Tutorial {
+        /// Specific tutorial topic (if not specified, shows selection menu)
+        #[arg(short, long)]
+        topic: Option<TutorialTopicArg>,
+    },
+
+    /// Explain a statute in natural language
+    Explain {
+        /// Input statute file
+        #[arg(short, long)]
+        input: String,
+
+        /// Detail level (basic, detailed, verbose)
+        #[arg(long, default_value = "detailed")]
+        detail: ExplainDetail,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Trace condition evaluation path
+    Trace {
+        /// Input statute file
+        #[arg(short, long)]
+        input: String,
+
+        /// Test case file with input variables
+        #[arg(short, long)]
+        test_case: String,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        trace_format: TraceFormat,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Benchmark verification or simulation performance
+    Benchmark {
+        /// Input statute file(s)
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Benchmark type (verify, simulate, all)
+        #[arg(long, default_value = "all")]
+        bench_type: BenchmarkType,
+
+        /// Number of iterations
+        #[arg(long, default_value = "100")]
+        iterations: usize,
+
+        /// Population size for simulation benchmarks
+        #[arg(short, long, default_value = "1000")]
+        population: usize,
+
+        /// Output file for results (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Migrate statutes between versions
+    Migrate {
+        /// Input statute file
+        #[arg(short, long)]
+        input: String,
+
+        /// Source DSL version
+        #[arg(long)]
+        from_version: String,
+
+        /// Target DSL version
+        #[arg(long)]
+        to_version: String,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Dry run (show migration plan without executing)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Generate dependency graphs
+    Graph {
+        /// Input statute file(s) or directory
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Graph type (dependency, reference, call)
+        #[arg(long, default_value = "dependency")]
+        graph_type: GraphType,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+
+        /// Graph format (dot, mermaid, json)
+        #[arg(long, default_value = "dot")]
+        graph_format: GraphFormat,
+    },
+
+    /// Launch interactive statute builder wizard
+    BuilderWizard {
+        /// Skip the wizard and show help
+        #[arg(long)]
+        help_only: bool,
+    },
+
+    /// Launch interactive diff viewer with accept/reject
+    DiffViewer {
+        /// First file to compare
+        #[arg(short, long)]
+        old: String,
+
+        /// Second file to compare
+        #[arg(short, long)]
+        new: String,
+    },
+
+    /// Launch interactive simulation parameter tuning
+    SimTune {
+        /// Input statute file(s)
+        #[arg(short, long)]
+        input: Vec<String>,
+    },
+
+    /// Resolve statute conflicts interactively
+    ResolveConflicts {
+        /// Statute files with conflicts
+        #[arg(short, long)]
+        input: Vec<String>,
+    },
+
+    /// Browse registry with TUI dashboard
+    RegistryBrowser {
+        /// Registry directory path (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        registry: String,
+
+        /// Start in search mode
+        #[arg(long)]
+        search: bool,
+    },
+
+    /// Execute batch operations on multiple statutes
+    Batch {
+        /// Batch operation to perform
+        #[command(subcommand)]
+        operation: BatchOperation,
+    },
+
+    /// Profile CPU and memory usage
+    Profile {
+        /// Input statute file(s)
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Profile type (cpu, memory, all)
+        #[arg(long, default_value = "all")]
+        profile_type: ProfileType,
+
+        /// Number of iterations for profiling
+        #[arg(long, default_value = "100")]
+        iterations: usize,
+
+        /// Output file for profile results (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Generate flamegraph (requires flamegraph to be installed)
+        #[arg(long)]
+        flamegraph: bool,
+
+        /// Output directory for flamegraph files (Linux only)
+        #[cfg(target_os = "linux")]
+        #[arg(long, default_value = "./profiles")]
+        flamegraph_dir: String,
+    },
+
+    /// Debug step-through evaluation
+    Debug {
+        /// Input statute file
+        #[arg(short, long)]
+        input: String,
+
+        /// Test case file with input variables
+        #[arg(short, long)]
+        test_case: String,
+
+        /// Enable interactive mode (step through evaluation)
+        #[arg(long)]
+        interactive: bool,
+
+        /// Show memory allocations
+        #[arg(long)]
+        show_memory: bool,
+
+        /// Show timing breakdown
+        #[arg(long)]
+        show_timing: bool,
+
+        /// Output file for debug trace (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Registry operations (push, pull, diff, sync, login, logout)
+    Registry {
+        /// Registry operation to perform
+        #[command(subcommand)]
+        operation: RegistryOperation,
+    },
+
+    /// Plugin management (install, uninstall, list, enable, disable)
+    Plugin {
+        /// Plugin operation to perform
+        #[command(subcommand)]
+        operation: PluginOperation,
+    },
+
+    /// Configuration management (validate, diff, profiles)
+    Config {
+        /// Config operation to perform
+        #[command(subcommand)]
+        operation: ConfigOperation,
+    },
+
+    /// Script management and execution (Lua scripting)
+    Script {
+        /// Script operation to perform
+        #[command(subcommand)]
+        operation: ScriptOperation,
+    },
+
+    /// AI-powered CLI features
+    Ai {
+        /// AI operation to perform
+        #[command(subcommand)]
+        operation: AiOperation,
+    },
+
+    /// Launch interactive TUI dashboard
+    Dashboard {
+        /// Enable vim-style keyboard shortcuts
+        #[arg(long)]
+        vim_keys: bool,
+
+        /// Disable mouse support
+        #[arg(long)]
+        no_mouse: bool,
+    },
+
+    /// Workflow automation operations
+    Workflow {
+        /// Workflow operation to perform
+        #[command(subcommand)]
+        operation: WorkflowOperation,
+    },
+
+    /// Cloud integration operations (AWS, Azure, GCP)
+    Cloud {
+        /// Cloud operation to perform
+        #[command(subcommand)]
+        operation: CloudOperation,
+    },
+
+    /// Team collaboration operations (workspace, history, sessions, notifications, access)
+    Team {
+        /// Team operation to perform
+        #[command(subcommand)]
+        operation: TeamOperation,
+    },
+
+    /// Performance profiling operations
+    Perf {
+        /// Performance operation to perform
+        #[command(subcommand)]
+        operation: PerfOperation,
+    },
+
+    /// Phase-level execution profiling with percentiles and allocation tracking
+    Profiling {
+        /// Input statute file(s) to profile (read, parse, and verify phases)
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Number of iterations to sample per phase
+        #[arg(long, default_value = "50")]
+        iterations: usize,
+
+        /// Output file for the profile report (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Offline command queue, local cache, sync, and conflict resolution
+    Offline {
+        /// Offline operation to perform
+        #[command(subcommand)]
+        operation: OfflineOperation,
+    },
+
+    /// Audit logging of CLI operations (enterprise audit trail)
+    AuditLog {
+        /// Audit-log operation to perform
+        #[command(subcommand)]
+        operation: AuditLogOperation,
+    },
+
+    /// Enterprise policy inspection and enforcement
+    Policy {
+        /// Policy operation to perform
+        #[command(subcommand)]
+        operation: PolicyOperation,
+    },
+
+    /// Centralized, layered configuration management
+    CentralConfig {
+        /// Centralized-config operation to perform
+        #[command(subcommand)]
+        operation: CentralConfigOperation,
+    },
+
+    /// Intelligent assistant: suggestions, recommendations, usage learning
+    Assistant {
+        /// Assistant operation to perform
+        #[command(subcommand)]
+        operation: AssistantOperation,
+    },
+
+    /// Run self-diagnostics on environment, config, policy, and audit health
+    Diagnose,
+
+    /// Detect and repair invalid configuration
+    Repair {
+        /// Configuration file to repair (defaults to project/user config)
+        #[arg(short, long)]
+        config: Option<String>,
+
+        /// Show proposed repairs without writing them
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Crash recovery and resume of interrupted long operations
+    Recover {
+        /// Recovery operation to perform
+        #[command(subcommand)]
+        operation: RecoverOperation,
+    },
+}
+
+/// Generates shell completions and writes them to stdout.
+pub fn generate_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "legalis", &mut std::io::stdout());
+}
+
+/// Generates man page and writes it to stdout.
+pub fn generate_man_page() -> std::io::Result<()> {
+    let cmd = Cli::command();
+    let man = Man::new(cmd);
+    let mut buffer = Vec::new();
+    man.render(&mut buffer)?;
+    std::io::Write::write_all(&mut std::io::stdout(), &buffer)?;
+    Ok(())
+}
+
+/// Generates man pages for all subcommands to a directory.
+pub fn generate_all_man_pages(output_dir: &std::path::Path) -> std::io::Result<()> {
+    let cmd = Cli::command();
+
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(output_dir)?;
+
+    // Generate main man page
+    let man = Man::new(cmd.clone());
+    let mut buffer = Vec::new();
+    man.render(&mut buffer)?;
+    let man_path = output_dir.join("legalis.1");
+    std::fs::write(man_path, buffer)?;
+
+    // Generate man pages for subcommands
+    for subcmd in cmd.get_subcommands() {
+        let name = subcmd.get_name();
+        let subcmd_name = format!("legalis-{}", name);
+        let man = Man::new(subcmd.clone()).title(&subcmd_name);
+        let mut buffer = Vec::new();
+        man.render(&mut buffer)?;
+        let man_path = output_dir.join(format!("{}.1", subcmd_name));
+        std::fs::write(man_path, buffer)?;
+    }
+
+    Ok(())
+}

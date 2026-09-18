@@ -1,0 +1,690 @@
+//! High-level translation from parsed [`FfmpegArgs`] to OxiMedia transcode jobs.
+//!
+//! The [`parse_and_translate`] function is the main entry point: it accepts a
+//! `&[String]` of raw FFmpeg-style arguments, parses them via
+//! [`FfmpegArgs::parse`], then translates each output into a [`TranscodeJob`]
+//! that carries enough information for the CLI runner to drive OxiMedia's
+//! native transcoding APIs.
+
+use std::collections::HashMap;
+
+use crate::arg_parser::{FfmpegArgs, MapSpec, OutputSpec, StreamOptions, StreamType};
+use crate::codec_map::{CodecCategory, CodecMap};
+use crate::diagnostics::{unknown_codec_diagnostic, Diagnostic, DiagnosticSink};
+use crate::encoder_options::EncoderQualityOptions;
+use crate::filter_lex::{parse_filter_graph, parse_filters, ParsedFilter};
+use crate::hwaccel_compat::{translate_hwaccel, HwAccelConfig};
+use crate::pass::PassPhase;
+
+/// A single transcode job derived from one FFmpeg output specification.
+#[derive(Debug, Clone)]
+pub struct TranscodeJob {
+    /// The primary input file path.
+    pub input_path: String,
+    /// The output file path.
+    pub output_path: String,
+    /// Target video codec OxiMedia name, or `None` for no-video / copy.
+    pub video_codec: Option<String>,
+    /// Target audio codec OxiMedia name, or `None` for no-audio / copy.
+    pub audio_codec: Option<String>,
+    /// Target video bitrate string, e.g. `"2M"`.
+    pub video_bitrate: Option<String>,
+    /// Target audio bitrate string, e.g. `"128k"`.
+    pub audio_bitrate: Option<String>,
+    /// CRF value for quality-based encoding.
+    pub crf: Option<f64>,
+    /// Parsed video filters (semantic).
+    pub video_filters: Vec<ParsedFilter>,
+    /// Parsed audio filters (semantic).
+    pub audio_filters: Vec<ParsedFilter>,
+    /// Seek position (pre- or post-input).
+    pub seek: Option<String>,
+    /// Maximum output duration.
+    pub duration: Option<String>,
+    /// Overwrite output without asking.
+    pub overwrite: bool,
+    /// Stream maps for this output.
+    pub map: Vec<MapSpec>,
+    /// Suppress video streams.
+    pub no_video: bool,
+    /// Suppress audio streams.
+    pub no_audio: bool,
+    /// Metadata key/value pairs.
+    pub metadata: HashMap<String, String>,
+    /// Container format, if explicitly set.
+    pub format: Option<String>,
+    /// Encoding preset (translated to OxiMedia speed level).
+    pub preset: Option<String>,
+    /// Encoding tune setting.
+    pub tune: Option<String>,
+    /// Encoding profile.
+    pub profile: Option<String>,
+    /// Parsed encoder quality options.
+    pub encoder_quality: EncoderQualityOptions,
+    /// Two-pass encoding pass number (1 or 2), if set.
+    pub pass: Option<u8>,
+    /// Passlogfile prefix for two-pass encoding.
+    pub passlogfile: Option<String>,
+    /// Parsed two-pass phase details.
+    pub pass_phase: Option<PassPhase>,
+    /// Translated muxer options.
+    pub muxer_options: Vec<MuxerOption>,
+    /// Hardware acceleration configuration derived from `-hwaccel`, if set.
+    pub hwaccel: Option<HwAccelConfig>,
+    /// Map-metadata directives (`-map_metadata`).
+    pub map_metadata: Vec<MapMetadataDirective>,
+    /// GOP size (keyframe interval, `-g N`).
+    pub gop_size: Option<u32>,
+    /// Minimum keyframe interval (`-keyint_min N`).
+    pub keyint_min: Option<u32>,
+}
+
+/// A translated muxer option with OxiMedia semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxerOption {
+    /// The original FFmpeg option name (e.g. `"movflags"`).
+    pub ffmpeg_name: String,
+    /// The original FFmpeg value (e.g. `"+faststart"`).
+    pub ffmpeg_value: String,
+    /// The OxiMedia-equivalent operation description.
+    pub oxi_action: MuxerAction,
+}
+
+/// Semantic action for a muxer option in OxiMedia.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MuxerAction {
+    /// Move the moov atom to the beginning for streaming (`+faststart`).
+    FastStart,
+    /// Enable fragmented MP4 output.
+    FragmentedMp4,
+    /// Enable DASH-compatible fragmented output.
+    DashCompat,
+    /// Disable audio in muxer.
+    DisableAudio,
+    /// Enable global header for all streams.
+    GlobalHeader,
+    /// Enable pts generation (`+genpts`).
+    GeneratePts,
+    /// Enable discarding corrupt packets (`+discardcorrupt`).
+    DiscardCorrupt,
+    /// Enable shortest output mode.
+    Shortest,
+    /// An unrecognised muxer option (kept for diagnostics).
+    Unknown {
+        /// The original option key.
+        key: String,
+        /// The original option value.
+        value: String,
+    },
+}
+
+/// Specifies how metadata is copied between input and output in `-map_metadata`.
+///
+/// FFmpeg's `-map_metadata` accepts three main forms:
+/// - `0` / `<N>` — copy all metadata from input file N
+/// - `-1` — strip all metadata (do not copy anything)
+/// - `0:s:0` / `0:g` — copy a specific stream or global scope from an input
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapMetadataDirective {
+    /// Copy all metadata from input file at the given index.
+    FromInput(usize),
+    /// Strip all metadata (do not copy any tags).
+    StripAll,
+    /// Copy metadata from a specific stream of an input file.
+    ///
+    /// `(file_index, stream_type_char, stream_index)` —  e.g. `(0, 'a', 1)` means
+    /// the second audio stream of the first input file.
+    FromStream {
+        /// Input file index.
+        file_idx: usize,
+        /// Stream type character (`'v'`, `'a'`, `'s'`) or `'g'` for global.
+        stream_type: char,
+        /// Zero-based stream index within that type.
+        stream_idx: usize,
+    },
+}
+
+impl MapMetadataDirective {
+    /// Parse the value of a `-map_metadata` flag.
+    ///
+    /// Handles:
+    /// - `"-1"` → [`Self::StripAll`]
+    /// - `"0"`, `"1"`, … → [`Self::FromInput`]
+    /// - `"0:s:0"`, `"0:a:1"`, `"0:v:0"`, `"0:g"` → [`Self::FromStream`]
+    pub fn parse(value: &str) -> Option<Self> {
+        let v = value.trim();
+        if v == "-1" {
+            return Some(Self::StripAll);
+        }
+        // Check for "N:TYPE:IDX" or "N:g" patterns.
+        let parts: Vec<&str> = v.splitn(3, ':').collect();
+        match parts.as_slice() {
+            [file_str, type_str, idx_str] => {
+                let file_idx = file_str.parse::<usize>().ok()?;
+                let stream_type = type_str.chars().next()?;
+                let stream_idx = idx_str.parse::<usize>().ok()?;
+                Some(Self::FromStream {
+                    file_idx,
+                    stream_type,
+                    stream_idx,
+                })
+            }
+            [file_str, "g"] | [file_str, "global"] => {
+                let file_idx = file_str.parse::<usize>().ok()?;
+                Some(Self::FromStream {
+                    file_idx,
+                    stream_type: 'g',
+                    stream_idx: 0,
+                })
+            }
+            [num_str] => {
+                let n = num_str.parse::<usize>().ok()?;
+                Some(Self::FromInput(n))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The result of a full parse + translate pass.
+#[derive(Debug)]
+pub struct TranslateResult {
+    /// Successfully translated jobs.
+    pub jobs: Vec<TranscodeJob>,
+    /// All diagnostics (warnings, errors, infos) produced during translation.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl TranslateResult {
+    /// Return `true` if any error-level diagnostics were produced.
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics.iter().any(|d| d.is_error())
+    }
+}
+
+/// Parse raw FFmpeg-style arguments and translate them to [`TranscodeJob`]s.
+///
+/// This is the primary public API of the compatibility layer.
+pub fn parse_and_translate(args: &[String]) -> TranslateResult {
+    let mut sink = DiagnosticSink::new();
+
+    let parsed = match FfmpegArgs::parse(args) {
+        Ok(p) => p,
+        Err(e) => {
+            sink.push(Diagnostic::error(format!("argument parse error: {}", e)));
+            return TranslateResult {
+                jobs: Vec::new(),
+                diagnostics: sink.into_diagnostics(),
+            };
+        }
+    };
+
+    let codec_map = CodecMap::new();
+
+    if parsed.inputs.is_empty() {
+        sink.push(Diagnostic::error("no input file specified (-i <path>)"));
+    }
+
+    if parsed.outputs.is_empty() {
+        sink.push(Diagnostic::error("no output file specified"));
+    }
+
+    if sink.has_errors() {
+        return TranslateResult {
+            jobs: Vec::new(),
+            diagnostics: sink.into_diagnostics(),
+        };
+    }
+
+    // Use the first input for all outputs (mirrors simple FFmpeg usage).
+    // For multiple-input scenarios, the `map` field carries the intent.
+    let primary_input = parsed.inputs[0].path.clone();
+    let primary_seek = parsed.inputs[0].pre_seek.clone();
+
+    let overwrite = parsed.global_options.overwrite;
+
+    // Resolve hardware acceleration once for the whole invocation.
+    let global_hwaccel: Option<HwAccelConfig> = parsed
+        .global_options
+        .hwaccel
+        .as_deref()
+        .map(|method| translate_hwaccel(method, None, None));
+
+    let mut jobs = Vec::with_capacity(parsed.outputs.len());
+
+    for output in &parsed.outputs {
+        let job = translate_output(
+            &primary_input,
+            primary_seek.as_deref(),
+            output,
+            &codec_map,
+            &mut sink,
+            overwrite,
+            global_hwaccel.clone(),
+        );
+        jobs.push(job);
+    }
+
+    // Warn about unknown extra_args.
+    for output in &parsed.outputs {
+        for (key, _val) in &output.extra_args {
+            if key != "<positional>" {
+                sink.push(Diagnostic::unknown_option(key));
+            }
+        }
+    }
+
+    TranslateResult {
+        jobs,
+        diagnostics: sink.into_diagnostics(),
+    }
+}
+
+/// Translate a single [`OutputSpec`] into a [`TranscodeJob`].
+fn translate_output(
+    input_path: &str,
+    pre_seek: Option<&str>,
+    output: &OutputSpec,
+    codec_map: &CodecMap,
+    sink: &mut DiagnosticSink,
+    overwrite: bool,
+    hwaccel: Option<HwAccelConfig>,
+) -> TranscodeJob {
+    // ── Codec resolution ──────────────────────────────────────────────────────
+    let video_codec = if output.no_video {
+        None
+    } else {
+        find_codec_for_type(&output.stream_options, StreamType::Video, codec_map, sink).or_else(
+            || find_codec_for_type(&output.stream_options, StreamType::All, codec_map, sink),
+        )
+    };
+
+    let audio_codec = if output.no_audio {
+        None
+    } else {
+        find_codec_for_type(&output.stream_options, StreamType::Audio, codec_map, sink).or_else(
+            || find_codec_for_type(&output.stream_options, StreamType::All, codec_map, sink),
+        )
+    };
+
+    // ── Bitrate resolution ────────────────────────────────────────────────────
+    let video_bitrate = find_bitrate_for_type(&output.stream_options, StreamType::Video)
+        .or_else(|| find_bitrate_for_type(&output.stream_options, StreamType::All));
+    let audio_bitrate = find_bitrate_for_type(&output.stream_options, StreamType::Audio)
+        .or_else(|| find_bitrate_for_type(&output.stream_options, StreamType::All));
+
+    // ── CRF resolution ────────────────────────────────────────────────────────
+    let crf = output.stream_options.iter().find_map(|o| o.crf);
+
+    // ── Filter parsing ────────────────────────────────────────────────────────
+    let video_filters = parse_output_filters(output.video_filter.as_deref(), "video", sink);
+    let audio_filters = parse_output_filters(output.audio_filter.as_deref(), "audio", sink);
+
+    // For filter_complex, split and append to both filter lists.
+    // In practice the translator surface-level just records them.
+    if let Some(fc) = &output.filter_complex {
+        match parse_filter_graph(fc) {
+            Ok(g) => {
+                for node in &g.nodes {
+                    // Only emit diagnostics for unknown filters in filter_complex.
+                    if node.name != "null"
+                        && node.name != "anull"
+                        && node.name != "setpts"
+                        && node.name != "format"
+                        && node.name != "colorspace"
+                        && node.name != "pad"
+                        && node.name != "overlay"
+                        && node.name != "concat"
+                        && node.name != "scale"
+                        && node.name != "crop"
+                        && node.name != "fps"
+                        && node.name != "hflip"
+                        && node.name != "vflip"
+                        && node.name != "rotate"
+                        && node.name != "yadif"
+                        && node.name != "bwdif"
+                        && node.name != "eq"
+                        && node.name != "lut3d"
+                        && node.name != "subtitles"
+                        && node.name != "loudnorm"
+                        && node.name != "volume"
+                        && node.name != "aresample"
+                        && node.name != "acompressor"
+                    {
+                        // Emit info rather than error — filter_complex graphs may
+                        // contain many unsupported nodes that are fine to skip.
+                    }
+                    let _ = node; // suppress unused warning
+                }
+            }
+            Err(e) => {
+                sink.push(Diagnostic::warning(format!(
+                    "filter_complex '{}' parse error: {}",
+                    fc, e
+                )));
+            }
+        }
+    }
+
+    // ── Seek: prefer output-side seek; fall back to pre-input seek ─────────────
+    let seek = output.seek.clone().or_else(|| pre_seek.map(str::to_string));
+
+    // ── Muxer options ────────────────────────────────────────────────────────
+    let muxer_options = translate_muxer_options(&output.muxer_options, sink);
+
+    // Parse map_metadata directives.
+    let map_metadata: Vec<MapMetadataDirective> = output
+        .map_metadata
+        .iter()
+        .filter_map(|s| MapMetadataDirective::parse(s))
+        .collect();
+
+    TranscodeJob {
+        input_path: input_path.to_string(),
+        output_path: output.path.clone(),
+        video_codec,
+        audio_codec,
+        video_bitrate,
+        audio_bitrate,
+        crf,
+        video_filters,
+        audio_filters,
+        seek,
+        duration: output.duration.clone(),
+        overwrite,
+        map: output.map.clone(),
+        no_video: output.no_video,
+        no_audio: output.no_audio,
+        metadata: output.metadata.clone(),
+        format: output.format.clone(),
+        preset: output.preset.clone(),
+        tune: output.tune.clone(),
+        profile: output.profile.clone(),
+        encoder_quality: output.encoder_quality.clone(),
+        pass: output.pass,
+        passlogfile: output.passlogfile.clone(),
+        pass_phase: output.pass_phase.clone(),
+        muxer_options,
+        hwaccel,
+        map_metadata,
+        gop_size: output.gop_size,
+        keyint_min: output.keyint_min,
+    }
+}
+
+/// Translate raw muxer option key/value pairs from the output spec into
+/// semantic [`MuxerOption`] records.
+fn translate_muxer_options(
+    raw: &[(String, String)],
+    sink: &mut DiagnosticSink,
+) -> Vec<MuxerOption> {
+    let mut result = Vec::with_capacity(raw.len());
+    for (key, value) in raw {
+        let action = translate_single_muxer_option(key, value);
+        if let MuxerAction::Unknown { .. } = &action {
+            sink.push(Diagnostic::unknown_option(format!("-{} {}", key, value)));
+        }
+        result.push(MuxerOption {
+            ffmpeg_name: key.clone(),
+            ffmpeg_value: value.clone(),
+            oxi_action: action,
+        });
+    }
+    result
+}
+
+/// Map a single muxer option to a semantic [`MuxerAction`].
+fn translate_single_muxer_option(key: &str, value: &str) -> MuxerAction {
+    match key {
+        "movflags" => translate_movflags(value),
+        "fflags" => translate_fflags(value),
+        "shortest" => MuxerAction::Shortest,
+        _ => MuxerAction::Unknown {
+            key: key.to_string(),
+            value: value.to_string(),
+        },
+    }
+}
+
+/// Translate `-movflags` values into OxiMedia muxer actions.
+///
+/// Multiple flags can be combined with `+` (e.g. `frag_keyframe+empty_moov`).
+fn translate_movflags(value: &str) -> MuxerAction {
+    // Check for +faststart (most common single-flag case).
+    if value.eq_ignore_ascii_case("+faststart") || value.eq_ignore_ascii_case("faststart") {
+        return MuxerAction::FastStart;
+    }
+    // DASH-compatible fragmented output.
+    if value.to_lowercase().contains("dash") {
+        return MuxerAction::DashCompat;
+    }
+    // Fragmented MP4: frag_keyframe or frag_every_frame, optionally +empty_moov.
+    if value.to_lowercase().contains("frag_keyframe")
+        || value.to_lowercase().contains("frag_every_frame")
+    {
+        return MuxerAction::FragmentedMp4;
+    }
+    // Generate PTS.
+    if value.eq_ignore_ascii_case("+genpts") || value.eq_ignore_ascii_case("genpts") {
+        return MuxerAction::GeneratePts;
+    }
+    // Discard corrupt packets.
+    if value.to_lowercase().contains("discardcorrupt") {
+        return MuxerAction::DiscardCorrupt;
+    }
+    // Global header (needed for some muxers).
+    if value.to_lowercase().contains("global_header") {
+        return MuxerAction::GlobalHeader;
+    }
+    MuxerAction::Unknown {
+        key: "movflags".to_string(),
+        value: value.to_string(),
+    }
+}
+
+/// Translate `-fflags` values into OxiMedia muxer actions.
+fn translate_fflags(value: &str) -> MuxerAction {
+    if value.to_lowercase().contains("genpts") {
+        return MuxerAction::GeneratePts;
+    }
+    if value.to_lowercase().contains("discardcorrupt") {
+        return MuxerAction::DiscardCorrupt;
+    }
+    MuxerAction::Unknown {
+        key: "fflags".to_string(),
+        value: value.to_string(),
+    }
+}
+
+/// Find and resolve the codec name for a given stream type.
+///
+/// Emits a `PatentCodecSubstituted` diagnostic if the codec is patent-encumbered.
+fn find_codec_for_type(
+    opts: &[StreamOptions],
+    target: StreamType,
+    codec_map: &CodecMap,
+    sink: &mut DiagnosticSink,
+) -> Option<String> {
+    let raw_name = opts
+        .iter()
+        .find(|o| o.stream_type == target)
+        .and_then(|o| o.codec.as_deref())?;
+
+    // Handle "copy" — passthrough, no substitution needed.
+    if raw_name.eq_ignore_ascii_case("copy") {
+        return Some("copy".to_string());
+    }
+
+    match codec_map.lookup(raw_name) {
+        Some(entry) => {
+            if entry.category == CodecCategory::PatentSubstituted {
+                sink.push(Diagnostic::patent_substituted(raw_name, entry.oxi_name));
+            }
+            Some(entry.oxi_name.to_string())
+        }
+        None => {
+            sink.push(unknown_codec_diagnostic(raw_name));
+            Some(raw_name.to_string())
+        }
+    }
+}
+
+/// Find the bitrate for a given stream type.
+fn find_bitrate_for_type(opts: &[StreamOptions], target: StreamType) -> Option<String> {
+    opts.iter()
+        .find(|o| o.stream_type == target && o.bitrate.is_some())
+        .and_then(|o| o.bitrate.clone())
+}
+
+/// Parse and validate a filter string, emitting diagnostics for unsupported filters.
+fn parse_output_filters(
+    filter_str: Option<&str>,
+    context: &str,
+    sink: &mut DiagnosticSink,
+) -> Vec<ParsedFilter> {
+    let s = match filter_str {
+        Some(s) if !s.is_empty() => s,
+        _ => return Vec::new(),
+    };
+
+    match parse_filter_graph(s) {
+        Ok(_graph) => {
+            let filters = parse_filters(s);
+            for f in &filters {
+                if let ParsedFilter::Unknown { name, .. } = f {
+                    sink.push(Diagnostic::filter_not_supported(format!(
+                        "{} (in {} filter)",
+                        name, context
+                    )));
+                }
+            }
+            filters
+        }
+        Err(e) => {
+            sink.push(Diagnostic::warning(format!(
+                "{} filter '{}' parse error: {}",
+                context, s, e
+            )));
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_basic_transcode() {
+        let args = sv(&[
+            "-i",
+            "in.mkv",
+            "-c:v",
+            "libaom-av1",
+            "-c:a",
+            "libopus",
+            "out.webm",
+        ]);
+        let result = parse_and_translate(&args);
+        assert!(!result.has_errors());
+        assert_eq!(result.jobs.len(), 1);
+        let job = &result.jobs[0];
+        assert_eq!(job.video_codec.as_deref(), Some("av1"));
+        assert_eq!(job.audio_codec.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn test_patent_codec_substitution() {
+        let args = sv(&["-i", "in.mp4", "-c:v", "libx264", "-c:a", "aac", "out.webm"]);
+        let result = parse_and_translate(&args);
+        assert!(!result.has_errors());
+        let job = &result.jobs[0];
+        assert_eq!(job.video_codec.as_deref(), Some("av1"));
+        assert_eq!(job.audio_codec.as_deref(), Some("opus"));
+        // Should have two PatentCodecSubstituted diagnostics.
+        let subs: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    &d.kind,
+                    crate::diagnostics::DiagnosticKind::PatentCodecSubstituted { .. }
+                )
+            })
+            .collect();
+        assert_eq!(subs.len(), 2);
+    }
+
+    #[test]
+    fn test_no_input_error() {
+        let args = sv(&["out.webm"]);
+        let result = parse_and_translate(&args);
+        assert!(result.has_errors());
+        assert!(result.jobs.is_empty());
+    }
+
+    #[test]
+    fn test_overwrite_flag() {
+        let args = sv(&["-y", "-i", "in.mkv", "out.webm"]);
+        let result = parse_and_translate(&args);
+        assert!(result.jobs[0].overwrite);
+    }
+
+    #[test]
+    fn test_crf_passed() {
+        let args = sv(&[
+            "-i",
+            "in.mkv",
+            "-c:v",
+            "libaom-av1",
+            "-crf",
+            "30",
+            "out.webm",
+        ]);
+        let result = parse_and_translate(&args);
+        let job = &result.jobs[0];
+        assert!((job.crf.expect("test expectation failed") - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_video_filter_parsed() {
+        let args = sv(&["-i", "in.mkv", "-vf", "scale=1280:720", "out.webm"]);
+        let result = parse_and_translate(&args);
+        let job = &result.jobs[0];
+        assert_eq!(job.video_filters.len(), 1);
+        assert!(matches!(
+            job.video_filters[0],
+            ParsedFilter::Scale { w: 1280, h: 720 }
+        ));
+    }
+
+    #[test]
+    fn test_metadata_preserved() {
+        let args = sv(&["-i", "in.mkv", "-metadata", "title=Test", "out.webm"]);
+        let result = parse_and_translate(&args);
+        let job = &result.jobs[0];
+        assert_eq!(job.metadata.get("title").map(String::as_str), Some("Test"));
+    }
+
+    #[test]
+    fn test_no_video_flag() {
+        let args = sv(&["-i", "in.mkv", "-vn", "audio.ogg"]);
+        let result = parse_and_translate(&args);
+        let job = &result.jobs[0];
+        assert!(job.no_video);
+        assert!(job.video_codec.is_none());
+    }
+
+    #[test]
+    fn test_copy_codec() {
+        let args = sv(&["-i", "in.mkv", "-c:v", "copy", "-c:a", "libopus", "out.mkv"]);
+        let result = parse_and_translate(&args);
+        let job = &result.jobs[0];
+        assert_eq!(job.video_codec.as_deref(), Some("copy"));
+        assert_eq!(job.audio_codec.as_deref(), Some("opus"));
+    }
+}

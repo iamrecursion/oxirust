@@ -1,0 +1,46 @@
+# Ogg container dictionary for fuzzing
+# Contains common Ogg patterns and magic bytes
+
+# Ogg page sync pattern
+"OggS"
+"\x4F\x67\x67\x53"
+
+# Version
+"\x00"
+
+# Header type flags
+"\x01"
+"\x02"
+"\x04"
+
+# Granule position patterns
+"\x00\x00\x00\x00\x00\x00\x00\x00"
+"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+
+# Serial numbers
+"\x00\x00\x00\x00"
+"\xFF\xFF\xFF\xFF"
+
+# Page sequence
+"\x00\x00\x00\x00"
+"\x01\x00\x00\x00"
+
+# Codec headers
+"\x01vorbis"
+"\x03vorbis"
+"\x05vorbis"
+"\x80theora"
+"\x81theora"
+"\x82theora"
+"OpusHead"
+"OpusTags"
+"\x7FFLAC"
+"Speex"
+
+# Segment table patterns
+"\x00"
+"\xFF"
+"\x01"
+
+# CRC patterns
+"\x00\x00\x00\x00"

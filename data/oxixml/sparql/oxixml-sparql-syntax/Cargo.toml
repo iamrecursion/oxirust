@@ -1,0 +1,30 @@
+[package]
+name = "oxixml-sparql-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SPARQL 1.0/1.1 (+ optional 1.2/SPARQL-star) query and update syntax to algebra (a Pure-Rust spargebra replacement)."
+keywords = ["sparql", "rdf", "parser", "query", "algebra"]
+categories = ["parser-implementations", "parsing"]
+readme = "README.md"
+
+[features]
+default = []
+# SPARQL 1.2 / SPARQL-star: triple terms, reifiers, annotation blocks, `VERSION` and the
+# RDF 1.2 built-ins (`TRIPLE`, `SUBJECT`, `LANGDIR`, `hasLANG`, …).
+sparql-12 = ["oxixml-model/rdf-12"]
+
+[dependencies]
+oxixml-model = { workspace = true }
+oxixml-iri = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "oximedia-virtual"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Virtual production and LED wall tools for OxiMedia"
+keywords = ["virtual-production", "led", "video", "multimedia", "graphics"]
+categories = ["multimedia", "graphics"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+oximedia-core = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

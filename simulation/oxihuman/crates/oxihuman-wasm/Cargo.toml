@@ -1,0 +1,48 @@
+[package]
+name        = "oxihuman-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage    = "https://github.com/cool-japan/oxihuman"
+documentation = "https://docs.rs/oxihuman-wasm"
+description = "WebAssembly bindings for OxiHuman — full browser-ready API"
+readme      = "README.md"
+keywords    = ["wasm", "webassembly", "human", "browser", "makehuman"]
+categories  = ["wasm", "web-programming", "science"]
+exclude     = ["target/", "tests/fixtures/", "*.wasm", "wasm-opt.toml"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace          = true
+serde_json.workspace      = true
+oxihuman-core.workspace   = true
+oxihuman-morph.workspace  = true
+oxihuman-mesh.workspace   = true
+oxihuman-export.workspace = true
+oxihuman-viewer.workspace = true
+oxihuman-physics.workspace = true
+serde.workspace           = true
+wasm-bindgen             = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+
+[dev-dependencies]
+wasm-bindgen-test         = "0.3.76"
+serde_json.workspace      = true
+criterion.workspace       = true
+oxihuman-test-utils = { path = "../oxihuman-test-utils" }
+
+[[bench]]
+name    = "wasm_bench"
+harness = false
+
+[features]
+default = []
+# Canonical browser feature: the full wasm-bindgen JS/TS API surface.
+# Build with: wasm-pack build --target web --no-default-features --features bindgen
+bindgen = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
+# Deprecated alias of `bindgen` (kept for pre-0.3 compatibility).
+wasm    = ["bindgen"]

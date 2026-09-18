@@ -1,0 +1,384 @@
+// Copyright 2026 COOLJAPAN OU (Team KitaSan)
+// SPDX-License-Identifier: Apache-2.0
+
+//! Core MD simulation driver (MdSim) and Berendsen thermostat.
+
+use super::config::{Ensemble, KB_REDUCED, MdConfig, MdState, atom_kinetic_energy};
+use super::tracking::KJ_MOL_PER_ANG3_TO_BAR;
+
+// ---------------------------------------------------------------------------
+// MdSim — self-contained MD driver
+// ---------------------------------------------------------------------------
+
+/// Self-contained MD simulation driver using plain arrays (no nalgebra).
+///
+/// Operates on [`MdState`] with an explicit velocity-Verlet integration loop
+/// and optional velocity-rescaling thermostat.
+pub struct MdSim {
+    /// Run configuration.
+    pub config: MdConfig,
+    /// Current dynamical state.
+    pub state: MdState,
+}
+
+impl MdSim {
+    /// Create a new simulation.
+    pub fn new(config: MdConfig, state: MdState) -> Self {
+        Self { config, state }
+    }
+
+    // -----------------------------------------------------------------------
+    // Kinetic energy
+    // -----------------------------------------------------------------------
+
+    /// Compute kinetic energy (kJ mol⁻¹) from current velocities (Å ps⁻¹) and
+    /// masses (amu).
+    ///
+    /// KE = ½ Σᵢ mᵢ |vᵢ|² · 0.01
+    ///
+    /// The factor `0.01` converts amu · Å² · ps⁻² to kJ mol⁻¹
+    /// ([`KJMOL_PER_AMU_A2_PS2`](super::KJMOL_PER_AMU_A2_PS2)).
+    pub fn compute_kinetic_energy(&self) -> f64 {
+        self.state
+            .velocities
+            .iter()
+            .zip(self.state.masses.iter())
+            .map(|(v, &m)| atom_kinetic_energy(v, m))
+            .sum()
+    }
+
+    // -----------------------------------------------------------------------
+    // Temperature
+    // -----------------------------------------------------------------------
+
+    /// Compute instantaneous temperature (K) from kinetic energy.
+    ///
+    /// T = 2 KE / (3 N k_B)
+    pub fn compute_temperature(&self) -> f64 {
+        let n = self.state.n_atoms() as f64;
+        if n == 0.0 {
+            return 0.0;
+        }
+        let ke = self.compute_kinetic_energy();
+        2.0 * ke / (3.0 * n * KB_REDUCED)
+    }
+
+    // -----------------------------------------------------------------------
+    // Pressure
+    // -----------------------------------------------------------------------
+
+    /// Compute the instantaneous pressure (bar) from the virial theorem.
+    ///
+    /// ```text
+    /// P = (2·KE + W) / (3 V)
+    /// ```
+    ///
+    /// where `KE` is the kinetic energy (kJ mol⁻¹), `W = Σ_{i<j} r_ij · F_ij` is
+    /// the scalar *pair* virial (kJ mol⁻¹, minimum-image separations `r_ij`; see
+    /// [`MdSim::velocity_verlet_step_virial`]) and `V` is the box volume (Å³).
+    ///
+    /// The kinetic term `2·KE / (3 V) = N k_B T / V` is the ideal-gas pressure, so
+    /// a non-interacting gas (`virial = 0`) obeys `P V = N k_B T`.  The result is
+    /// converted to bar with 1 kJ mol⁻¹ Å⁻³ = 16605.4 bar.
+    ///
+    /// Returns `0.0` for a degenerate (zero or non-finite volume) box.
+    pub fn compute_pressure(&self, virial: f64) -> f64 {
+        let v =
+            self.config.box_lengths[0] * self.config.box_lengths[1] * self.config.box_lengths[2];
+        if !(v.is_finite() && v > 0.0) {
+            return 0.0;
+        }
+        let twice_kinetic = 2.0 * self.compute_kinetic_energy();
+        (twice_kinetic + virial) / (3.0 * v) * KJ_MOL_PER_ANG3_TO_BAR
+    }
+
+    // -----------------------------------------------------------------------
+    // Velocity-Verlet integrator (higher-order version with forces_fn)
+    // -----------------------------------------------------------------------
+
+    /// Perform one velocity-Verlet step with an external force function.
+    ///
+    /// `forces_fn(positions, box_lengths) -> forces`
+    ///
+    /// The step does not evaluate a virial.  To run constant-pressure dynamics use
+    /// [`MdSim::velocity_verlet_step_virial`], whose force function also returns
+    /// the pair virial.
+    pub fn velocity_verlet_step(
+        &mut self,
+        forces_fn: impl Fn(&[[f64; 3]], &[f64; 3]) -> Vec<[f64; 3]>,
+    ) {
+        self.velocity_verlet_step_with(
+            |pos, box_lengths| (forces_fn(pos, box_lengths), 0.0),
+            |_| {},
+        );
+    }
+
+    /// Perform one velocity-Verlet step with a force function that also returns
+    /// the scalar pair virial, and return the virial at the new positions.
+    ///
+    /// `forces_fn(positions, box_lengths) -> (forces, virial)` with
+    ///
+    /// ```text
+    /// virial = W = Σ_{i<j} r_ij · F_ij
+    /// ```
+    ///
+    /// evaluated with the minimum-image separation `r_ij = r_i − r_j` and the force
+    /// `F_ij` on atom `i` due to atom `j` (kJ mol⁻¹).  A repulsive pair therefore
+    /// contributes `+|F| r`.  Do **not** use the atomic sum `Σ_i r_i · F_i` of wrapped
+    /// coordinates: under periodic boundary conditions a pair that interacts across a
+    /// cell face picks up a spurious `L · F_ij` term.
+    ///
+    /// The returned value feeds [`MdSim::compute_pressure`].
+    pub fn velocity_verlet_step_virial(
+        &mut self,
+        forces_fn: impl Fn(&[[f64; 3]], &[f64; 3]) -> (Vec<[f64; 3]>, f64),
+    ) -> f64 {
+        self.velocity_verlet_step_with(forces_fn, |_| {})
+    }
+
+    /// Velocity-Verlet step shared by all drivers.
+    ///
+    /// `rescale_box` runs after the position update and before the periodic wrap
+    /// and the force evaluation, so a barostat can dilate the box and the
+    /// coordinates (and rescale the velocities) in the same step and the new
+    /// forces and virial are evaluated on the dilated configuration.  Returns the
+    /// virial of that final force evaluation.
+    pub(super) fn velocity_verlet_step_with<F, H>(&mut self, forces_fn: F, rescale_box: H) -> f64
+    where
+        F: Fn(&[[f64; 3]], &[f64; 3]) -> (Vec<[f64; 3]>, f64),
+        H: FnOnce(&mut MdSim),
+    {
+        let dt = self.config.dt;
+        let n = self.state.n_atoms();
+
+        // Half-step velocity update: v(t + dt/2) = v(t) + F(t)/(2m) * dt
+        // (F in kJ mol⁻¹ Å⁻¹, m in amu, v in Å ps⁻¹: the factor 100 is in `velocity_increment`).
+        self.state.kick_velocities(0.5 * dt);
+
+        // Full-step position update: x(t + dt) = x(t) + v(t + dt/2) * dt
+        for i in 0..n {
+            for a in 0..3 {
+                self.state.positions[i][a] += dt * self.state.velocities[i][a];
+            }
+        }
+
+        // Pressure coupling: dilate box and coordinates before the forces are evaluated.
+        rescale_box(self);
+
+        // PBC wrap
+        if self.config.pbc {
+            for i in 0..n {
+                for a in 0..3 {
+                    let l = self.config.box_lengths[a];
+                    self.state.positions[i][a] = self.state.positions[i][a].rem_euclid(l);
+                }
+            }
+        }
+
+        // Compute new forces (and the pair virial)
+        let (forces, virial) = forces_fn(&self.state.positions, &self.config.box_lengths);
+        self.state.forces = forces;
+
+        // Second half-step velocity update
+        self.state.kick_velocities(0.5 * dt);
+        virial
+    }
+
+    // -----------------------------------------------------------------------
+    // Velocity-rescaling thermostat
+    // -----------------------------------------------------------------------
+
+    /// Apply simple velocity-rescaling thermostat to hit `target_T` (K).
+    ///
+    /// Scales all velocities by √(T_target / T_current).
+    pub fn apply_velocity_rescaling(&mut self, target_t: f64) {
+        let t_current = self.compute_temperature();
+        if t_current < 1e-10 {
+            return;
+        }
+        let scale = (target_t / t_current).sqrt();
+        for v in self.state.velocities.iter_mut() {
+            v[0] *= scale;
+            v[1] *= scale;
+            v[2] *= scale;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Single combined step
+    // -----------------------------------------------------------------------
+
+    /// Advance one step of *force-free* (ballistic) dynamics, then apply the
+    /// configured ensemble controls.
+    ///
+    /// This integrator deliberately uses zero inter-particle forces: it
+    /// propagates the particles as a non-interacting (ideal-gas) system, which
+    /// is useful for exercising the thermostat / ensemble machinery or for free
+    /// streaming. It computes **no** physical forces. For an interacting system,
+    /// call [`Self::velocity_verlet_step`] or [`Self::run_with_forces`] with a
+    /// real force function.
+    pub fn step(&mut self) {
+        let zero_forces = |pos: &[[f64; 3]], _box: &[f64; 3]| vec![[0.0f64; 3]; pos.len()];
+        self.velocity_verlet_step(zero_forces);
+
+        match self.config.ensemble {
+            Ensemble::NVT | Ensemble::NPT => {
+                self.apply_velocity_rescaling(self.config.temperature);
+            }
+            Ensemble::NVE => {}
+        }
+
+        let ke = self.compute_kinetic_energy();
+        let t = self.compute_temperature();
+        self.state.kinetic_energy = ke;
+        self.state.temperature = t;
+        self.state.step += 1;
+        self.state.time += self.config.dt;
+    }
+
+    /// Run for `n_steps` steps, recording (KE, PE, T) every `record_every` steps.
+    pub fn run_with_forces(
+        &mut self,
+        forces_fn: impl Fn(&[[f64; 3]], &[f64; 3]) -> Vec<[f64; 3]>,
+        record_every: u64,
+    ) -> Vec<(f64, f64, f64)> {
+        // Initial forces
+        self.state.forces = forces_fn(&self.state.positions, &self.config.box_lengths);
+
+        let mut records = Vec::new();
+        let n_steps = self.config.n_steps;
+        for s in 0..n_steps {
+            self.velocity_verlet_step(&forces_fn);
+
+            if self.config.ensemble == Ensemble::NVT || self.config.ensemble == Ensemble::NPT {
+                self.apply_velocity_rescaling(self.config.temperature);
+            }
+
+            let ke = self.compute_kinetic_energy();
+            self.state.kinetic_energy = ke;
+            self.state.temperature = self.compute_temperature();
+            self.state.step += 1;
+            self.state.time += self.config.dt;
+
+            if record_every > 0 && (s + 1) % record_every == 0 {
+                records.push((ke, self.state.potential_energy, self.state.temperature));
+            }
+        }
+        records
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Berendsen thermostat (self-contained, no trait dep)
+// ---------------------------------------------------------------------------
+
+/// Berendsen velocity-rescaling thermostat for the self-contained MD driver.
+///
+/// Rescales velocities toward `target_t` with a coupling constant `tau`:
+///
+/// ```text
+/// scale = sqrt(1 + dt/tau * (T_target / T_current - 1))
+/// ```
+pub struct BerendsenRescaler {
+    /// Coupling time constant (ps).
+    pub tau: f64,
+}
+
+impl BerendsenRescaler {
+    /// Create a new Berendsen rescaler.
+    pub fn new(tau: f64) -> Self {
+        assert!(tau > 0.0, "tau must be positive");
+        Self { tau }
+    }
+
+    /// Compute the velocity scaling factor for this time step.
+    pub fn scale_factor(&self, t_current: f64, target_t: f64, dt: f64) -> f64 {
+        if t_current < 1e-10 {
+            return 1.0;
+        }
+        let ratio = target_t / t_current;
+        (1.0 + dt / self.tau * (ratio - 1.0)).max(0.0).sqrt()
+    }
+}
+
+impl MdSim {
+    /// Apply Berendsen velocity rescaling with coupling time `tau` (ps).
+    pub fn apply_berendsen_thermostat(&mut self, target_t: f64, tau: f64) {
+        let t_current = self.compute_temperature();
+        let rescaler = BerendsenRescaler::new(tau);
+        let scale = rescaler.scale_factor(t_current, target_t, self.config.dt);
+        for v in self.state.velocities.iter_mut() {
+            v[0] *= scale;
+            v[1] *= scale;
+            v[2] *= scale;
+        }
+    }
+
+    /// Remove centre-of-mass velocity from the system.
+    pub fn remove_com_velocity(&mut self) {
+        let n = self.state.n_atoms();
+        if n == 0 {
+            return;
+        }
+        let mut total_mass = 0.0;
+        let mut com_vel = [0.0; 3];
+        for (&m, vel) in self
+            .state
+            .masses
+            .iter()
+            .zip(self.state.velocities.iter())
+            .take(n)
+        {
+            total_mass += m;
+            for (cv, &v) in com_vel.iter_mut().zip(vel.iter()) {
+                *cv += m * v;
+            }
+        }
+        if total_mass > 0.0 {
+            for cv in com_vel.iter_mut() {
+                *cv /= total_mass;
+            }
+            for vel in self.state.velocities.iter_mut().take(n) {
+                for (v, &cv) in vel.iter_mut().zip(com_vel.iter()) {
+                    *v -= cv;
+                }
+            }
+        }
+    }
+
+    /// Compute total momentum \[px, py, pz\] (amu Å ps⁻¹).
+    pub fn total_momentum(&self) -> [f64; 3] {
+        let mut p = [0.0; 3];
+        for (&m, vel) in self.state.masses.iter().zip(self.state.velocities.iter()) {
+            for (pa, &v) in p.iter_mut().zip(vel.iter()) {
+                *pa += m * v;
+            }
+        }
+        p
+    }
+
+    /// Compute total energy (kinetic + potential) from stored state (kJ mol⁻¹).
+    pub fn total_energy(&self) -> f64 {
+        self.state.kinetic_energy + self.state.potential_energy
+    }
+
+    /// Perform a full MD step using an external force function and Berendsen
+    /// thermostat (NVT) or simple velocity-Verlet (NVE).
+    pub fn step_with_forces(
+        &mut self,
+        forces_fn: impl Fn(&[[f64; 3]], &[f64; 3]) -> Vec<[f64; 3]>,
+        tau: f64,
+    ) {
+        self.velocity_verlet_step(forces_fn);
+        match self.config.ensemble {
+            Ensemble::NVT | Ensemble::NPT => {
+                self.apply_berendsen_thermostat(self.config.temperature, tau);
+            }
+            Ensemble::NVE => {}
+        }
+        self.state.kinetic_energy = self.compute_kinetic_energy();
+        self.state.temperature = self.compute_temperature();
+        self.state.step += 1;
+        self.state.time += self.config.dt;
+    }
+}

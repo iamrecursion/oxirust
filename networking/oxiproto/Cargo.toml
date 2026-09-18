@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxiproto-core",
+    "crates/oxiproto-build",
+    "crates/oxiproto",
+    "crates/oxiproto-reflect",
+    "crates/oxiproto-wkt",
+    "crates/oxiproto-codegen",
+    "crates/oxiproto-cli",
+    "crates/oxiproto-json",
+    "examples",
+]
+
+[workspace.package]
+version = "0.1.6"
+edition = "2021"
+rust-version = "1.89"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxiproto"
+description = "OxiProto is the COOLJAPAN Pure-Rust Protocol Buffers stack."
+
+[workspace.dependencies]
+oxiproto-core = { path = "crates/oxiproto-core", version = "0.1.6" }
+oxiproto-build = { path = "crates/oxiproto-build", version = "0.1.6" }
+oxiproto = { path = "crates/oxiproto", version = "0.1.6" }
+oxiproto-reflect = { path = "crates/oxiproto-reflect", version = "0.1.6" }
+oxiproto-wkt = { path = "crates/oxiproto-wkt", version = "0.1.6" }
+oxiproto-codegen = { path = "crates/oxiproto-codegen", version = "0.1.6" }
+oxiproto-cli     = { path = "crates/oxiproto-cli", version = "0.1.6" }
+oxiproto-json    = { path = "crates/oxiproto-json", version = "0.1.6" }
+clap             = { version = "4.6.4", features = ["derive"] }
+prost = { version = "0.14.4", default-features = false }
+prost-build = { version = "0.14.4" }
+prost-types = { version = "0.14.4", default-features = false }
+prost-reflect = { version = "0.16.5", default-features = false, features = ["derive"] }
+protox = { version = "0.9.1" }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+time = { version = "0.3.54", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0" }
+base64 = { version = "0.23" }
+syn = { version = "3", features = ["full"] }
+prettyplease = { version = "0.3" }
+proptest = { version = "1.11" }
+criterion = { version = "0.8.2" }
+clap_mangen = { version = "0.3" }

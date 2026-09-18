@@ -1,0 +1,40 @@
+[package]
+name = "tensorlogic-infer"
+version.workspace = true
+description = "Execution and autodiff traits for TensorLogic inference engines"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tensorlogic-infer"
+readme = "README.md"
+keywords = ["tensor", "logic", "inference", "type-inference", "reasoning"]
+categories = ["science", "algorithms", "mathematics"]
+
+[dependencies]
+ndarray.workspace = true
+thiserror.workspace = true
+tensorlogic-ir.workspace = true
+num_cpus.workspace = true
+scirs2-core.workspace = true
+scirs2-linalg.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+async = ["tokio"]
+metal     = []
+vulkan    = []
+rocm      = []
+webgpu    = []
+levelzero = []
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+
+[[bench]]
+name = "execution_benchmarks"
+harness = false

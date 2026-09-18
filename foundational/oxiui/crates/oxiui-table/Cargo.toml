@@ -1,0 +1,62 @@
+[package]
+name        = "oxiui-table"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "Virtualized table widget with egui and iced backends for OxiUI"
+readme      = "README.md"
+keywords    = ["gui", "table", "egui", "iced", "cooljapan"]
+categories  = ["gui"]
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["eframe"]  # optional dep declared under the egui-table feature for downstream eframe::App integration; only referenced in a doc comment today
+
+[features]
+default    = []
+egui-table    = ["dep:egui", "dep:eframe"]
+iced-table    = ["dep:iced"]
+text-table    = ["dep:oxiui-text"]
+theme-table   = ["dep:oxiui-theme"]
+a11y-table    = ["dep:oxiui-accessibility", "dep:accesskit"]
+persist-table = ["dep:oxicode"]
+
+[dependencies]
+oxiui-core = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
+
+[dependencies.oxiui-text]
+workspace = true
+optional  = true
+
+[dependencies.oxiui-theme]
+workspace = true
+optional  = true
+
+[dependencies.oxiui-accessibility]
+workspace = true
+optional  = true
+
+[dependencies.oxicode]
+workspace = true
+optional  = true
+
+[dependencies.accesskit]
+workspace = true
+optional  = true
+
+[dependencies.egui]
+workspace = true
+optional  = true
+
+[dependencies.eframe]
+workspace = true
+optional  = true
+
+[dependencies.iced]
+workspace = true
+optional  = true

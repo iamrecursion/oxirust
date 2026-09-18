@@ -1,0 +1,177 @@
+# Performance Testing Configuration for scirs2-special
+#
+# This configuration file defines performance testing parameters,
+# thresholds, and benchmark settings for the CI/CD pipeline.
+
+[general]
+# Overall testing configuration
+timeout_seconds = 3600  # 1 hour maximum for all benchmarks
+min_measurement_time_ms = 5000  # Minimum 5 seconds per benchmark
+max_measurement_time_ms = 60000  # Maximum 60 seconds per benchmark
+warmup_iterations = 10
+measurement_iterations = 100
+
+[thresholds]
+# Performance regression thresholds
+regression_threshold = 1.15    # 15% slowdown triggers regression alert
+warning_threshold = 1.10       # 10% slowdown triggers warning
+improvement_threshold = 0.90   # 10% speedup is considered improvement
+critical_threshold = 1.25      # 25% slowdown triggers critical alert
+
+# Statistical significance
+confidence_level = 0.95
+min_sample_size = 50
+max_coefficient_variation = 0.05  # 5% max CV for stable measurements
+
+[benchmarks]
+# Enable/disable specific benchmark categories
+core_functions = true
+array_operations = true
+memory_intensive = true
+algorithm_switching = true
+edge_cases = true
+critical_paths = true
+regression_prone = true
+
+[core_functions]
+# Single-value function benchmarks
+gamma = { enabled = true, priority = "high", max_time_ms = 10000 }
+erf = { enabled = true, priority = "high", max_time_ms = 8000 }
+bessel_j0 = { enabled = true, priority = "high", max_time_ms = 12000 }
+bessel_j1 = { enabled = true, priority = "medium", max_time_ms = 10000 }
+bessel_y0 = { enabled = true, priority = "medium", max_time_ms = 10000 }
+gamma_complex = { enabled = true, priority = "medium", max_time_ms = 15000 }
+hypergeometric_2f1 = { enabled = true, priority = "low", max_time_ms = 20000 }
+elliptic_k = { enabled = true, priority = "low", max_time_ms = 15000 }
+
+[array_operations]
+# Vectorized operation benchmarks
+array_sizes = [100, 1000, 10000]
+max_size_for_detailed_analysis = 10000
+enable_simd_comparison = true
+enable_parallel_comparison = true
+
+gamma_array = { enabled = true, priority = "high" }
+erf_array = { enabled = true, priority = "high" }
+bessel_array = { enabled = true, priority = "medium" }
+statistical_functions = { enabled = true, priority = "medium" }
+
+[memory_intensive]
+# Large array and memory allocation tests
+large_array_size = 100000
+matrix_dimensions = [100, 500, 1000]
+enable_memory_profiling = true
+max_memory_increase_percent = 20  # Alert if memory usage increases >20%
+
+[algorithm_switching]
+# Test performance around algorithm boundary points
+gamma_boundaries = [0.5, 1.0, 8.0, 100.0]
+bessel_boundaries = [5.0, 50.0]
+erf_boundaries = [1.5, 6.0]
+hypergeometric_boundaries = [0.8, 0.95]
+
+[edge_cases]
+# Edge case performance testing
+near_zero_values = [1e-10, 1e-8, 1e-6]
+large_values = [100.0, 170.0, 700.0]  # Near overflow points
+complex_argument_ranges = [
+    { re_range = [-5.0, 5.0], im_range = [-5.0, 5.0], samples = 100 }
+]
+
+bessel_zero_proximities = [1e-6, 1e-8, 1e-10]  # Near Bessel function zeros
+
+[critical_paths]
+# Simulate real-world usage patterns
+scientific_workload = { enabled = true, iterations = 1000 }
+ml_workload = { enabled = true, iterations = 1000 }
+statistical_workload = { enabled = true, iterations = 1000 }
+financial_workload = { enabled = true, iterations = 500 }
+
+[regression_prone]
+# Areas that have shown performance variations historically
+gamma_cancellation = { enabled = true, test_points = 20 }
+bessel_oscillatory = { enabled = true, test_points = 100 }
+hypergeometric_singularities = { enabled = true, test_points = 50 }
+complex_branch_cuts = { enabled = true, test_points = 50 }
+
+[reporting]
+# Report generation configuration
+generate_markdown = true
+generate_json = true
+generate_plots = true
+include_system_info = true
+include_git_info = true
+
+# Plot configuration
+plot_width = 12
+plot_height = 8
+plot_dpi = 150
+trend_days = 30
+
+[database]
+# Performance data storage
+db_path = "performance.db"
+retention_days = 90
+backup_frequency_days = 7
+enable_compression = true
+
+[ci_integration]
+# CI/CD pipeline integration
+fail_on_regression = true
+fail_on_critical = true
+warn_on_threshold = true
+post_pr_comments = true
+update_baselines_on_main = true
+
+# Artifact configuration
+upload_results = true
+upload_plots = true
+upload_raw_data = false  # Too large for regular uploads
+artifact_retention_days = 30
+
+[notifications]
+# Performance alert notifications
+email_on_regression = false
+slack_webhook = ""  # Optional Slack webhook URL
+teams_webhook = ""  # Optional Teams webhook URL
+
+[environment]
+# Environment-specific settings
+expected_cpu_cores = 4
+expected_memory_gb = 8
+enable_cpu_affinity = false
+disable_turbo_boost = false  # For consistent measurements
+
+# Compiler optimizations
+target_cpu = "native"
+enable_lto = true
+codegen_units = 1
+
+[validation]
+# Cross-validation with reference implementations
+enable_scipy_comparison = true
+scipy_tolerance = 1e-12
+enable_gsl_comparison = false  # Requires GSL installation
+enable_mpfr_comparison = false  # Requires MPFR for high precision
+
+# Numerical accuracy checks
+accuracy_test_points = [
+    { function = "gamma", point = 0.5, expected = 1.7724538509055159 },
+    { function = "gamma", point = 1.0, expected = 1.0 },
+    { function = "gamma", point = 2.0, expected = 1.0 },
+    { function = "erf", point = 0.0, expected = 0.0 },
+    { function = "erf", point = 1.0, expected = 0.8427007929497149 },
+    { function = "bessel_j0", point = 0.0, expected = 1.0 },
+]
+
+[experimental]
+# Experimental features and optimizations
+enable_gpu_benchmarks = false
+enable_distributed_benchmarks = false
+enable_profile_guided_optimization = false
+enable_approximation_benchmarks = false
+
+# Auto-tuning
+enable_auto_threshold_adjustment = false
+adaptive_measurement_time = false
+dynamic_sample_size = false

@@ -1,0 +1,26 @@
+[package]
+name = "oximedia-lut"
+description = "Look-Up Table (LUT) processing for color grading and correction"
+keywords = ["color", "lut", "grading", "video", "multimedia"]
+categories = ["multimedia::video"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+oximedia-core = { workspace = true }
+thiserror = { workspace = true }
+nom = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+quick-xml = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }

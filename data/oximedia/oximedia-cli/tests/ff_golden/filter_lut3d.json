@@ -1,0 +1,9 @@
+{
+  "name": "filter_lut3d",
+  "args": ["-i", "in.mkv", "-vf", "lut3d=path.cube", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_filters": 1
+  }
+}

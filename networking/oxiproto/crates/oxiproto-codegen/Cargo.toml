@@ -1,0 +1,48 @@
+[package]
+name = "oxiproto-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust protobuf code generator from FileDescriptorSet to Rust structs/enums"
+readme = "README.md"
+keywords = ["protobuf", "codegen", "prost"]
+categories = ["development-tools"]
+
+[features]
+default = []
+format = ["dep:syn", "dep:prettyplease"]
+
+[dependencies]
+prost-types.workspace = true
+oxiproto-core.workspace = true
+
+[dependencies.syn]
+workspace = true
+optional = true
+
+[dependencies.prettyplease]
+workspace = true
+optional = true
+
+[dev-dependencies]
+syn = { workspace = true, features = ["full"] }
+prost = { workspace = true, features = ["derive"] }
+prost-build.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies.criterion]
+workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+# Pure-Rust `.proto` parsing for build.rs, so generating the test fixtures does
+# not require a `protoc` executable on PATH. See build.rs for why this is protox
+# and not the sibling oxiproto-build.
+protox.workspace = true
+
+[[bench]]
+name = "codegen"
+harness = false

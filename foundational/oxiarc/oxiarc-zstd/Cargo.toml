@@ -1,0 +1,52 @@
+[package]
+name = "oxiarc-zstd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Pure Rust Zstandard (zstd) compression implementation for OxiArc"
+readme = "README.md"
+keywords = ["compression", "zstd", "zstandard", "fse", "huffman"]
+categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+oxiarc-core = { workspace = true }
+rayon = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "zstd_bench"
+harness = false
+
+[[bench]]
+name = "stream_bench"
+harness = false
+
+[features]
+default = []
+parallel = ["rayon"]
+# Async I/O support via Tokio: `AsyncZstdDecompressor` (implements
+# `oxiarc_core::async_io::AsyncDecompressor`) and `AsyncZstdReader`
+# (`tokio::io::AsyncRead`), both bounded and built on `ZstdStream`.
+async-io = ["oxiarc-core/async-io", "dep:tokio"]
+# Live differential tests (tests/zstd_oracle.rs) that shell out to the
+# reference `zstd` CLI and verify BOTH directions: reference-compress ->
+# oxiarc-decode (byte-identical) and oxiarc-compress -> reference-decode
+# (accepted and correct). Each test self-skips (prints a note, does not
+# fail) when `zstd` is not on PATH.
+zstd-oracle = []
+
+[lints]
+workspace = true

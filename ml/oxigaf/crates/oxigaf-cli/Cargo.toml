@@ -1,0 +1,88 @@
+[package]
+name = "oxigaf-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigaf-cli"
+description = "CLI for OxiGAF — Gaussian Avatar Reconstruction"
+readme = "README.md"
+keywords = ["cli", "gaussian-splatting", "3d", "avatar", "tool"]
+categories = ["command-line-utilities", "graphics", "multimedia"]
+
+[package.metadata.docs.rs]
+features = ["parallel", "flash_attention", "mixed_precision", "gpu_debug"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bin]]
+name = "oxigaf"
+path = "src/main.rs"
+
+[dependencies]
+oxigaf = { workspace = true }
+oxigaf-flame = { workspace = true }
+oxigaf-trainer = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+indicatif = { workspace = true }
+tokio = { workspace = true }
+image = { workspace = true }
+rand = { workspace = true }
+nalgebra = { workspace = true }
+bytemuck = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+owo-colors = { workspace = true }
+oxiarc-archive = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+crossterm = { workspace = true }
+ureq = { workspace = true }
+rustls = { workspace = true }
+oxitls-rustcrypto-provider = { workspace = true }
+sha2 = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+# Default features (none - minimal configuration)
+default = []
+
+# Performance optimizations
+# Note: `simd` requires nightly Rust; on stable it is accepted but compiled out.
+simd = ["oxigaf/simd"]
+parallel = ["oxigaf/parallel"]
+flash_attention = ["oxigaf/flash_attention"]
+mixed_precision = ["oxigaf/mixed_precision"]
+
+# Data format features
+# Forwarding completeness: the `convert` subcommand reads `.npz` through its
+# own reader (src/convert.rs), so the CLI itself does not need this. It is
+# forwarded so a `cargo install oxigaf-cli --features …` invocation can reach
+# `oxigaf-flame/npz` (i.e. a working `FlameSequence::from_npz`) the same way
+# every other oxigaf feature is reachable.
+npz = ["oxigaf/npz"]
+
+# Debug features
+gpu_debug = ["oxigaf/gpu_debug"]
+
+# Convenience feature bundles
+full_performance = ["oxigaf/full_performance"]
+all_features = ["oxigaf/all_features"]

@@ -1,0 +1,787 @@
+# celers-broker-sql
+
+MySQL database broker implementation for CeleRS - a high-performance Celery-compatible task queue framework for Rust.
+
+**Version: 0.3.1 | Status: [Alpha] | Tests: 216 (`--all-features`, excluding `#[ignore]`d) + 107 doctests | Updated: 2026-08-26**
+
+## Features
+
+- **Reliable Task Queue**: MySQL-based task queue with `FOR UPDATE SKIP LOCKED` for distributed workers
+- **Priority Queues**: Tasks can be prioritized for execution order
+- **Dead Letter Queue (DLQ)**: Automatic handling of permanently failed tasks
+- **Delayed Execution**: Schedule tasks for future execution with `enqueue_at` and `enqueue_after`
+- **Batch Operations**: High-throughput batch enqueue/dequeue/ack operations
+- **Queue Control**: Pause/resume queue processing at runtime
+- **Task Inspection**: Query task status, statistics, and worker assignments
+- **Result Storage**: Store and retrieve task execution results (`celers_broker_results`, migration `010_broker_results.sql`)
+- **Worker Tracking**: Monitor which workers are processing which tasks
+- **Health Monitoring**: Database health checks and table size monitoring
+- **Maintenance Tools**: Task archiving, stuck task recovery, and selective purging
+- **Prometheus Metrics**: Optional metrics integration (with `metrics` feature)
+
+## Requirements
+
+- **MySQL 8.0.1 or newer**, or **MariaDB 10.6 or newer**.
+
+  Every dequeue path uses `FOR UPDATE ... SKIP LOCKED`, which was introduced
+  in MySQL 8.0.1 and MariaDB 10.6. It does not exist in MySQL 5.7 or in any
+  earlier MariaDB release.
+
+  The server version is probed once when the broker connects
+  (`MysqlBroker::new`, `with_queue`, `with_config`,
+  `with_circuit_breaker_config`). An unsupported server is rejected there with
+  a `CelersError::Configuration` naming the required version, rather than
+  producing an opaque parse error on every dequeue. Version strings the probe
+  cannot recognise (proxies such as ProxySQL or RDS Proxy, and forks) are
+  logged and accepted.
+
+- Rust 2021 edition
+
+## Logical queues
+
+`MysqlBroker::with_queue(url, "payments")` scopes the broker to a logical
+queue, backed by the indexed `celers_tasks.queue_name` column. Enqueue,
+dequeue, `queue_size` and `get_statistics` are all queue-scoped, so several
+brokers can share one database without seeing each other's tasks.
+
+Operator-facing and destructive helpers are deliberately **database-wide**,
+not queue-scoped: `purge_all`, `purge_by_state`, `purge_by_task_name`,
+`archive_completed_tasks`, `recover_stuck_tasks`, `list_tasks`,
+`count_by_task_name`, and the DLQ helpers.
+
+The five bulk statements among them (`purge_all`, `purge_by_state`,
+`purge_by_task_name`, `archive_completed_tasks`, `recover_stuck_tasks`) are
+retried on `ERROR 1213 (40001) Deadlock found`, with the same bounded, jittered
+backoff the claim/ack/reject paths use. Running maintenance against a live
+queue can form a lock cycle with in-flight claims, and InnoDB resolves one by
+rolling a transaction back — which is not a failure of the maintenance call and
+should not be reported as one.
+
+## Testing against a real server
+
+The unit tests run with no database. To additionally exercise the integration
+suite, point `CELERS_TEST_MYSQL_URL` at a MySQL 8 / MariaDB 10.6 instance:
+
+```bash
+CELERS_TEST_MYSQL_URL=mysql://celers:celers_password@127.0.0.1:3306/celers_test \
+    cargo nextest run -p celers-broker-sql --all-features --run-ignored all
+```
+
+The repository's `docker-compose.yml` provides a matching server behind the
+`test` profile (`docker compose --profile test up -d mysql`), or run
+`scripts/test-integration.sh --only mysql`, which brings it up, provisions the
+extra databases described below, exports every variable and runs this suite for
+you.
+
+With a server configured the suite is **236/236** (verified 2026-08-26 against
+MySQL 8.0, under both `nextest`'s default parallel execution and
+`--test-threads=1`).
+
+`--run-ignored all` matters: most of the integration suite early-returns when
+the variable is unset (so a run with no server stays green), but a few tests
+are `#[ignore]`d and are only selected by that flag. Every gated test that
+does skip prints a `SKIPPED: <test name> (set CELERS_TEST_MYSQL_URL to run)`
+line naming itself, so a skipped run and a real run can be told apart from the
+output rather than only from the test count. No gated test falls back to a
+hardcoded connection string: unset means skip, never a surprise connection to
+`localhost`.
+
+The older `src/tests.rs` suite also accepts the bare `MYSQL_URL` as a
+documented fallback, but `CELERS_TEST_MYSQL_URL` is the name to use.
+
+### Sharing a database with `celers-backend-db`
+
+Pointing this crate and `celers-backend-db` at the **same** database is
+supported and covered by a test
+(`broker_and_result_backend_coexist_on_one_database`), which migrates both
+crates onto one database and round-trips a result through each:
+
+```bash
+CELERS_TEST_MYSQL_URL=mysql://celers:celers_password@127.0.0.1:3306/celers_test \
+    cargo nextest run -p celers-broker-sql -p celers-backend-db \
+    --all-features --run-ignored all
+```
+
+This used to fail: both crates auto-migrated a `celers_task_results` table
+with incompatible schemas, and both declared a schema-scoped
+`chk_result_state` CHECK constraint, so whichever migrated second died with
+`ERROR 1072` or `ERROR 3822`. The broker's table is now
+`celers_broker_results` and its constraint `chk_broker_result_state`; existing
+databases are upgraded in place by `migrate()`.
+
+**If you query the result table directly, repoint it.** `celers_task_results`
+now belongs exclusively to `celers-backend-db`. `migrate()`'s untracked
+`rename_legacy_broker_results_table` step carries an existing broker table
+across with `RENAME TABLE`, preserving every row and index, but only when the
+table actually carries this crate's schema (it probes for the `traceback`
+column); a `celers_task_results` that belongs to the result backend is
+recognised and left strictly alone, and the legacy table is never dropped or
+written to under any branch.
+
+### Testing the upgrade path
+
+The rename has its own suite, `tests_hardening::migration_upgrade`, which drives
+all four branches against a real server. It drops and recreates both result
+tables, so it must **not** share a database with anything else and reads a
+separate variable naming a disposable schema:
+
+```bash
+CELERS_TEST_MYSQL_UPGRADE_URL=mysql://celers:celers_password@127.0.0.1:3306/celers_upgrade_test \
+    cargo nextest run -p celers-broker-sql --all-features -E 'test(migration_upgrade)'
+```
+
+The suite refuses to run if that URL names the same database as
+`CELERS_TEST_MYSQL_URL`, and skips with a visible line when it is unset. The
+stock `mysql:8.0` image grants its `MYSQL_USER` rights on `MYSQL_DATABASE` only,
+so the database has to be created with the root credentials —
+`scripts/test-integration.sh --only mysql` does this for you.
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+celers-broker-sql = "0.3"
+celers-core = "0.3"
+
+# Optional: Enable Prometheus metrics
+# celers-broker-sql = { version = "0.3", features = ["metrics"] }
+```
+
+## Quick Start
+
+### 1. Create a MySQL Database
+
+```sql
+CREATE DATABASE celers;
+```
+
+### 2. Initialize the Broker
+
+```rust
+use celers_broker_sql::MysqlBroker;
+use celers_core::Broker;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create broker
+    let broker = MysqlBroker::new("mysql://user:pass@localhost/celers").await?;
+
+    // Run migrations (creates tables and indexes)
+    broker.migrate().await?;
+
+    Ok(())
+}
+```
+
+### 3. Enqueue Tasks
+
+```rust
+use celers_core::SerializedTask;
+
+// Create a task
+let task = SerializedTask::new("my_task".to_string(), vec![1, 2, 3, 4]);
+
+// Enqueue it
+let task_id = broker.enqueue(task).await?;
+println!("Enqueued task: {}", task_id);
+```
+
+### 4. Dequeue and Process Tasks
+
+```rust
+// Dequeue a task
+if let Some(message) = broker.dequeue().await? {
+    let task = message.task;
+    println!("Processing task: {}", task.metadata.name);
+
+    // Process the task...
+
+    // Acknowledge completion
+    broker.ack(&task.metadata.id, message.receipt_handle.as_deref()).await?;
+}
+```
+
+## Advanced Usage
+
+### Delayed Task Execution
+
+```rust
+use std::time::SystemTime;
+
+// Schedule for specific timestamp (Unix seconds)
+let execute_at = SystemTime::now()
+    .duration_since(SystemTime::UNIX_EPOCH)?
+    .as_secs() as i64 + 3600; // 1 hour from now
+
+broker.enqueue_at(task, execute_at).await?;
+
+// Or schedule after a delay (seconds)
+broker.enqueue_after(task, 300).await?; // 5 minutes
+```
+
+### Batch Operations
+
+```rust
+// Batch enqueue (high throughput)
+let tasks = vec![
+    SerializedTask::new("task1".to_string(), vec![1]),
+    SerializedTask::new("task2".to_string(), vec![2]),
+    SerializedTask::new("task3".to_string(), vec![3]),
+];
+let task_ids = broker.enqueue_batch(tasks).await?;
+
+// Batch dequeue
+let messages = broker.dequeue_batch(10).await?;
+
+// Batch ack
+let tasks_to_ack: Vec<_> = messages.iter()
+    .map(|m| (m.task.metadata.id, m.receipt_handle.clone()))
+    .collect();
+broker.ack_batch(&tasks_to_ack).await?;
+```
+
+### Queue Control
+
+```rust
+// Pause queue (dequeue returns None)
+broker.pause();
+assert!(broker.is_paused());
+
+// Resume queue
+broker.resume();
+assert!(!broker.is_paused());
+```
+
+### Task Inspection
+
+```rust
+use celers_broker_sql::DbTaskState;
+
+// Get task details
+if let Some(task_info) = broker.get_task(&task_id).await? {
+    println!("Task: {} - State: {:?}", task_info.task_name, task_info.state);
+}
+
+// List tasks by state
+let pending_tasks = broker.list_tasks(Some(DbTaskState::Pending), 100, 0).await?;
+
+// Get queue statistics
+let stats = broker.get_statistics().await?;
+println!("Pending: {}, Processing: {}, Completed: {}",
+    stats.pending, stats.processing, stats.completed);
+
+// Count by task name
+let counts = broker.count_by_task_name().await?;
+for count in counts {
+    println!("{}: {} pending, {} completed",
+        count.task_name, count.pending, count.completed);
+}
+
+// List scheduled tasks
+let scheduled = broker.list_scheduled_tasks(100, 0).await?;
+for task in scheduled {
+    println!("Task {} scheduled in {} seconds",
+        task.task_name, task.delay_remaining_secs);
+}
+```
+
+### Worker Tracking
+
+```rust
+// Dequeue with worker ID
+let worker_id = "worker-001";
+if let Some(message) = broker.dequeue_with_worker_id(worker_id).await? {
+    // Process task...
+    broker.ack(&message.task.metadata.id, message.receipt_handle.as_deref()).await?;
+}
+
+// Get tasks by worker
+let worker_tasks = broker.get_tasks_by_worker(worker_id).await?;
+```
+
+### Task Result Storage
+
+> **Table name**: these calls read and write `celers_broker_results`, created by migration
+> `010_broker_results.sql`. It used to be called `celers_task_results` — the same name
+> `celers-backend-db`'s `MysqlResultBackend` uses for its own, differently shaped table, which
+> made the two crates collide on a shared database. `migrate()` renames a pre-existing
+> `celers_task_results` (rows and indexes preserved) when it carries this crate's schema, and
+> leaves the result backend's table alone when it does not.
+
+```rust
+use celers_broker_sql::TaskResultStatus;
+use serde_json::json;
+
+// Store result
+broker.store_result(
+    &task_id,
+    "my_task",
+    TaskResultStatus::Success,
+    Some(json!({"output": "done"})),
+    None, // error
+    None, // traceback
+    Some(1500), // runtime in ms
+).await?;
+
+// Retrieve result
+if let Some(result) = broker.get_result(&task_id).await? {
+    println!("Result: {:?}", result.result);
+    println!("Runtime: {}ms", result.runtime_ms.unwrap_or(0));
+}
+```
+
+### Dead Letter Queue (DLQ)
+
+```rust
+// List DLQ tasks
+let dlq_tasks = broker.list_dlq(100, 0).await?;
+
+// Requeue from DLQ
+if let Some(dlq_task) = dlq_tasks.first() {
+    let new_task_id = broker.requeue_from_dlq(&dlq_task.id).await?;
+    println!("Requeued as: {}", new_task_id);
+}
+
+// Purge DLQ
+let purged = broker.purge_all_dlq().await?;
+println!("Purged {} tasks from DLQ", purged);
+```
+
+### Health Checks and Maintenance
+
+```rust
+use std::time::Duration;
+
+// Health check
+let health = broker.check_health().await?;
+println!("MySQL version: {}", health.database_version);
+println!("Pending tasks: {}", health.pending_tasks);
+
+// Archive old completed tasks (older than 7 days)
+let archived = broker.archive_completed_tasks(Duration::from_secs(7 * 24 * 3600)).await?;
+println!("Archived {} old tasks", archived);
+
+// Recover stuck tasks (processing > 1 hour)
+let recovered = broker.recover_stuck_tasks(Duration::from_secs(3600)).await?;
+println!("Recovered {} stuck tasks", recovered);
+
+// Archive old results (older than 30 days)
+let archived_results = broker.archive_results(Duration::from_secs(30 * 24 * 3600)).await?;
+println!("Archived {} old results", archived_results);
+```
+
+### Database Monitoring
+
+```rust
+// Get table sizes
+let table_sizes = broker.get_table_sizes().await?;
+for table in table_sizes {
+    println!("{}: {} rows, {} bytes data, {} bytes indexes",
+        table.table_name, table.row_count, table.data_size_bytes, table.index_size_bytes);
+}
+
+// Optimize tables (run periodically)
+broker.optimize_tables().await?;
+
+// Analyze tables (update index statistics)
+broker.analyze_tables().await?;
+```
+
+### Prometheus Metrics (with `metrics` feature)
+
+```rust
+// Update metrics (call periodically, e.g., every 10 seconds)
+#[cfg(feature = "metrics")]
+broker.update_metrics().await?;
+
+// Metrics exposed:
+// - celers_tasks_enqueued_total
+// - celers_tasks_enqueued_by_type
+// - celers_queue_size (pending tasks)
+// - celers_processing_queue_size
+// - celers_dlq_size
+```
+
+### Multi-tenant Queues
+
+```rust
+// Create broker with specific queue name
+let queue_a = MysqlBroker::with_queue("mysql://...", "queue_a").await?;
+let queue_b = MysqlBroker::with_queue("mysql://...", "queue_b").await?;
+
+// Each queue is logically separated (stored in metadata)
+queue_a.enqueue(task_a).await?;
+queue_b.enqueue(task_b).await?;
+```
+
+## Database Schema
+
+### Tables
+
+- `celers_tasks` - Main task queue
+- `celers_dead_letter_queue` - Failed tasks that exceeded max retries
+- `celers_broker_results` - Task execution results (renamed from `celers_task_results`; see below)
+- `celers_task_history` - Task audit trail (future)
+
+Every object this crate creates is named so it cannot collide with
+`celers-backend-db` in a shared schema: `celers_broker_results` rather than
+`celers_task_results` for the table, and `chk_broker_result_state` rather than
+`chk_result_state` for the CHECK constraint on `celers_results` (MySQL scopes
+CHECK constraint names to the schema, not the table). `migrate()` upgrades a
+database created before either rename, and never touches a
+`celers_task_results` that carries the result backend's schema.
+
+### Key Indexes
+
+- `idx_tasks_queue_dequeue` - `(queue_name, state, scheduled_at, priority, created_at)`;
+  the composite index the claim's candidate scan is built for
+- `idx_tasks_state_priority` - Efficient dequeue by state and priority
+- `idx_tasks_scheduled` - Scheduled task processing
+- `idx_tasks_worker` - Worker tracking
+- `idx_tasks_task_name` - Task name lookups
+- `idx_results_task_name` - Result queries by task type
+- See migration files for complete index strategy
+
+### How a claim locks
+
+A claim is two statements, not one:
+
+1. a **non-locking** `SELECT id … WHERE queue_name = ? AND state = 'pending'
+   AND scheduled_at <= NOW() ORDER BY priority DESC, created_at ASC LIMIT ?`
+   that picks candidates, and
+2. a locking `SELECT … FORCE INDEX (PRIMARY) WHERE id IN (…) AND state =
+   'pending' FOR UPDATE SKIP LOCKED` that locks only those primary keys.
+
+The single locking `SELECT` this replaces took next-key locks that reached
+into a *different* logical queue's index records — one worker's in-flight
+claim could make another queue's `dequeue()` return `None` — and its filesort
+locked the whole due backlog of its own queue before `LIMIT` applied. The
+two-statement form holds one `X,REC_NOT_GAP` record lock per row it actually
+claims, and nothing else.
+
+## Performance Tuning
+
+### Connection Pool
+
+```rust
+// As of 0.3.0, MysqlBroker wraps a single multiplexed connection via
+// oxisql-mysql — not a real N-connection pool. PoolConfig::max_connections
+// (via with_config()) is still accepted for source compatibility and
+// diagnostics reporting, but no longer sizes a literal pool.
+```
+
+### Batch Operations
+
+Use batch operations for high throughput:
+- `enqueue_batch()` - Up to 10x faster than individual enqueues
+- `dequeue_batch()` - Fetch multiple tasks in one transaction
+- `ack_batch()` - Acknowledge multiple tasks at once
+
+### MySQL Configuration
+
+Recommended `my.cnf` settings:
+
+```ini
+[mysqld]
+# Connection settings
+max_connections = 500
+connect_timeout = 10
+wait_timeout = 28800
+
+# Performance
+innodb_buffer_pool_size = 2G  # 70-80% of RAM
+innodb_log_file_size = 512M
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+
+# Query cache (MySQL 5.7)
+query_cache_type = 0
+query_cache_size = 0
+```
+
+### Maintenance Schedule
+
+Run these operations periodically:
+
+```rust
+// Daily: Archive old tasks
+broker.archive_completed_tasks(Duration::from_secs(7 * 24 * 3600)).await?;
+
+// Daily: Recover stuck tasks
+broker.recover_stuck_tasks(Duration::from_secs(3600)).await?;
+
+// Weekly: Optimize tables
+broker.optimize_tables().await?;
+
+// Weekly: Analyze tables
+broker.analyze_tables().await?;
+
+// Monthly: Archive old results
+broker.archive_results(Duration::from_secs(30 * 24 * 3600)).await?;
+```
+
+## Comparison with PostgreSQL Broker
+
+### Similarities
+
+- Same `FOR UPDATE SKIP LOCKED` pattern
+- Same API (implements `Broker` trait)
+- Same performance characteristics
+- Same safety guarantees
+
+### Differences
+
+- **MySQL** uses `?` placeholders vs PostgreSQL `$1, $2`
+- **MySQL** stores UUIDs as `CHAR(36)` vs native `UUID` type
+- **MySQL** uses stored procedures vs PostgreSQL functions
+- **MySQL** `DATE_ADD()` vs PostgreSQL `INTERVAL` syntax
+- **MySQL** `ON DUPLICATE KEY UPDATE` vs PostgreSQL `ON CONFLICT`
+
+## Error Handling
+
+All operations return `Result<T, CelersError>`:
+
+```rust
+match broker.enqueue(task).await {
+    Ok(task_id) => println!("Enqueued: {}", task_id),
+    Err(e) => eprintln!("Failed to enqueue: {}", e),
+}
+```
+
+## Migration
+
+Migrations are embedded in the binary and run via `broker.migrate()`:
+
+- `001_init.sql` - Initial schema (tasks, DLQ, history tables)
+- `002_results.sql` - Results table
+- `003_performance_indexes.sql` - Additional performance indexes
+
+To run migrations:
+
+```rust
+broker.migrate().await?;
+```
+
+Migrations are idempotent and can be run multiple times safely.
+
+## Backup and Restore Procedures
+
+### Database Backup
+
+Use `mysqldump` for backing up CeleRS tables:
+
+```bash
+# Backup all CeleRS tables
+mysqldump -u user -p database_name \
+  celers_tasks \
+  celers_dead_letter_queue \
+  celers_broker_results \
+  celers_task_history \
+  celers_migrations \
+  > celers_backup_$(date +%Y%m%d_%H%M%S).sql
+
+# Backup with compression
+mysqldump -u user -p database_name \
+  celers_tasks \
+  celers_dead_letter_queue \
+  celers_broker_results \
+  celers_task_history \
+  celers_migrations \
+  | gzip > celers_backup_$(date +%Y%m%d_%H%M%S).sql.gz
+
+# Include routines (stored procedures)
+mysqldump -u user -p database_name \
+  --routines \
+  --triggers \
+  celers_tasks \
+  celers_dead_letter_queue \
+  celers_broker_results \
+  celers_task_history \
+  celers_migrations \
+  > celers_full_backup_$(date +%Y%m%d_%H%M%S).sql
+```
+
+### Selective Backup Strategies
+
+```bash
+# Backup only pending and processing tasks (for migration)
+mysqldump -u user -p database_name celers_tasks \
+  --where="state IN ('pending', 'processing')" \
+  > celers_active_tasks_$(date +%Y%m%d).sql
+
+# Backup DLQ for analysis
+mysqldump -u user -p database_name celers_dead_letter_queue \
+  > celers_dlq_$(date +%Y%m%d).sql
+
+# Backup results for auditing
+mysqldump -u user -p database_name celers_broker_results \
+  > celers_results_$(date +%Y%m%d).sql
+```
+
+### Database Restore
+
+```bash
+# Restore from backup
+mysql -u user -p database_name < celers_backup_20260118_120000.sql
+
+# Restore from compressed backup
+gunzip < celers_backup_20260118_120000.sql.gz | mysql -u user -p database_name
+
+# Restore specific table
+mysql -u user -p database_name < celers_tasks_backup.sql
+```
+
+### Point-in-Time Recovery
+
+Enable binary logging in MySQL for PITR:
+
+```ini
+[mysqld]
+log_bin = /var/log/mysql/mysql-bin.log
+binlog_format = ROW
+expire_logs_days = 7
+```
+
+Recovery procedure:
+
+```bash
+# 1. Restore from last full backup
+mysql -u user -p database_name < last_full_backup.sql
+
+# 2. Apply binary logs up to specific point
+mysqlbinlog --start-datetime="2026-01-18 10:00:00" \
+            --stop-datetime="2026-01-18 11:30:00" \
+            /var/log/mysql/mysql-bin.000001 | \
+            mysql -u user -p database_name
+```
+
+### Automated Backup Script
+
+```bash
+#!/bin/bash
+# celers_backup.sh - Automated CeleRS backup script
+
+BACKUP_DIR="/backups/celers"
+DB_NAME="your_database"
+DB_USER="backup_user"
+RETENTION_DAYS=30
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Create backup directory
+mkdir -p "$BACKUP_DIR"
+
+# Perform backup
+mysqldump -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
+  --routines \
+  --triggers \
+  celers_tasks \
+  celers_dead_letter_queue \
+  celers_broker_results \
+  celers_task_history \
+  celers_migrations \
+  | gzip > "$BACKUP_DIR/celers_$TIMESTAMP.sql.gz"
+
+# Remove old backups
+find "$BACKUP_DIR" -name "celers_*.sql.gz" -mtime +$RETENTION_DAYS -delete
+
+# Verify backup
+if [ -f "$BACKUP_DIR/celers_$TIMESTAMP.sql.gz" ]; then
+    echo "Backup completed: celers_$TIMESTAMP.sql.gz"
+    # Optional: Upload to S3 or other storage
+    # aws s3 cp "$BACKUP_DIR/celers_$TIMESTAMP.sql.gz" s3://my-bucket/celers-backups/
+else
+    echo "Backup failed!" >&2
+    exit 1
+fi
+```
+
+### Disaster Recovery Checklist
+
+1. **Before Disaster:**
+   - Regular automated backups (daily minimum)
+   - Test restore procedures monthly
+   - Store backups offsite (S3, GCS, etc.)
+   - Monitor backup success/failure
+   - Document recovery procedures
+
+2. **During Recovery:**
+   - Stop all workers to prevent new tasks
+   - Assess data loss window
+   - Restore from most recent backup
+   - Apply binary logs if available
+   - Verify data integrity
+   - Resume workers gradually
+
+3. **After Recovery:**
+   - Check for lost tasks (compare with application logs)
+   - Verify DLQ items
+   - Monitor for anomalies
+   - Document incident for post-mortem
+
+### Data Migration Between Environments
+
+```bash
+# Export from production
+mysqldump -u user -p prod_db \
+  --where="state IN ('pending', 'processing')" \
+  celers_tasks > prod_tasks.sql
+
+# Import to staging
+mysql -u user -p staging_db < prod_tasks.sql
+
+# Or use programmatic approach
+```
+
+```rust
+// Programmatic migration example
+async fn migrate_pending_tasks(
+    source_broker: &MysqlBroker,
+    target_broker: &MysqlBroker,
+) -> Result<u64> {
+    let pending_tasks = source_broker
+        .list_tasks(Some(DbTaskState::Pending), 10000, 0)
+        .await?;
+
+    let mut migrated = 0u64;
+    for task_info in pending_tasks {
+        // Fetch task payload and metadata
+        // Enqueue to target broker
+        // Mark as migrated in source
+        migrated += 1;
+    }
+
+    Ok(migrated)
+}
+```
+
+## Examples
+
+See the [examples](examples/) directory for complete working examples:
+
+- **task_producer.rs** - Comprehensive task enqueueing with different patterns (single, batch, scheduled, priority)
+- **worker_pool.rs** - Production-ready worker pool with health monitoring and graceful shutdown
+- **circuit_breaker.rs** - Circuit breaker pattern for resilient database operations
+- **bulk_import_export.rs** - Data migration and backup utilities using JSON format
+- **recurring_tasks.rs** - Scheduled periodic task execution (cron-like functionality)
+- **advanced_retry.rs** - Sophisticated retry strategies with exponential backoff and jitter
+
+Each example includes detailed documentation and can be run with:
+```bash
+cargo run -p celers-broker-sql --example <example_name>
+```
+
+For detailed usage instructions, see [examples/README.md](examples/README.md).
+
+## License
+
+Apache-2.0
+
+## Contributing
+
+Contributions welcome! Please ensure:
+
+- All tests pass: `cargo test`
+- No warnings: `cargo clippy`
+- Code is formatted: `cargo fmt`

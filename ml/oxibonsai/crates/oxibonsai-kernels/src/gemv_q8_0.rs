@@ -1,0 +1,287 @@
+//! Q8_0 GEMV kernel (tiered SIMD + row-parallel).
+//!
+//! Computes `output[row] = dot(W_row, input)` for each row of the weight matrix
+//! `W`, where weights are stored as Q8_0 blocks (32 weights per block, 34 bytes).
+//!
+//! [`gemv_q8_0`] is the public entry point: it routes through the runtime
+//! [`KernelDispatcher`] (AVX-512 / AVX2 int8-decode +
+//! FMA on x86-64, scalar elsewhere) and Rayon row-parallelism for large output
+//! counts, exactly like the Q1_0 / ternary / FP8 formats. `gemv_q8_0_scalar`
+//! is the pure-scalar correctness reference the SIMD tiers are checked against.
+
+use oxibonsai_core::{BlockQ8_0, QK_Q8_0};
+
+use crate::dispatch::{cpu_kernel_tier, KernelDispatcher};
+use crate::error::{KernelError, KernelResult};
+
+/// Q8_0 GEMV: `output = W × input` with automatic SIMD-tier + row-parallel
+/// dispatch.
+///
+/// This is the production entry point. It selects the best CPU kernel tier for
+/// the current machine (cached) and, for large `n_rows`, splits the independent
+/// output rows across Rayon threads — mirroring the Q1_0 / ternary / FP8
+/// dispatch paths. The numeric result equals `gemv_q8_0_scalar` within f32
+/// rounding.
+///
+/// - `blocks`: Row-major weight blocks.  Row `r` occupies
+///   `blocks[r * blocks_per_row .. (r+1) * blocks_per_row]`
+///   where `blocks_per_row = in_features / QK_Q8_0`.
+/// - `input`: FP32 input vector of length `in_features`.
+/// - `output`: FP32 output vector of length `n_rows`.
+/// - `n_rows`: Number of output rows (= out_features).
+/// - `in_features`: Inner dimension (must be divisible by `QK_Q8_0 = 32`).
+///
+/// # Errors
+///
+/// - [`KernelError::NotBlockAligned`] if `in_features % QK_Q8_0 != 0`.
+/// - [`KernelError::NamedDimensionMismatch`] (code `DIMENSION_MISMATCH`)
+///   naming `"blocks"` if `blocks.len() < n_rows * blocks_per_row`, or
+///   `"input"` if `input.len() < in_features`.
+/// - [`KernelError::NamedBufferTooSmall`] (code `BUFFER_TOO_SMALL`) naming
+///   `"output"` if `output.len() < n_rows`.
+///
+/// Match on [`KernelError::error_code`] rather than the variant shape: it is
+/// identical for the named and unnamed forms of one condition (K-02).
+pub fn gemv_q8_0(
+    blocks: &[BlockQ8_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    in_features: usize,
+) -> KernelResult<()> {
+    let dispatcher = KernelDispatcher::with_tier(cpu_kernel_tier());
+    crate::parallel::gemv_q8_0_par(&dispatcher, blocks, input, output, n_rows, in_features)
+}
+
+/// Scalar reference GEMV for a Q8_0-quantized weight matrix.
+///
+/// Pure scalar Rust — no SIMD, no unsafe. The inner loop dequantizes one block
+/// at a time into a 32-element stack buffer. Used as the correctness reference
+/// for the SIMD tiers and as the fallback on targets without an SIMD kernel.
+/// See [`gemv_q8_0`] for the parameter contract.
+pub(crate) fn gemv_q8_0_scalar(
+    blocks: &[BlockQ8_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    in_features: usize,
+) -> KernelResult<()> {
+    if !in_features.is_multiple_of(QK_Q8_0) {
+        return Err(KernelError::NotBlockAligned {
+            count: in_features,
+            block_size: QK_Q8_0,
+        });
+    }
+    let blocks_per_row = in_features / QK_Q8_0;
+    let expected_blocks = n_rows * blocks_per_row;
+    if blocks.len() < expected_blocks {
+        return Err(KernelError::DimensionMismatch {
+            expected: expected_blocks,
+            got: blocks.len(),
+        });
+    }
+    if input.len() < in_features {
+        return Err(KernelError::DimensionMismatch {
+            expected: in_features,
+            got: input.len(),
+        });
+    }
+    if output.len() < n_rows {
+        return Err(KernelError::BufferTooSmall {
+            needed: n_rows,
+            available: output.len(),
+        });
+    }
+
+    let mut tmp = [0.0f32; 32];
+    for row in 0..n_rows {
+        let mut acc = 0.0f32;
+        for b in 0..blocks_per_row {
+            let block = &blocks[row * blocks_per_row + b];
+            block.dequant_to_buf(&mut tmp);
+            let base = b * QK_Q8_0;
+            for j in 0..QK_Q8_0 {
+                acc += tmp[j] * input[base + j];
+            }
+        }
+        output[row] = acc;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::f16;
+
+    fn make_q8_block(scale: f32, qs: [i8; 32]) -> BlockQ8_0 {
+        BlockQ8_0 {
+            d: f16::from_f32(scale),
+            qs,
+        }
+    }
+
+    /// All qs=0 → weight = 0; output must be 0.
+    #[test]
+    fn q8_0_all_zero_weights() {
+        let block = make_q8_block(1.0, [0i8; 32]);
+        let blocks = vec![block];
+        let input = vec![1.0f32; 32];
+        let mut output = vec![99.0f32; 1];
+        gemv_q8_0(&blocks, &input, &mut output, 1, 32).unwrap();
+        assert!(
+            output[0].abs() < 1e-5,
+            "all-zero weights → output 0, got {}",
+            output[0]
+        );
+    }
+
+    /// Single row, all qs=1, scale=1.0, all-1 input → output = 32.0.
+    #[test]
+    fn q8_0_unit_weights_single_block() {
+        let block = make_q8_block(1.0, [1i8; 32]);
+        let blocks = vec![block];
+        let input = vec![1.0f32; 32];
+        let mut output = vec![0.0f32; 1];
+        gemv_q8_0(&blocks, &input, &mut output, 1, 32).unwrap();
+        assert!(
+            (output[0] - 32.0).abs() < 1e-4,
+            "unit weights: expected 32.0, got {}",
+            output[0]
+        );
+    }
+
+    /// Positive + negative weights mixed: alternating +1 and -1.
+    #[test]
+    fn q8_0_positive_negative_mix() {
+        let mut qs = [0i8; 32];
+        for (j, q) in qs.iter_mut().enumerate() {
+            *q = if j % 2 == 0 { 1 } else { -1 };
+        }
+        // All-1 input → dot = 16*(+1) + 16*(-1) = 0
+        let block = make_q8_block(1.0, qs);
+        let blocks = vec![block];
+        let input = vec![1.0f32; 32];
+        let mut output = vec![99.0f32; 1];
+        gemv_q8_0(&blocks, &input, &mut output, 1, 32).unwrap();
+        assert!(
+            output[0].abs() < 1e-4,
+            "alternating sign: expected 0, got {}",
+            output[0]
+        );
+    }
+
+    /// Max scale: qs=127, scale=1.0, all-1 input → 32*127 = 4064.
+    #[test]
+    fn q8_0_max_scale() {
+        let block = make_q8_block(1.0, [127i8; 32]);
+        let blocks = vec![block];
+        let input = vec![1.0f32; 32];
+        let mut output = vec![0.0f32; 1];
+        gemv_q8_0(&blocks, &input, &mut output, 1, 32).unwrap();
+        assert!(
+            (output[0] - 32.0 * 127.0).abs() < 1.0,
+            "max scale: expected {}, got {}",
+            32.0 * 127.0,
+            output[0]
+        );
+    }
+
+    /// 3 rows × 64 features (2 blocks per row).
+    #[test]
+    fn q8_0_multiple_rows() {
+        let zero_block = make_q8_block(1.0, [0i8; 32]);
+        let unit_block = make_q8_block(1.0, [1i8; 32]);
+
+        // Row 0: [unit, zero] → 32
+        // Row 1: [zero, unit] → 32
+        // Row 2: [unit, unit] → 64
+        let blocks = vec![
+            unit_block, zero_block, zero_block, unit_block, unit_block, unit_block,
+        ];
+        let input = vec![1.0f32; 64];
+        let mut output = vec![0.0f32; 3];
+        gemv_q8_0(&blocks, &input, &mut output, 3, 64).unwrap();
+        assert!((output[0] - 32.0).abs() < 1e-4, "row0: {}", output[0]);
+        assert!((output[1] - 32.0).abs() < 1e-4, "row1: {}", output[1]);
+        assert!((output[2] - 64.0).abs() < 1e-4, "row2: {}", output[2]);
+    }
+
+    /// in_features not a multiple of 32 → NotBlockAligned error.
+    #[test]
+    fn q8_0_not_block_aligned() {
+        let block = make_q8_block(1.0, [0i8; 32]);
+        let blocks = vec![block];
+        let input = vec![1.0f32; 31];
+        let mut output = vec![0.0f32; 1];
+        let result = gemv_q8_0(&blocks, &input, &mut output, 1, 31);
+        assert!(
+            matches!(result, Err(KernelError::NotBlockAligned { .. })),
+            "expected NotBlockAligned, got {result:?}"
+        );
+    }
+
+    /// Too few blocks → `DIMENSION_MISMATCH`.
+    ///
+    /// Asserted on [`KernelError::error_code`], not on the variant shape: the
+    /// named and unnamed forms of one condition deliberately share a code
+    /// (see `error.rs`), so this test keeps holding as construction sites
+    /// migrate from `DimensionMismatch` to `dimension_mismatch("blocks", …)`.
+    #[test]
+    fn q8_0_wrong_block_count() {
+        let block = make_q8_block(1.0, [0i8; 32]);
+        let blocks = vec![block];
+        let input = vec![1.0f32; 32];
+        let mut output = vec![0.0f32; 2];
+        let err = gemv_q8_0(&blocks, &input, &mut output, 2, 32)
+            .expect_err("too few blocks must be rejected");
+        assert_eq!(
+            err.error_code(),
+            "DIMENSION_MISMATCH",
+            "expected DIMENSION_MISMATCH, got {err:?}"
+        );
+    }
+
+    /// Output buffer too small → `BUFFER_TOO_SMALL` (see
+    /// [`q8_0_wrong_block_count`] for why this asserts on the code).
+    #[test]
+    fn q8_0_output_too_small() {
+        let block = make_q8_block(1.0, [0i8; 32]);
+        let blocks = vec![block];
+        let input = vec![1.0f32; 32];
+        let mut output = vec![];
+        let err = gemv_q8_0(&blocks, &input, &mut output, 1, 32)
+            .expect_err("an undersized output buffer must be rejected");
+        assert_eq!(
+            err.error_code(),
+            "BUFFER_TOO_SMALL",
+            "expected BUFFER_TOO_SMALL, got {err:?}"
+        );
+    }
+
+    /// Quantize→dequant round-trip, then GEMV vs naive FP32 matmul.
+    #[test]
+    fn q8_0_gemv_matches_quantized_dequant() {
+        use oxibonsai_core::BlockQ8_0 as BQ;
+        let raw: Vec<f32> = (0..64).map(|i| (i as f32) * 0.5 - 16.0).collect();
+        let blocks = BQ::quantize(&raw).unwrap();
+
+        let mut deq = vec![0.0f32; 64];
+        BQ::dequant(&blocks, &mut deq).unwrap();
+
+        let input = vec![1.0f32; 64];
+        let reference: f32 = deq.iter().sum();
+
+        let mut output = vec![0.0f32; 1];
+        gemv_q8_0(&blocks, &input, &mut output, 1, 64).unwrap();
+        assert!(
+            (output[0] - reference).abs() < 1e-3,
+            "GEMV must match dequant+dot: expected {reference}, got {}",
+            output[0]
+        );
+    }
+}

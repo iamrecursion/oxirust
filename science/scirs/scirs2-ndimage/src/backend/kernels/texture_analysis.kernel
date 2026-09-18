@@ -1,0 +1,409 @@
+// Texture analysis kernels for GPU execution
+// Includes Local Binary Patterns, GLCM, and other texture descriptors
+
+__kernel void local_binary_pattern_2d(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const int radius,
+    const int points
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float center = input[y * width + x];
+    int lbp_code = 0;
+    
+    // Compute LBP for circular neighborhood
+    for (int p = 0; p < points; p++) {
+        float angle = 2.0f * M_PI * p / points;
+        float sample_x = x + radius * cos(angle);
+        float sample_y = y + radius * sin(angle);
+        
+        // Bilinear interpolation for sub-pixel sampling
+        int x1 = (int)floor(sample_x);
+        int y1 = (int)floor(sample_y);
+        int x2 = x1 + 1;
+        int y2 = y1 + 1;
+        
+        float dx = sample_x - x1;
+        float dy = sample_y - y1;
+        
+        // Clamp coordinates
+        x1 = clamp(x1, 0, width - 1);
+        y1 = clamp(y1, 0, height - 1);
+        x2 = clamp(x2, 0, width - 1);
+        y2 = clamp(y2, 0, height - 1);
+        
+        // Bilinear interpolation
+        float val11 = input[y1 * width + x1];
+        float val12 = input[y2 * width + x1];
+        float val21 = input[y1 * width + x2];
+        float val22 = input[y2 * width + x2];
+        
+        float interpolated = val11 * (1 - dx) * (1 - dy) +
+                           val21 * dx * (1 - dy) +
+                           val12 * (1 - dx) * dy +
+                           val22 * dx * dy;
+        
+        // Set bit if interpolated value >= center
+        if (interpolated >= center) {
+            lbp_code |= (1 << p);
+        }
+    }
+    
+    output[y * width + x] = (float)lbp_code;
+}
+
+__kernel void uniform_local_binary_pattern_2d(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float center = input[y * width + x];
+    int binary_pattern = 0;
+    
+    // 8-point circular LBP
+    int dx[] = {1, 1, 0, -1, -1, -1, 0, 1};
+    int dy[] = {0, 1, 1, 1, 0, -1, -1, -1};
+    
+    for (int i = 0; i < 8; i++) {
+        int nx = clamp(x + dx[i], 0, width - 1);
+        int ny = clamp(y + dy[i], 0, height - 1);
+        
+        if (input[ny * width + nx] >= center) {
+            binary_pattern |= (1 << i);
+        }
+    }
+    
+    // Count transitions (uniformity measure)
+    int transitions = 0;
+    for (int i = 0; i < 8; i++) {
+        int bit1 = (binary_pattern >> i) & 1;
+        int bit2 = (binary_pattern >> ((i + 1) % 8)) & 1;
+        if (bit1 != bit2) {
+            transitions++;
+        }
+    }
+    
+    // Uniform patterns have at most 2 transitions
+    if (transitions <= 2) {
+        // Count number of 1s for uniform patterns
+        int ones = 0;
+        for (int i = 0; i < 8; i++) {
+            ones += (binary_pattern >> i) & 1;
+        }
+        output[y * width + x] = (float)ones;
+    } else {
+        output[y * width + x] = 9.0f; // Non-uniform pattern label
+    }
+}
+
+__kernel void glcm_cooccurrence_2d(
+    __global const float* input,
+    __global int* cooccurrence_matrix,
+    const int height,
+    const int width,
+    const int levels,
+    const int dx,
+    const int dy,
+    const float min_val,
+    const float max_val
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int nx = x + dx;
+    int ny = y + dy;
+    
+    // Check if neighbor is within bounds
+    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+        // Quantize pixel values to levels
+        float val1 = input[y * width + x];
+        float val2 = input[ny * width + nx];
+        
+        int level1 = (int)((val1 - min_val) / (max_val - min_val) * (levels - 1));
+        int level2 = (int)((val2 - min_val) / (max_val - min_val) * (levels - 1));
+        
+        level1 = clamp(level1, 0, levels - 1);
+        level2 = clamp(level2, 0, levels - 1);
+        
+        // Atomic increment in cooccurrence matrix
+        atomic_inc(&cooccurrence_matrix[level1 * levels + level2]);
+    }
+}
+
+__kernel void glcm_features_2d(
+    __global const int* cooccurrence_matrix,
+    __global float* features,
+    const int levels,
+    const int total_pairs
+) {
+    int tid = get_global_id(0);
+    
+    if (tid > 0) return; // Only one thread computes features
+    
+    // Normalize cooccurrence matrix
+    float normalized_matrix[256]; // Assuming max 16x16 matrix
+    float sum = 0.0f;
+    
+    for (int i = 0; i < levels * levels; i++) {
+        sum += cooccurrence_matrix[i];
+    }
+    
+    for (int i = 0; i < levels * levels; i++) {
+        normalized_matrix[i] = (float)cooccurrence_matrix[i] / sum;
+    }
+    
+    // Feature 0: Energy (Angular Second Moment)
+    float energy = 0.0f;
+    for (int i = 0; i < levels; i++) {
+        for (int j = 0; j < levels; j++) {
+            float p = normalized_matrix[i * levels + j];
+            energy += p * p;
+        }
+    }
+    features[0] = energy;
+    
+    // Feature 1: Contrast
+    float contrast = 0.0f;
+    for (int i = 0; i < levels; i++) {
+        for (int j = 0; j < levels; j++) {
+            float p = normalized_matrix[i * levels + j];
+            contrast += (i - j) * (i - j) * p;
+        }
+    }
+    features[1] = contrast;
+    
+    // Feature 2: Correlation
+    float mean_i = 0.0f, mean_j = 0.0f;
+    float var_i = 0.0f, var_j = 0.0f;
+    
+    // Compute means
+    for (int i = 0; i < levels; i++) {
+        for (int j = 0; j < levels; j++) {
+            float p = normalized_matrix[i * levels + j];
+            mean_i += i * p;
+            mean_j += j * p;
+        }
+    }
+    
+    // Compute variances
+    for (int i = 0; i < levels; i++) {
+        for (int j = 0; j < levels; j++) {
+            float p = normalized_matrix[i * levels + j];
+            var_i += (i - mean_i) * (i - mean_i) * p;
+            var_j += (j - mean_j) * (j - mean_j) * p;
+        }
+    }
+    
+    float correlation = 0.0f;
+    if (var_i > 0 && var_j > 0) {
+        for (int i = 0; i < levels; i++) {
+            for (int j = 0; j < levels; j++) {
+                float p = normalized_matrix[i * levels + j];
+                correlation += ((i - mean_i) * (j - mean_j) * p) / sqrt(var_i * var_j);
+            }
+        }
+    }
+    features[2] = correlation;
+    
+    // Feature 3: Homogeneity (Inverse Difference Moment)
+    float homogeneity = 0.0f;
+    for (int i = 0; i < levels; i++) {
+        for (int j = 0; j < levels; j++) {
+            float p = normalized_matrix[i * levels + j];
+            homogeneity += p / (1.0f + (i - j) * (i - j));
+        }
+    }
+    features[3] = homogeneity;
+    
+    // Feature 4: Entropy
+    float entropy = 0.0f;
+    for (int i = 0; i < levels; i++) {
+        for (int j = 0; j < levels; j++) {
+            float p = normalized_matrix[i * levels + j];
+            if (p > 0) {
+                entropy -= p * log2(p);
+            }
+        }
+    }
+    features[4] = entropy;
+}
+
+__kernel void gabor_filter_2d(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const float theta,      // Orientation
+    const float lambda,     // Wavelength
+    const float phi,        // Phase offset
+    const float sigma,      // Standard deviation
+    const float gamma       // Aspect ratio
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int center_x = width / 2;
+    int center_y = height / 2;
+    
+    float sum = 0.0f;
+    int kernel_size = (int)(6 * sigma);
+    
+    for (int ky = -kernel_size; ky <= kernel_size; ky++) {
+        for (int kx = -kernel_size; kx <= kernel_size; kx++) {
+            int px = clamp(x + kx, 0, width - 1);
+            int py = clamp(y + ky, 0, height - 1);
+            
+            // Rotate coordinates
+            float x_rot = kx * cos(theta) + ky * sin(theta);
+            float y_rot = -kx * sin(theta) + ky * cos(theta);
+            
+            // Gabor function
+            float exp_term = exp(-(x_rot * x_rot + gamma * gamma * y_rot * y_rot) / (2 * sigma * sigma));
+            float cos_term = cos(2 * M_PI * x_rot / lambda + phi);
+            float gabor_val = exp_term * cos_term;
+            
+            sum += input[py * width + px] * gabor_val;
+        }
+    }
+    
+    output[y * width + x] = sum;
+}
+
+__kernel void laws_texture_energy_2d(
+    __global const float* input,
+    __global float* output,
+    __global const float* filter_mask,
+    const int height,
+    const int width,
+    const int filter_size,
+    const int window_size
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int half_filter = filter_size / 2;
+    int half_window = window_size / 2;
+    
+    // Apply filter to get response
+    float filtered_response = 0.0f;
+    for (int fy = -half_filter; fy <= half_filter; fy++) {
+        for (int fx = -half_filter; fx <= half_filter; fx++) {
+            int px = clamp(x + fx, 0, width - 1);
+            int py = clamp(y + fy, 0, height - 1);
+            
+            int filter_idx = (fy + half_filter) * filter_size + (fx + half_filter);
+            filtered_response += input[py * width + px] * filter_mask[filter_idx];
+        }
+    }
+    
+    // Compute energy in local window
+    float energy = 0.0f;
+    for (int wy = -half_window; wy <= half_window; wy++) {
+        for (int wx = -half_window; wx <= half_window; wx++) {
+            int px = clamp(x + wx, 0, width - 1);
+            int py = clamp(y + wy, 0, height - 1);
+            
+            // For simplicity, using the filtered response at center
+            // In practice, you'd apply the filter at each position
+            energy += filtered_response * filtered_response;
+        }
+    }
+    
+    output[y * width + x] = energy / (window_size * window_size);
+}
+
+__kernel void fractal_dimension_2d(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const int window_size
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int half_window = window_size / 2;
+    
+    // Differential box counting method
+    float sum_log_N = 0.0f;
+    float sum_log_r = 0.0f;
+    float sum_log_r_sq = 0.0f;
+    float sum_log_N_log_r = 0.0f;
+    int valid_scales = 0;
+    
+    // Different box sizes (scales)
+    for (int r = 2; r <= half_window; r *= 2) {
+        int boxes_x = window_size / r;
+        int boxes_y = window_size / r;
+        
+        if (boxes_x < 2 || boxes_y < 2) continue;
+        
+        int box_count = 0;
+        
+        for (int by = 0; by < boxes_y; by++) {
+            for (int bx = 0; bx < boxes_x; bx++) {
+                float min_val = INFINITY;
+                float max_val = -INFINITY;
+                
+                // Find min/max in box
+                for (int py = by * r; py < (by + 1) * r; py++) {
+                    for (int px = bx * r; px < (bx + 1) * r; px++) {
+                        int sample_x = clamp(x - half_window + px, 0, width - 1);
+                        int sample_y = clamp(y - half_window + py, 0, height - 1);
+                        
+                        float val = input[sample_y * width + sample_x];
+                        min_val = fmin(min_val, val);
+                        max_val = fmax(max_val, val);
+                    }
+                }
+                
+                // Count boxes needed to cover height difference
+                int height_diff = (int)ceil((max_val - min_val) * 255.0f); // Assume normalized input
+                box_count += max(1, height_diff / r + 1);
+            }
+        }
+        
+        if (box_count > 0) {
+            float log_r = log((float)r);
+            float log_N = log((float)box_count);
+            
+            sum_log_r += log_r;
+            sum_log_N += log_N;
+            sum_log_r_sq += log_r * log_r;
+            sum_log_N_log_r += log_N * log_r;
+            valid_scales++;
+        }
+    }
+    
+    // Linear regression to find fractal dimension
+    float fractal_dim = 2.0f; // Default value
+    if (valid_scales > 1) {
+        float denom = valid_scales * sum_log_r_sq - sum_log_r * sum_log_r;
+        if (fabs(denom) > 1e-6) {
+            float slope = (valid_scales * sum_log_N_log_r - sum_log_N * sum_log_r) / denom;
+            fractal_dim = -slope; // Negative because N ∝ r^(-D)
+        }
+    }
+    
+    output[y * width + x] = fractal_dim;
+}

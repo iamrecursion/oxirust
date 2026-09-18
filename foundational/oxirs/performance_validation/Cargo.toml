@@ -1,0 +1,59 @@
+[package]
+name = "oxirs-performance-validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Revolutionary performance validation and benchmarking suite for OxiRS"
+keywords = ["performance", "benchmarking", "validation", "testing", "profiling"]
+categories = ["development-tools", "database"]
+publish = false
+
+[dependencies]
+# SciRS2 Core Dependencies (Full Usage - MANDATORY)
+scirs2-core = { workspace = true, features = ["random", "array", "parallel", "simd", "profiling", "memory_management", "ml_pipeline"] }
+
+# OxiRS RDF store (data model) and the real oxirs-arq SPARQL parser/algebra
+# executor (the same engine oxirs-fuseki uses in production) for genuine
+# scenario query execution instead of sleep-based simulation.
+oxirs-core = { workspace = true }
+oxirs-arq = { workspace = true }
+
+# Async Runtime
+tokio = { workspace = true, features = ["full"] }
+
+# Standard Library Extensions
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Logging and Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Random number generation (direct usage in benchmark files)
+rand = { workspace = true }
+clap = { workspace = true }
+
+# Time Handling
+chrono = { workspace = true, features = ["serde"] }
+
+# Real system telemetry (memory/CPU) for accurate SystemInfo and workload metrics
+sysinfo = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cuda", "opencl"))'] }
+
+[features]
+default = ["quantum", "gpu", "distributed", "ml"]
+quantum = []
+gpu = ["scirs2-core/gpu"]
+distributed = []
+ml = []
+cosmic-scale = []
+
+# NOTE: Profiles are intentionally NOT declared here. Cargo ignores `[profile.*]`
+# sections in non-root workspace members (and emits a warning for them), so all
+# build profiles are configured once at the workspace root Cargo.toml.

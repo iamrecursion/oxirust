@@ -1,0 +1,219 @@
+# Changelog
+
+All notable changes to OxiFont are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+OxiFont adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [0.2.3] - Unreleased
+
+### Added
+
+### Changed
+
+### Fixed
+
+---
+
+## [0.2.2] - 2026-08-06
+
+### Added
+
+- **`oxifont-subset`: `instance()` — static instancing of a variable face at one design location.** A `glyf`-flavoured variable font plus a fully pinned user-space location in, a complete **static** SFNT out: `instance(font_data, face_index, &[(*b"wght", 700.0)])`. Coordinates are `(tag, value)` in the same user units `fvar` records, clamped to each axis's `[min, max]`; an axis absent from the list pins at its `fvar` default, and a tag that names no axis is the new `SubsetError::UnknownAxis` rather than a silently-ignored typo that would embed the default weight while reporting success. `font_data` may be a `ttcf` collection (`face_index` selects the face exactly as `subset_font_at_face` does); the result is always a single-face SFNT at offset 0. **Glyph IDs do not move** — same glyph count, same order — so `cmap`, `GSUB`, `GPOS`, `GDEF`, `kern`, `COLR`, `MATH` and `sbix` carry over verbatim and the output feeds straight into the ordinary subsetting entry points, which is what makes instance-then-subset a two-line call site. Outlines come from the full `gvar` tuple walk (both offset formats, shared and embedded peak tuples, intermediate regions, shared and private packed point numbers, packed deltas, IUP against the default outline, composites kept as composites with their component offsets moved and re-encoded to word arguments when a delta pushes them out of `int8`); advances and side bearings come from the four phantom points, so `hmtx`/`vmtx`/`hhea`/`vhea` are rebuilt rather than inherited, and empty glyphs — whose advances do vary — are covered because the walk iterates `0..numGlyphs` rather than the `glyf` records. `HVAR`/`VVAR` are read in exactly one place, the `fvar`-without-`gvar` carve-out where there are no phantoms to consult. The whole coordinate pipeline runs in 16.16 fixed point with FreeType's rounded division and converts to F2Dot14 once at the end; every emitted coordinate, advance and bearing is rounded exactly once with `otRound` (round half toward +∞). `fvar`, `avar`, `gvar`, `cvar`, `HVAR`, `VVAR`, `MVAR`, `STAT`, `DSIG`, `VORG` and `cvt `/`fpgm`/`prep`/`gasp` are dropped, per-glyph instruction streams are stripped and the `maxp` hinting counters zeroed (the hint tables and the programs that call into them have to leave together), `head`/`maxp` boxes and counters are recomputed, and `OS/2` `usWeightClass`/`usWidthClass`/`fsSelection`, `head.macStyle` and `post.italicAngle` follow the pinned location. The function is a pure, byte-deterministic function of its inputs, contains no `unwrap`/`expect`/panicking index outside tests, and bounds every allocation by an already-validated length — it parses attacker-supplied web-font bytes on some call paths. New module `instance`, re-exported at the crate root.
+- **`oxifont-subset`: `SubsetOptions::drop_variations`** — emit a static subset by dropping `fvar`, `avar`, `gvar`, `cvar`, `HVAR`, `VVAR`, `MVAR` and `STAT`. Without it, subsetting a variable face keeps it variable: `fvar`/`avar`/`STAT` are on the verbatim list and `gvar`/`HVAR`/`VVAR` are rewritten and kept, so a PDF or web embed of a face nobody asked to instance carries the entire variation machinery (measured 2.6× the program size on a stock two-axis UI font). The retained outlines and advances are then the source's **default master**; to pin a different location call `instance()` first, after which the flag is a no-op. `SubsetOptions` is now `#[non_exhaustive]` so further options stay additive — build it from `SubsetOptions::default()` and the builder methods rather than a struct literal.
+- `oxifont-subset`: `SubsetStats::cff_charstrings_verbatim`, set when the `CFF `/`CFF2` rewriter fell back to copying the source charstrings (CID-keyed fonts carrying an `FDSelect`, and structures it cannot parse). That table is correct only under the *original* glyph numbering while the rest of the subset has been renumbered, so the glyphs render as the wrong characters and the table stays source-sized; the flag lets an embedder detect the case and embed the original face or refuse, instead of shipping silent garbage. Always `false` for a `glyf`-flavoured font.
+- **`oxifont-subset`: `SubsetGidMap` — the subset's old ↔ new glyph-ID mapping is now reachable from the public API.** The pipeline renumbers retained glyphs densely from 0 in ascending old-GID order *after* composite-component closure, so the new IDs a PDF CIDFont must emit as CIDs (`Identity-H` + `/CIDToGIDMap /Identity`) could not be derived from the requested glyph set alone, and nothing — `subset_font`, `subset_by_gids`, `subset_with_gid_set`, or `PdfFontSubsetter::finalize` — returned them: the crate could not back a CID font, which its own `pdf_subset` module exists for. New `gid_map` module with `SubsetGidMap` (`new_gid(old)`, `old_gid(new)`, `contains_old_gid`, `new_to_old() -> &[u16]`, `len`/`is_empty`, `iter()` over `(old, new)` in old-GID order), re-exported at the crate root. New `_mapped` entry points return it as a third tuple element without changing the bytes or statistics their existing siblings produce: `subset_font_with_options_mapped`, `subset_by_gids_mapped`, `subset_with_gid_set_mapped`, `subset_with_table_map_mapped`, `subset_with_gid_set_at_face_mapped`, and `PdfFontSubsetter::finalize_mapped`.
+- **`oxifont-subset` / `oxifont-core`: `ttcf` collections can be subset by face index.** `read_table_directory` delegated to `SfntTableMap::parse`, which refuses the `ttcf` magic, and every entry point re-parsed at offset 0 — so every stock Windows CJK face (`msgothic.ttc`, `meiryo.ttc`, `YuGothM.ttc`, `msyh.ttc`, `msjh.ttc`, `simsun.ttc`, all of which ship only as collections) was unusable as-is. `oxifont-core` gains `sfnt::TTC_MAGIC`, `sfnt::face_count(data)`, `sfnt::face_offset(data, face_index)`, and `SfntTableMap::parse_face(data, face_index)` (the `ttf_parser::Face::parse(data, index)` shape), which validate the collection header — major version 1 or 2, non-zero `numFonts`, an offset table that actually fits — before trusting any offset in it, and validate the SFNT header at the selected offset exactly as offset 0 is validated. `oxifont-subset` gains `face_count`, `tables::read_table_directory_at_face`, the `_at_face` entry points `subset_font_at_face` / `subset_font_with_options_at_face` / `subset_by_gids_at_face` / `subset_with_gid_set_at_face` / `subset_with_gid_set_at_face_mapped`, and `PdfFontSubsetter::new_at_face` / `for_pdf_at_face` / `for_web_at_face` / `face_index()`. An out-of-range index is the new typed `SubsetError::FaceIndexOutOfRange { index, count }` (`SfntError::FaceIndexOutOfRange` in `oxifont-core`), never a panic; a malformed container is `SfntError::MalformedCollection`. The historical offset-0 entry points deliberately keep refusing a collection rather than auto-selecting face 0: a collection's faces are different fonts, so which one to subset is the caller's decision, and offset-0 single-font behaviour stays byte-identical.
+- `oxifont-hinting`: two `cargo-fuzz` targets (`fuzz/fuzz_targets/`) — one driving `HintingEngine::new` + `set_ppem` + `hint_glyph` over arbitrary font bytes, one driving the interpreter directly over a synthetic `fpgm`/`prep`/glyph instruction blob — backing the crate's "never panics on hostile bytecode" claim with fuzzing rather than hand-written unit tests alone.
+- `oxifont-subset`: `SubsetStats::dropped_context_subtables`, a count of advanced GSUB/GPOS subtables (GSUB 5/6/8, GPOS 3/5/7/8) that were dropped during layout rewriting because they were malformed or could no longer match under the subset, so callers can detect shaping degradation instead of it being silent.
+- `oxifont` facade: optional `hinting` feature re-exporting `oxifont-hinting` as the `oxifont::hinting` module, plus a `oxifont::hinted_outline(font_bytes, gid, ppem)` convenience wrapper for one-shot grid-fitting.
+- `oxifont`: four runnable examples under `crates/oxifont/examples/` covering the headline flows the README advertises — `discover_query_match` (default features), `parse_metrics_outline`, `subset_woff2_roundtrip`, and `hinting_at_ppem` (the latter three require `bundled-noto` plus their respective feature).
+- `oxifont-adapter-native`: new `db` Cargo feature; `NativeCatalog::into_db()` / `NativeCatalog::as_db()` on both the CoreText and DirectWrite catalogs, bridging into `oxifont_db::FontDatabase` for CSS Level 4 querying via the same `From<oxifont_core::FaceInfo>` conversion `oxifont-adapter-pure` already uses.
+- Workspace-root `rustfmt.toml` (`edition = "2021"`, `max_width = 100`) and `clippy.toml` (`msrv = "1.89"`), completing the SECURITY.md/CONTRIBUTING.md hygiene rollout so formatting and lint configuration are pinned rather than implicit.
+
+### Changed
+
+- **Breaking**: `oxifont-subset::pdf_subset::PdfSubsetResult` gained a third public field, `gid_map: SubsetGidMap`, so that `finalize_into_result` carries the CID assignment alongside the bytes and statistics. Code that only reads the struct is unaffected; code that constructs it with a struct literal or destructures it exhaustively must account for the new field (`..` or `gid_map`). `finalize_into_result` now delegates to `finalize_mapped`; the bytes and statistics it returns are unchanged.
+- **Breaking**: `oxifont-bundled::BundledFont::parsed_face()` no longer panics on a decompression/parse failure. The public `parsed` field's type changed from `OnceLock<Arc<ParsedFace>>` to `OnceLock<Result<Arc<ParsedFace>, FontError>>`; a failure is now returned as `Err` (and cached — once a `BundledFont` fails to parse it keeps returning the same `Err` rather than retrying) instead of unwinding the caller's stack. The bundled Latin/CJK constants shipped by this crate are unaffected (their bytes are always valid).
+- `oxifont-subset`: every advanced OpenType layout lookup is now GID-remapped instead of being silently dropped from the subset. GSUB types 5/6 (`ContextSubst`/`ChainContextSubst`) and GPOS types 7/8 (`ContextPos`/`ChainContextPos`) are supported in **all three formats** — format 1 (glyph rule sets, with each rule's input/backtrack/lookahead sequence remapped and rules referencing departed glyphs pruned), format 2 (class rule sets, with the coverage and all one-to-three `ClassDef`s remapped and class values preserved), and format 3 (per-position coverages) — as are GSUB type 8 (`ReverseChainSingleSubst`), GPOS type 3 (`CursivePos`, NULL entry/exit anchors preserved) and GPOS type 5 (`MarkLigPos`, per-component NULL anchors preserved). Contextual lookups wrapped in an Extension subtable (GSUB 7 / GPOS 9) are carried through the wrapper rather than dropped. New internal module `otl_context` keeps parsed contextual subtables in an intermediate form until the final old→new lookup index map is known, so a `seqLookupRecord` is always written with the renumbered `lookupListIndex` (records whose target lookup was dropped are pruned) — there is no longer any path that can emit a stale index. `SubsetStats::dropped_context_subtables` now counts only subtables that were malformed or can no longer match under the subset. Anchor tables copied by the new cursive / mark-to-ligature rewriters are measured exactly (Anchor format 3 carries its `Device`/`VariationIndex` tables, whose sizes are derived from `deltaFormat`), and a malformed or truncated anchor drops the subtable instead of being silently rewritten as a NULL anchor that would position nothing.
+- `oxifont-subset::subset_with_table_map` now subsets from the `SfntTableMap` it is handed instead of re-parsing `map.raw()` at offset 0, which is what the entry point exists to avoid; as a side effect a map produced by `SfntTableMap::parse_face` / `parse_at_offset` now subsets that face of a collection rather than failing on the container magic. Output for a plain per-face map is byte-identical (pinned by `tests/shared_table_map.rs`). The same restructuring removes a redundant second table-directory walk from `subset_font_with_options`.
+- `oxifont-hinting`: composite glyph components placed by point matching (`ARGS_ARE_XY_VALUES` clear) now resolve the actual point-to-point offset — transforming the component's matched point through its 2×2 matrix first, then aligning it with the parent's matched point, per the TrueType composite-glyph spec — instead of always assembling at a silent `(0, 0)` offset. An out-of-range point index is now a typed `HintingError::MalformedTable` instead of producing plausible-but-wrong outline geometry.
+- `oxifont-core`: `pub mod info` (and `FaceInfo::path: PathBuf` within it) is now correctly gated behind the `std` feature instead of being unconditionally compiled; `cargo build -p oxifont-core --no-default-features` compiles (verified).
+- `oxifont-parser` / `oxifont-db`: `VariationAxis::name` is now resolved against the font's `name` table (preferring an English Unicode record, falling back to any Unicode record, then to the numeric name ID as a last resort) instead of being the raw stringified name ID (`oxifont-parser`, e.g. `"256"`) or an empty string (`oxifont-db`).
+- `oxifont-discovery`: scanning a `.woff`/`.woff2` file when the corresponding `woff1`/`woff2` feature is not compiled in now returns `FontError::UnsupportedFormat` instead of a fabricated placeholder `FaceInfo` with an empty family and PostScript name that was otherwise indistinguishable from a real 400-weight normal face.
+- `oxifont-adapter-native` (DirectWrite): a font face backed by more than one `IDWriteFontFile` (composite fonts) is now skipped during enumeration instead of being reported with only its first file's path — `FaceInfo::path` has no way to represent more than one file, so a partial path was silently misleading.
+- Root `Cargo.toml`: `quick-xml` now resolves to the `oxixml-quickxml-compat` package (via Cargo's `package = "…"` rename) instead of the upstream `quick-xml` crate; `deny.toml` gained a matching `bans` entry so the upstream crate cannot be pulled in by mistake.
+- `oxiarc-deflate` / `oxiarc-brotli` updated from 0.4.0 to 0.4.1; `quick-xml` (the `oxixml-quickxml-compat` package) 0.1.0 → 0.1.1.
+- `oxicode` updated from 0.2.5 to 0.2.6.
+
+### Fixed
+
+- **`oxifont-subset`: `.notdef` is now retained by every entry point.** `subset_from_tables` never inserted glyph 0, so `subset_with_gid_set`, `subset_with_gid_set_mapped`, `subset_with_gid_set_at_face`, `subset_with_gid_set_at_face_mapped` and the codepoint entry points produced a font with **no `.notdef`** — while `subset_by_gids_mapped` and `subset_with_table_map_mapped` did insert it, and `subset_with_table_map`'s own documentation called `.notdef` "always included implicitly". The same glyph set therefore got two different numberings depending on which entry point you came in through, and a PDF CIDFont built on the first kind silently promoted the caller's lowest requested glyph (U+0020 in the common case) to CID 0. This is behaviour-correcting, not additive: it makes the code match the documented contract that all six entry points already claimed. Subsets whose requested set already contained glyph 0 are byte-identical.
+- **`oxifont-subset`: `DSIG` is no longer copied into a subset.** A digital signature covers the bytes of the font it was made for, and every table in a subset has just been rewritten — so the signature was invalid by construction, and 8–10 KB of it on a stock Windows UI face. `b"DSIG"` is off the verbatim list unconditionally.
+- **`oxifont-subset::tables::build_sfnt` no longer stamps CFF-flavoured subsets with the TrueType sfnt magic.** The sfnt version was written unconditionally as `0x00010000`, so a subset whose outlines live in a `CFF ` (or `CFF2`) table told every consumer that dispatches on the magic to go looking for a `glyf` table that is not there — and find no outlines at all. The version is now chosen from the outline table actually present: `OTTO` (`0x4F54544F`) for CFF/CFF2, `0x00010000` otherwise. New public constants `tables::SFNT_VERSION_TRUETYPE` and `tables::SFNT_VERSION_CFF`.
+- **`oxifont-subset::tables::build_sfnt` offset-table search fields now follow the OpenType formulas.** `searchRange` was computed as `16 * numTables.next_power_of_two() / 2`, which is correct only when `numTables` is *not* an exact power of two — at `numTables = 8` it emitted `searchRange = 64` / `rangeShift = 64` instead of `128` / `0`. All three fields are now `entrySelector = floor(log2(numTables))`, `searchRange = 2^entrySelector * 16`, `rangeShift = numTables * 16 - searchRange`, computed in `u32` and narrowed with saturation. An empty table list emits all zeros instead of panicking with a subtract overflow in debug builds.
+- `README.md`: added the missing `hinting` feature-flag row and an Architecture-section note now that the facade can re-export it; reworded the four `bundled-noto-cjk-*` feature rows from "Embedded Noto Sans …" to "opt-in, build-time-supplied" so they no longer restate the fabricated-bytes problem the 0.2.1 F2 fix already closed.
+- `oxifont-subset::SubsetOptions::retain_layout_tables` doc comments no longer claim GSUB/GPOS/GDEF are kept "verbatim" (they are GID-remapped, which is what makes the subset valid); now cross-reference `SubsetStats::dropped_context_subtables` for the contextual-lookup caveat.
+- `TODO.md`: `### M5` heading corrected from "(In Progress)" to "(Complete)" — every M5 item was already checked.
+- `crates/oxifont-bundled/TODO.md`: corrected two "build.rs compression generation deferred" claims — `build.rs` has zlib-compressed every top-level `fonts/*.ttf` into `$OUT_DIR/<name>.ttf.z` (via `oxiarc_deflate::zlib_compress`, level 6) under the `compressed` feature since that feature landed.
+- `crates/oxifont-adapter-native/TODO.md`: checked off the `into_db()`/`as_db()` bridge item now that it is implemented (see Added).
+- `oxifont-adapter-native` (DirectWrite, `#[cfg(windows)]`): `src/directwrite.rs` was missing a `FontFace` trait import that its own `postscript_name()` call requires, so the crate could not compile on `x86_64-pc-windows-msvc` at all prior to this fix (pre-existing; discovered while cross-checking this release's DirectWrite changes with `cargo check --target x86_64-pc-windows-msvc`, unrelated to any change above).
+- `oxifont-subset`: two lint blockers on the `cargo clippy --all-targets -- -D warnings` gate, both pre-existing and both surfaced while verifying the changes above on Windows. `tests/cff.rs::is_cff2_font` is only called from `#[cfg(target_os = "macos")]` / `#[cfg(target_os = "linux")]` blocks and is now gated to match instead of tripping `dead_code` on every other target; the `otl` / `otl_gpos` module docs linked `[`crate::otl_context`]`, a `pub(crate)` module, which `rustdoc -D warnings` rejects as a private intra-doc link, and now name it in plain prose.
+- Remaining workspace-wide lint blockers on the same gate (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), all pre-existing: `oxifont-db` spelled the `wght`/`ital`/`wdth` axis tags as `[b'w', b'g', b'h', b't']`-style byte-char arrays in `src/face.rs`, `src/query.rs`, and four test files, which the current toolchain's `clippy::byte_char_slices` rejects — all are now `*b"wght"`-style byte strings; `oxifont-discovery/tests/system_tests.rs`'s `TTF_FIXTURE` / `unique_tmp_dir` / `cleanup` helpers are only used by the `#[cfg(unix)]` symlink test and are now gated to match instead of tripping `dead_code` on Windows; `oxifont-adapter-pure/tests/integration.rs`'s macOS-only CSS generic-family test used a `#[cfg(not(target_os = "macos"))] { return; }` block that trips `needless_return` and is now `#[cfg(target_os = "macos")]` on the test item itself (on other platforms the test no longer appears in the run count instead of passing vacuously). The workspace gate is now clean on Windows.
+
+---
+
+## [0.2.1] - 2026-07-30
+
+### Added
+
+- **`oxifont-hinting`** (new crate): a Pure Rust TrueType bytecode hinting interpreter (grid-fitting VM). `HintingEngine::new` loads a font's hinting tables from a `SfntTableMap` and runs `fpgm` once; `set_ppem` scales the CVT and runs `prep`; `hint_glyph` grid-fits a single glyph to 26.6 fixed-point coordinates, and `HintedGlyph::to_outline()` decomposes the result into `oxifont_core::GlyphOutline` path commands. The VM never panics on malformed or hostile bytecode — every stack, storage, CVT, point, and jump access is bounds-checked and mapped to a typed `HintingError`, with bounded instruction count, call depth, and loop counts so infinite loops and deep recursion terminate with an error instead of hanging or overflowing the native stack. Not yet re-exported from the `oxifont` facade crate; depend on `oxifont-hinting` directly.
+- `oxifont-bundled`: build-time CJK font resolution. Enabling `bundled-noto-cjk-{jp,kr,sc,tc}` now compiles a `noto_sans_<lang>_regular()` accessor that stages a real, developer-supplied TTF at build time — via the `OXIFONT_NOTO_CJK_<LANG>` environment variable (e.g. `OXIFONT_NOTO_CJK_JP=/path/to/NotoSansJP-Regular.ttf`) or an in-tree `fonts/cjk-<lang>/NotoSans<LANG>-Regular.ttf` file — validated as a genuine SFNT (`build.rs` panics on a bad magic instead of bundling garbage).
+
+### Changed
+
+- **Breaking**: `oxifont-bundled` CJK fonts are no longer `pub static NOTO_SANS_{JP,KR,SC,TC}_REGULAR: &[u8]` zero-byte placeholders. Each is now a `noto_sans_<lang>_regular() -> Result<&'static [u8], oxifont_core::FontError>` function, returning `Err(FontError::NotFound)` when no font was supplied at build time instead of an empty slice. `BundledFontProvider` now omits a CJK entry entirely rather than ever listing empty or fabricated bytes.
+- `oxifont-subset::cmap`: `build_format4` now returns `Result<Vec<u8>, SubsetError>` instead of `Vec<u8>`. Header field arithmetic (segCount, searchRange, entrySelector, rangeShift) is computed in `usize`/`u32` and range-checked before narrowing to `u16`, rejecting subsets whose format-4 cmap would exceed the ~8189-segment addressable limit with a typed `SubsetError::InvalidFont` instead of risking silent `u16` overflow.
+- `oxiarc-deflate` / `oxiarc-brotli` updated from 0.3.3 to 0.4.0; `quick-xml` 0.40.1 → 0.41.0; `memmap2` 0.9.10 → 0.9.11.
+- `oxicode` updated from 0.2.4 to 0.2.5.
+
+### Fixed
+
+- **WOFF2 `Read255UShort` decoding** (`oxifont-webfont`, `woff2/glyf.rs` and `woff2/header.rs`): the `oneMoreByteCode2` branch (control byte `254`) incorrectly read a 2-byte big-endian `u16` + 506 (3 bytes total); per WOFF2 §5.1 it must read a single byte + 506 (2 bytes total). A WOFF2 font produced by an encoder that emits the `254` form would misparse and desync the byte stream. This crate's own encoder always prefers the `255` form for that value range, so self-encoded round-trips were unaffected.
+- `oxifont-subset::cmap::build_format4`: large-but-valid subsets with segment counts near the `u16` boundary previously risked silent overflow in the `search_range`/`length` computation (via `next_power_of_two` on `u16`), which could emit a corrupt cmap table in release builds; now validated and rejected with a typed error before any narrowing occurs.
+
+### Removed
+
+- **`oxifont-webfont`: `benches/woff2_compare.rs`** and its `woff2-patched`, `ttf2woff2`, and `bytes` dev-dependencies. Both reference implementations depend non-optionally on the `brotli` crate, which `deny.toml` bans in favour of `oxiarc-brotli`; this dev-only path was the sole reason `cargo deny check bans` failed. Our own decode/encode paths remain covered by `benches/woff2_decode.rs` and `benches/woff2_streaming.rs`.
+
+### Security
+
+- **`oxifont-webfont`**: `reconstruct_glyf_loca` now rejects a transformed WOFF2 glyf block whose `nPointsStream` advertises more points than the accompanying `flagStream` can contain, checked *before* reserving any point-sized buffers — closing a potential multi-gigabyte-allocation denial-of-service from a crafted WOFF2 font.
+
+---
+
+## [0.2.0] - 2026-06-22
+
+### Added
+
+- **`oxifont-core`: `platform_dirs` module** — pure Rust replacement for all 7 `dirs::*` call sites; provides `cache_dir()`, `config_dir()`, `data_dir()`, and `home_dir()` using only `std::env` (macOS `$HOME/Library/…`, Linux XDG, Windows `%LOCALAPPDATA%`/`%USERPROFILE%`), eliminating the `dirs` crate from the dependency closure entirely.
+
+### Removed
+
+- **`dirs` crate** removed from `oxifont-db` and `oxifont-discovery` (was version 6.x); all consumers now use `oxifont-core::platform_dirs` instead.
+- **`native` feature removed from the `oxifont` facade crate** — applications that need CoreText (macOS) or DirectWrite (Windows) native font enumeration must now depend directly on `oxifont-adapter-native` and opt into its `native` feature; the facade re-export layer no longer aggregates the native platform adapter, keeping the facade dependency closure pure under all feature combinations.
+
+### Changed
+
+- `oxifont-adapter-pure` cache-directory resolution ported from `dirs::cache_dir()` to `oxifont_core::platform_dirs::cache_dir()`.
+- `oxifont-discovery` fontconfig XML path resolution ported from `dirs::home_dir()` / `dirs::config_dir()` to `oxifont_core::platform_dirs`.
+- `oxitext` and other downstream ecosystem consumers updated to depend on `oxifont-adapter-native` directly rather than relying on the facade `native` feature.
+
+### Security
+
+- **Pure Rust Policy v2 L1 compliance**: `yeslogic-fontconfig-sys` (a C FFI crate) is no longer reachable from the `oxifont` facade crate under any feature combination; it remains available only through `oxifont-adapter-native` where FFI is intentional and feature-gated.
+
+[0.2.1]: https://github.com/cool-japan/oxifont/releases/tag/v0.2.1
+[0.2.0]: https://github.com/cool-japan/oxifont/releases/tag/v0.2.0
+
+---
+
+## [0.1.3] - 2026-06-19
+
+### Changed
+
+- All nine workspace member crates bumped from `0.1.2` to `0.1.3` (`oxifont-core`, `oxifont-parser`, `oxifont-discovery`, `oxifont-adapter-pure`, `oxifont-db`, `oxifont-webfont`, `oxifont-subset`, `oxifont-adapter-native`, `oxifont-bundled`).
+
+[0.1.3]: https://github.com/cool-japan/oxifont/releases/tag/v0.1.3
+
+---
+
+## [0.1.2] - 2026-06-10
+
+### Added
+
+- **`oxifont-bundled`: `compressed` feature — build-time zlib compression via `build.rs`** — `build.rs` now reads every `.ttf` file from `fonts/`, compresses them with `oxiarc-deflate::zlib_compress` (level 6), and writes `<name>.ttf.z` files to `$OUT_DIR`; when the `compressed` feature is enabled, `BundledFont` embeds the zlib bytes via `include_bytes!(concat!(env!("OUT_DIR"), "..."))` and decompresses on first parse, reducing embedded binary size.
+- **`oxifont-bundled`: `BundledFont::decompressed_data()` works correctly with actual compressed data** — removed the forward-compatibility SFNT-magic bypass in `decompress_font`; the function now directly calls `oxiarc_deflate::zlib_decompress`; the magic bypass was designed for a future build script that has now landed.
+- **`oxifont-webfont`: WOFF2 glyf/loca passthrough support** — enhanced glyf/loca table handling with improved passthrough logic for non-transformed tables, and improved reconstruction logic for transformed glyf tables.
+- **`oxifont-bundled`: additional compressed feature tests** — added `compressed_tests` module with `compressed_data_is_not_raw_sfnt` and round-trip validity tests; updated `sans_regular_ttf_magic`, `sans_bold_ttf_magic`, `serif_regular_ttf_magic`, and `all_fonts_have_valid_ttf_magic` to use `decompressed_data()` so they work under both compressed and non-compressed builds.
+
+### Changed
+
+- `oxifont-bundled` `decompressed_data_length_matches_raw_data` test updated to correctly assert that stored bytes are smaller than decompressed bytes under the `compressed` feature, and equal lengths without the feature.
+- `oxiarc-deflate` bumped from `0.3.2` to `0.3.3`.
+- `oxiarc-brotli` bumped from `0.3.2` to `0.3.3`.
+
+[0.1.2]: https://github.com/cool-japan/oxifont/releases/tag/v0.1.2
+
+---
+
+## [0.1.1] - 2026-06-04
+
+### Added
+
+- **`oxifont-adapter-native`: `shaper_bridge` module** — new cross-platform public module (`pub mod shaper_bridge`) providing `collect_fallback_fonts_for_text`, `collect_fonts_for_text`, `load_best_native_font_for_text`, `load_native_font_for_codepoint_with_index`, and `find_native_font_for_codepoint`; lets shaping engines (oxitext-shape, swash, rustybuzz) obtain raw font bytes for every missing codepoint in a single OS font enumeration pass, avoiding the N×M overhead of one query per codepoint
+- **`oxifont-adapter-native` (macOS)**: `load_fallback_font_bytes(codepoint)` and `load_fallback_font_bytes_with_index(codepoint)` — return raw SFNT bytes (and TTC face index) for the first system font covering the given codepoint via CoreText; allows shaping engines to call `FontRef::from_index` directly without managing path-to-bytes conversion
+- **`oxifont-adapter-pure`: `FontDatabase::font_bytes(&self, info)` → `Result<Vec<u8>, FontError>`** — exposes raw SFNT bytes for a catalogued face, serving as the integration point for `oxifont-subset::subset_font` and WOFF2 encoding without requiring callers to import `oxifont-subset` directly
+- **`oxifont-adapter-pure` feature `db`**: `FontDatabase::into_db(self)` and `FontDatabase::as_db(&self)` — convert the pure-Rust filesystem catalog to an `oxifont_db::FontDatabase`, enabling CSS Fonts Level 4 queries (`oxifont_db::Query`) on the result of a directory scan
+- **`oxifont-adapter-pure` feature `subset`**: `FontDatabase::subset_face(info, codepoints)` and `FontDatabase::subset_face_for_web(info, codepoints)` — convenience wrappers that chain `font_bytes()` with `oxifont_subset::subset_font` / `subset_font_for_web` in one call; the `_for_web` variant strips hints and trims name records for smaller web font downloads
+- **`oxifont-parser`: `GlyphOutlineData` struct** and **`ParsedFace::outline_with_bbox(gid)` → `Option<GlyphOutlineData>`** — returns path commands together with the font's own authoritative ink bounding box (`x_min`/`y_min`/`x_max`/`y_max`) and `hmtx` advance width/LSB, enabling rasterisation without fontdue or any third-party hinting library
+- **`oxifont-parser`: `FontCapabilities` impl for `ParsedFace`** — implements `gsub_features()`, `gpos_features()`, `supported_scripts()`, `supported_languages()`, and `has_feature([u8; 4])`, giving shaping engines (oxitext-shape) GSUB/GPOS feature metadata without hand-parsing raw table bytes
+- **`oxifont-db`: `FontDatabase::locale_families_for(bcp47)` → `Vec<String>`** — returns locale-specific family names for the given BCP-47 tag by resolving it to a Windows LCID with progressive tag-shortening fallback; primary integration point for `oxitext-icu` locale-aware rendering
+- **`oxifont-db`: `FontDatabase::faces_for_script(script_tag: &[u8; 4])` → `Vec<&FaceInfo>`** — returns all faces whose OS/2 Unicode range bits cover the requested OpenType script tag (e.g. `b"arab"`, `b"deva"`, `b"hani"`); used by `oxitext-shape` for per-script font selection
+- **`oxifont-subset`: `pdf_subset` module** — new `PdfFontSubsetter` builder and `PdfSubsetResult` struct for incremental PDF font subsetting; accumulates codepoints and raw GIDs across pages via `add_codepoint`, `add_text`, `add_gid`, then produces subset SFNT bytes + CIDToGIDMap in a single `finalize()` call; also exposes `cmap_to_gid_map_pub` for external cmap parsing
+- **`oxifont-webfont`: `build_sfnt_cow` and `detect_sfnt_version_cow`** — zero-copy SFNT assembly variants that accept `Cow<'_, [u8]>` table slices; non-transformed tables borrow directly from the decompressed WOFF2 buffer, eliminating one copy per table in the hot WOFF2 decode path
+- **`oxifont-adapter-native`**: DirectWrite integration test file (`tests/directwrite.rs`) with 8 platform-gated tests covering catalog enumeration, well-known Windows fonts, weight ranges, family names, path existence, `system_with_options`, reload stability, and italic face detection
+- **Fuzz targets** added for `oxifont-db` (`fuzz_query`), `oxifont-parser` (`fuzz_parse`, `fuzz_face_methods`), `oxifont-subset` (`fuzz_subset`, `fuzz_subset_by_gids`), and `oxifont-webfont` (`fuzz_woff1_decode`, `fuzz_woff2_decode`, `fuzz_detect_auto`)
+
+### Changed
+
+- `NativeError` (`oxifont-adapter-native`) marked `#[non_exhaustive]` — downstream match expressions must include a catch-all arm; enables future variants without a semver break
+- `FontError` (`oxifont-core`) marked `#[non_exhaustive]` — same forward-compatibility guarantee for the shared error type
+- `SfntError` (`oxifont-core`) marked `#[non_exhaustive]`
+- `GlyphOutline` (`oxifont-core`) coordinate-system documentation expanded with Y-axis convention, screen-space conversion pattern, and `oxitext-raster` field mapping (`cx`/`cy` → `x1`/`y1`); doc-example extended with Y-flip transform demonstration
+- `oxifont-webfont` WOFF2 decode path switched from owned-table `extract_and_transform_tables` to the new `extract_and_transform_tables_cow` path, reducing per-table allocations for non-transformed tables
+- `oxicode` updated from 0.2.3 to 0.2.4
+- `dashmap` dependency removed from workspace
+- `woff2-patched`, `ttf2woff2`, and `bytes` added as dev-dependencies in `oxifont-webfont` for the new `woff2_compare` benchmark
+
+---
+
+## [0.1.0] — 2026-06-01
+
+Initial release of the OxiFont workspace — 10 crates, ~28 000 Rust SLOC,
+zero FFI under default features.
+
+### New Crates
+
+| Crate | Description |
+|---|---|
+| `oxifont-core` | Core trait surface (`FontFace`, `FontCatalog`, `FontCollection`, `NameTable`), shared types (`FaceInfo`, `FontQuery`, `FontStyle`, `FontStretch`, `FontMetrics`, `GlyphOutline`, `KerningPair`, `ColorGlyphFormat`, `VariationAxis`), `SfntTableMap` zero-copy table directory |
+| `oxifont-parser` | TTF/OTF/TTC parsing via `ttf-parser`; `ParsedFace` implementing `FontFace` with full metrics, outline extraction, kerning, color-glyph detection, PostScript name, table queries, vertical advance |
+| `oxifont-discovery` | Pure Rust OS font-directory scanner for macOS, Linux, and Windows; `walkdir`-based recursion, WOFF/WOFF2 awareness, optional `fontconfig` XML config parsing |
+| `oxifont-adapter-pure` | `FontDatabase` catalog via filesystem scan; CSS generic-family alias resolution; optional JSON/binary disk cache |
+| `oxifont-adapter-native` | CoreText (macOS) and DirectWrite (Windows) native font enumeration; weight mapping, symbolic traits, localized strings; platform FFI behind the `native` feature |
+| `oxifont-db` | In-memory indexed font database; CSS Fonts Level 4 §4.5 family/style/weight/stretch matching; `Query` builder; 60+ BCP-47 to LCID locale mappings; `cache` feature for JSON/binary disk cache |
+| `oxifont-subset` | TrueType and CFF/CFF2 glyph subsetter; composite glyph closure; cmap (format 4/12) rewriting; hmtx/vmtx/hhea/vhea rewriting; GSUB/GPOS/GDEF layout pruning; HVAR/VVAR delta-set index map rewriting; gvar per-glyph variation tuple subsetting; COLR/CPAL, CBDT/CBLC, SVG, sbix, MATH table subsetting |
+| `oxifont-webfont` | WOFF1 decode + encode (zlib per-table via `oxiarc-deflate`); WOFF2 decode + encode (brotli via `oxiarc-brotli`); transformed glyf/loca/hmtx reconstruction; streaming WOFF2 decoder; font-format autodetection |
+| `oxifont-bundled` | Compile-time embedded SIL-OFL-1.1 Noto font subsets (Noto Sans, Noto Serif, Noto Sans Italic, Noto Sans Mono; CJK JP/KR/SC/TC behind sub-features); compressed storage via `oxiarc-deflate` |
+| `oxifont` | Facade re-export crate; `load_font`, `load_font_bytes`, `detect_format`, `decode_and_parse`; feature-gated modules for each subcrate; `prelude` module; `version()` |
+
+### Highlights
+
+- **Pure Rust by default**: all default features are 100% FFI-free; CoreText and DirectWrite are opt-in via `native`
+- **WOFF1 + WOFF2 round-trip**: encode and decode are both implemented and tested with real TTF fixtures
+- **Full subsetting pipeline**: Unicode codepoint set → subsetted SFNT bytes covering TrueType, CFF, CFF2, variable fonts, color fonts (COLR, CBDT, SVG, sbix), and OpenType Layout tables
+- **CSS Level 4 query engine**: family/weight/style/stretch narrowing per specification, generic-alias resolution, variable-font `wght`-axis preference, locale-aware name reads
+- **SfntTableMap**: shared zero-copy SFNT directory parser in `oxifont-core` eliminates redundant table walks in parser and subsetter
+- **949 tests** pass across the workspace (5 slow, 0 failures)
+- **MSRV 1.89**, edition 2021
+
+### Compression / Encoding Policy
+
+All zlib/DEFLATE operations use `oxiarc-deflate`; all Brotli operations use
+`oxiarc-brotli`. No `flate2`, `brotli`, `miniz_oxide`, or `zip` crates are
+used anywhere in the dependency tree.
+
+[0.1.1]: https://github.com/cool-japan/oxifont/releases/tag/v0.1.1

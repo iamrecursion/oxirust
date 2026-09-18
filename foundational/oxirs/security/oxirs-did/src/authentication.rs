@@ -1,0 +1,1180 @@
+//! # Authentication
+//!
+//! DID authentication method management and challenge-response protocol.
+//!
+//! This module implements a challenge-response authentication flow for
+//! Decentralized Identifiers (DIDs), supporting Ed25519, Secp256k1, RSA,
+//! and X25519 key types.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use oxirs_did::authentication::{
+//!     AuthMethod, AuthenticatorConfig, Authenticator, AuthResponse,
+//! };
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = AuthenticatorConfig {
+//!     challenge_ttl_ms: 30_000,
+//!     max_active_challenges: 100,
+//! };
+//! let mut auth = Authenticator::new(config);
+//!
+//! auth.register_did("did:example:alice", AuthMethod::Ed25519("aabbcc".to_string()));
+//!
+//! let challenge = auth.issue_challenge("did:example:alice", 1_000)?;
+//! assert_eq!(challenge.did, "did:example:alice");
+//! # Ok(())
+//! # }
+//! ```
+
+use std::collections::HashMap;
+
+// ─── Auth method ──────────────────────────────────────────────────────────────
+
+/// A cryptographic authentication method bound to a DID.
+///
+/// The inner `String` carries the public key material encoded as hex or
+/// base64, depending on the method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// Ed25519 verification key.
+    Ed25519(String),
+    /// Secp256k1 verification key (Ethereum-style).
+    Secp256k1(String),
+    /// RSA public key.
+    RSA(String),
+    /// X25519 key-agreement key.
+    X25519(String),
+}
+
+impl AuthMethod {
+    /// Returns a human-readable label for this method type.
+    pub fn type_label(&self) -> &'static str {
+        match self {
+            AuthMethod::Ed25519(_) => "Ed25519",
+            AuthMethod::Secp256k1(_) => "Secp256k1",
+            AuthMethod::RSA(_) => "RSA",
+            AuthMethod::X25519(_) => "X25519",
+        }
+    }
+
+    /// Returns the public key material string.
+    pub fn public_key(&self) -> &str {
+        match self {
+            AuthMethod::Ed25519(k) => k,
+            AuthMethod::Secp256k1(k) => k,
+            AuthMethod::RSA(k) => k,
+            AuthMethod::X25519(k) => k,
+        }
+    }
+}
+
+// ─── Challenge / response ─────────────────────────────────────────────────────
+
+/// A server-issued authentication challenge.
+#[derive(Debug, Clone)]
+pub struct AuthChallenge {
+    /// Unique challenge identifier (UUID-like string).
+    pub challenge_id: String,
+    /// 32 random bytes to be signed by the authenticating party.
+    pub challenge_bytes: Vec<u8>,
+    /// Unix timestamp (ms) when the challenge was issued.
+    pub issued_at: u64,
+    /// Unix timestamp (ms) after which the challenge is invalid.
+    pub expires_at: u64,
+    /// The DID this challenge was issued for.
+    pub did: String,
+}
+
+/// A client's response to an [`AuthChallenge`].
+#[derive(Debug, Clone)]
+pub struct AuthResponse {
+    /// The challenge identifier returned by the server.
+    pub challenge_id: String,
+    /// The DID of the authenticating party.
+    pub did: String,
+    /// Cryptographic signature over `challenge_bytes`.
+    pub signature: Vec<u8>,
+    /// The authentication method used to produce the signature.
+    pub method: AuthMethod,
+}
+
+// ─── Verification result ──────────────────────────────────────────────────────
+
+/// The outcome of verifying an [`AuthResponse`].
+#[derive(Debug, Clone)]
+pub struct VerificationResult {
+    /// `true` when the response passes all checks.
+    pub verified: bool,
+    /// The DID that was authenticated.
+    pub did: String,
+    /// Type label of the method used (e.g. `"Ed25519"`).
+    pub method_type: String,
+    /// Non-`None` when `verified == false`; describes the failure.
+    pub error: Option<String>,
+}
+
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+/// Errors that can occur during authentication operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticationError {
+    /// The referenced challenge has expired.
+    ChallengeExpired(String),
+    /// The signature does not verify against the challenge bytes.
+    InvalidSignature,
+    /// No DID with this identifier is registered.
+    UnknownDid(String),
+    /// The requested authentication method is not supported.
+    UnsupportedMethod(String),
+    /// The `challenge_id` in the response does not match any active challenge.
+    ChallengeMismatch,
+    /// An internal error occurred (e.g. the OS entropy source was unavailable).
+    Internal(String),
+}
+
+impl std::fmt::Display for AuthenticationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthenticationError::ChallengeExpired(id) => {
+                write!(f, "challenge expired: {id}")
+            }
+            AuthenticationError::InvalidSignature => write!(f, "invalid signature"),
+            AuthenticationError::UnknownDid(did) => write!(f, "unknown DID: {did}"),
+            AuthenticationError::UnsupportedMethod(m) => {
+                write!(f, "unsupported auth method: {m}")
+            }
+            AuthenticationError::ChallengeMismatch => write!(f, "challenge ID mismatch"),
+            AuthenticationError::Internal(msg) => write!(f, "internal error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthenticationError {}
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+/// Configuration for the [`Authenticator`].
+#[derive(Debug, Clone)]
+pub struct AuthenticatorConfig {
+    /// How many milliseconds a challenge remains valid after issuance.
+    pub challenge_ttl_ms: u64,
+    /// Maximum number of concurrently active (non-expired) challenges.
+    pub max_active_challenges: usize,
+}
+
+impl Default for AuthenticatorConfig {
+    fn default() -> Self {
+        Self {
+            challenge_ttl_ms: 30_000,
+            max_active_challenges: 1_000,
+        }
+    }
+}
+
+// ─── Authenticator ────────────────────────────────────────────────────────────
+
+/// Manages DID registrations and the challenge-response authentication flow.
+///
+/// # Design notes
+///
+/// * Challenge bytes are 32 fresh bytes drawn from the OS CSPRNG on every
+///   [`issue_challenge`](Authenticator::issue_challenge) call, so a challenge
+///   is unpredictable and non-replayable.
+/// * Response verification performs a **real** cryptographic signature check:
+///   the response signature must be a valid signature over the challenge bytes
+///   under the public key registered for the DID. Currently only
+///   [`AuthMethod::Ed25519`] (32-byte hex-encoded public key, 64-byte
+///   signature) is verifiable; other method types are rejected with an explicit
+///   "unsupported" error rather than being accepted.
+pub struct Authenticator {
+    config: AuthenticatorConfig,
+    /// Registered DIDs → their authentication method.
+    registered: HashMap<String, AuthMethod>,
+    /// Active challenges keyed by challenge ID.
+    active_challenges: HashMap<String, AuthChallenge>,
+    /// Monotonically increasing counter used to make challenge IDs unique.
+    sequence: u64,
+}
+
+impl Authenticator {
+    /// Creates a new `Authenticator` with the given configuration.
+    pub fn new(config: AuthenticatorConfig) -> Self {
+        Self {
+            config,
+            registered: HashMap::new(),
+            active_challenges: HashMap::new(),
+            sequence: 0,
+        }
+    }
+
+    // ── Registration ──────────────────────────────────────────────────────────
+
+    /// Registers (or replaces) the authentication method for `did`.
+    pub fn register_did(&mut self, did: &str, method: AuthMethod) {
+        self.registered.insert(did.to_string(), method);
+    }
+
+    /// Returns the number of registered DIDs.
+    pub fn registered_did_count(&self) -> usize {
+        self.registered.len()
+    }
+
+    // ── Challenge issuance ────────────────────────────────────────────────────
+
+    /// Issues a new authentication challenge for `did`.
+    ///
+    /// Fails with [`AuthenticationError::UnknownDid`] when the DID is not
+    /// registered, or with [`AuthenticationError::UnsupportedMethod`] when the
+    /// active-challenge limit has been reached.
+    ///
+    /// # Parameters
+    /// * `did`    – the DID requesting authentication.
+    /// * `now_ms` – current Unix timestamp in milliseconds.
+    pub fn issue_challenge(
+        &mut self,
+        did: &str,
+        now_ms: u64,
+    ) -> Result<AuthChallenge, AuthenticationError> {
+        if !self.registered.contains_key(did) {
+            return Err(AuthenticationError::UnknownDid(did.to_string()));
+        }
+
+        if self.active_challenges.len() >= self.config.max_active_challenges {
+            return Err(AuthenticationError::UnsupportedMethod(
+                "max active challenges reached".to_string(),
+            ));
+        }
+
+        // Fresh 32-byte challenge from the OS CSPRNG (unpredictable, non-replayable).
+        // Sourced from oxicrypto-rand (→ getrandom); fails closed if the OS
+        // entropy source is unavailable rather than issuing a weak challenge.
+        let seq = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        let challenge_bytes: Vec<u8> = oxicrypto_rand::random_bytes(32)
+            .map_err(|e| AuthenticationError::Internal(format!("OS entropy source failed: {e}")))?;
+
+        let challenge_id = format!("chg-{did}-{seq}");
+        let challenge = AuthChallenge {
+            challenge_id: challenge_id.clone(),
+            challenge_bytes,
+            issued_at: now_ms,
+            expires_at: now_ms + self.config.challenge_ttl_ms,
+            did: did.to_string(),
+        };
+
+        self.active_challenges
+            .insert(challenge_id, challenge.clone());
+        Ok(challenge)
+    }
+
+    // ── Response verification ─────────────────────────────────────────────────
+
+    /// Verifies an [`AuthResponse`] against its corresponding challenge.
+    ///
+    /// Returns a [`VerificationResult`] indicating success or the reason for
+    /// failure.  Never returns `Err` — all error paths are represented in
+    /// `VerificationResult::error`.
+    ///
+    /// # Single-use challenges (replay protection)
+    /// The matched challenge is **consumed** (removed from `active_challenges`)
+    /// on the very first verification attempt, regardless of whether that
+    /// attempt succeeds or fails. A challenge nonce is therefore usable for at
+    /// most one `verify_response` call: replaying a previously-valid
+    /// `(challenge_id, signature)` pair a second time fails with
+    /// "challenge not found". This upholds the single-use-nonce property of the
+    /// challenge-response protocol; without it a captured valid response would
+    /// remain replayable until the challenge's TTL naturally elapsed.
+    ///
+    /// # Verification contract
+    /// The response is accepted only when `response.signature` is a valid
+    /// cryptographic signature over `challenge.challenge_bytes` under the public
+    /// key registered for the DID (see [`verify_signature_over_challenge`]).
+    pub fn verify_response(&mut self, response: &AuthResponse, now_ms: u64) -> VerificationResult {
+        // Look up AND consume the active challenge. Removing it up front makes
+        // every issued challenge single-use: a captured valid response cannot be
+        // replayed because the challenge is gone after the first attempt.
+        let challenge = match self.active_challenges.remove(&response.challenge_id) {
+            Some(c) => c,
+            None => {
+                return VerificationResult {
+                    verified: false,
+                    did: response.did.clone(),
+                    method_type: response.method.type_label().to_string(),
+                    error: Some(format!("challenge not found: {}", response.challenge_id)),
+                };
+            }
+        };
+
+        // Ensure the challenge belongs to this DID.
+        if challenge.did != response.did {
+            return VerificationResult {
+                verified: false,
+                did: response.did.clone(),
+                method_type: response.method.type_label().to_string(),
+                error: Some("DID mismatch in challenge".to_string()),
+            };
+        }
+
+        // Check expiry.
+        if now_ms > challenge.expires_at {
+            return VerificationResult {
+                verified: false,
+                did: response.did.clone(),
+                method_type: response.method.type_label().to_string(),
+                error: Some(format!("challenge expired at {}", challenge.expires_at)),
+            };
+        }
+
+        // Verify the DID is registered and fetch its registered method (the
+        // signature is checked against the REGISTERED key, never against a
+        // key supplied in the attacker-controlled response).
+        let registered_method = match self.registered.get(&response.did) {
+            Some(m) => m,
+            None => {
+                return VerificationResult {
+                    verified: false,
+                    did: response.did.clone(),
+                    method_type: response.method.type_label().to_string(),
+                    error: Some(format!("DID not registered: {}", response.did)),
+                };
+            }
+        };
+
+        // Real cryptographic signature verification over the challenge bytes.
+        match verify_signature_over_challenge(
+            registered_method,
+            &challenge.challenge_bytes,
+            &response.signature,
+        ) {
+            Ok(true) => VerificationResult {
+                verified: true,
+                did: response.did.clone(),
+                method_type: registered_method.type_label().to_string(),
+                error: None,
+            },
+            Ok(false) => VerificationResult {
+                verified: false,
+                did: response.did.clone(),
+                method_type: registered_method.type_label().to_string(),
+                error: Some("signature verification failed".to_string()),
+            },
+            Err(msg) => VerificationResult {
+                verified: false,
+                did: response.did.clone(),
+                method_type: registered_method.type_label().to_string(),
+                error: Some(msg),
+            },
+        }
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    /// Returns the number of currently active (not yet expired or consumed)
+    /// challenges.
+    pub fn active_challenges(&self) -> usize {
+        self.active_challenges.len()
+    }
+
+    /// Removes all challenges whose `expires_at` is strictly less than
+    /// `now_ms`.  Returns the number removed.
+    pub fn purge_expired(&mut self, now_ms: u64) -> usize {
+        let before = self.active_challenges.len();
+        self.active_challenges.retain(|_, c| c.expires_at >= now_ms);
+        before - self.active_challenges.len()
+    }
+}
+
+/// Verify a `signature` over `challenge_bytes` under the public key carried by
+/// `method`.
+///
+/// Returns `Ok(true)` on a valid signature, `Ok(false)` on a well-formed but
+/// invalid signature, and `Err(msg)` when the method/key material cannot be
+/// used for verification (e.g. unsupported method type or malformed key).
+///
+/// Only Ed25519 is cryptographically verifiable here: the public key must be a
+/// 32-byte value hex-encoded in [`AuthMethod::Ed25519`], and the signature must
+/// be 64 bytes. Secp256k1/RSA/X25519 are not verifiable in this crate and are
+/// rejected explicitly instead of being accepted.
+pub fn verify_signature_over_challenge(
+    method: &AuthMethod,
+    challenge_bytes: &[u8],
+    signature: &[u8],
+) -> Result<bool, String> {
+    match method {
+        AuthMethod::Ed25519(pk_hex) => {
+            let pk = hex::decode(pk_hex.trim())
+                .map_err(|e| format!("invalid Ed25519 public key hex: {e}"))?;
+            if pk.len() != 32 {
+                return Err(format!(
+                    "Ed25519 public key must be 32 bytes, got {}",
+                    pk.len()
+                ));
+            }
+            if signature.len() != 64 {
+                // Wrong-length signature is a plain verification failure.
+                return Ok(false);
+            }
+            crate::proof::ed25519::verify_ed25519(&pk, challenge_bytes, signature)
+                .map_err(|e| e.to_string())
+        }
+        AuthMethod::Secp256k1(_) | AuthMethod::RSA(_) | AuthMethod::X25519(_) => Err(format!(
+            "signature verification for {} authentication methods is not supported",
+            method.type_label()
+        )),
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> AuthenticatorConfig {
+        AuthenticatorConfig {
+            challenge_ttl_ms: 60_000,
+            max_active_challenges: 10,
+        }
+    }
+
+    fn make_auth() -> Authenticator {
+        Authenticator::new(default_config())
+    }
+
+    /// Build a real Ed25519 identity: returns (hex public key, signer) where the
+    /// signer can produce a valid signature over the challenge bytes.
+    fn ed25519_identity(seed_byte: u8) -> (String, crate::proof::ed25519::Ed25519Signer) {
+        let signer = crate::proof::ed25519::Ed25519Signer::from_bytes(&[seed_byte; 32])
+            .expect("valid 32-byte seed");
+        let pk_hex = hex::encode(signer.public_key_bytes());
+        (pk_hex, signer)
+    }
+
+    // ── registration ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_register_single_did() {
+        let mut auth = make_auth();
+        auth.register_did(
+            "did:example:alice",
+            AuthMethod::Ed25519("pubkey1".to_string()),
+        );
+        assert_eq!(auth.registered_did_count(), 1);
+    }
+
+    #[test]
+    fn test_register_multiple_dids() {
+        let mut auth = make_auth();
+        auth.register_did("did:example:alice", AuthMethod::Ed25519("k1".to_string()));
+        auth.register_did("did:example:bob", AuthMethod::Secp256k1("k2".to_string()));
+        auth.register_did("did:example:carol", AuthMethod::RSA("k3".to_string()));
+        assert_eq!(auth.registered_did_count(), 3);
+    }
+
+    #[test]
+    fn test_register_replaces_existing_method() {
+        let mut auth = make_auth();
+        auth.register_did("did:example:alice", AuthMethod::Ed25519("old".to_string()));
+        auth.register_did("did:example:alice", AuthMethod::RSA("new".to_string()));
+        assert_eq!(auth.registered_did_count(), 1);
+    }
+
+    // ── challenge issuance ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_issue_challenge_for_registered_did() {
+        let mut auth = make_auth();
+        auth.register_did("did:example:alice", AuthMethod::Ed25519("k".to_string()));
+        let ch = auth
+            .issue_challenge("did:example:alice", 1000)
+            .expect("challenge");
+        assert_eq!(ch.did, "did:example:alice");
+        assert_eq!(ch.issued_at, 1000);
+        assert_eq!(ch.expires_at, 61_000);
+        assert_eq!(ch.challenge_bytes.len(), 32);
+    }
+
+    #[test]
+    fn test_issue_challenge_for_unknown_did_fails() {
+        let mut auth = make_auth();
+        let err = auth
+            .issue_challenge("did:example:unknown", 1000)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AuthenticationError::UnknownDid("did:example:unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_challenge_increments_active_count() {
+        let mut auth = make_auth();
+        auth.register_did("did:example:alice", AuthMethod::Ed25519("k".to_string()));
+        auth.issue_challenge("did:example:alice", 0).expect("1");
+        auth.issue_challenge("did:example:alice", 0).expect("2");
+        assert_eq!(auth.active_challenges(), 2);
+    }
+
+    #[test]
+    fn test_challenge_bytes_are_csprng_unpredictable() {
+        // Challenges are drawn from the OS CSPRNG, so two authenticators (or two
+        // calls) practically never produce identical challenge bytes.
+        let mut a1 = make_auth();
+        let mut a2 = make_auth();
+        let did = "did:example:alice";
+        a1.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        a2.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        let c1 = a1.issue_challenge(did, 0).expect("c1");
+        let c2 = a2.issue_challenge(did, 0).expect("c2");
+        assert_ne!(c1.challenge_bytes, c2.challenge_bytes);
+        assert_eq!(c1.challenge_bytes.len(), 32);
+    }
+
+    #[test]
+    fn test_challenge_bytes_differ_between_calls() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        let c1 = auth.issue_challenge(did, 0).expect("c1");
+        let c2 = auth.issue_challenge(did, 0).expect("c2");
+        assert_ne!(c1.challenge_bytes, c2.challenge_bytes);
+    }
+
+    #[test]
+    fn test_max_active_challenges_limit() {
+        let mut auth = Authenticator::new(AuthenticatorConfig {
+            challenge_ttl_ms: 60_000,
+            max_active_challenges: 2,
+        });
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        auth.issue_challenge(did, 0).expect("1");
+        auth.issue_challenge(did, 0).expect("2");
+        let err = auth.issue_challenge(did, 0).unwrap_err();
+        match err {
+            AuthenticationError::UnsupportedMethod(msg) => {
+                assert!(msg.contains("max active challenges"))
+            }
+            _ => panic!("expected UnsupportedMethod"),
+        }
+    }
+
+    // ── verify response ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_valid_response() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        let (pk_hex, signer) = ed25519_identity(7);
+        auth.register_did(did, AuthMethod::Ed25519(pk_hex.clone()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: signer.sign(&ch.challenge_bytes),
+            method: AuthMethod::Ed25519(pk_hex),
+        };
+
+        let result = auth.verify_response(&response, 2000);
+        assert!(result.verified);
+        assert!(result.error.is_none());
+        assert_eq!(result.did, did);
+    }
+
+    #[test]
+    fn test_verify_forged_signature_rejected() {
+        // An attacker who only knows the (public) challenge bytes cannot forge a
+        // valid response: echoing the challenge as the "signature" fails.
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        let (pk_hex, _signer) = ed25519_identity(11);
+        auth.register_did(did, AuthMethod::Ed25519(pk_hex.clone()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let forged = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: ch.challenge_bytes.clone(), // the old bypass
+            method: AuthMethod::Ed25519(pk_hex),
+        };
+        assert!(!auth.verify_response(&forged, 2000).verified);
+    }
+
+    #[test]
+    fn test_verify_tampered_signature_rejected() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        let (pk_hex, signer) = ed25519_identity(9);
+        auth.register_did(did, AuthMethod::Ed25519(pk_hex.clone()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let mut sig = signer.sign(&ch.challenge_bytes);
+        sig[0] ^= 0xFF; // flip one bit of a valid signature
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: sig,
+            method: AuthMethod::Ed25519(pk_hex),
+        };
+        assert!(!auth.verify_response(&response, 2000).verified);
+    }
+
+    #[test]
+    fn test_verify_signature_over_wrong_challenge_rejected() {
+        // A valid signature over a DIFFERENT challenge does not authenticate.
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        let (pk_hex, signer) = ed25519_identity(5);
+        auth.register_did(did, AuthMethod::Ed25519(pk_hex.clone()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: signer.sign(b"some other message"),
+            method: AuthMethod::Ed25519(pk_hex),
+        };
+        assert!(!auth.verify_response(&response, 2000).verified);
+    }
+
+    #[test]
+    fn test_verify_wrong_signature_fails() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("pk".to_string()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: vec![0xFF; 32],
+            method: AuthMethod::Ed25519("pk".to_string()),
+        };
+
+        let result = auth.verify_response(&response, 2000);
+        assert!(!result.verified);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn test_verify_expired_challenge_fails() {
+        let mut auth = Authenticator::new(AuthenticatorConfig {
+            challenge_ttl_ms: 1_000,
+            max_active_challenges: 10,
+        });
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("pk".to_string()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: ch.challenge_bytes.clone(),
+            method: AuthMethod::Ed25519("pk".to_string()),
+        };
+
+        // now_ms = issued_at + ttl + 1 → expired
+        let result = auth.verify_response(&response, 1000 + 1_000 + 1);
+        assert!(!result.verified);
+        assert!(result.error.unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn test_verify_unknown_challenge_id_fails() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("pk".to_string()));
+
+        let response = AuthResponse {
+            challenge_id: "non-existent-id".to_string(),
+            did: did.to_string(),
+            signature: vec![0u8; 32],
+            method: AuthMethod::Ed25519("pk".to_string()),
+        };
+
+        let result = auth.verify_response(&response, 1000);
+        assert!(!result.verified);
+    }
+
+    #[test]
+    fn test_verify_wrong_did_fails() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("pk".to_string()));
+        auth.register_did("did:example:bob", AuthMethod::Ed25519("pk2".to_string()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: "did:example:bob".to_string(), // wrong DID
+            signature: ch.challenge_bytes.clone(),
+            method: AuthMethod::Ed25519("pk2".to_string()),
+        };
+
+        let result = auth.verify_response(&response, 2000);
+        assert!(!result.verified);
+    }
+
+    #[test]
+    fn test_verify_registered_did_with_real_signature_passes() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        let (pk_hex, signer) = ed25519_identity(3);
+        auth.register_did(did, AuthMethod::Ed25519(pk_hex.clone()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: signer.sign(&ch.challenge_bytes),
+            method: AuthMethod::Ed25519(pk_hex),
+        };
+
+        // DID registered + challenge exists + valid signature → passes.
+        let result = auth.verify_response(&response, 2000);
+        assert!(result.verified);
+    }
+
+    #[test]
+    fn regression_challenge_single_use_prevents_replay() {
+        // A valid response must verify exactly once. A second verify_response
+        // with the SAME (challenge_id, signature) pair must fail because the
+        // challenge is consumed on first use (replay protection).
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        let (pk_hex, signer) = ed25519_identity(31);
+        auth.register_did(did, AuthMethod::Ed25519(pk_hex.clone()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: signer.sign(&ch.challenge_bytes),
+            method: AuthMethod::Ed25519(pk_hex),
+        };
+
+        // First attempt: valid.
+        let first = auth.verify_response(&response, 2000);
+        assert!(first.verified, "first use of a valid response must verify");
+        assert_eq!(auth.active_challenges(), 0, "challenge must be consumed");
+
+        // Second attempt (replay): rejected — challenge no longer exists.
+        let second = auth.verify_response(&response, 2000);
+        assert!(!second.verified, "replayed response must be rejected");
+        assert!(second
+            .error
+            .expect("error present")
+            .contains("challenge not found"));
+    }
+
+    #[test]
+    fn regression_challenge_consumed_even_on_failed_attempt() {
+        // Even a FAILED verification consumes the challenge, so an attacker
+        // cannot brute-force signatures against a single live challenge.
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        let (pk_hex, signer) = ed25519_identity(41);
+        auth.register_did(did, AuthMethod::Ed25519(pk_hex.clone()));
+        let ch = auth.issue_challenge(did, 1000).expect("challenge");
+
+        // First attempt: wrong (forged) signature → fails.
+        let forged = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: vec![0u8; 64],
+            method: AuthMethod::Ed25519(pk_hex.clone()),
+        };
+        assert!(!auth.verify_response(&forged, 2000).verified);
+        assert_eq!(auth.active_challenges(), 0, "challenge consumed on failure");
+
+        // Now even the CORRECT signature cannot reuse the spent challenge.
+        let correct = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: signer.sign(&ch.challenge_bytes),
+            method: AuthMethod::Ed25519(pk_hex),
+        };
+        assert!(!auth.verify_response(&correct, 2000).verified);
+    }
+
+    // ── purge expired ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_purge_expired_removes_old_challenges() {
+        let mut auth = Authenticator::new(AuthenticatorConfig {
+            challenge_ttl_ms: 1_000,
+            max_active_challenges: 10,
+        });
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+
+        // Issue at t=0 (expires at 1000)
+        auth.issue_challenge(did, 0).expect("c1");
+        // Issue at t=500 (expires at 1500)
+        auth.issue_challenge(did, 500).expect("c2");
+
+        assert_eq!(auth.active_challenges(), 2);
+
+        // Purge at t=1001 → first challenge expired
+        let removed = auth.purge_expired(1001);
+        assert_eq!(removed, 1);
+        assert_eq!(auth.active_challenges(), 1);
+    }
+
+    #[test]
+    fn test_purge_expired_removes_all_when_all_expired() {
+        let mut auth = Authenticator::new(AuthenticatorConfig {
+            challenge_ttl_ms: 500,
+            max_active_challenges: 10,
+        });
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        auth.issue_challenge(did, 0).expect("c1");
+        auth.issue_challenge(did, 0).expect("c2");
+        auth.issue_challenge(did, 0).expect("c3");
+
+        let removed = auth.purge_expired(1_000);
+        assert_eq!(removed, 3);
+        assert_eq!(auth.active_challenges(), 0);
+    }
+
+    #[test]
+    fn test_purge_expired_keeps_valid_challenges() {
+        let mut auth = Authenticator::new(AuthenticatorConfig {
+            challenge_ttl_ms: 10_000,
+            max_active_challenges: 10,
+        });
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        auth.issue_challenge(did, 5_000).expect("c1");
+        auth.issue_challenge(did, 5_000).expect("c2");
+
+        let removed = auth.purge_expired(1_000);
+        assert_eq!(removed, 0);
+        assert_eq!(auth.active_challenges(), 2);
+    }
+
+    #[test]
+    fn test_purge_returns_zero_when_nothing_expired() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        auth.issue_challenge(did, 10_000).expect("c");
+
+        let removed = auth.purge_expired(5_000);
+        assert_eq!(removed, 0);
+    }
+
+    // ── challenge TTL edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn test_challenge_ttl_exact_boundary_valid() {
+        let ttl = 5_000u64;
+        let mut auth = Authenticator::new(AuthenticatorConfig {
+            challenge_ttl_ms: ttl,
+            max_active_challenges: 10,
+        });
+        let did = "did:example:alice";
+        let (pk_hex, signer) = ed25519_identity(21);
+        auth.register_did(did, AuthMethod::Ed25519(pk_hex.clone()));
+        let ch = auth.issue_challenge(did, 1000).expect("ch");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: signer.sign(&ch.challenge_bytes),
+            method: AuthMethod::Ed25519(pk_hex),
+        };
+
+        // Exactly at expires_at should still be valid (not strictly greater)
+        let result = auth.verify_response(&response, 1000 + ttl);
+        assert!(result.verified, "boundary should be valid");
+    }
+
+    #[test]
+    fn test_challenge_ttl_one_ms_over_invalid() {
+        let ttl = 5_000u64;
+        let mut auth = Authenticator::new(AuthenticatorConfig {
+            challenge_ttl_ms: ttl,
+            max_active_challenges: 10,
+        });
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        let ch = auth.issue_challenge(did, 1000).expect("ch");
+
+        let response = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: ch.challenge_bytes.clone(),
+            method: AuthMethod::Ed25519("k".to_string()),
+        };
+
+        let result = auth.verify_response(&response, 1000 + ttl + 1);
+        assert!(!result.verified);
+    }
+
+    // ── each auth method type ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_auth_method_ed25519_label() {
+        let m = AuthMethod::Ed25519("pk".to_string());
+        assert_eq!(m.type_label(), "Ed25519");
+        assert_eq!(m.public_key(), "pk");
+    }
+
+    #[test]
+    fn test_auth_method_secp256k1_label() {
+        let m = AuthMethod::Secp256k1("04abcd".to_string());
+        assert_eq!(m.type_label(), "Secp256k1");
+        assert_eq!(m.public_key(), "04abcd");
+    }
+
+    #[test]
+    fn test_auth_method_rsa_label() {
+        let m = AuthMethod::RSA("MIIB...".to_string());
+        assert_eq!(m.type_label(), "RSA");
+        assert_eq!(m.public_key(), "MIIB...");
+    }
+
+    #[test]
+    fn test_auth_method_x25519_label() {
+        let m = AuthMethod::X25519("xkey123".to_string());
+        assert_eq!(m.type_label(), "X25519");
+        assert_eq!(m.public_key(), "xkey123");
+    }
+
+    #[test]
+    fn test_register_ed25519_and_issue_challenge() {
+        let mut auth = make_auth();
+        auth.register_did("did:key:ed25519", AuthMethod::Ed25519("edpk".to_string()));
+        let ch = auth.issue_challenge("did:key:ed25519", 0).expect("ch");
+        assert_eq!(ch.did, "did:key:ed25519");
+    }
+
+    #[test]
+    fn test_register_secp256k1_verification_unsupported() {
+        // Secp256k1 is not cryptographically verifiable in this crate: it must
+        // be rejected explicitly, never silently accepted.
+        let mut auth = make_auth();
+        let did = "did:ethr:0xabc";
+        auth.register_did(did, AuthMethod::Secp256k1("04key".to_string()));
+        let ch = auth.issue_challenge(did, 0).expect("ch");
+        let resp = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: ch.challenge_bytes.clone(),
+            method: AuthMethod::Secp256k1("04key".to_string()),
+        };
+        let result = auth.verify_response(&resp, 100);
+        assert!(!result.verified);
+        assert!(result.error.unwrap().contains("not supported"));
+    }
+
+    #[test]
+    fn test_register_rsa_verification_unsupported() {
+        let mut auth = make_auth();
+        let did = "did:web:example.com";
+        auth.register_did(did, AuthMethod::RSA("rsapub".to_string()));
+        let ch = auth.issue_challenge(did, 0).expect("ch");
+        let resp = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: ch.challenge_bytes.clone(),
+            method: AuthMethod::RSA("rsapub".to_string()),
+        };
+        let result = auth.verify_response(&resp, 100);
+        assert!(!result.verified);
+        assert_eq!(result.method_type, "RSA");
+    }
+
+    #[test]
+    fn test_register_x25519_verification_unsupported() {
+        // X25519 is a key-agreement key, not a signing key.
+        let mut auth = make_auth();
+        let did = "did:key:x25519";
+        auth.register_did(did, AuthMethod::X25519("x25519pk".to_string()));
+        let ch = auth.issue_challenge(did, 0).expect("ch");
+        let resp = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: ch.challenge_bytes.clone(),
+            method: AuthMethod::X25519("x25519pk".to_string()),
+        };
+        let result = auth.verify_response(&resp, 100);
+        assert!(!result.verified);
+        assert_eq!(result.method_type, "X25519");
+    }
+
+    // ── error display ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_error_display_challenge_expired() {
+        let e = AuthenticationError::ChallengeExpired("chg-1".to_string());
+        assert!(e.to_string().contains("chg-1"));
+    }
+
+    #[test]
+    fn test_error_display_invalid_signature() {
+        let e = AuthenticationError::InvalidSignature;
+        assert!(e.to_string().contains("invalid signature"));
+    }
+
+    #[test]
+    fn test_error_display_unknown_did() {
+        let e = AuthenticationError::UnknownDid("did:x:y".to_string());
+        assert!(e.to_string().contains("did:x:y"));
+    }
+
+    #[test]
+    fn test_error_display_unsupported_method() {
+        let e = AuthenticationError::UnsupportedMethod("ECDSA-P384".to_string());
+        assert!(e.to_string().contains("ECDSA-P384"));
+    }
+
+    #[test]
+    fn test_error_display_challenge_mismatch() {
+        let e = AuthenticationError::ChallengeMismatch;
+        assert!(e.to_string().contains("mismatch"));
+    }
+
+    // ── method equality ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_auth_method_equality() {
+        let m1 = AuthMethod::Ed25519("same".to_string());
+        let m2 = AuthMethod::Ed25519("same".to_string());
+        let m3 = AuthMethod::Ed25519("different".to_string());
+        assert_eq!(m1, m2);
+        assert_ne!(m1, m3);
+    }
+
+    #[test]
+    fn test_auth_method_cross_type_inequality() {
+        let m1 = AuthMethod::Ed25519("k".to_string());
+        let m2 = AuthMethod::Secp256k1("k".to_string());
+        assert_ne!(m1, m2);
+    }
+
+    // ── sequence counter ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_challenge_ids_are_unique() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        let c1 = auth.issue_challenge(did, 0).expect("c1");
+        let c2 = auth.issue_challenge(did, 0).expect("c2");
+        let c3 = auth.issue_challenge(did, 0).expect("c3");
+        assert_ne!(c1.challenge_id, c2.challenge_id);
+        assert_ne!(c2.challenge_id, c3.challenge_id);
+        assert_ne!(c1.challenge_id, c3.challenge_id);
+    }
+
+    // ── default config ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_default_config_values() {
+        let cfg = AuthenticatorConfig::default();
+        assert_eq!(cfg.challenge_ttl_ms, 30_000);
+        assert_eq!(cfg.max_active_challenges, 1_000);
+    }
+
+    // ── verification result fields ────────────────────────────────────────────
+
+    #[test]
+    fn test_verification_result_method_type_on_failure() {
+        let mut auth = make_auth();
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::RSA("rsa-pub".to_string()));
+        let ch = auth.issue_challenge(did, 0).expect("ch");
+
+        let resp = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: vec![0x00; 32], // wrong signature
+            method: AuthMethod::RSA("rsa-pub".to_string()),
+        };
+        let result = auth.verify_response(&resp, 100);
+        assert!(!result.verified);
+        assert_eq!(result.method_type, "RSA");
+    }
+
+    #[test]
+    fn test_multiple_dids_independent_challenges() {
+        let mut auth = make_auth();
+        let (pk_a, signer_a) = ed25519_identity(1);
+        let (pk_b, signer_b) = ed25519_identity(2);
+        auth.register_did("did:a", AuthMethod::Ed25519(pk_a.clone()));
+        auth.register_did("did:b", AuthMethod::Ed25519(pk_b.clone()));
+
+        let ca = auth.issue_challenge("did:a", 0).expect("ca");
+        let cb = auth.issue_challenge("did:b", 0).expect("cb");
+
+        let ra = AuthResponse {
+            challenge_id: ca.challenge_id.clone(),
+            did: "did:a".to_string(),
+            signature: signer_a.sign(&ca.challenge_bytes),
+            method: AuthMethod::Ed25519(pk_a),
+        };
+        let rb = AuthResponse {
+            challenge_id: cb.challenge_id.clone(),
+            did: "did:b".to_string(),
+            signature: signer_b.sign(&cb.challenge_bytes),
+            method: AuthMethod::Ed25519(pk_b),
+        };
+
+        assert!(auth.verify_response(&ra, 1000).verified);
+        assert!(auth.verify_response(&rb, 1000).verified);
+        // Cross-use: did:a's signature over did:b's challenge must fail.
+        let cross = AuthResponse {
+            challenge_id: cb.challenge_id.clone(),
+            did: "did:b".to_string(),
+            signature: ra.signature.clone(),
+            method: AuthMethod::Ed25519("".to_string()),
+        };
+        assert!(!auth.verify_response(&cross, 1000).verified);
+    }
+
+    #[test]
+    fn test_purge_then_issue_within_limit() {
+        let mut auth = Authenticator::new(AuthenticatorConfig {
+            challenge_ttl_ms: 1_000,
+            max_active_challenges: 2,
+        });
+        let did = "did:example:alice";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        auth.issue_challenge(did, 0).expect("c1");
+        auth.issue_challenge(did, 0).expect("c2");
+        // At limit; purge expired challenges
+        auth.purge_expired(2_000);
+        // Now we can issue again
+        auth.issue_challenge(did, 2_500).expect("c3");
+        assert_eq!(auth.active_challenges(), 1);
+    }
+
+    #[test]
+    fn test_zero_challenges_active_initially() {
+        let auth = make_auth();
+        assert_eq!(auth.active_challenges(), 0);
+    }
+
+    #[test]
+    fn test_verify_response_did_field_propagated() {
+        let mut auth = make_auth();
+        let did = "did:example:charlie";
+        auth.register_did(did, AuthMethod::Ed25519("k".to_string()));
+        let ch = auth.issue_challenge(did, 0).expect("ch");
+
+        let resp = AuthResponse {
+            challenge_id: ch.challenge_id.clone(),
+            did: did.to_string(),
+            signature: ch.challenge_bytes.clone(),
+            method: AuthMethod::Ed25519("k".to_string()),
+        };
+        let result = auth.verify_response(&resp, 100);
+        assert_eq!(result.did, did);
+    }
+}

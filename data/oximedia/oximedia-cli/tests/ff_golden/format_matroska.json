@@ -1,0 +1,9 @@
+{
+  "name": "format_matroska",
+  "args": ["-i", "in.mkv", "-f", "matroska", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "format": "matroska"
+  }
+}

@@ -1,0 +1,146 @@
+[package]
+name = "scirs2-io"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Input/Output utilities module for SciRS2 (scirs2-io)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["io", "serialization", "data", "scientific", "scipy"]
+categories = ["science", "encoding"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-machete]
+# kamadak-exif's lib name is `exif` (machete misses the rename)
+ignored = ["kamadak-exif"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["parallel", "simd", "gpu", "array", "random"] }
+byteorder = { workspace = true }
+image = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+oxicode = { workspace = true }  # Binary serialization (SIMD-optimized)
+rmp-serde = { workspace = true }
+oxiarc-archive = { workspace = true }  # Pure Rust compression (COOLJAPAN Policy)
+# Pure Rust compression libraries (COOLJAPAN Policy)
+oxiarc-deflate = { workspace = true }
+oxiarc-lz4 = { workspace = true }
+oxiarc-zstd = { workspace = true }
+sha2 = { workspace = true }
+crc32fast = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+tempfile = { workspace = true }
+regex = { workspace = true }
+netcdf3 = { workspace = true }
+kamadak-exif = { workspace = true, optional = true }
+# Pure-Rust HDF5 (COOLJAPAN Pure Rust Policy). Non-optional: HDF5 support is
+# unconditional now that no C library is linked.
+oxih5 = { workspace = true }
+oxih5-core = { workspace = true }
+# rayon = { workspace = true }  # Now use scirs2-core parallel abstractions
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["fs", "io-util", "time", "rt", "rt-multi-thread"] }
+futures = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+reqwest = { workspace = true, optional = true }
+# Pure-Rust rustls CryptoProvider (OxiTLS, `oxitls-rustcrypto-provider` resolved under the
+# `rustls-rustcrypto` name -- see the "PURE RUST BLOCKER (reqwest)" note in the workspace root
+# Cargo.toml). Installed as the process-default provider by src/tls.rs right before every eager
+# reqwest client construction, unless the application already installed a provider of its own.
+rustls = { workspace = true, optional = true }
+rustls-rustcrypto = { workspace = true, optional = true }
+num_cpus = { workspace = true }
+statrs = { workspace = true }
+indexmap = { workspace = true, features = ["serde"] }
+# Apache Arrow and Parquet support
+arrow = { workspace = true, optional = true }
+parquet = { workspace = true, default-features = false, optional = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+crossbeam-channel = { workspace = true }
+cron = { workspace = true }
+oxiarc-snappy = { workspace = true }  # Pure Rust Snappy (COOLJAPAN Policy)
+oxiarc-brotli = { workspace = true }  # Pure Rust Brotli (COOLJAPAN Policy)
+# Pure-Rust SQLite-compatible backend (noffi migration; rusqlite removed per COOLJAPAN Policy)
+oxisql-core = { workspace = true, optional = true }
+oxisql-sqlite-compat = { workspace = true, optional = true }
+# sqlx removed - postgres/mysql implementations are stubs only
+# mongodb removed - stub only, no actual crate usage
+# redis removed - stub only, no actual crate usage
+# Real-time streaming
+tokio-tungstenite = { workspace = true, optional = true }
+rumqttc = { workspace = true, optional = true }
+eventsource-client = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+# prost removed - not used in any source file
+url = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+
+[features]
+default = ["csv", "compression", "validation", "image_io"]
+image_io = ["dep:image", "dep:kamadak-exif"]
+csv = []
+# Default compression uses 100% Pure Rust libraries (COOLJAPAN Policy)
+compression = []
+validation = []
+# No-op alias. HDF5 support is now unconditional (pure-Rust oxih5, no C library),
+# so this gates nothing. Retained for one release so downstream manifests that list
+# `features = ["hdf5"]` keep resolving; remove in the release after this one.
+hdf5 = []
+parquet = ["dep:parquet", "dep:arrow"]
+async = ["dep:tokio", "dep:futures", "dep:futures-util", "dep:async-trait"]
+reqwest = ["dep:reqwest", "dep:log", "dep:rustls", "dep:rustls-rustcrypto", "async"]  # HTTP client; pulls `async` because HttpClient/NetworkClient download/upload are async fns gated on the async feature (reqwest alone fails to compile: E0599 on HttpClient::download/upload); rustls + rustls-rustcrypto: OxiTLS provider auto-installed by src/tls.rs
+aws-sdk-s3 = []
+google-cloud-storage = []
+azure-storage-blobs = []
+# GPU compression uses Pure Rust oxiarc-* compression (COOLJAPAN Policy)
+gpu = []
+exif = ["image_io"]
+# Database features — pure Rust via oxisql-sqlite-compat (COOLJAPAN Policy, rusqlite removed)
+sqlite = ["dep:oxisql-core", "dep:oxisql-sqlite-compat", "dep:tokio"]
+# sqlite-stable is now an alias for sqlite (rusqlite removed)
+sqlite-stable = ["sqlite"]
+postgres = ["async"]  # Stub implementation only (no actual sqlx dependency)
+mysql = ["async"]     # Stub implementation only (no actual sqlx dependency)
+mongodb = ["async"]   # Stub feature (no actual mongodb crate dependency)
+redis = []            # Stub feature (no actual redis crate dependency)
+database = ["sqlite", "postgres", "mysql"]
+database-full = ["database"]  # Full database support
+# Real-time streaming features
+websocket = ["dep:tokio-tungstenite", "async"]
+mqtt = ["dep:rumqttc", "async"]
+sse = ["dep:eventsource-client", "async", "reqwest"]
+grpc = ["dep:tonic", "async"]
+realtime = ["websocket", "mqtt", "sse", "grpc"]
+all = ["csv", "compression", "validation", "image_io", "hdf5", "async", "reqwest", "aws-sdk-s3", "google-cloud-storage", "azure-storage-blobs", "gpu", "exif", "database", "mongodb", "redis", "realtime"]
+
+[[example]]
+name = "hdf5_example"
+path = "examples/hdf5_example.rs"
+
+[[example]]
+name = "async_io_example"
+path = "examples/async_io_example.rs"
+required-features = ["async"]
+
+[[example]]
+name = "network_cloud_example"
+path = "examples/network_cloud_example.rs"
+required-features = ["async", "reqwest"]

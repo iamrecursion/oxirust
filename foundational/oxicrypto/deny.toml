@@ -1,0 +1,27 @@
+[bans]
+deny = [
+    # `ring` stays banned everywhere except as a *direct dev-dependency* of
+    # oxicrypto-bench, which benchmarks oxicrypto's AEAD/hash primitives
+    # against RustCrypto's `ring`-backed baselines. It never reaches any
+    # non-dev, non-benchmark build.
+    { name = "ring", wrappers = ["oxicrypto-bench"], reason = "dev-only benchmark baseline in oxicrypto-bench; never a production/runtime dependency" },
+    { name = "aws-lc-rs" },
+    { name = "openssl-sys" },
+    { name = "openssl" },
+    { name = "native-tls" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "MIT-0",
+]
+confidence-threshold = 0.8

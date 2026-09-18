@@ -1,0 +1,8 @@
+Name,Age,Height,Weight
+Alice,25,168.5,55.2
+Bob,32,175.0,72.8
+Charlie,41,182.3,90.5
+Diana,28,162.0,50.3
+# This is a comment line that should be ignored
+Eve,36,170.1,63.7
+Frank,45,178.9,88.2

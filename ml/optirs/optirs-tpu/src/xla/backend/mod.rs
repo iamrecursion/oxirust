@@ -1,0 +1,194 @@
+use std::fmt::Debug;
+// XLA backend components
+//
+// This module contains the backend components for XLA compilation,
+// including code generation, runtime integration, and profiling integration.
+
+pub mod code_generation;
+pub mod profiling_integration;
+pub mod runtime_integration;
+
+use scirs2_core::numeric::Float;
+use std::collections::HashMap;
+
+use super::frontend::XLAComputation;
+use super::optimization::MemoryPlan;
+use super::TPUConfig;
+use crate::error::Result;
+
+pub use code_generation::*;
+pub use profiling_integration::*;
+pub use runtime_integration::*;
+
+/// XLA backend system for code generation and runtime integration
+pub struct XLABackend<T: Float + Debug + Send + Sync + 'static> {
+    /// Code generator
+    code_generator: TPUCodeGenerator<T>,
+
+    /// Runtime integration manager
+    runtime_manager: RuntimeIntegration,
+
+    /// Profiling integration
+    profiling_manager: ProfilingIntegration<T>,
+
+    /// Backend configuration
+    config: BackendConfig,
+
+    /// Backend statistics
+    stats: BackendStatistics,
+}
+
+/// Backend configuration
+#[derive(Debug, Clone)]
+pub struct BackendConfig {
+    /// Target TPU configuration
+    pub target_tpu: TPUConfig,
+
+    /// Enable optimized code generation
+    pub enable_optimized_codegen: bool,
+
+    /// Enable runtime profiling
+    pub enable_profiling: bool,
+
+    /// Debug mode
+    pub debug_mode: bool,
+
+    /// Verification mode
+    pub verification_mode: bool,
+
+    /// Custom backend options
+    pub custom_options: HashMap<String, String>,
+}
+
+/// Backend statistics
+#[derive(Debug, Default)]
+pub struct BackendStatistics {
+    /// Code generation time (microseconds)
+    pub codegen_time_us: u64,
+
+    /// Binary size (bytes)
+    pub binary_size: usize,
+
+    /// Runtime integration time (microseconds)
+    pub runtime_integration_time_us: u64,
+
+    /// Number of kernels generated
+    pub kernels_generated: usize,
+
+    /// Optimization passes applied
+    pub optimization_passes: usize,
+}
+
+impl<T: Float + Debug + Default + std::fmt::Debug + Clone + Send + Sync> XLABackend<T> {
+    /// Create new XLA backend
+    pub fn new(config: BackendConfig) -> Self {
+        Self {
+            code_generator: TPUCodeGenerator::new(config.target_tpu.clone()),
+            runtime_manager: RuntimeIntegration::new(config.target_tpu.clone()),
+            profiling_manager: ProfilingIntegration::new(&config),
+            config,
+            stats: BackendStatistics::default(),
+        }
+    }
+
+    /// Generate code and integrate with runtime
+    pub fn compile_and_integrate(
+        &mut self,
+        computation: &XLAComputation<T>,
+        memory_plan: &MemoryPlan<T>,
+    ) -> Result<Vec<u8>> {
+        let start_time = std::time::Instant::now();
+
+        // Generate code
+        let generated_code = self
+            .code_generator
+            .generate_code(computation, memory_plan)?;
+        let codegen_duration = start_time.elapsed();
+        self.stats.codegen_time_us = codegen_duration.as_micros() as u64;
+
+        // Integrate with runtime
+        let runtime_start = std::time::Instant::now();
+        let binary = self
+            .runtime_manager
+            .integrate(generated_code, &self.config.target_tpu)?;
+        let runtime_integration_duration = runtime_start.elapsed();
+        self.stats.runtime_integration_time_us = runtime_integration_duration.as_micros() as u64;
+        self.stats.binary_size = binary.len();
+
+        // Set up profiling if enabled, and record this compile step's real
+        // measured timings into it -- without this, `profiling_manager`
+        // would only ever hold empty sessions and every later
+        // `export_data()` would report empty files regardless of how much
+        // real compilation work had just happened.
+        if self.config.enable_profiling {
+            self.profiling_manager
+                .setup_profiling(computation, &binary)?;
+            self.profiling_manager
+                .record_compile_timings(codegen_duration, runtime_integration_duration);
+        }
+
+        Ok(binary)
+    }
+
+    /// Get backend statistics
+    pub fn get_statistics(&self) -> &BackendStatistics {
+        &self.stats
+    }
+
+    /// The profiling integration this backend set up for the compiled program.
+    pub fn profiling(&self) -> &ProfilingIntegration<T> {
+        &self.profiling_manager
+    }
+
+    /// Mutable access to the profiling integration, so the *runtime* side can
+    /// report the memory and timing events it observes into the same profile
+    /// the compile side started.
+    pub fn profiling_mut(&mut self) -> &mut ProfilingIntegration<T> {
+        &mut self.profiling_manager
+    }
+
+    /// Reset backend state
+    pub fn reset(&mut self) {
+        self.stats = BackendStatistics::default();
+        self.code_generator.reset();
+        self.profiling_manager.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xla_backend_creation() {
+        use crate::main_types::{PodTopology, TPUConfig, TPUVersion};
+
+        let tpu_config = TPUConfig {
+            tpu_version: TPUVersion::V4,
+            num_cores: 8,
+            enable_xla: true,
+            xla_optimization_level: crate::main_types::XLAOptimizationLevel::Standard,
+            mixed_precision: true,
+            batch_size_per_core: 32,
+            enable_pod_coordination: false,
+            pod_topology: PodTopology::Pod2x2,
+            memory_optimization: crate::main_types::TPUMemoryOptimization::Balanced,
+            gradient_compression: true,
+            prefetch_depth: 2,
+            experimental_features: false,
+        };
+
+        let config = BackendConfig {
+            target_tpu: tpu_config,
+            enable_optimized_codegen: true,
+            enable_profiling: false,
+            debug_mode: false,
+            verification_mode: false,
+            custom_options: HashMap::new(),
+        };
+
+        let backend: XLABackend<f32> = XLABackend::new(config);
+        assert_eq!(backend.stats.binary_size, 0);
+        assert_eq!(backend.stats.kernels_generated, 0);
+    }
+}

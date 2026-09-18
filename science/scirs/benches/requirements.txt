@@ -1,0 +1,22 @@
+# Python dependencies for SciRS2 v0.2.0 benchmark suite
+# Install with: pip install -r requirements.txt
+
+# Core scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Data analysis and visualization
+pandas>=2.0.0
+matplotlib>=3.7.0
+
+# Additional utilities
+tabulate>=0.9.0
+
+# Optional: PyTorch for neural network benchmarks (future)
+# torch>=2.0.0
+
+# Optional: For better plots
+# seaborn>=0.12.0
+
+# Optional: Progress bars
+# tqdm>=4.65.0

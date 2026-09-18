@@ -1,0 +1,58 @@
+[package]
+name = "legalis-us"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "United States jurisdiction support for Legalis-RS (Common Law)"
+repository.workspace = true
+keywords = ["legalis", "usa", "common-law", "constitution", "ucc"]
+categories = ["text-processing", "localization", "internationalization"]
+homepage.workspace = true
+documentation = "https://docs.rs/legalis-us"
+
+[dependencies]
+legalis-core.workspace = true
+legalis-dsl.workspace = true
+legalis-verifier.workspace = true
+legalis-sim.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[example]]
+name = "tort_battery_example"
+path = "examples/tort_battery_example.rs"
+
+[[example]]
+name = "famous_cases"
+path = "examples/famous_cases.rs"
+
+[[example]]
+name = "choice_of_law_multistate"
+path = "examples/choice_of_law_multistate.rs"
+
+[[example]]
+name = "state_comparison"
+path = "examples/state_comparison.rs"
+
+[[example]]
+name = "uniform_acts_ucc"
+path = "examples/uniform_acts_ucc.rs"
+
+[[example]]
+name = "professional_licensing"
+path = "examples/professional_licensing.rs"
+
+[[example]]
+name = "products_liability"
+path = "examples/products_liability.rs"
+
+[[example]]
+name = "federal_preemption"
+path = "examples/federal_preemption.rs"

@@ -1,0 +1,370 @@
+// Advanced edge detection kernels for GPU execution
+// Includes Canny edge detection and other sophisticated algorithms
+
+__kernel void canny_gradient_2d(
+    __global const float* input,
+    __global float* gradient_magnitude,
+    __global float* gradient_direction,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    // Sobel gradient computation
+    float gx = 0.0f, gy = 0.0f;
+    
+    // Sobel X kernel: [-1, 0, 1; -2, 0, 2; -1, 0, 1]
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int px = clamp(x + dx, 0, width - 1);
+            int py = clamp(y + dy, 0, height - 1);
+            float pixel = input[py * width + px];
+            
+            // Sobel X weights
+            if (dx == -1) gx -= pixel * (dy == 0 ? 2.0f : 1.0f);
+            if (dx == 1) gx += pixel * (dy == 0 ? 2.0f : 1.0f);
+            
+            // Sobel Y weights
+            if (dy == -1) gy -= pixel * (dx == 0 ? 2.0f : 1.0f);
+            if (dy == 1) gy += pixel * (dx == 0 ? 2.0f : 1.0f);
+        }
+    }
+    
+    float magnitude = sqrt(gx * gx + gy * gy);
+    float direction = atan2(gy, gx);
+    
+    gradient_magnitude[y * width + x] = magnitude;
+    gradient_direction[y * width + x] = direction;
+}
+
+__kernel void canny_non_maximum_suppression_2d(
+    __global const float* gradient_magnitude,
+    __global const float* gradient_direction,
+    __global float* output,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float magnitude = gradient_magnitude[y * width + x];
+    float direction = gradient_direction[y * width + x];
+    
+    // Convert angle to 0-180 degrees
+    direction = direction * 180.0f / M_PI;
+    if (direction < 0) direction += 180.0f;
+    
+    // Determine gradient direction sector
+    int sector;
+    if ((direction >= 0 && direction < 22.5f) || (direction >= 157.5f && direction <= 180.0f)) {
+        sector = 0; // Horizontal
+    } else if (direction >= 22.5f && direction < 67.5f) {
+        sector = 1; // Diagonal /
+    } else if (direction >= 67.5f && direction < 112.5f) {
+        sector = 2; // Vertical
+    } else {
+        sector = 3; // Diagonal \
+    }
+    
+    // Get neighboring pixels based on gradient direction
+    float neighbor1 = 0.0f, neighbor2 = 0.0f;
+    
+    switch (sector) {
+        case 0: // Horizontal
+            if (x > 0) neighbor1 = gradient_magnitude[y * width + (x - 1)];
+            if (x < width - 1) neighbor2 = gradient_magnitude[y * width + (x + 1)];
+            break;
+        case 1: // Diagonal /
+            if (x > 0 && y < height - 1) neighbor1 = gradient_magnitude[(y + 1) * width + (x - 1)];
+            if (x < width - 1 && y > 0) neighbor2 = gradient_magnitude[(y - 1) * width + (x + 1)];
+            break;
+        case 2: // Vertical
+            if (y > 0) neighbor1 = gradient_magnitude[(y - 1) * width + x];
+            if (y < height - 1) neighbor2 = gradient_magnitude[(y + 1) * width + x];
+            break;
+        case 3: // Diagonal \
+            if (x > 0 && y > 0) neighbor1 = gradient_magnitude[(y - 1) * width + (x - 1)];
+            if (x < width - 1 && y < height - 1) neighbor2 = gradient_magnitude[(y + 1) * width + (x + 1)];
+            break;
+    }
+    
+    // Non-maximum suppression
+    if (magnitude >= neighbor1 && magnitude >= neighbor2) {
+        output[y * width + x] = magnitude;
+    } else {
+        output[y * width + x] = 0.0f;
+    }
+}
+
+__kernel void canny_double_threshold_2d(
+    __global const float* input,
+    __global float* output,
+    const float low_threshold,
+    const float high_threshold,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float value = input[y * width + x];
+    
+    if (value >= high_threshold) {
+        output[y * width + x] = 1.0f; // Strong edge
+    } else if (value >= low_threshold) {
+        output[y * width + x] = 0.5f; // Weak edge
+    } else {
+        output[y * width + x] = 0.0f; // No edge
+    }
+}
+
+__kernel void canny_edge_tracking_2d(
+    __global float* edges,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    if (edges[y * width + x] == 0.5f) { // Weak edge
+        bool connected_to_strong = false;
+        
+        // Check 8-neighborhood for strong edges
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                
+                int nx = x + dx;
+                int ny = y + dy;
+                
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                    if (edges[ny * width + nx] == 1.0f) {
+                        connected_to_strong = true;
+                        break;
+                    }
+                }
+            }
+            if (connected_to_strong) break;
+        }
+        
+        if (connected_to_strong) {
+            edges[y * width + x] = 1.0f; // Promote to strong edge
+        } else {
+            edges[y * width + x] = 0.0f; // Suppress
+        }
+    }
+}
+
+__kernel void laplacian_of_gaussian_2d(
+    __global const float* input,
+    __global float* output,
+    const float sigma,
+    const int kernel_size,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int half_size = kernel_size / 2;
+    float sigma_sq = sigma * sigma;
+    float two_sigma_sq = 2.0f * sigma_sq;
+    float sigma_pow4 = sigma_sq * sigma_sq;
+    
+    float sum = 0.0f;
+    float weight_sum = 0.0f;
+    
+    // Apply Laplacian of Gaussian kernel
+    for (int ky = -half_size; ky <= half_size; ky++) {
+        for (int kx = -half_size; kx <= half_size; kx++) {
+            int px = clamp(x + kx, 0, width - 1);
+            int py = clamp(y + ky, 0, height - 1);
+            
+            float r_sq = kx * kx + ky * ky;
+            float exp_term = exp(-r_sq / two_sigma_sq);
+            float log_weight = (r_sq - two_sigma_sq) / sigma_pow4 * exp_term;
+            
+            sum += input[py * width + px] * log_weight;
+            weight_sum += fabs(log_weight);
+        }
+    }
+    
+    output[y * width + x] = sum / weight_sum;
+}
+
+__kernel void zero_crossing_2d(
+    __global const float* input,
+    __global float* output,
+    const float threshold,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float center = input[y * width + x];
+    bool zero_crossing = false;
+    
+    // Check 4-neighborhood for zero crossings
+    int dx[] = {-1, 1, 0, 0};
+    int dy[] = {0, 0, -1, 1};
+    
+    for (int i = 0; i < 4; i++) {
+        int nx = x + dx[i];
+        int ny = y + dy[i];
+        
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+            float neighbor = input[ny * width + nx];
+            
+            // Check for sign change with sufficient magnitude
+            if ((center * neighbor < 0) && (fabs(center - neighbor) > threshold)) {
+                zero_crossing = true;
+                break;
+            }
+        }
+    }
+    
+    output[y * width + x] = zero_crossing ? 1.0f : 0.0f;
+}
+
+__kernel void harris_corner_response_2d(
+    __global const float* input,
+    __global float* output,
+    const float k,
+    const float sigma,
+    const int window_size,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int half_window = window_size / 2;
+    
+    // Compute image gradients using Sobel
+    float Ixx = 0.0f, Iyy = 0.0f, Ixy = 0.0f;
+    
+    for (int wy = -half_window; wy <= half_window; wy++) {
+        for (int wx = -half_window; wx <= half_window; wx++) {
+            int px = clamp(x + wx, 1, width - 2);
+            int py = clamp(y + wy, 1, height - 2);
+            
+            // Compute gradients
+            float gx = (input[py * width + (px + 1)] - input[py * width + (px - 1)]) * 0.5f;
+            float gy = (input[(py + 1) * width + px] - input[(py - 1) * width + px]) * 0.5f;
+            
+            // Gaussian weighting
+            float weight = exp(-(wx * wx + wy * wy) / (2.0f * sigma * sigma));
+            
+            // Accumulate structure tensor elements
+            Ixx += weight * gx * gx;
+            Iyy += weight * gy * gy;
+            Ixy += weight * gx * gy;
+        }
+    }
+    
+    // Harris corner response
+    float det = Ixx * Iyy - Ixy * Ixy;
+    float trace = Ixx + Iyy;
+    float response = det - k * trace * trace;
+    
+    output[y * width + x] = response;
+}
+
+__kernel void oriented_fast_keypoints_2d(
+    __global const float* input,
+    __global float* keypoint_response,
+    __global float* keypoint_orientation,
+    const float threshold,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x < 3 || x >= width - 3 || y < 3 || y >= height - 3) {
+        keypoint_response[y * width + x] = 0.0f;
+        return;
+    }
+    
+    float center = input[y * width + x];
+    
+    // FAST corner detection on Bresenham circle of radius 3
+    int circle_x[] = {0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1};
+    int circle_y[] = {3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1, 0, 1, 2, 3};
+    
+    int num_continuous = 0;
+    int max_continuous = 0;
+    bool was_brighter = false;
+    bool was_darker = false;
+    
+    // Check continuous pixels
+    for (int i = 0; i < 32; i++) { // Check circle twice for continuity
+        int idx = i % 16;
+        int px = x + circle_x[idx];
+        int py = y + circle_y[idx];
+        
+        float pixel = input[py * width + px];
+        bool is_brighter = pixel > center + threshold;
+        bool is_darker = pixel < center - threshold;
+        
+        if (is_brighter || is_darker) {
+            if ((is_brighter && was_brighter) || (is_darker && was_darker)) {
+                num_continuous++;
+            } else {
+                max_continuous = max(max_continuous, num_continuous);
+                num_continuous = 1;
+                was_brighter = is_brighter;
+                was_darker = is_darker;
+            }
+        } else {
+            max_continuous = max(max_continuous, num_continuous);
+            num_continuous = 0;
+            was_brighter = was_darker = false;
+        }
+    }
+    
+    max_continuous = max(max_continuous, num_continuous);
+    
+    // Corner detected if at least 9 continuous pixels
+    if (max_continuous >= 9) {
+        keypoint_response[y * width + x] = 1.0f;
+        
+        // Compute orientation using intensity centroid
+        float m01 = 0.0f, m10 = 0.0f;
+        int patch_radius = 7;
+        
+        for (int py = -patch_radius; py <= patch_radius; py++) {
+            for (int px = -patch_radius; px <= patch_radius; px++) {
+                if (px * px + py * py <= patch_radius * patch_radius) {
+                    int sample_x = clamp(x + px, 0, width - 1);
+                    int sample_y = clamp(y + py, 0, height - 1);
+                    float intensity = input[sample_y * width + sample_x];
+                    
+                    m01 += py * intensity;
+                    m10 += px * intensity;
+                }
+            }
+        }
+        
+        keypoint_orientation[y * width + x] = atan2(m01, m10);
+    } else {
+        keypoint_response[y * width + x] = 0.0f;
+        keypoint_orientation[y * width + x] = 0.0f;
+    }
+}

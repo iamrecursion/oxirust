@@ -1,0 +1,9 @@
+{
+  "name": "map_specific",
+  "args": ["-i", "in.mkv", "-map", "0:v:0", "-map", "0:a:1", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "map": 2
+  }
+}

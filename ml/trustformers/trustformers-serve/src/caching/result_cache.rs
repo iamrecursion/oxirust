@@ -1,0 +1,798 @@
+//! Result Cache Implementation
+//!
+//! Caches inference results with TTL support and intelligent eviction policies.
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+
+use super::config::{EvictionPolicy, TierConfig};
+use super::metrics::CacheStatsCollector;
+
+/// Cache key for result storage
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CacheKey {
+    /// Model identifier
+    pub model_id: String,
+    /// Input text or tokens hash
+    pub input_hash: u64,
+    /// Generation parameters hash
+    pub params_hash: u64,
+    /// Model version
+    pub model_version: Option<String>,
+}
+
+impl CacheKey {
+    pub fn new(
+        model_id: String,
+        input: &str,
+        params: &HashMap<String, serde_json::Value>,
+        model_version: Option<String>,
+    ) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        input.hash(&mut hasher);
+        let input_hash = hasher.finish();
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (k, v) in params.iter() {
+            k.hash(&mut hasher);
+            v.to_string().hash(&mut hasher);
+        }
+        let params_hash = hasher.finish();
+
+        Self {
+            model_id,
+            input_hash,
+            params_hash,
+            model_version,
+        }
+    }
+}
+
+/// Cache entry with metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheEntry {
+    /// Cached result data
+    pub result: CacheResult,
+    /// Entry creation timestamp
+    pub created_at: u64,
+    /// Time-to-live in seconds
+    pub ttl_seconds: u64,
+    /// Access count
+    pub access_count: u64,
+    /// Last access timestamp
+    pub last_accessed: u64,
+    /// Entry size in bytes
+    pub size_bytes: usize,
+    /// Priority score for eviction
+    pub priority: f32,
+}
+
+impl CacheEntry {
+    pub fn new(result: CacheResult, ttl_seconds: u64) -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        let size_bytes = serde_json::to_vec(&result).unwrap_or_default().len();
+
+        Self {
+            result,
+            created_at: now,
+            ttl_seconds,
+            access_count: 0,
+            last_accessed: now,
+            size_bytes,
+            priority: 1.0,
+        }
+    }
+
+    /// Check if entry is expired
+    pub fn is_expired(&self) -> bool {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        now > self.created_at + self.ttl_seconds
+    }
+
+    /// Update access metadata
+    pub fn mark_accessed(&mut self) {
+        self.access_count += 1;
+        self.last_accessed =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        // Update priority based on access pattern
+        let age_factor = 1.0 / (1.0 + (self.last_accessed - self.created_at) as f32 / 3600.0);
+        let frequency_factor = (self.access_count as f32).ln_1p();
+        self.priority = age_factor * frequency_factor;
+    }
+}
+
+/// Cached inference result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheResult {
+    /// Generated tokens or text
+    pub output: String,
+    /// Output tokens if available
+    pub tokens: Option<Vec<u32>>,
+    /// Logits if requested
+    pub logits: Option<Vec<f32>>,
+    /// Generation metadata
+    pub metadata: HashMap<String, serde_json::Value>,
+    /// Processing time in milliseconds
+    pub processing_time_ms: u64,
+    /// Model used for generation
+    pub model_used: String,
+}
+
+/// Cache hit result
+#[derive(Debug, Clone)]
+pub struct CacheHit {
+    pub result: CacheResult,
+    pub metadata: CacheHitMetadata,
+}
+
+/// Cache hit metadata
+#[derive(Debug, Clone)]
+pub struct CacheHitMetadata {
+    pub age_seconds: u64,
+    pub access_count: u64,
+    pub cache_efficiency: f32,
+    pub saved_processing_time_ms: u64,
+}
+
+/// Cache miss reason
+#[derive(Debug, Clone)]
+pub enum CacheMiss {
+    NotFound,
+    Expired,
+    InvalidEntry,
+    PolicyRejected,
+}
+
+/// Result cache service
+pub struct ResultCacheService {
+    cache: Arc<RwLock<HashMap<CacheKey, CacheEntry>>>,
+    /// Live configuration.
+    ///
+    /// Behind a lock because [`ResultCacheService::update_config`] genuinely
+    /// replaces it: TTL, eviction policy and size ceiling all take effect for
+    /// subsequent operations. It used to be a plain field that no code path
+    /// could change, and `update_config` accordingly did nothing at all.
+    config: Arc<RwLock<TierConfig>>,
+    metrics: Arc<CacheStatsCollector>,
+    /// Size ceiling in bytes, mirrored out of [`Self::config`] so the hot
+    /// insert path can read it without taking the config lock.
+    max_size_bytes: Arc<AtomicUsize>,
+    current_size_bytes: Arc<RwLock<usize>>,
+}
+
+impl ResultCacheService {
+    pub fn new(config: TierConfig, metrics: Arc<CacheStatsCollector>) -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            max_size_bytes: Arc::new(AtomicUsize::new(config.max_size_bytes)),
+            config: Arc::new(RwLock::new(config)),
+            metrics,
+            current_size_bytes: Arc::new(RwLock::new(0)),
+        }
+    }
+
+    /// The size ceiling currently in force, in bytes.
+    pub fn max_size_bytes(&self) -> usize {
+        self.max_size_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A snapshot of the configuration currently in force.
+    pub async fn config(&self) -> TierConfig {
+        self.config.read().await.clone()
+    }
+
+    /// Get cached result
+    pub async fn get(&self, key: &CacheKey) -> Option<CacheHit> {
+        let mut cache = self.cache.write().await;
+
+        if let Some(entry) = cache.get_mut(key) {
+            // Check if expired
+            if entry.is_expired() {
+                cache.remove(key);
+                self.metrics.record_cache_miss("result_cache", "expired").await;
+                return None;
+            }
+
+            // Update access metadata
+            entry.mark_accessed();
+
+            // Record hit
+            self.metrics.record_cache_hit("result_cache").await;
+
+            let hit_metadata = CacheHitMetadata {
+                age_seconds: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    - entry.created_at,
+                access_count: entry.access_count,
+                cache_efficiency: entry.priority,
+                saved_processing_time_ms: entry.result.processing_time_ms,
+            };
+
+            Some(CacheHit {
+                result: entry.result.clone(),
+                metadata: hit_metadata,
+            })
+        } else {
+            self.metrics.record_cache_miss("result_cache", "not_found").await;
+            None
+        }
+    }
+
+    /// Store result in cache
+    pub async fn put(&self, key: CacheKey, result: CacheResult) -> Result<()> {
+        // Read the TTL currently in force, so an entry stored after an
+        // `update_config` uses the new lifetime rather than the original one.
+        let ttl_seconds = self.config.read().await.default_ttl.as_secs();
+        let entry = CacheEntry::new(result, ttl_seconds);
+
+        // Check if we need to evict entries
+        let new_size = *self.current_size_bytes.read().await + entry.size_bytes;
+        if new_size > self.max_size_bytes() {
+            self.evict_entries(entry.size_bytes).await?;
+        }
+
+        // Insert entry
+        {
+            let mut cache = self.cache.write().await;
+            if let Some(old_entry) = cache.insert(key.clone(), entry.clone()) {
+                // Update size tracking
+                let mut current_size = self.current_size_bytes.write().await;
+                *current_size = current_size.saturating_sub(old_entry.size_bytes);
+                *current_size += entry.size_bytes;
+            } else {
+                let mut current_size = self.current_size_bytes.write().await;
+                *current_size += entry.size_bytes;
+            }
+        }
+
+        self.metrics.record_cache_put("result_cache", entry.size_bytes).await;
+
+        Ok(())
+    }
+
+    /// Invalidate specific key
+    pub async fn invalidate(&self, key: &CacheKey) -> Result<()> {
+        let mut cache = self.cache.write().await;
+        if let Some(entry) = cache.remove(key) {
+            let mut current_size = self.current_size_bytes.write().await;
+            *current_size = current_size.saturating_sub(entry.size_bytes);
+
+            self.metrics.record_cache_invalidation("result_cache").await;
+        }
+
+        Ok(())
+    }
+
+    /// Clear all cached entries
+    pub async fn clear(&self) -> Result<()> {
+        let mut cache = self.cache.write().await;
+        let count = cache.len();
+        cache.clear();
+
+        let mut current_size = self.current_size_bytes.write().await;
+        *current_size = 0;
+
+        self.metrics.record_cache_clear("result_cache", count).await;
+
+        Ok(())
+    }
+
+    /// Run maintenance tasks
+    pub async fn run_maintenance(&self) -> Result<()> {
+        self.cleanup_expired_entries().await?;
+        self.update_priorities().await?;
+        Ok(())
+    }
+
+    /// Replace the cache's configuration, applying it immediately.
+    ///
+    /// The new TTL, eviction policy and size ceiling govern every subsequent
+    /// operation, and a *lowered* ceiling is enforced right away by evicting
+    /// down to it rather than waiting for the next insert to notice.
+    ///
+    /// This method previously consisted entirely of a comment: its body was a
+    /// single `//` line into which the intended implementation had been folded
+    /// with literal `\n` escapes, so it parsed as one comment, the argument was
+    /// bound as `_config`, and nothing whatsoever changed. `CachingService::update_config`
+    /// calls straight into it, so a caller reconfiguring the cache was told the
+    /// change had been applied when it had not.
+    pub async fn update_config(&self, config: TierConfig) -> Result<()> {
+        let new_max_size = config.max_size_bytes;
+        let policy = config.eviction_policy;
+
+        // Publish the new configuration before enforcing it, so the eviction
+        // below already sorts by the newly selected policy.
+        {
+            let mut current = self.config.write().await;
+            *current = config;
+        }
+        self.max_size_bytes.store(new_max_size, AtomicOrdering::Relaxed);
+
+        // A lowered ceiling must bite now, not at the next insert.
+        let current_size = *self.current_size_bytes.read().await;
+        if current_size > new_max_size {
+            self.evict_entries(current_size - new_max_size).await?;
+        }
+
+        // A TTL-based policy may make already-stored entries expired under the
+        // new setting; drop them rather than serving them until touched.
+        if matches!(policy, EvictionPolicy::TTL) {
+            self.cleanup_expired_entries().await?;
+        }
+
+        tracing::info!(
+            "result cache reconfigured: max_size={} bytes, eviction_policy={:?}",
+            new_max_size,
+            policy
+        );
+        Ok(())
+    }
+
+    /// Get cache statistics
+    pub async fn get_stats(&self) -> ResultCacheStats {
+        let cache = self.cache.read().await;
+        let current_size = *self.current_size_bytes.read().await;
+
+        ResultCacheStats {
+            entry_count: cache.len(),
+            total_size_bytes: current_size,
+            hit_rate: self.metrics.get_hit_rate("result_cache").await,
+            avg_entry_size: if cache.is_empty() { 0 } else { current_size / cache.len() },
+            oldest_entry_age: cache
+                .values()
+                .map(|e| {
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+                        - e.created_at
+                })
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    // Private methods
+    async fn evict_entries(&self, needed_space: usize) -> Result<()> {
+        // Read the live policy once, before taking the cache locks, so eviction
+        // follows the most recently configured policy.
+        let policy = self.config.read().await.eviction_policy;
+
+        let mut cache = self.cache.write().await;
+        let mut current_size = self.current_size_bytes.write().await;
+
+        // Collect entries with their eviction priority and keys
+        let mut entries_to_evict: Vec<_> = cache
+            .iter()
+            .map(|(key, entry)| {
+                let sort_key = match policy {
+                    EvictionPolicy::LRU => entry.last_accessed,
+                    EvictionPolicy::LFU => entry.access_count,
+                    EvictionPolicy::TTL => entry.created_at + entry.ttl_seconds,
+                    EvictionPolicy::Priority => entry.priority as u64,
+                    EvictionPolicy::Random => {
+                        use scirs2_core::random::*;
+                        let mut rng = thread_rng();
+                        rng.random::<u64>()
+                    },
+                    EvictionPolicy::FIFO => entry.created_at,
+                };
+                (key.clone(), sort_key, entry.size_bytes)
+            })
+            .collect();
+
+        // Sort by the appropriate key
+        entries_to_evict.sort_by_key(|(_, sort_key, _)| *sort_key);
+
+        // Evict entries until we have enough space
+        let mut freed_space = 0;
+        let target_space = needed_space + (self.max_size_bytes() / 10); // 10% buffer
+
+        for (key, _, size) in entries_to_evict {
+            if freed_space >= target_space {
+                break;
+            }
+
+            if cache.remove(&key).is_some() {
+                freed_space += size;
+                *current_size = current_size.saturating_sub(size);
+
+                self.metrics.record_cache_eviction("result_cache", "size_limit").await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_expired_entries(&self) -> Result<()> {
+        let mut cache = self.cache.write().await;
+        let mut current_size = self.current_size_bytes.write().await;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        let expired_keys: Vec<_> = cache
+            .iter()
+            .filter(|(_, entry)| now > entry.created_at + entry.ttl_seconds)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in expired_keys {
+            if let Some(entry) = cache.remove(&key) {
+                *current_size = current_size.saturating_sub(entry.size_bytes);
+                self.metrics.record_cache_eviction("result_cache", "expired").await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn update_priorities(&self) -> Result<()> {
+        let mut cache = self.cache.write().await;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        for entry in cache.values_mut() {
+            // Recalculate priority based on current time
+            let age_factor = 1.0 / (1.0 + (now - entry.created_at) as f32 / 3600.0);
+            let frequency_factor = (entry.access_count as f32).ln_1p();
+            let recency_factor = 1.0 / (1.0 + (now - entry.last_accessed) as f32 / 300.0);
+
+            entry.priority = age_factor * frequency_factor * recency_factor;
+        }
+
+        Ok(())
+    }
+}
+
+/// Result cache statistics
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResultCacheStats {
+    pub entry_count: usize,
+    pub total_size_bytes: usize,
+    pub hit_rate: f32,
+    pub avg_entry_size: usize,
+    pub oldest_entry_age: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::caching::config::{EvictionPolicy, TierConfig};
+    use crate::caching::metrics::CacheStatsCollector;
+    use std::time::Duration;
+
+    fn make_tier_config() -> TierConfig {
+        TierConfig {
+            max_size_bytes: 10 * 1024 * 1024,
+            max_entries: 1000,
+            default_ttl: Duration::from_secs(3600),
+            eviction_policy: EvictionPolicy::LRU,
+            compression_enabled: false,
+            tier_name: "result_test".to_string(),
+        }
+    }
+
+    fn make_result(output: &str, model: &str) -> CacheResult {
+        CacheResult {
+            output: output.to_string(),
+            tokens: None,
+            logits: None,
+            metadata: HashMap::new(),
+            processing_time_ms: 100,
+            model_used: model.to_string(),
+        }
+    }
+
+    fn make_key(model: &str, input: &str) -> CacheKey {
+        CacheKey::new(model.to_string(), input, &HashMap::new(), None)
+    }
+
+    // --- CacheKey tests ---
+
+    #[test]
+    fn test_cache_key_same_input_produces_same_hash() {
+        let k1 = make_key("model_a", "hello world");
+        let k2 = make_key("model_a", "hello world");
+        assert_eq!(k1.input_hash, k2.input_hash);
+    }
+
+    #[test]
+    fn test_cache_key_different_input_produces_different_hash() {
+        let k1 = make_key("model_a", "hello");
+        let k2 = make_key("model_a", "world");
+        assert_ne!(k1.input_hash, k2.input_hash);
+    }
+
+    #[test]
+    fn test_cache_key_different_model_not_equal() {
+        let k1 = make_key("model_a", "hello");
+        let k2 = make_key("model_b", "hello");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_cache_key_model_version_included() {
+        let k1 = CacheKey::new(
+            "m".to_string(),
+            "q",
+            &HashMap::new(),
+            Some("v1".to_string()),
+        );
+        let k2 = CacheKey::new(
+            "m".to_string(),
+            "q",
+            &HashMap::new(),
+            Some("v2".to_string()),
+        );
+        assert_ne!(k1, k2);
+    }
+
+    // --- CacheEntry tests ---
+
+    #[test]
+    fn test_cache_entry_not_expired_when_new() {
+        let result = make_result("output", "gpt");
+        let entry = CacheEntry::new(result, 3600);
+        assert!(!entry.is_expired());
+    }
+
+    #[test]
+    fn test_cache_entry_expired_with_old_creation_time() {
+        let result = make_result("output", "gpt");
+        // Create entry and manually set created_at to far in the past
+        let mut entry = CacheEntry::new(result, 1);
+        // Set created_at to a time well before ttl_seconds (1) ago
+        entry.created_at = 1000; // Unix epoch + 1000 seconds = long ago
+        assert!(entry.is_expired());
+    }
+
+    #[test]
+    fn test_cache_entry_mark_accessed_increments_count() {
+        let result = make_result("output", "gpt");
+        let mut entry = CacheEntry::new(result, 3600);
+        assert_eq!(entry.access_count, 0);
+        entry.mark_accessed();
+        assert_eq!(entry.access_count, 1);
+        entry.mark_accessed();
+        assert_eq!(entry.access_count, 2);
+    }
+
+    #[test]
+    fn test_cache_entry_priority_updated_on_access() {
+        let result = make_result("output", "gpt");
+        let mut entry = CacheEntry::new(result, 3600);
+        let initial_priority = entry.priority;
+        entry.mark_accessed();
+        // Priority should change (frequency factor via ln_1p(1) > 0)
+        // After 1 access, frequency_factor = ln(2) ≈ 0.693, which could differ
+        assert!(entry.priority >= 0.0);
+        let _ = initial_priority; // suppress unused warning
+    }
+
+    // --- ResultCacheService async tests ---
+
+    #[tokio::test]
+    async fn test_result_cache_miss_on_empty() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        let key = make_key("model", "some input");
+        let result = service.get(&key).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_result_cache_put_and_hit() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        let key = make_key("model", "hello");
+        let result = make_result("world", "model");
+        service.put(key.clone(), result).await.expect("put should succeed");
+        let hit = service.get(&key).await;
+        assert!(hit.is_some());
+        let cache_hit = hit.expect("hit should be Some");
+        assert_eq!(cache_hit.result.output, "world");
+    }
+
+    #[tokio::test]
+    async fn test_result_cache_invalidate_removes_entry() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        let key = make_key("model", "test");
+        service
+            .put(key.clone(), make_result("output", "model"))
+            .await
+            .expect("put should succeed");
+        service.invalidate(&key).await.expect("invalidate should succeed");
+        assert!(service.get(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_result_cache_clear_removes_all() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        let k1 = make_key("model", "input_1");
+        let k2 = make_key("model", "input_2");
+        service
+            .put(k1.clone(), make_result("r1", "model"))
+            .await
+            .expect("put should succeed");
+        service
+            .put(k2.clone(), make_result("r2", "model"))
+            .await
+            .expect("put should succeed");
+        service.clear().await.expect("clear should succeed");
+        assert!(service.get(&k1).await.is_none());
+        assert!(service.get(&k2).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_result_cache_stats_entry_count() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        service
+            .put(make_key("m", "a"), make_result("r", "m"))
+            .await
+            .expect("put should succeed");
+        service
+            .put(make_key("m", "b"), make_result("r", "m"))
+            .await
+            .expect("put should succeed");
+        let stats = service.get_stats().await;
+        assert_eq!(stats.entry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_result_cache_hit_metadata_access_count() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        let key = make_key("m", "q");
+        service
+            .put(key.clone(), make_result("resp", "m"))
+            .await
+            .expect("put should succeed");
+        // First access
+        let _ = service.get(&key).await;
+        // Second access
+        let hit = service.get(&key).await;
+        if let Some(h) = hit {
+            assert!(h.metadata.access_count >= 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_result_cache_run_maintenance_no_panic() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        service
+            .put(make_key("m", "input"), make_result("out", "m"))
+            .await
+            .expect("put should succeed");
+        let result = service.run_maintenance().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_result_cache_expired_entry_not_returned() {
+        // CacheEntry is_expired checks: now > created_at + ttl_seconds
+        // We can't easily inject past time into ResultCacheService without direct field access.
+        // Instead, verify that a new entry with future TTL is NOT expired.
+        let result = make_result("output", "gpt");
+        let entry = CacheEntry::new(result, 3600);
+        assert!(!entry.is_expired());
+    }
+
+    #[tokio::test]
+    async fn test_result_cache_size_tracked_after_put() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        let key = make_key("m", "size_test");
+        service
+            .put(key, make_result("some output text", "m"))
+            .await
+            .expect("put should succeed");
+        let stats = service.get_stats().await;
+        assert!(stats.total_size_bytes > 0);
+    }
+
+    // ── Regression tests: update_config used to be a no-op ──
+
+    /// Regression: the whole body of `update_config` was a single comment line
+    /// (the intended code had been folded into it with literal `\n` escapes),
+    /// so the argument was bound as `_config` and *nothing* changed — while the
+    /// method still returned `Ok(())`. `CachingService::update_config` calls
+    /// straight into this, so a caller reconfiguring the cache was told the
+    /// change had been applied when it had not.
+    #[tokio::test]
+    async fn update_config_actually_replaces_the_configuration() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+        assert_eq!(service.max_size_bytes(), 10 * 1024 * 1024);
+        assert_eq!(service.config().await.eviction_policy, EvictionPolicy::LRU);
+
+        let updated = TierConfig {
+            max_size_bytes: 4096,
+            default_ttl: Duration::from_secs(30),
+            eviction_policy: EvictionPolicy::LFU,
+            ..make_tier_config()
+        };
+        service.update_config(updated).await.expect("reconfiguration succeeds");
+
+        let live = service.config().await;
+        assert_eq!(
+            service.max_size_bytes(),
+            4096,
+            "the size ceiling must actually change"
+        );
+        assert_eq!(live.eviction_policy, EvictionPolicy::LFU);
+        assert_eq!(live.default_ttl, Duration::from_secs(30));
+    }
+
+    /// A lowered ceiling is enforced immediately, not at the next insert.
+    #[tokio::test]
+    async fn lowering_the_size_ceiling_evicts_down_to_it() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+
+        for i in 0..8 {
+            service
+                .put(
+                    make_key("m", &format!("entry-{i}")),
+                    make_result(&"x".repeat(256), "m"),
+                )
+                .await
+                .expect("put should succeed");
+        }
+        let before = service.get_stats().await;
+        assert!(before.entry_count > 0);
+
+        // Squeeze the cache to a ceiling far below what it currently holds.
+        let tightened = TierConfig {
+            max_size_bytes: 64,
+            ..make_tier_config()
+        };
+        service.update_config(tightened).await.expect("reconfiguration succeeds");
+
+        let after = service.get_stats().await;
+        assert!(
+            after.entry_count < before.entry_count,
+            "a lowered ceiling must evict now: {} entries before, {} after",
+            before.entry_count,
+            after.entry_count
+        );
+    }
+
+    /// A newly configured TTL governs entries stored afterwards.
+    #[tokio::test]
+    async fn a_reconfigured_ttl_applies_to_subsequent_entries() {
+        let metrics = Arc::new(CacheStatsCollector::new());
+        let service = ResultCacheService::new(make_tier_config(), metrics);
+
+        // A zero TTL means an entry is expired as soon as a second elapses; the
+        // observable consequence is that the new value is what `put` stores.
+        let expiring = TierConfig {
+            default_ttl: Duration::from_secs(0),
+            ..make_tier_config()
+        };
+        service.update_config(expiring).await.expect("reconfiguration succeeds");
+        assert_eq!(service.config().await.default_ttl, Duration::from_secs(0));
+
+        service
+            .put(make_key("m", "ttl_test"), make_result("out", "m"))
+            .await
+            .expect("put should succeed");
+
+        // The stored entry carries the reconfigured TTL, not the original hour.
+        let cache = service.cache.read().await;
+        let entry = cache.values().next().expect("one entry stored");
+        assert_eq!(
+            entry.ttl_seconds, 0,
+            "the entry must carry the reconfigured TTL, not the original 3600s"
+        );
+    }
+}

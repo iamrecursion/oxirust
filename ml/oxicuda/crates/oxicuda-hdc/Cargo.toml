@@ -1,0 +1,34 @@
+[package]
+name = "oxicuda-hdc"
+description = "Hyperdimensional Computing (HDC) / Vector Symbolic Architectures for OxiCUDA — binary/integer/complex hypervectors, binding/bundling/permutation, HD classifier, item & associative memories, record/n-gram/pattern encoding"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+license.workspace = true
+homepage = "https://github.com/cool-japan/oxicuda"
+repository.workspace = true
+keywords = ["gpu", "hyperdimensional", "vsa", "neuromorphic", "pure-rust"]
+categories = ["science", "algorithms"]
+
+[lints]
+workspace = true
+
+[features]
+# Enables on-device GPU tests that JIT-compile the hand-written PTX kernels,
+# launch them on a real CUDA device, and assert numerical equivalence to the
+# crate's CPU references. Tests skip gracefully when no GPU is present.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name = "hdc_ops"
+harness = false

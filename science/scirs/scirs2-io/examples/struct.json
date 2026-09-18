@@ -1,0 +1,16 @@
+{
+  "name": "Experiment 1",
+  "parameters": {
+    "pressure": 101.3,
+    "humidity": 45.0,
+    "temperature": 25.5
+  },
+  "measurements": [
+    10.5,
+    11.2,
+    9.8,
+    10.1,
+    10.3
+  ],
+  "success": true
+}

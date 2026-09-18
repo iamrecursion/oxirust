@@ -1,0 +1,9 @@
+{
+  "name": "filter_fps",
+  "args": ["-i", "in.mkv", "-vf", "fps=30", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_filters": 1
+  }
+}

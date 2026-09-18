@@ -1,0 +1,45 @@
+[package]
+name = "legalis-eu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "European Union jurisdiction support for Legalis-RS (GDPR, Consumer Rights, Competition, Treaties)"
+repository.workspace = true
+keywords = ["legalis", "eu", "gdpr", "european-union", "competition"]
+categories = ["text-processing", "localization", "internationalization"]
+homepage.workspace = true
+documentation = "https://docs.rs/legalis-eu"
+
+[dependencies]
+legalis-core.workspace = true
+legalis-dsl.workspace = true
+legalis-i18n.workspace = true
+legalis-verifier.workspace = true
+legalis-audit.workspace = true
+legalis-sim.workspace = true
+legalis-lod.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+uuid.workspace = true
+schemars = { version = "1.2", optional = true, features = ["chrono04"] }
+
+[features]
+default = []
+serde = []
+schema = ["dep:schemars"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "gdpr_validation"
+harness = false
+
+[[bench]]
+name = "ip_validation"
+harness = false

@@ -1,0 +1,80 @@
+[package]
+name = "oximedia-monitor"
+description = "Real-time media pipeline monitoring and health checking"
+keywords = ["monitoring", "pipeline", "health", "multimedia", "broadcast"]
+categories = ["multimedia", "development-tools"]
+readme = "README.md"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace dependencies
+oximedia-core = { workspace = true, optional = true }
+oximedia-metering = { workspace = true }
+oximedia-scopes = { workspace = true }
+oximedia-timecode = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+tracing = { workspace = true }
+rayon = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+
+# Additional dependencies for monitoring
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+flume = { workspace = true }
+crossbeam.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+futures-util = { workspace = true }
+nvml-wrapper = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+oxisql-core = { workspace = true, optional = true }
+oxisql-sqlite-compat = { workspace = true, optional = true }
+sysinfo = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+reqwest = { workspace = true }
+lettre = { workspace = true, optional = true }
+http-body-util = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+mockito = { workspace = true }
+
+[features]
+default = []
+gpu = ["nvml-wrapper"]
+integrations = ["oximedia-core"]
+email = ["lettre"]
+sqlite = ["oxisql-core", "oxisql-sqlite-compat"]
+full = ["gpu", "integrations", "email", "sqlite"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "orphan_smoke"
+path = "tests/orphan_smoke.rs"
+
+[[test]]
+name = "alert_pipeline_dispatch"
+path = "tests/alert_pipeline_dispatch.rs"

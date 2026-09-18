@@ -1,0 +1,200 @@
+# =============================================================================
+# deny.toml - OxiPhysics dependency policy, enforced with cargo-deny
+#
+# Install once:  cargo install cargo-deny --locked
+#
+# Run every check (this is part of the contributor gate, see CONTRIBUTING.md):
+#
+#   cargo deny check
+#
+# or a single one:
+#
+#   cargo deny check bans        # banned / replaced crates (no network needed)
+#   cargo deny check sources     # crates.io only, no git dependencies
+#   cargo deny check licenses    # permissive-licence allow-list
+#   cargo deny check advisories  # RustSec advisories (fetches the advisory db)
+#
+# There is deliberately no GitHub workflow for this: the only workflows in this
+# repository are the pypi-publish.yml / npm-publish.yml release workflows, so
+# the check is run locally.
+#
+# The [bans] section is the machine-checkable form of the COOLJAPAN Pure Rust
+# policy: default features must be free of C/C++/Fortran code, FFI must be
+# optional and feature-gated, and the crates for which the COOLJAPAN ecosystem
+# ships a replacement (oxiblas, oxifft, oxicode, oxiz, oxiarc-*, ...) must not
+# come back in through a dependency.
+# =============================================================================
+
+[graph]
+# Analyse the FULL feature space of every workspace member (cargo's
+# --all-features), so that feature-gated dependencies such as the opt-in
+# `cuda-backend` of oxiphysics-gpu cannot hide from the checks below.
+all-features = true
+# `targets` is deliberately NOT set: dependencies are analysed for every
+# platform, not just the ones wheels / wasm are shipped for, because the crates
+# are consumed from crates.io on any target. A banned crate that only appears
+# behind a rarely used cfg (android, freebsd, haiku, ...) is therefore still
+# caught.
+
+[advisories]
+# A yanked release is a withdrawn release: never depend on one.
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "`paste` is unmaintained (archived by its author); there is no known vulnerability. It is a proc-macro reached only through scirs2-core -> statrs -> nalgebra 0.33 -> simba 0.9; the workspace's own nalgebra 0.35 / simba 0.10 no longer depend on it (nalgebra 0.34 still uses simba 0.9). Remove this entry once nothing in the graph pulls simba 0.9 any more; cargo deny then reports the ignore as unused." },
+]
+
+[licenses]
+# Only permissive licences are accepted (the workspace itself is Apache-2.0).
+# Each entry is used by at least one crate in the current graph. A crate under
+# any other licence fails the check and has to be reviewed before it is added
+# here. Alternatives that only occur as one side of an `OR` expression (for
+# example Unlicense or LGPL-2.1-or-later) are intentionally not listed.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+# Duplicate versions are reported but do not fail the check. Most of them come
+# from scirs2-core's older nalgebra / rand / wide stack and cannot be removed
+# from this workspace.
+multiple-versions = "warn"
+# `*` version requirements are forbidden. Path / git dependencies are exempt
+# where cargo-deny allows it (unpublished crates and dev-dependencies, which
+# crates.io strips at publish time).
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# `wrappers` lets the listed crates (and only them) depend DIRECTLY on a banned
+# crate; every other dependency path to it is an error.
+deny = [
+    # --- BLAS / LAPACK (C, Fortran) -> oxiblas ---
+    { crate = "openblas-src", reason = "OpenBLAS (C/Fortran): use oxiblas" },
+    { crate = "openblas-build", reason = "OpenBLAS build helper: use oxiblas" },
+    { crate = "openblas", reason = "OpenBLAS (C/Fortran): use oxiblas" },
+    { crate = "blas-src", reason = "selects a C/Fortran BLAS to link: use oxiblas" },
+    { crate = "blas-sys", reason = "BLAS FFI: use oxiblas" },
+    { crate = "cblas-sys", reason = "CBLAS FFI: use oxiblas" },
+    { crate = "lapack-src", reason = "selects a C/Fortran LAPACK to link: use oxiblas" },
+    { crate = "lapack-sys", reason = "LAPACK (Fortran) FFI: use oxiblas" },
+    { crate = "lapack", reason = "LAPACK (Fortran) bindings: use oxiblas" },
+    { crate = "ndarray-linalg", reason = "needs a C/Fortran LAPACK backend: use oxiblas" },
+    { crate = "netlib-src", reason = "builds reference BLAS/LAPACK from C/Fortran: use oxiblas" },
+    { crate = "intel-mkl-src", reason = "links Intel MKL: use oxiblas" },
+    { crate = "accelerate-src", reason = "links Apple Accelerate: use oxiblas" },
+
+    # --- FFT -> oxifft ---
+    { crate = "rustfft", reason = "COOLJAPAN policy: use oxifft" },
+    { crate = "fftw", reason = "FFTW (C) bindings: use oxifft" },
+    { crate = "fftw-sys", reason = "FFTW (C) FFI: use oxifft" },
+    { crate = "fftw-src", reason = "builds FFTW (C): use oxifft" },
+
+    # --- SMT solver -> oxiz ---
+    { crate = "z3", reason = "Z3 (C++): use oxiz" },
+    { crate = "z3-sys", reason = "Z3 (C++) FFI: use oxiz" },
+
+    # --- SQLite -> oxisql-sqlite-compat ---
+    { crate = "rusqlite", reason = "bundles / links libsqlite3 (C): use oxisql-sqlite-compat" },
+    { crate = "libsqlite3-sys", reason = "SQLite (C) FFI: use oxisql-sqlite-compat" },
+
+    # --- Serialization -> oxicode ---
+    { crate = "bincode", reason = "COOLJAPAN policy: use oxicode" },
+
+    # --- Compression / archives -> oxiarc-* ---
+    { crate = "zip", reason = "COOLJAPAN policy: use oxiarc-* (archive)" },
+    { crate = "flate2", reason = "COOLJAPAN policy: use oxiarc-deflate" },
+    { crate = "miniz_oxide", reason = "COOLJAPAN policy: use oxiarc-deflate" },
+    { crate = "libz-sys", reason = "zlib (C) FFI: use oxiarc-deflate" },
+    { crate = "zstd", reason = "COOLJAPAN policy: use oxiarc-zstd" },
+    { crate = "zstd-safe", reason = "wraps zstd-sys (C): use oxiarc-zstd" },
+    { crate = "zstd-sys", reason = "zstd (C) FFI: use oxiarc-zstd" },
+    { crate = "bzip2", reason = "COOLJAPAN policy: use oxiarc-bzip2" },
+    { crate = "bzip2-sys", reason = "bzip2 (C) FFI: use oxiarc-bzip2" },
+    { crate = "lz4", reason = "COOLJAPAN policy: use oxiarc-lz4" },
+    { crate = "lz4-sys", reason = "lz4 (C) FFI: use oxiarc-lz4" },
+    { crate = "lz4_flex", reason = "COOLJAPAN policy: use oxiarc-lz4" },
+    { crate = "tar", reason = "COOLJAPAN policy: use oxiarc-* (archive)" },
+    { crate = "snap", reason = "COOLJAPAN policy: use oxiarc-snappy" },
+    { crate = "brotli", reason = "COOLJAPAN policy: use oxiarc-brotli" },
+    { crate = "brotli-decompressor", reason = "COOLJAPAN policy: use oxiarc-brotli" },
+
+    # --- Crypto / TLS (C, assembly) -> oxicrypto-* / oxitls-* ---
+    { crate = "openssl-sys", reason = "OpenSSL (C) FFI: use oxitls-*" },
+    { crate = "openssl", reason = "binds openssl-sys (C): use oxitls-*" },
+    { crate = "openssl-src", reason = "builds OpenSSL (C): use oxitls-*" },
+    { crate = "native-tls", reason = "platform TLS (C): use oxitls-*" },
+    { crate = "ring", reason = "C / assembly crypto: use oxicrypto-* / oxitls-*" },
+    { crate = "aws-lc-sys", reason = "aws-lc (C) FFI: use oxicrypto-* / oxitls-*" },
+    { crate = "aws-lc-rs", reason = "wraps aws-lc-sys (C): use oxicrypto-* / oxitls-*" },
+
+    # --- Scientific data formats -> oxih5 ---
+    { crate = "hdf5", reason = "HDF5 (C) bindings: use oxih5" },
+    { crate = "hdf5-sys", reason = "HDF5 (C) FFI: use oxih5" },
+
+    # --- Key-value stores -> oxistore-* ---
+    { crate = "rocksdb", reason = "RocksDB (C++) bindings: use oxistore-*" },
+    { crate = "librocksdb-sys", reason = "RocksDB (C++) FFI: use oxistore-*" },
+    { crate = "lmdb", reason = "LMDB (C) bindings: use oxistore-*" },
+    { crate = "lmdb-sys", reason = "LMDB (C) FFI: use oxistore-*" },
+
+    # --- Big numbers -> oxinum-* ---
+    { crate = "rug", reason = "binds gmp-mpfr-sys (C): use oxinum-*" },
+    { crate = "gmp", reason = "GMP (C) bindings: use oxinum-*" },
+    { crate = "gmp-mpfr-sys", reason = "GMP / MPFR / MPC (C) FFI: use oxinum-*" },
+
+    # --- Fonts and text shaping -> oxifont-* / oxitext-* ---
+    { crate = "freetype", reason = "FreeType (C) bindings: use oxifont-*" },
+    { crate = "freetype-sys", reason = "FreeType (C) FFI: use oxifont-*" },
+    { crate = "fontconfig", reason = "fontconfig (C) bindings: use oxifont-*" },
+    { crate = "fontconfig-sys", reason = "fontconfig (C) FFI: use oxifont-*" },
+    { crate = "yeslogic-fontconfig-sys", reason = "fontconfig (C) FFI: use oxifont-*" },
+    { crate = "harfbuzz", reason = "HarfBuzz (C++) bindings: use oxitext-*" },
+    { crate = "harfbuzz-sys", reason = "HarfBuzz (C++) FFI: use oxitext-*" },
+
+    # --- Audio codecs -> oxiaudio-* ---
+    { crate = "minimp3", reason = "minimp3 (C) bindings: use oxiaudio-*" },
+    { crate = "minimp3-sys", reason = "minimp3 (C) FFI: use oxiaudio-*" },
+    { crate = "flac-sys", reason = "FLAC (C) FFI: use oxiaudio-*" },
+    { crate = "vorbis-sys", reason = "Vorbis (C) FFI: use oxiaudio-*" },
+
+    # --- ONNX runtime -> oxionnx ---
+    { crate = "ort-sys", reason = "ONNX Runtime (C++) FFI: use oxionnx" },
+
+    # --- C / C++ build tooling ---
+    # No crate that ships in a library, wheel or wasm build may need a C
+    # toolchain. `cc` is reached today only through three crates, none of which
+    # is part of a release artifact:
+    #   alloca               <- criterion (dev-dependency used by the benches)
+    #   minicov              <- wasm-bindgen-test (only built with
+    #                           --cfg wasm_bindgen_unstable_test_coverage)
+    #   iana-time-zone-haiku <- iana-time-zone <- chrono <- scirs2-core
+    #                           (target_os = "haiku" only)
+    { crate = "cc", wrappers = ["alloca", "minicov", "iana-time-zone-haiku"], reason = "C/C++ compiler driver: Pure Rust policy, only the dev-only / Haiku-only users listed here may build C" },
+    { crate = "cmake", reason = "C/C++ build driver: Pure Rust policy" },
+    { crate = "bindgen", reason = "C header binding generator: Pure Rust policy" },
+    { crate = "clang-sys", reason = "libclang FFI (bindgen backend): Pure Rust policy" },
+
+    # --- CUDA ---
+    # cudarc loads the CUDA driver / NVRTC at run time (no link-time CUDA), but
+    # it is still FFI. It is allowed only as oxiphysics-gpu's optional,
+    # non-default `cuda-backend` feature; the Pure-Rust replacement is oxicuda.
+    { crate = "cudarc", wrappers = ["oxiphysics-gpu"], reason = "CUDA FFI: keep it behind oxiphysics-gpu's opt-in `cuda-backend` feature (Pure-Rust replacement: oxicuda)" },
+]
+
+# OS / GPU / windowing boundary crates (libc, windows-sys, libloading, ash,
+# wayland-sys, ndk-sys, renderdoc-sys, js-sys, web-sys, wasm-bindgen, pyo3-ffi,
+# ...) arrive through wgpu, wasm-bindgen and PyO3. They are not listed above, so
+# they are allowed; only the crates named in `deny` are banned.
+
+[sources]
+# Everything must come from crates.io: no alternative registries, no git
+# dependencies (they cannot be published and they bypass the advisory checks).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

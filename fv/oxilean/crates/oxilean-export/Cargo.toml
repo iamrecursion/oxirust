@@ -1,0 +1,24 @@
+[package]
+name = "oxilean-export"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+description = "lean4export NDJSON reader feeding the oxilean-verify trusted computing base"
+categories = ["development-tools", "parser-implementations", "science"]
+keywords = ["lean4", "lean", "proof", "ndjson", "parser"]
+
+[dependencies]
+# ONLY the kernel — this crate is inside the TCB. No external runtime deps.
+oxilean-kernel = { workspace = true }
+
+[dev-dependencies]
+# Tests may use the workspace proptest, but the core suite is deterministic.
+proptest.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

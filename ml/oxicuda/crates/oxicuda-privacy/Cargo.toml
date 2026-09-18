@@ -1,0 +1,36 @@
+[package]
+name = "oxicuda-privacy"
+description = "Differential Privacy primitives for OxiCUDA — exponential/report-noisy-max/PTR mechanisms, SVT, f-DP/GDP/zCDP/PRV accounting, DP-FTRL/Adam optimizers, local DP (GRR/OUE/RAPPOR), smooth sensitivity, subsampling/shuffling amplification"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+license.workspace = true
+homepage = "https://github.com/cool-japan/oxicuda"
+repository.workspace = true
+keywords = ["gpu", "diff-privacy", "privacy", "pure-rust"]
+categories = ["science", "algorithms"]
+
+[lints]
+workspace = true
+
+[features]
+# Enables on-device GPU tests that JIT-compile the hand-written PTX kernels in
+# `ptx_kernels`, launch them on a real CUDA device, and assert numerical
+# equivalence to the crate's CPU references (or bit-exact host re-derivation of
+# the kernels' inline LCG RNG). Every test skips gracefully when no GPU is
+# present, so this feature is safe to enable on CPU-only machines.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name = "privacy_ops"
+harness = false

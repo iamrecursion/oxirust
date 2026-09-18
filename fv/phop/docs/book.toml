@@ -1,0 +1,8 @@
+[book]
+title = "phop — Differentiable Symbolic Discovery"
+authors = ["COOLJAPAN OÜ (Team KitaSan)"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/cool-japan/phop"

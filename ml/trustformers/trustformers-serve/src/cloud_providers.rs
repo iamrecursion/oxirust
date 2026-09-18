@@ -1,0 +1,1130 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::error;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudProviderConfig {
+    pub providers: Vec<ProviderConfig>,
+    pub default_provider: Option<String>,
+    pub failover_enabled: bool,
+    pub timeout_seconds: u64,
+    pub retry_policy: RetryPolicy,
+    pub cost_optimization: CostOptimizationConfig,
+    pub monitoring: MonitoringConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub name: String,
+    pub provider_type: CloudProviderType,
+    pub enabled: bool,
+    pub priority: u32,
+    pub region: String,
+    pub credentials: CredentialsConfig,
+    pub endpoints: EndpointConfig,
+    pub limits: LimitsConfig,
+    pub features: FeatureConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CloudProviderType {
+    AwsSagemaker,
+    GoogleVertexAi,
+    AzureMachineLearning,
+    HuggingFaceInference,
+    OpenAiApi,
+    AnthropicClaude,
+    Custom(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialsConfig {
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub service_account_key: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub tenant_id: Option<String>,
+    pub api_key: Option<String>,
+    pub oauth_token: Option<String>,
+    pub custom_headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointConfig {
+    pub inference_endpoint: String,
+    pub model_management_endpoint: Option<String>,
+    pub training_endpoint: Option<String>,
+    pub monitoring_endpoint: Option<String>,
+    pub custom_endpoints: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    pub max_requests_per_second: u32,
+    pub max_concurrent_requests: u32,
+    pub max_payload_size_bytes: u64,
+    pub max_response_size_bytes: u64,
+    pub request_timeout_seconds: u64,
+    pub batch_size_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureConfig {
+    pub supports_streaming: bool,
+    pub supports_batch_inference: bool,
+    pub supports_model_deployment: bool,
+    pub supports_auto_scaling: bool,
+    pub supports_monitoring: bool,
+    pub supports_a_b_testing: bool,
+    pub supports_custom_models: bool,
+    pub supported_model_formats: Vec<String>,
+    pub supported_data_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub exponential_backoff: bool,
+    pub jitter: bool,
+    pub retry_on_timeout: bool,
+    pub retry_on_rate_limit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostOptimizationConfig {
+    pub enabled: bool,
+    pub budget_limit_usd: Option<f64>,
+    pub cost_per_request_limit: Option<f64>,
+    pub auto_scaling_enabled: bool,
+    pub spot_instances_enabled: bool,
+    pub cost_monitoring_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    pub enabled: bool,
+    pub metrics_collection_interval_seconds: u64,
+    pub health_check_interval_seconds: u64,
+    pub performance_tracking: bool,
+    pub cost_tracking: bool,
+    pub error_tracking: bool,
+    pub alert_thresholds: AlertThresholds,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertThresholds {
+    pub error_rate_threshold: f64,
+    pub latency_threshold_ms: u64,
+    pub cost_threshold_usd: f64,
+    pub availability_threshold: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudInferenceRequest {
+    pub request_id: String,
+    pub model_name: String,
+    pub model_version: Option<String>,
+    pub input_data: InputData,
+    pub parameters: HashMap<String, serde_json::Value>,
+    pub output_config: OutputConfig,
+    pub priority: RequestPriority,
+    pub timeout_seconds: Option<u64>,
+    pub callback_url: Option<String>,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InputData {
+    Text(String),
+    Image(Vec<u8>),
+    Audio(Vec<u8>),
+    Video(Vec<u8>),
+    Document(Vec<u8>),
+    Structured(serde_json::Value),
+    Batch(Vec<InputData>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    pub format: OutputFormat,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub stream: bool,
+    pub include_probabilities: bool,
+    pub return_metadata: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OutputFormat {
+    Text,
+    Json,
+    Structured,
+    Binary,
+    Stream,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RequestPriority {
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudInferenceResponse {
+    pub request_id: String,
+    pub provider: String,
+    pub model_name: String,
+    pub model_version: Option<String>,
+    pub output_data: OutputData,
+    pub metadata: ResponseMetadata,
+    pub performance: PerformanceMetrics,
+    pub cost: CostMetrics,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OutputData {
+    Text(String),
+    Json(serde_json::Value),
+    Binary(Vec<u8>),
+    Stream(Vec<u8>),
+    Batch(Vec<OutputData>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseMetadata {
+    /// Measured round-trip time of the provider call, in milliseconds.
+    pub processing_time_ms: u64,
+    /// Time the request spent queued before processing.
+    ///
+    /// `None` when the provider does not report it — which is every public
+    /// inference API. It is never guessed.
+    pub queue_time_ms: Option<u64>,
+    pub model_load_time_ms: Option<u64>,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub finish_reason: Option<String>,
+    pub confidence_score: Option<f32>,
+    pub provider_metadata: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceMetrics {
+    pub latency_ms: u64,
+    pub throughput_tokens_per_second: Option<f32>,
+    pub memory_usage_mb: Option<u64>,
+    pub cpu_usage_percent: Option<f32>,
+    pub gpu_usage_percent: Option<f32>,
+    pub provider_metrics: HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostMetrics {
+    /// Whether these figures came from the provider's API.
+    ///
+    /// When `false`, every amount below is zero because the provider returned
+    /// no billing data — not because the request was free. Never present a
+    /// `false` snapshot as a cost.
+    pub reported_by_provider: bool,
+    pub cost_usd: f64,
+    pub input_cost_usd: f64,
+    pub output_cost_usd: f64,
+    pub compute_cost_usd: f64,
+    pub storage_cost_usd: f64,
+    pub network_cost_usd: f64,
+    pub currency: String,
+    pub billing_period: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDeploymentRequest {
+    pub deployment_id: String,
+    pub model_name: String,
+    pub model_version: String,
+    pub model_artifact_uri: String,
+    pub instance_type: String,
+    pub instance_count: u32,
+    pub auto_scaling_config: Option<AutoScalingConfig>,
+    pub environment_variables: HashMap<String, String>,
+    pub resource_requirements: ResourceRequirements,
+    pub deployment_config: DeploymentConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoScalingConfig {
+    pub enabled: bool,
+    pub min_instances: u32,
+    pub max_instances: u32,
+    pub target_cpu_utilization: f32,
+    pub target_memory_utilization: f32,
+    pub scale_up_cooldown_seconds: u64,
+    pub scale_down_cooldown_seconds: u64,
+    pub custom_metrics: Vec<CustomMetric>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomMetric {
+    pub name: String,
+    pub target_value: f64,
+    pub comparison_operator: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceRequirements {
+    pub cpu_cores: f32,
+    pub memory_gb: f32,
+    pub gpu_count: u32,
+    pub gpu_type: Option<String>,
+    pub storage_gb: f32,
+    pub network_bandwidth_mbps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentConfig {
+    pub enable_logging: bool,
+    pub enable_monitoring: bool,
+    pub enable_data_capture: bool,
+    pub health_check_grace_period_seconds: u64,
+    pub rolling_update_strategy: RollingUpdateStrategy,
+    pub security_config: SecurityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollingUpdateStrategy {
+    pub max_unavailable_percent: u32,
+    pub max_surge_percent: u32,
+    pub update_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    pub enable_vpc: bool,
+    pub vpc_id: Option<String>,
+    pub subnet_ids: Vec<String>,
+    pub security_group_ids: Vec<String>,
+    pub enable_encryption: bool,
+    pub kms_key_id: Option<String>,
+    pub iam_role_arn: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDeploymentResponse {
+    pub deployment_id: String,
+    pub deployment_status: DeploymentStatus,
+    /// Cloud resource identifier returned by the deployment API, when it
+    /// returns one.
+    pub endpoint_arn: Option<String>,
+    /// Publicly invocable URL, when the provider exposes one. `None` for
+    /// SDK-only endpoints such as SageMaker.
+    pub endpoint_url: Option<String>,
+    pub deployment_time: DateTime<Utc>,
+    /// Hourly price, when the deployment API returns one. `None` means the
+    /// provider published no price — never assume zero cost.
+    pub estimated_cost_per_hour: Option<f64>,
+    /// Provider-published performance estimate, when one exists.
+    pub performance_estimate: Option<PerformanceEstimate>,
+    pub monitoring_dashboard_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DeploymentStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Updating,
+    Deleting,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceEstimate {
+    pub expected_latency_ms: u64,
+    pub expected_throughput_rps: f32,
+    pub max_concurrent_requests: u32,
+    pub memory_usage_estimate_mb: u64,
+}
+
+#[async_trait]
+pub trait CloudProvider: Send + Sync {
+    async fn initialize(&self, config: &ProviderConfig) -> Result<()>;
+    async fn inference(&self, request: CloudInferenceRequest) -> Result<CloudInferenceResponse>;
+    async fn batch_inference(
+        &self,
+        requests: Vec<CloudInferenceRequest>,
+    ) -> Result<Vec<CloudInferenceResponse>>;
+    async fn deploy_model(
+        &self,
+        request: ModelDeploymentRequest,
+    ) -> Result<ModelDeploymentResponse>;
+    async fn update_deployment(
+        &self,
+        deployment_id: &str,
+        config: ModelDeploymentRequest,
+    ) -> Result<ModelDeploymentResponse>;
+    async fn delete_deployment(&self, deployment_id: &str) -> Result<()>;
+    async fn get_deployment_status(&self, deployment_id: &str) -> Result<DeploymentStatus>;
+    async fn list_deployments(&self) -> Result<Vec<ModelDeploymentResponse>>;
+    async fn get_model_info(&self, model_name: &str) -> Result<ModelInfo>;
+    async fn health_check(&self) -> Result<HealthStatus>;
+    async fn get_metrics(&self) -> Result<ProviderMetrics>;
+    async fn get_cost_estimate(&self, request: &CloudInferenceRequest) -> Result<f64>;
+    fn get_provider_type(&self) -> CloudProviderType;
+    fn supports_feature(&self, feature: &str) -> bool;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub model_type: String,
+    pub input_schema: serde_json::Value,
+    pub output_schema: serde_json::Value,
+    pub supported_formats: Vec<String>,
+    /// Maximum input size the provider publishes, if any.
+    pub max_input_size: Option<u64>,
+    /// Maximum output size the provider publishes, if any.
+    pub max_output_size: Option<u64>,
+    /// Pricing, when the provider publishes it through its API. `None` means
+    /// no price was returned — it is never invented.
+    pub pricing: Option<PricingInfo>,
+    /// Performance characteristics, when the provider publishes them.
+    pub performance_characteristics: Option<PerformanceCharacteristics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingInfo {
+    pub input_cost_per_token: f64,
+    pub output_cost_per_token: f64,
+    pub compute_cost_per_hour: f64,
+    pub minimum_charge: f64,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceCharacteristics {
+    pub average_latency_ms: u64,
+    pub throughput_tokens_per_second: f32,
+    pub memory_requirements_mb: u64,
+    pub concurrent_request_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthStatus {
+    pub provider: String,
+    pub status: String,
+    pub availability: f64,
+    pub last_check: DateTime<Utc>,
+    pub response_time_ms: u64,
+    pub error_rate: f64,
+    pub active_deployments: u32,
+    pub region_status: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderMetrics {
+    pub provider: String,
+    /// Requests per second measured over this process's observation window.
+    pub requests_per_second: f32,
+    /// Mean measured round-trip latency, in milliseconds.
+    pub average_latency_ms: u64,
+    /// Observed error ratio in `[0, 1]`.
+    pub error_rate: f64,
+    /// Hourly spend, when the provider reports it. `None` otherwise.
+    pub cost_per_hour: Option<f64>,
+    pub active_connections: u32,
+    pub queue_depth: u32,
+    pub throughput_tokens_per_second: f32,
+    /// Host utilisation, when the provider exposes it. Public inference APIs
+    /// do not, so this is normally `None` rather than a plausible-looking
+    /// invented figure.
+    pub resource_utilization: Option<ResourceUtilization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceUtilization {
+    pub cpu_usage_percent: f32,
+    pub memory_usage_percent: f32,
+    pub gpu_usage_percent: f32,
+    pub network_io_mbps: f32,
+    pub storage_io_mbps: f32,
+}
+
+pub struct CloudProviderManager {
+    providers: HashMap<String, Box<dyn CloudProvider>>,
+    config: CloudProviderConfig,
+    stats: Arc<RwLock<CloudProviderStats>>,
+    load_balancer: LoadBalancer,
+    cost_tracker: Arc<RwLock<CostTracker>>,
+    health_monitor: Arc<RwLock<HealthMonitor>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CloudProviderStats {
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub average_latency_ms: f64,
+    pub total_cost_usd: f64,
+    pub provider_stats: HashMap<String, ProviderStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderStats {
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub average_latency_ms: f64,
+    pub total_cost_usd: f64,
+    pub last_used: Option<DateTime<Utc>>,
+}
+
+struct LoadBalancer {
+    strategy: LoadBalancingStrategy,
+}
+
+#[derive(Debug, Clone)]
+pub enum LoadBalancingStrategy {
+    RoundRobin,
+    LeastLatency,
+    LowestCost,
+    HighestAvailability,
+    WeightedRoundRobin(HashMap<String, f32>),
+}
+
+/// Running spend against the operator's configured budget.
+///
+/// 0.2.1: all three fields were written once at construction and never read
+/// again, so `cost_optimization.budget_limit_usd` was configuration that did
+/// nothing -- a manager could spend without limit while appearing to enforce a
+/// budget. [`CloudProviderManager::inference`] now checks it before dispatching
+/// and [`CloudProviderManager::update_stats`] charges every response to it.
+struct CostTracker {
+    /// Ceiling from `cost_optimization.budget_limit_usd`.
+    daily_budget: f64,
+    /// Total charged so far.
+    current_spend: f64,
+    /// Per-provider breakdown of that total.
+    cost_per_provider: HashMap<String, f64>,
+}
+
+/// Cache of the last health sweep, so callers do not re-probe every provider on
+/// every request.
+///
+/// 0.2.1: both fields were written once and never read --
+/// `monitoring.health_check_interval_seconds` governed nothing and no health
+/// result was ever retained.
+struct HealthMonitor {
+    /// Minimum gap between health sweeps, from configuration.
+    check_interval: tokio::time::Duration,
+    /// Last observed status per provider.
+    provider_health: HashMap<String, HealthStatus>,
+    /// When the last sweep completed, if one has.
+    last_check: Option<tokio::time::Instant>,
+}
+
+impl CloudProviderManager {
+    pub async fn new(config: CloudProviderConfig) -> Result<Self> {
+        let mut providers: HashMap<String, Box<dyn CloudProvider>> = HashMap::new();
+
+        // Initialize providers based on configuration
+        for provider_config in &config.providers {
+            if provider_config.enabled {
+                let provider = Self::create_provider(&provider_config.provider_type).await?;
+                provider.initialize(provider_config).await?;
+                providers.insert(provider_config.name.clone(), provider);
+            }
+        }
+
+        let daily_budget = config.cost_optimization.budget_limit_usd.unwrap_or(f64::MAX);
+        let check_interval_seconds = config.monitoring.health_check_interval_seconds;
+
+        Ok(Self {
+            providers,
+            config,
+            stats: Arc::new(RwLock::new(CloudProviderStats::default())),
+            load_balancer: LoadBalancer {
+                strategy: LoadBalancingStrategy::RoundRobin,
+            },
+            cost_tracker: Arc::new(RwLock::new(CostTracker {
+                daily_budget,
+                current_spend: 0.0,
+                cost_per_provider: HashMap::new(),
+            })),
+            health_monitor: Arc::new(RwLock::new(HealthMonitor {
+                check_interval: tokio::time::Duration::from_secs(check_interval_seconds),
+                provider_health: HashMap::new(),
+                last_check: None,
+            })),
+        })
+    }
+
+    async fn create_provider(provider_type: &CloudProviderType) -> Result<Box<dyn CloudProvider>> {
+        match provider_type {
+            CloudProviderType::AwsSagemaker => Ok(Box::new(AwsSagemakerProvider::new().await?)),
+            CloudProviderType::GoogleVertexAi => Ok(Box::new(GoogleVertexAiProvider::new().await?)),
+            CloudProviderType::AzureMachineLearning => {
+                Ok(Box::new(AzureMachineLearningProvider::new().await?))
+            },
+            CloudProviderType::HuggingFaceInference => {
+                Ok(Box::new(HuggingFaceProvider::new().await?))
+            },
+            CloudProviderType::OpenAiApi => Ok(Box::new(OpenAiProvider::new().await?)),
+            CloudProviderType::AnthropicClaude => Ok(Box::new(AnthropicProvider::new().await?)),
+            CloudProviderType::Custom(name) => Ok(Box::new(CustomProvider::new(name).await?)),
+        }
+    }
+
+    /// Dispatch `request` to the selected provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no provider can be selected, when the configured
+    /// daily budget is already exhausted, or when the provider call itself
+    /// fails.
+    pub async fn inference(
+        &self,
+        request: CloudInferenceRequest,
+    ) -> Result<CloudInferenceResponse> {
+        // Refuse before spending rather than after: a configured budget that is
+        // only checked afterwards is not a budget.
+        {
+            let tracker = self.cost_tracker.read().await;
+            if tracker.current_spend >= tracker.daily_budget {
+                return Err(anyhow::anyhow!(
+                    "cloud provider budget exhausted: spent {:.4} USD of a {:.4} USD limit",
+                    tracker.current_spend,
+                    tracker.daily_budget
+                ));
+            }
+        }
+        let provider_name = self.select_provider(&request).await?;
+        let provider = self
+            .providers
+            .get(&provider_name)
+            .ok_or_else(|| anyhow::anyhow!("Provider not found: {}", provider_name))?;
+
+        let start_time = std::time::Instant::now();
+        let result = provider.inference(request).await;
+        let duration = start_time.elapsed();
+
+        // Update statistics
+        self.update_stats(&provider_name, &result, duration).await;
+
+        result
+    }
+
+    async fn select_provider(&self, _request: &CloudInferenceRequest) -> Result<String> {
+        if let Some(default_provider) = &self.config.default_provider {
+            if self.providers.contains_key(default_provider) {
+                return Ok(default_provider.clone());
+            }
+        }
+
+        // Use load balancing strategy
+        match &self.load_balancer.strategy {
+            LoadBalancingStrategy::RoundRobin => {
+                let provider_names: Vec<String> = self.providers.keys().cloned().collect();
+                if provider_names.is_empty() {
+                    return Err(anyhow::anyhow!("No providers available"));
+                }
+                let stats = self.stats.read().await;
+                let index = (stats.total_requests as usize) % provider_names.len();
+                Ok(provider_names[index].clone())
+            },
+            LoadBalancingStrategy::LeastLatency => {
+                let stats = self.stats.read().await;
+                let provider_name = stats
+                    .provider_stats
+                    .iter()
+                    .min_by(|(_, a), (_, b)| {
+                        a.average_latency_ms
+                            .partial_cmp(&b.average_latency_ms)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .or_else(|| self.providers.keys().next().cloned())
+                    .ok_or_else(|| anyhow::anyhow!("No providers available"))?;
+                Ok(provider_name)
+            },
+            LoadBalancingStrategy::LowestCost => {
+                let stats = self.stats.read().await;
+                let provider_name = stats
+                    .provider_stats
+                    .iter()
+                    .min_by(|(_, a), (_, b)| {
+                        a.total_cost_usd
+                            .partial_cmp(&b.total_cost_usd)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .or_else(|| self.providers.keys().next().cloned())
+                    .ok_or_else(|| anyhow::anyhow!("No providers available"))?;
+                Ok(provider_name)
+            },
+            _ => {
+                // Default to first available provider
+                self.providers
+                    .keys()
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("No providers available"))
+            },
+        }
+    }
+
+    async fn update_stats(
+        &self,
+        provider_name: &str,
+        result: &Result<CloudInferenceResponse>,
+        duration: std::time::Duration,
+    ) {
+        let mut stats = self.stats.write().await;
+        stats.total_requests += 1;
+
+        match result {
+            Ok(response) => {
+                stats.successful_requests += 1;
+                let provider_stats =
+                    stats.provider_stats.entry(provider_name.to_string()).or_default();
+                provider_stats.requests += 1;
+                provider_stats.last_used = Some(Utc::now());
+                provider_stats.successes += 1;
+                provider_stats.total_cost_usd += response.cost.cost_usd;
+
+                // Charge the same real cost to the budget tracker.
+                let mut tracker = self.cost_tracker.write().await;
+                tracker.current_spend += response.cost.cost_usd;
+                *tracker.cost_per_provider.entry(provider_name.to_string()).or_insert(0.0) +=
+                    response.cost.cost_usd;
+
+                let latency_ms = duration.as_millis() as f64;
+                provider_stats.average_latency_ms = (provider_stats.average_latency_ms
+                    * (provider_stats.requests - 1) as f64
+                    + latency_ms)
+                    / provider_stats.requests as f64;
+            },
+            Err(_) => {
+                stats.failed_requests += 1;
+                let provider_stats =
+                    stats.provider_stats.entry(provider_name.to_string()).or_default();
+                provider_stats.requests += 1;
+                provider_stats.last_used = Some(Utc::now());
+                provider_stats.failures += 1;
+            },
+        }
+
+        // Update global average latency
+        let total_latency = stats
+            .provider_stats
+            .values()
+            .map(|s| s.average_latency_ms * s.requests as f64)
+            .sum::<f64>();
+        stats.average_latency_ms = total_latency / stats.total_requests as f64;
+
+        // Update global cost
+        stats.total_cost_usd = stats.provider_stats.values().map(|s| s.total_cost_usd).sum();
+    }
+
+    pub async fn get_stats(&self) -> CloudProviderStats {
+        self.stats.read().await.clone()
+    }
+
+    /// Total charged to the budget so far, and the configured ceiling.
+    pub async fn budget_status(&self) -> (f64, f64) {
+        let tracker = self.cost_tracker.read().await;
+        (tracker.current_spend, tracker.daily_budget)
+    }
+
+    /// Spend charged to each provider so far.
+    pub async fn cost_per_provider(&self) -> HashMap<String, f64> {
+        self.cost_tracker.read().await.cost_per_provider.clone()
+    }
+
+    /// The most recent health sweep, without probing again.
+    ///
+    /// Returns `None` when no sweep has run yet -- an empty map would read as
+    /// "no providers", which is a different claim.
+    pub async fn cached_health(&self) -> Option<HashMap<String, HealthStatus>> {
+        let monitor = self.health_monitor.read().await;
+        monitor.last_check.map(|_| monitor.provider_health.clone())
+    }
+
+    /// Health of every provider, re-probing only when the configured
+    /// `health_check_interval_seconds` has elapsed since the last sweep.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today: an unreachable provider is reported as `unhealthy`
+    /// rather than aborting the sweep.
+    pub async fn health_check_cached(&self) -> Result<HashMap<String, HealthStatus>> {
+        {
+            let monitor = self.health_monitor.read().await;
+            if let Some(last_check) = monitor.last_check {
+                if last_check.elapsed() < monitor.check_interval {
+                    return Ok(monitor.provider_health.clone());
+                }
+            }
+        }
+        self.health_check().await
+    }
+
+    /// Probe every provider now, and cache the result.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today: an unreachable provider is reported as `unhealthy`
+    /// rather than aborting the sweep.
+    pub async fn health_check(&self) -> Result<HashMap<String, HealthStatus>> {
+        let mut health_statuses = HashMap::new();
+
+        for (name, provider) in &self.providers {
+            match provider.health_check().await {
+                Ok(status) => {
+                    health_statuses.insert(name.clone(), status);
+                },
+                Err(e) => {
+                    error!("Health check failed for provider {}: {}", name, e);
+                    health_statuses.insert(
+                        name.clone(),
+                        HealthStatus {
+                            provider: name.clone(),
+                            status: "unhealthy".to_string(),
+                            availability: 0.0,
+                            last_check: Utc::now(),
+                            response_time_ms: 0,
+                            error_rate: 1.0,
+                            active_deployments: 0,
+                            region_status: HashMap::new(),
+                        },
+                    );
+                },
+            }
+        }
+
+        {
+            let mut monitor = self.health_monitor.write().await;
+            monitor.provider_health = health_statuses.clone();
+            monitor.last_check = Some(tokio::time::Instant::now());
+        }
+
+        Ok(health_statuses)
+    }
+}
+
+// ── Provider implementations ─────────────────────────────────────────────────
+//
+// Every provider below performs real API calls; see the module docs of
+// `cloud_providers::rest` and `cloud_providers::sagemaker`. There is no shared
+// macro producing canned responses any more.
+
+pub mod errors;
+pub mod rest;
+pub mod sagemaker;
+pub mod support;
+
+#[cfg(test)]
+mod cloud_provider_tests;
+
+pub use errors::CloudProviderError;
+pub use rest::{
+    AnthropicProvider, AzureMachineLearningProvider, CustomProvider, GoogleVertexAiProvider,
+    HuggingFaceProvider, OpenAiProvider,
+};
+pub use sagemaker::AwsSagemakerProvider;
+pub use support::{ObservedStats, ProviderState};
+
+impl Default for CloudProviderConfig {
+    fn default() -> Self {
+        Self {
+            providers: vec![],
+            default_provider: None,
+            failover_enabled: true,
+            timeout_seconds: 60,
+            retry_policy: RetryPolicy {
+                max_retries: 3,
+                initial_delay_ms: 1000,
+                max_delay_ms: 30000,
+                exponential_backoff: true,
+                jitter: true,
+                retry_on_timeout: true,
+                retry_on_rate_limit: true,
+            },
+            cost_optimization: CostOptimizationConfig {
+                enabled: true,
+                budget_limit_usd: Some(1000.0),
+                cost_per_request_limit: Some(10.0),
+                auto_scaling_enabled: true,
+                spot_instances_enabled: false,
+                cost_monitoring_interval_seconds: 300,
+            },
+            monitoring: MonitoringConfig {
+                enabled: true,
+                metrics_collection_interval_seconds: 60,
+                health_check_interval_seconds: 30,
+                performance_tracking: true,
+                cost_tracking: true,
+                error_tracking: true,
+                alert_thresholds: AlertThresholds {
+                    error_rate_threshold: 0.05,
+                    latency_threshold_ms: 5000,
+                    cost_threshold_usd: 100.0,
+                    availability_threshold: 0.99,
+                },
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_output_config() -> OutputConfig {
+        OutputConfig {
+            format: OutputFormat::Text,
+            max_tokens: Some(512),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: Some(50),
+            stream: false,
+            include_probabilities: false,
+            return_metadata: false,
+        }
+    }
+
+    fn make_inference_request(model: &str, text: &str) -> CloudInferenceRequest {
+        CloudInferenceRequest {
+            request_id: format!("req-{}", model),
+            model_name: model.to_string(),
+            model_version: None,
+            input_data: InputData::Text(text.to_string()),
+            parameters: HashMap::new(),
+            output_config: make_output_config(),
+            priority: RequestPriority::Normal,
+            timeout_seconds: Some(30),
+            callback_url: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_cloud_provider_config_default() {
+        let config = CloudProviderConfig::default();
+        assert!(config.failover_enabled);
+        assert_eq!(config.timeout_seconds, 60);
+        assert!(config.providers.is_empty());
+        assert!(config.default_provider.is_none());
+    }
+
+    #[test]
+    fn test_default_retry_policy() {
+        let config = CloudProviderConfig::default();
+        assert_eq!(config.retry_policy.max_retries, 3);
+        assert!(config.retry_policy.exponential_backoff);
+        assert!(config.retry_policy.jitter);
+        assert!(config.retry_policy.retry_on_timeout);
+        assert!(config.retry_policy.retry_on_rate_limit);
+    }
+
+    #[test]
+    fn test_default_cost_optimization() {
+        let config = CloudProviderConfig::default();
+        assert!(config.cost_optimization.enabled);
+        assert_eq!(config.cost_optimization.budget_limit_usd, Some(1000.0));
+        assert_eq!(config.cost_optimization.cost_per_request_limit, Some(10.0));
+    }
+
+    #[test]
+    fn test_default_monitoring_config() {
+        let config = CloudProviderConfig::default();
+        assert!(config.monitoring.enabled);
+        assert!(config.monitoring.performance_tracking);
+        assert!(config.monitoring.cost_tracking);
+        assert!(config.monitoring.error_tracking);
+    }
+
+    #[test]
+    fn test_alert_thresholds_defaults() {
+        let config = CloudProviderConfig::default();
+        let thresholds = &config.monitoring.alert_thresholds;
+        assert!((thresholds.error_rate_threshold - 0.05).abs() < 1e-10);
+        assert_eq!(thresholds.latency_threshold_ms, 5000);
+        assert!((thresholds.availability_threshold - 0.99).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_inference_request_construction() {
+        let req = make_inference_request("gpt4", "Hello world");
+        assert_eq!(req.model_name, "gpt4");
+        assert!(matches!(req.input_data, InputData::Text(_)));
+        assert_eq!(req.priority as u8, RequestPriority::Normal as u8);
+    }
+
+    #[test]
+    fn test_request_priority_variants() {
+        // Verify all variants are constructible
+        let _low = RequestPriority::Low;
+        let _normal = RequestPriority::Normal;
+        let _high = RequestPriority::High;
+        let _critical = RequestPriority::Critical;
+    }
+
+    #[test]
+    fn test_output_config_stream_false() {
+        let config = make_output_config();
+        assert!(!config.stream);
+        assert!(!config.include_probabilities);
+        assert!(!config.return_metadata);
+    }
+
+    #[test]
+    fn test_output_format_variants() {
+        let _text = OutputFormat::Text;
+        let _json = OutputFormat::Json;
+        let _structured = OutputFormat::Structured;
+        let _binary = OutputFormat::Binary;
+        let _stream = OutputFormat::Stream;
+    }
+
+    #[test]
+    fn test_cloud_provider_type_custom() {
+        let provider_type = CloudProviderType::Custom("my-custom-provider".to_string());
+        if let CloudProviderType::Custom(name) = provider_type {
+            assert_eq!(name, "my-custom-provider");
+        } else {
+            panic!("Expected Custom variant");
+        }
+    }
+
+    #[test]
+    fn test_deployment_status_variants() {
+        let _pending = DeploymentStatus::Pending;
+        let _in_progress = DeploymentStatus::InProgress;
+        let _completed = DeploymentStatus::Completed;
+        let _failed = DeploymentStatus::Failed;
+        let _updating = DeploymentStatus::Updating;
+        let _deleting = DeploymentStatus::Deleting;
+    }
+
+    #[test]
+    fn test_input_data_text_variant() {
+        let data = InputData::Text("test content".to_string());
+        if let InputData::Text(content) = data {
+            assert_eq!(content, "test content");
+        } else {
+            panic!("Expected Text variant");
+        }
+    }
+
+    #[test]
+    fn test_input_data_structured_variant() {
+        let value = serde_json::json!({"key": "value", "number": 42});
+        let data = InputData::Structured(value.clone());
+        if let InputData::Structured(v) = data {
+            assert_eq!(v["key"], "value");
+        } else {
+            panic!("Expected Structured variant");
+        }
+    }
+
+    #[test]
+    fn test_cost_metrics_construction() {
+        let cost = CostMetrics {
+            reported_by_provider: true,
+            cost_usd: 0.05,
+            input_cost_usd: 0.02,
+            output_cost_usd: 0.03,
+            compute_cost_usd: 0.0,
+            storage_cost_usd: 0.0,
+            network_cost_usd: 0.0,
+            currency: "USD".to_string(),
+            billing_period: "per_request".to_string(),
+        };
+        // Input + output = total
+        assert!((cost.input_cost_usd + cost.output_cost_usd - cost.cost_usd).abs() < 1e-10);
+    }
+
+    /// A snapshot the provider did not report must be recognisable as such: the
+    /// zeros are the absence of data, not a zero bill.
+    #[test]
+    fn test_unreported_cost_is_flagged() {
+        let cost = support::unreported_cost();
+        assert!(!cost.reported_by_provider);
+        assert_eq!(cost.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn test_performance_estimate_construction() {
+        let estimate = PerformanceEstimate {
+            expected_latency_ms: 50,
+            expected_throughput_rps: 200.0,
+            max_concurrent_requests: 100,
+            memory_usage_estimate_mb: 512,
+        };
+        assert!(estimate.expected_latency_ms > 0);
+        assert!(estimate.expected_throughput_rps > 0.0);
+    }
+
+    #[test]
+    fn test_load_balancing_strategy_variants() {
+        let _rr = LoadBalancingStrategy::RoundRobin;
+        let _ll = LoadBalancingStrategy::LeastLatency;
+        let _lc = LoadBalancingStrategy::LowestCost;
+        let _ha = LoadBalancingStrategy::HighestAvailability;
+        let mut weights = HashMap::new();
+        weights.insert("provider-a".to_string(), 0.7f32);
+        weights.insert("provider-b".to_string(), 0.3f32);
+        let _wr = LoadBalancingStrategy::WeightedRoundRobin(weights);
+    }
+
+    #[test]
+    fn test_provider_stats_default() {
+        let stats = ProviderStats::default();
+        assert_eq!(stats.requests, 0);
+        assert_eq!(stats.successes, 0);
+        assert_eq!(stats.failures, 0);
+        assert!(stats.last_used.is_none());
+    }
+
+    #[test]
+    fn test_cloud_provider_stats_default() {
+        let stats = CloudProviderStats::default();
+        assert_eq!(stats.total_requests, 0);
+        assert_eq!(stats.successful_requests, 0);
+        assert_eq!(stats.failed_requests, 0);
+        assert!(stats.provider_stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_manager_creation_no_providers() {
+        let config = CloudProviderConfig::default();
+        let manager = CloudProviderManager::new(config).await;
+        assert!(
+            manager.is_ok(),
+            "Manager with no enabled providers should initialise"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manager_stats_empty_initially() {
+        let config = CloudProviderConfig::default();
+        let manager = CloudProviderManager::new(config).await.expect("manager should initialise");
+        let stats = manager.get_stats().await;
+        assert_eq!(stats.total_requests, 0);
+        assert_eq!(stats.total_cost_usd, 0.0);
+    }
+}

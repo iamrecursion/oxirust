@@ -1,0 +1,80 @@
+[package]
+name = "oxigeo-workflow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigeo-workflow"
+readme = "README.md"
+description = "DAG-based workflow engine for complex geospatial processing pipelines"
+keywords = ["science", "workflow", "dag", "pipeline", "orchestration"]
+categories = ["science::geo", "asynchronous", "data-structures"]
+
+[dependencies]
+# Core dependencies
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+
+# DAG and scheduling
+petgraph = { workspace = true, features = ["serde-1"] }
+cron = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Optional dependencies for integrations
+reqwest = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+
+# Utilities
+regex = { workspace = true }
+num_cpus.workspace = true
+
+# Cryptography
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[features]
+default = ["server", "http-client"]
+full = ["http-client", "server"]
+http-client = ["reqwest"]
+integrations = ["http-client"]
+server = ["axum", "tower", "tower-http"]
+
+[[bench]]
+name = "workflow_bench"
+harness = false
+
+[lints]
+workspace = true
+
+# NOTE: `http-client` (reqwest -> aws-lc-sys) is not Pure Rust. `server`
+# (axum/tower) stays on a pure-Rust dependency closure. The `kafka` feature was
+# removed in 0.2.1 along with the retired `oxigeo-kafka` crate; it gated an
+# `rdkafka` dependency that no source file in this crate ever used. Workflows
+# still describe Kafka endpoints via the pure-Rust `IntegrationType::Kafka` /
+# `MessageQueueType::Kafka` metadata enums.
+[package.metadata.docs.rs]
+features = ["server"]
+rustdoc-args = ["--cfg", "docsrs"]

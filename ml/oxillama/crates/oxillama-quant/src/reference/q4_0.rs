@@ -1,0 +1,558 @@
+//! Q4_0 reference (naive) implementation.
+//!
+//! Q4_0 block format (18 bytes per 32 weights):
+//! - 2 bytes: FP16 scale (d)
+//! - 16 bytes: 32 × 4-bit unsigned nibbles packed into 16 bytes
+//!
+//! Each weight is reconstructed as: `(nibble - 8) * d`
+//!
+//! # Nibble layout
+//!
+//! GGML packs the block in **split halves**, not interleaved pairs — see
+//! `dequantize_row_q4_0` in `llama.cpp/ggml/src/ggml-quants.c`:
+//!
+//! ```text
+//! weight[j]      ← qs[j] & 0x0F        for j in 0..16
+//! weight[j + 16] ← qs[j] >> 4          for j in 0..16
+//! ```
+//!
+//! So byte `j` carries weight `j` in its low nibble and weight `j + 16` in its
+//! high nibble.  Q5_0, Q4_K (`l` / `l + 32`) and Q6_K (`l` / `l + 64`) use the
+//! same convention one block size up.  Reading it as `weight[2j]` /
+//! `weight[2j + 1]` silently permutes every Q4_0 tensor.
+
+use crate::error::{QuantError, QuantResult};
+use crate::traits::QuantKernel;
+use crate::types::QuantTensor;
+
+/// Block size for Q4_0: 32 weights per block.
+const Q4_0_BLOCK_SIZE: usize = 32;
+/// Bytes per Q4_0 block: 2 (scale) + 16 (data).
+const Q4_0_BLOCK_BYTES: usize = 18;
+
+/// Reference (naive scalar) Q4_0 kernel.
+pub struct Q4_0Ref;
+
+impl QuantKernel for Q4_0Ref {
+    fn dequant_block(&self, block: &[u8], output: &mut [f32]) -> QuantResult<()> {
+        if block.len() < Q4_0_BLOCK_BYTES {
+            return Err(QuantError::BufferTooSmall {
+                needed: Q4_0_BLOCK_BYTES,
+                available: block.len(),
+            });
+        }
+        if output.len() < Q4_0_BLOCK_SIZE {
+            return Err(QuantError::BufferTooSmall {
+                needed: Q4_0_BLOCK_SIZE,
+                available: output.len(),
+            });
+        }
+
+        // Read FP16 scale
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+
+        // Dequantize 32 nibbles into the two halves of the block.
+        for i in 0..Q4_0_BLOCK_SIZE / 2 {
+            let byte = block[2 + i];
+            let lo = (byte & 0x0F) as i32 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+            output[i] = lo as f32 * d;
+            output[i + Q4_0_BLOCK_SIZE / 2] = hi as f32 * d;
+        }
+
+        Ok(())
+    }
+
+    fn gemv(
+        &self,
+        quant_matrix: &QuantTensor,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> QuantResult<()> {
+        let n_rows = quant_matrix.shape[0];
+        let n_cols = if quant_matrix.shape.len() > 1 {
+            quant_matrix.shape[1]
+        } else {
+            quant_matrix.n_elements() / n_rows
+        };
+
+        if input.len() < n_cols {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_cols,
+                got: input.len(),
+            });
+        }
+        if output.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: output.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(Q4_0_BLOCK_SIZE);
+        let row_bytes = blocks_per_row * Q4_0_BLOCK_BYTES;
+
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            let row_start = row * row_bytes;
+            let mut sum = 0.0f32;
+
+            for blk in 0..blocks_per_row {
+                let block_offset = row_start + blk * Q4_0_BLOCK_BYTES;
+                let block = &quant_matrix.data[block_offset..block_offset + Q4_0_BLOCK_BYTES];
+                let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let input_offset = blk * Q4_0_BLOCK_SIZE;
+
+                for i in 0..Q4_0_BLOCK_SIZE / 2 {
+                    let byte = block[2 + i];
+                    let lo = (byte & 0x0F) as i32 - 8;
+                    let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                    let idx_lo = input_offset + i;
+                    let idx_hi = idx_lo + Q4_0_BLOCK_SIZE / 2;
+                    if idx_lo < n_cols {
+                        sum += lo as f32 * d * input[idx_lo];
+                    }
+                    if idx_hi < n_cols {
+                        sum += hi as f32 * d * input[idx_hi];
+                    }
+                }
+            }
+            *out = sum;
+        });
+
+        Ok(())
+    }
+
+    fn gemm(
+        &self,
+        quant_matrix: &QuantTensor,
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> QuantResult<()> {
+        // Implement GEMM as M independent GEMVs for the reference implementation
+        for row in 0..m {
+            let input_row = &input[row * k..(row + 1) * k];
+            let output_row = &mut output[row * n..(row + 1) * n];
+            self.gemv(quant_matrix, input_row, output_row)?;
+        }
+        Ok(())
+    }
+
+    fn block_size(&self) -> usize {
+        Q4_0_BLOCK_SIZE
+    }
+
+    fn block_bytes(&self) -> usize {
+        Q4_0_BLOCK_BYTES
+    }
+
+    fn name(&self) -> &'static str {
+        "Q4_0"
+    }
+}
+
+/// Convert an IEEE 754 FP16 half-precision value to FP32.
+fn f16_to_f32(bits: u16) -> f32 {
+    half::f16::from_bits(bits).to_f32()
+}
+
+/// Q8_0 activation block constants.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Scalar oracle for the fused Q4_0 weight × Q8_0 activation GEMV.
+///
+/// Computes `out[row] += Σ_block (dequant_q4_0_weight · dequant_q8_0_act)`.
+/// Values are **added** to `out` — callers must zero it for a fresh result.
+///
+/// This standalone function (not a trait override) is intended as a reference
+/// to validate SIMD implementations with tolerance 1e-3.
+///
+/// # Block mapping
+/// One Q4_0 weight block (32 weights, 18 bytes) is paired 1-to-1 with one
+/// Q8_0 activation block (32 values, 34 bytes).
+pub fn matvec_q8_fused_reference(
+    weights: &[u8],
+    acts_q8: &[u8],
+    out: &mut [f32],
+    n_rows: usize,
+    n_cols: usize,
+) -> QuantResult<()> {
+    if out.len() < n_rows {
+        return Err(QuantError::DimensionMismatch {
+            expected: n_rows,
+            got: out.len(),
+        });
+    }
+
+    let blocks_per_row = n_cols.div_ceil(Q4_0_BLOCK_SIZE);
+    let row_bytes = blocks_per_row * Q4_0_BLOCK_BYTES;
+    let acts_needed = blocks_per_row * Q8_0_BLOCK_BYTES;
+
+    if weights.len() < n_rows * row_bytes {
+        return Err(QuantError::BufferTooSmall {
+            needed: n_rows * row_bytes,
+            available: weights.len(),
+        });
+    }
+    if acts_q8.len() < acts_needed {
+        return Err(QuantError::BufferTooSmall {
+            needed: acts_needed,
+            available: acts_q8.len(),
+        });
+    }
+
+    crate::parallel::for_each_row(out, n_rows, n_cols, |row, out_val| {
+        let row_start = row * row_bytes;
+        let mut sum = 0.0f32;
+
+        for blk in 0..blocks_per_row {
+            // Weight block.
+            let w_start = row_start + blk * Q4_0_BLOCK_BYTES;
+            let w_block = &weights[w_start..w_start + Q4_0_BLOCK_BYTES];
+            let d_w = f16_to_f32(u16::from_le_bytes([w_block[0], w_block[1]]));
+
+            // Q8_0 activation block (1:1 with weight block).
+            let a_start = blk * Q8_0_BLOCK_BYTES;
+            let a_block = &acts_q8[a_start..a_start + Q8_0_BLOCK_BYTES];
+            let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+            let q8_bytes = &a_block[2..]; // 32 i8 values
+
+            let w_offset = blk * Q4_0_BLOCK_SIZE;
+            let valid = (n_cols - w_offset).min(Q4_0_BLOCK_SIZE);
+
+            // Split-half layout: byte `i` holds weight `i` (low nibble) and
+            // weight `i + 16` (high nibble), so each nibble is paired with the
+            // activation lane of the same index.  A partial trailing block
+            // truncates the two halves independently.
+            for i in 0..(Q4_0_BLOCK_SIZE / 2) {
+                let byte = w_block[2 + i];
+                let q_lo = (byte & 0x0F) as i32 - 8;
+                let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                if i < valid {
+                    let a_lo = q8_bytes[i] as i8 as f32;
+                    sum += q_lo as f32 * d_w * a_lo * d_a;
+                }
+                let hi_idx = i + Q4_0_BLOCK_SIZE / 2;
+                if hi_idx < valid {
+                    let a_hi = q8_bytes[hi_idx] as i8 as f32;
+                    sum += q_hi as f32 * d_w * a_hi * d_a;
+                }
+            }
+        }
+
+        *out_val += sum; // ACCUMULATE
+    });
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_q4_0_block(scale: f32, nibbles: &[u8; 16]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(Q4_0_BLOCK_BYTES);
+        let d_bits = half::f16::from_f32(scale).to_bits();
+        block.extend_from_slice(&d_bits.to_le_bytes());
+        block.extend_from_slice(nibbles);
+        block
+    }
+
+    #[test]
+    fn test_dequant_block_zeros() {
+        // All nibbles = 8 (zero after subtracting 8)
+        let block = make_q4_0_block(1.0, &[0x88; 16]);
+        let kernel = Q4_0Ref;
+        let mut output = vec![0.0f32; 32];
+        kernel.dequant_block(&block, &mut output).unwrap();
+        for &v in &output {
+            assert!((v).abs() < 1e-5, "expected 0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_dequant_block_simple() {
+        // First byte: lo=0 (val=-8*d), hi=15 (val=7*d).
+        // GGML's split-half layout puts the low nibble of byte 0 at weight 0
+        // and its high nibble at weight 16 — *not* at weight 1.
+        let mut nibbles = [0x88u8; 16];
+        nibbles[0] = 0xF0; // lo=0 → -8, hi=15 → 7
+        let block = make_q4_0_block(0.5, &nibbles);
+        let kernel = Q4_0Ref;
+        let mut output = vec![0.0f32; 32];
+        kernel.dequant_block(&block, &mut output).unwrap();
+
+        assert!((output[0] - (-4.0)).abs() < 0.01, "got {}", output[0]); // -8 * 0.5
+        assert!((output[16] - 3.5).abs() < 0.01, "got {}", output[16]); // 7 * 0.5
+        assert!((output[1]).abs() < 0.01, "got {}", output[1]); // 0x8 → 0
+    }
+
+    #[test]
+    fn test_gemv_identity_like() {
+        let kernel = Q4_0Ref;
+        // Create a 1-row, 32-col quantized matrix
+        let block = make_q4_0_block(1.0, &[0x88; 16]); // all zeros
+        let tensor = QuantTensor::new(block, vec![1, 32], oxillama_gguf::GgufTensorType::Q4_0);
+
+        let input = vec![1.0f32; 32];
+        let mut output = vec![0.0f32; 1];
+        kernel.gemv(&tensor, &input, &mut output).unwrap();
+
+        // All weights are zero, so output should be zero
+        assert!((output[0]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_gemm_batched_q4_0() {
+        let kernel = Q4_0Ref;
+        // 2-row weight matrix, each row is 1 block of 32 cols with all-zero weights
+        let block = make_q4_0_block(1.0, &[0x88; 16]); // all zero weights
+        let mut data = Vec::new();
+        data.extend_from_slice(&block);
+        data.extend_from_slice(&block);
+        let tensor = QuantTensor::new(data, vec![2, 32], oxillama_gguf::GgufTensorType::Q4_0);
+
+        // 2 input rows × 32 cols
+        let input = vec![1.0f32; 64];
+        // 2 input rows × 2 weight rows = 4 outputs
+        let mut output = vec![0.0f32; 4];
+        kernel
+            .gemm(&tensor, &input, &mut output, 2, 2, 32)
+            .expect("test: q4_0 gemm");
+        // All weights are zero → all outputs must be zero
+        for (i, &v) in output.iter().enumerate() {
+            assert!(v.abs() < 1e-5, "output[{i}] = {v}, expected 0");
+        }
+    }
+
+    #[test]
+    fn test_gemv_input_too_small_errors() {
+        let kernel = Q4_0Ref;
+        let block = make_q4_0_block(1.0, &[0x88; 16]);
+        let tensor = QuantTensor::new(block, vec![1, 32], oxillama_gguf::GgufTensorType::Q4_0);
+        let input = vec![0.0f32; 4]; // need 32
+        let mut output = vec![0.0f32; 1];
+        assert!(
+            kernel.gemv(&tensor, &input, &mut output).is_err(),
+            "too-small input should error"
+        );
+    }
+
+    #[test]
+    fn test_gemv_output_too_small_errors() {
+        let kernel = Q4_0Ref;
+        let block = make_q4_0_block(1.0, &[0x88; 16]);
+        let mut data = Vec::new();
+        data.extend_from_slice(&block);
+        data.extend_from_slice(&block);
+        let tensor = QuantTensor::new(data, vec![2, 32], oxillama_gguf::GgufTensorType::Q4_0);
+        let input = vec![0.0f32; 32];
+        let mut output = vec![0.0f32; 1]; // need 2
+        assert!(
+            kernel.gemv(&tensor, &input, &mut output).is_err(),
+            "too-small output should error"
+        );
+    }
+
+    #[test]
+    fn test_q4_0_kernel_metadata() {
+        let kernel = Q4_0Ref;
+        assert_eq!(kernel.block_size(), Q4_0_BLOCK_SIZE);
+        assert_eq!(kernel.block_bytes(), Q4_0_BLOCK_BYTES);
+        assert_eq!(kernel.name(), "Q4_0");
+    }
+
+    #[test]
+    fn test_dequant_block_too_small_errors() {
+        let kernel = Q4_0Ref;
+        let mut output = vec![0.0f32; 32];
+        assert!(
+            kernel.dequant_block(&[0u8; 4], &mut output).is_err(),
+            "block too small should error"
+        );
+    }
+
+    #[test]
+    fn test_dequant_output_too_small_errors() {
+        let kernel = Q4_0Ref;
+        let block = make_q4_0_block(1.0, &[0x88; 16]);
+        let mut output = vec![0.0f32; 1]; // need 32
+        assert!(
+            kernel.dequant_block(&block, &mut output).is_err(),
+            "output too small should error"
+        );
+    }
+
+    // ── matvec_q8_fused_reference ─────────────────────────────────────────
+
+    /// Build a Q8_0 activation block from a scale and 32 i8 values.
+    fn make_q8_0_block(scale: f32, qs: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        let d_bits = half::f16::from_f32(scale).to_bits();
+        block.extend_from_slice(&d_bits.to_le_bytes());
+        for &q in qs {
+            block.push(q as u8);
+        }
+        block
+    }
+
+    #[test]
+    fn test_fused_ref_zero_activations() {
+        // Zero activations → output must stay zero regardless of weights.
+        let nibbles = [0x5Au8; 16];
+        let w_block = make_q4_0_block(1.0, &nibbles);
+        let a_block = make_q8_0_block(1.0, &[0i8; 32]);
+
+        let mut out = vec![0.0f32; 1];
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out, 1, 32)
+            .expect("fused ref zero acts");
+        assert!(out[0].abs() < 1e-5, "expected 0, got {}", out[0]);
+    }
+
+    #[test]
+    fn test_fused_ref_zero_weights() {
+        // Zero weights (nibble=8 → weight=0) → output must stay zero.
+        let w_block = make_q4_0_block(1.0, &[0x88u8; 16]);
+        let a_block = make_q8_0_block(1.0, &[127i8; 32]);
+
+        let mut out = vec![0.0f32; 1];
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out, 1, 32)
+            .expect("fused ref zero weights");
+        assert!(out[0].abs() < 1e-5, "expected 0, got {}", out[0]);
+    }
+
+    #[test]
+    fn test_fused_ref_accumulates() {
+        // Verify ACCUMULATE semantics: result is added to existing out value.
+        let w_block = make_q4_0_block(1.0, &[0x88u8; 16]); // zero weights
+        let a_block = make_q8_0_block(1.0, &[0i8; 32]);
+
+        let mut out = vec![42.0f32; 1];
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out, 1, 32).expect("fused accumulate");
+        // Zero weights + zero acts → sum=0, out stays 42.
+        assert!(
+            (out[0] - 42.0).abs() < 1e-5,
+            "accumulation broken: got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn test_fused_matches_unfused_q4_0() {
+        // Fused oracle must match the two-pass unfused gemv path.
+        let nibbles: [u8; 16] = [
+            0x5A, 0xF0, 0x13, 0x7E, 0xC2, 0x48, 0x9D, 0x6B, 0xA3, 0x2F, 0x71, 0xE4, 0x0C, 0x58,
+            0xB6, 0xD9,
+        ];
+        let d_w = 0.25f32;
+        let d_a = 0.5f32;
+        let w_block = make_q4_0_block(d_w, &nibbles);
+
+        let q8_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, -1, 2, -3, 4, -5, 6, -7,
+            8, -9, 10, -11, 12, -13, 14, -15, 16,
+        ];
+        let a_block = make_q8_0_block(d_a, &q8_vals);
+
+        // Build f32 input for unfused gemv.
+        let input: Vec<f32> = q8_vals.iter().map(|&q| q as f32 * d_a).collect();
+
+        let tensor = QuantTensor::new(
+            w_block.clone(),
+            vec![1, 32],
+            oxillama_gguf::GgufTensorType::Q4_0,
+        );
+        let kernel = Q4_0Ref;
+        let mut out_unfused = vec![0.0f32; 1];
+        kernel
+            .gemv(&tensor, &input, &mut out_unfused)
+            .expect("unfused gemv");
+
+        let mut out_fused = vec![0.0f32; 1];
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out_fused, 1, 32).expect("fused ref");
+
+        let err = (out_fused[0] - out_unfused[0]).abs();
+        assert!(
+            err < 1e-3,
+            "fused vs unfused: fused={} unfused={} err={}",
+            out_fused[0],
+            out_unfused[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_fused_ref_multi_row() {
+        // Multi-row matrix: verify all rows match unfused path.
+        let n_rows = 4usize;
+        let n_cols = 64usize;
+        let blocks_per_row = 2usize;
+        let nibbles: [u8; 16] = [
+            0x13, 0x57, 0x9B, 0xDF, 0x24, 0x68, 0xAC, 0xE0, 0x5F, 0x3A, 0x72, 0x8D, 0xC6, 0x4E,
+            0x91, 0xB7,
+        ];
+        let scales_w = [0.1f32, 0.25f32, 0.5f32, 1.0f32];
+        let d_a = 0.125f32;
+        let q8_vals: [i8; 32] = [
+            2, 4, -6, 8, -10, 12, -14, 16, 1, -3, 5, -7, 9, -11, 13, -15, 0, 1, -2, 3, -4, 5, -6,
+            7, -8, 9, -10, 11, -12, 13, -14, 15,
+        ];
+
+        // Build weight data (n_rows × blocks_per_row blocks).
+        let mut weights: Vec<u8> = Vec::new();
+        for &sw in &scales_w {
+            for _ in 0..blocks_per_row {
+                weights.extend_from_slice(&make_q4_0_block(sw, &nibbles));
+            }
+        }
+
+        // Build activation data (blocks_per_row Q8_0 blocks).
+        let mut acts: Vec<u8> = Vec::new();
+        for _ in 0..blocks_per_row {
+            acts.extend_from_slice(&make_q8_0_block(d_a, &q8_vals));
+        }
+
+        // Build f32 inputs for unfused (repeated q8_vals twice for 64 cols).
+        let input: Vec<f32> = q8_vals
+            .iter()
+            .chain(q8_vals.iter())
+            .map(|&q| q as f32 * d_a)
+            .collect();
+
+        let kernel = Q4_0Ref;
+
+        // Unfused path per row.
+        let mut out_unfused = vec![0.0f32; n_rows];
+        for row in 0..n_rows {
+            let row_start = row * blocks_per_row * Q4_0_BLOCK_BYTES;
+            let row_data =
+                weights[row_start..row_start + blocks_per_row * Q4_0_BLOCK_BYTES].to_vec();
+            let tensor = QuantTensor::new(
+                row_data,
+                vec![1, n_cols],
+                oxillama_gguf::GgufTensorType::Q4_0,
+            );
+            kernel
+                .gemv(&tensor, &input, &mut out_unfused[row..row + 1])
+                .expect("unfused gemv row");
+        }
+
+        // Fused oracle path.
+        let mut out_fused = vec![0.0f32; n_rows];
+        matvec_q8_fused_reference(&weights, &acts, &mut out_fused, n_rows, n_cols)
+            .expect("fused ref multi row");
+
+        for i in 0..n_rows {
+            let err = (out_fused[i] - out_unfused[i]).abs();
+            assert!(
+                err < 1e-3,
+                "row {i}: fused={} unfused={} err={}",
+                out_fused[i],
+                out_unfused[i],
+                err
+            );
+        }
+    }
+}

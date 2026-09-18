@@ -1,0 +1,37 @@
+[package]
+name = "oxiui-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core traits and types for OxiUI — Pure Rust UI layer"
+readme = "README.md"
+categories = ["gui", "rendering"]
+keywords = ["gui", "cooljapan", "oxiui", "pure-rust", "widgets"]
+
+[features]
+## Enable `serde::{Serialize, Deserialize}` on `UiEvent` and its nested types.
+serde = ["dep:serde"]
+
+[dependencies]
+oxicode = { workspace = true }
+serde = { workspace = true, optional = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+proptest  = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "layout_cache"
+harness = false
+
+[[bench]]
+name = "event_dispatch"
+harness = false
+
+[[bench]]
+name = "flexbox_layout"
+harness = false

@@ -1,0 +1,85 @@
+# nextest configuration for the OxiMedia workspace.
+#
+# Latency-budget tests measure wall-clock time and must not be
+# affected by concurrent test load on the machine.  They are placed
+# in the `serial-latency` test group which allows at most 1 thread.
+
+[test-groups]
+serial-latency = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# Match latency/perf-budget tests across all packages — these measure
+# wall-clock time and must not be disturbed by concurrent test load.
+filter = "test(latency_budget) | test(perf_budget)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# oximedia-repair deep-scan perf tests are slow integration tests that
+# require exclusive access to avoid timing interference.
+filter = "package(oximedia-repair) and test(perf)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# mmap+streaming agreement tests are large I/O-intensive tests that fail
+# under full workspace load due to I/O contention; run them serially.
+filter = "test(mmap_and_streaming)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# Noise-estimation profile tests measure wall-clock time on large frames and
+# must run serially to avoid timing interference from concurrent workers.
+filter = "test(noise_estimate_profile)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# 128-channel mixing console stress test measures wall-clock time and must
+# not be disturbed by concurrent test load.
+filter = "test(mixing_console_128_channels_stress)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# oximedia-repair detect_patterns timing-budget tests scan large buffers and
+# have explicit wall-clock budgets (90s debug / 10s release).  They must run
+# serially to avoid false-positive O(n²) regression failures under load.
+filter = "test(test_detect_patterns_sparse_sync_bytes) | test(test_detect_patterns_rare_first_byte)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# oximedia-routing lock-free reader latency test asserts snapshot() < 1ms.
+# Under full workspace parallel test load the OS scheduler can delay the
+# thread beyond that bound; run it serially so the assertion is meaningful.
+filter = "test(test_concurrent_readers_never_block_longer_than_1ms)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# oximedia-videoip PreciseSleeper spin-wait test asserts overshoot < 500 µs
+# for a 100 µs spin.  Under full workspace parallel load the OS scheduler can
+# preempt the spinning thread and push overshoot well above that bound.
+filter = "test(test_precise_sleeper_spin)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# oximedia-video temporal_denoise parallel-performance test measures wall-clock
+# throughput with an explicit timing budget; concurrent test load would cause
+# false-positive failures under full workspace parallelism.
+filter = "test(test_temporal_denoise_parallel_performance)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# oximedia-repair mmap scan tests iterate over large files and trigger mmap
+# memory pressure under full workspace parallel load (SIGBUS risk).  Running
+# them serially also prevents stale-file races between the two tests that
+# share the same temp-file namespace.
+filter = "test(mmap_scan_file_larger_than_threshold) | test(mmap_falls_back_for_small_file)"
+test-group = "serial-latency"
+
+[[profile.default.overrides]]
+# oximedia-transcode EBU R128 conformance tests run multi-second 48 kHz stereo
+# tone signals (up to ~1M samples) through the sample-by-sample BS.1770-4
+# K-weighting IIR filter several times per test, then re-normalize and re-meter.
+# In an unoptimized debug build a single test can take 60–80 s of pure CPU.
+# Give them a generous slow-timeout (no premature termination) and run them
+# serially so they neither time out nor contend with the rest of the suite.
+filter = "package(oximedia-transcode) and test(ebu_r128_conformance)"
+test-group = "serial-latency"
+slow-timeout = { period = "120s", terminate-after = 4 }

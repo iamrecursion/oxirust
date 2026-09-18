@@ -1,0 +1,22 @@
+[package]
+name = "oxixml-unicode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Unicode Character Database tables for XML: general category, scripts, blocks, case folding, and NFC/NFD/NFKC/NFKD normalization (pure-Rust replacement for unicode-normalization and unicode-properties)."
+keywords = ["unicode", "normalization", "nfc", "xml", "casefolding"]
+categories = ["text-processing", "internationalization", "encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[lints]
+workspace = true

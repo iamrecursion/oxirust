@@ -1,0 +1,24 @@
+[bans]
+deny = [
+    { name = "freetype-sys" },
+    { name = "fontconfig-sys" },
+    { name = "harfbuzz-sys" },
+    { name = "brotli" },
+    { name = "flate2" },
+    { name = "miniz_oxide" },
+    { name = "ring" },
+    { name = "quick-xml", use-instead = "oxixml-xml" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "OFL-1.1",
+]
+confidence-threshold = 0.8

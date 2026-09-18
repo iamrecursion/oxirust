@@ -1,0 +1,29 @@
+[package]
+name = "phop-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Benchmark harness for phop (forward-eval throughput, discovery, recovery vs baselines)"
+publish = false
+
+[dependencies]
+phop-core.workspace = true
+scirs2-core.workspace = true
+
+[features]
+default = []
+# Enable the CUDA GPU forward path (forwards to phop-core/gpu-cuda); powers the
+# `gpu_throughput` binary used for the M4 perf gate.
+gpu-cuda = ["phop-core/gpu-cuda"]
+# Enable the Apple Metal GPU forward path (forwards to phop-core/gpu-metal); powers the
+# `gpu_throughput` binary on macOS.
+gpu-metal = ["phop-core/gpu-metal"]
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "forward"
+harness = false

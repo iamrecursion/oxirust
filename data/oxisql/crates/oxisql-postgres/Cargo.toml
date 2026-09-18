@@ -1,0 +1,49 @@
+[package]
+name = "oxisql-postgres"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust PostgreSQL backend for OxiSQL via tokio-postgres + OxiTLS (no libpq, no OpenSSL)"
+readme = "README.md"
+categories = ["database", "asynchronous"]
+keywords = ["database", "postgresql", "pure-rust", "cooljapan", "oxisql"]
+
+[features]
+default = []
+# Gate the integration tests (require a live Postgres instance).
+integration-postgres = []
+# Logical replication (CDC) support — parses the Postgres replication wire
+# protocol via postgres-protocol.
+replication = ["dep:postgres-protocol", "dep:fallible-iterator-02"]
+
+[dependencies]
+oxisql-core.workspace = true
+oxisql-parse.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+postgres-protocol = { workspace = true, optional = true }
+fallible-iterator-02 = { workspace = true, optional = true }
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+oxitls.workspace = true
+bytes.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+oxisql-pool = { path = "../oxisql-pool", features = ["postgres"] }
+deadpool-postgres.workspace = true
+criterion = { workspace = true }
+
+[[bench]]
+name = "postgres_benchmarks"
+harness = false

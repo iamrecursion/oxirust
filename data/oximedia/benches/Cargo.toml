@@ -1,0 +1,180 @@
+[package]
+name = "oximedia-benchmarks"
+description = "Benchmarks for OxiMedia ecosystem"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "container_bench"
+path = "container_bench.rs"
+harness = false
+
+[[bench]]
+name = "codec_bench"
+path = "codec_bench.rs"
+harness = false
+
+[[bench]]
+name = "audio_bench"
+path = "audio_bench.rs"
+harness = false
+
+[[bench]]
+name = "cv_bench"
+path = "cv_bench.rs"
+harness = false
+
+[[bench]]
+name = "graph_bench"
+path = "graph_bench.rs"
+harness = false
+
+[[bench]]
+name = "io_bench"
+path = "io_bench.rs"
+harness = false
+
+[[bench]]
+name = "compat_ffmpeg_bench"
+path = "compat_ffmpeg_bench.rs"
+harness = false
+
+[[bench]]
+name = "quality_metrics"
+path = "quality_metrics.rs"
+harness = false
+
+[[bench]]
+name = "audio_metering"
+path = "audio_metering.rs"
+harness = false
+
+[[bench]]
+name = "format_probe"
+path = "format_probe.rs"
+harness = false
+
+[[bench]]
+name = "dedup_hash"
+path = "dedup_hash.rs"
+harness = false
+
+# ── Legacy / reconciled benches ──────────────────────────────────────────────
+# These files existed as orphaned sources; registering them here activates them
+# as proper Criterion harnesses so contributors cannot accidentally edit dead code.
+
+[[bench]]
+name = "codec_encode_bench"
+path = "codec_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "filter_bench"
+path = "filter_benchmark.rs"
+harness = false
+
+# ── 0.1.2/0.1.3 crate benches ────────────────────────────────────────────────
+
+[[bench]]
+name = "hdr_bench"
+path = "hdr_bench.rs"
+harness = false
+
+[[bench]]
+name = "spatial_bench"
+path = "spatial_bench.rs"
+harness = false
+
+[[bench]]
+name = "cache_bench"
+path = "cache_bench.rs"
+harness = false
+
+[[bench]]
+name = "stream_bench"
+path = "stream_bench.rs"
+harness = false
+
+[[bench]]
+name = "video_bench"
+path = "video_bench.rs"
+harness = false
+
+[[bench]]
+name = "cdn_bench"
+path = "cdn_bench.rs"
+harness = false
+
+[[bench]]
+name = "neural_bench"
+path = "neural_bench.rs"
+harness = false
+
+[[bench]]
+name = "vr360_bench"
+path = "vr360_bench.rs"
+harness = false
+
+[[bench]]
+name = "analytics_bench"
+path = "analytics_bench.rs"
+harness = false
+
+[[bench]]
+name = "caption_gen_bench"
+path = "caption_gen_bench.rs"
+harness = false
+
+[[bench]]
+name = "pipeline_bench"
+path = "pipeline_bench.rs"
+harness = false
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-io = { workspace = true }
+oximedia-container = { workspace = true }
+oximedia-codec = { workspace = true, default-features = true, features = ["av1", "vp8", "vp9"], optional = true }
+oximedia-audio = { workspace = true }
+oximedia-graph = { workspace = true }
+oximedia-cv = { workspace = true, optional = true }
+oximedia-compat-ffmpeg = { workspace = true }
+oximedia-quality = { workspace = true }
+oximedia-metering = { workspace = true }
+oximedia-dedup = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+xxhash-rust = { workspace = true }
+oximedia-hdr = { workspace = true }
+oximedia-spatial = { workspace = true }
+oximedia-cache = { workspace = true }
+oximedia-stream = { workspace = true }
+oximedia-video = { workspace = true }
+oximedia-cdn = { workspace = true }
+oximedia-neural = { workspace = true }
+oximedia-360 = { workspace = true }
+oximedia-analytics = { workspace = true }
+oximedia-caption-gen = { workspace = true }
+oximedia-pipeline = { workspace = true }
+
+[dev-dependencies]
+# Pure-Rust default build: criterion (0.8) unconditionally pulls `alloca`,
+# whose build.rs compiles alloca.c via `cc` on unix/windows. As a
+# dev-dependency it is only compiled for bench/test targets, keeping the
+# default (no-dev) workspace build free of C compilation.
+criterion = { workspace = true }
+
+[features]
+default = []
+codec = ["dep:oximedia-codec"]
+cv = ["dep:oximedia-cv"]

@@ -1,0 +1,46 @@
+// Gradle build file for SciRS2 Android integration
+// Add this to your Android project's build.gradle
+
+android {
+    defaultConfig {
+        // Specify ABIs to include
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'
+        }
+    }
+
+    // Configure native library directories
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['../../../target/android/jniLibs']
+        }
+    }
+
+    // Enable native build
+    externalNativeBuild {
+        ndkBuild {
+            path 'Android.mk'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.22'
+}

@@ -1,0 +1,144 @@
+[package]
+name = "voirs-feedback"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Real-time feedback and interactive training system for VoiRS"
+readme = "README.md"
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/voirs-feedback"
+keywords = ["speech", "tts", "feedback", "training", "ai"]
+categories = ["multimedia::audio", "science", "development-tools"]
+rust-version.workspace = true
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core.workspace = true
+scirs2-fft.workspace = true
+
+# Core VoiRS dependencies
+voirs-sdk.workspace = true
+voirs-recognizer.workspace = true
+voirs-evaluation.workspace = true
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+# Kubernetes manifest generation (cloud_deployment.rs)
+serde_yaml.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Time and date
+chrono.workspace = true
+chrono-tz.workspace = true
+
+# Math and statistics
+statrs = "0.18"
+
+# Real-time features
+crossbeam-utils.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+
+# HTTP client for microservices
+reqwest = { workspace = true, optional = true }
+
+# Email support for alerts (rustls instead of native-tls — COOLJAPAN Pure Rust Policy)
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "pool", "hostname", "builder", "tokio1-rustls", "webpki-roots", "rustls-no-provider"] }
+
+# GraphQL support
+async-graphql = { version = "7.2", optional = true }
+
+# UI and visualization (optional)
+egui = { version = "0.35", optional = true }
+eframe = { version = "0.35", optional = true }
+# Only SVGBackend is used (src/visualization/charts.rs); the bitmap/image/gif
+# backends are left off because they pull png -> flate2 (COOLJAPAN policy).
+plotters = { version = "0.3", optional = true, default-features = false, features = ["svg_backend", "ttf", "datetime", "deprecated_items", "all_series", "all_elements", "full_palette", "colormaps"] }
+
+# Audio visualization
+hound = { workspace = true, optional = true }
+
+# Machine learning for adaptive feedback
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+
+# Configuration management
+config = "0.15"
+
+# Logging
+log.workspace = true
+env_logger = "0.11"
+
+# Collections and utilities
+indexmap = "2.14"
+uuid.workspace = true
+base64.workspace = true
+libc.workspace = true
+num_cpus.workspace = true
+regex.workspace = true
+
+# OAuth 2.0 and JWT support
+jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
+urlencoding = "2.1"
+
+# Database and persistence
+sqlx = { version = "0.9.0", features = ["sqlite", "postgres", "runtime-tokio", "tls-none", "chrono", "uuid", "json"], optional = true }
+sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "chrono", "uuid"], optional = true }
+oxicode = { workspace = true }
+oxiarc-deflate.workspace = true
+
+# Privacy and encryption
+aes-gcm = { version = "0.11", optional = true }
+argon2 = { version = "0.5", optional = true }
+hmac = { version = "0.13", optional = true }
+sha2 = { version = "0.11", optional = true }
+hex = { version = "0.4", optional = true }
+
+[features]
+default = ["realtime", "adaptive", "progress-tracking", "privacy", "microservices"]
+
+# Core features
+realtime = []
+adaptive = ["candle-core", "candle-nn"]
+progress-tracking = []
+gamification = []
+microservices = ["reqwest"]
+graphql = ["async-graphql"]
+
+# Database and persistence features
+persistence = ["sqlx"]
+orm = ["sea-orm", "persistence"]
+
+# Privacy and security features
+privacy = ["aes-gcm", "argon2", "hmac", "sha2", "hex"]
+
+# UI features
+ui = ["egui", "eframe", "plotters"]
+audio-export = ["hound"]
+
+# All features
+all-features = [
+    "realtime", "adaptive", "progress-tracking", 
+    "gamification", "ui", "audio-export", "persistence", "orm", "privacy"
+]
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = "0.8"
+tempfile = "3.27"
+
+[package.metadata.docs.rs]
+features = ["all-features"]
+rustdoc-args = ["--cfg", "docsrs"]
+[lints]
+workspace = true

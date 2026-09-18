@@ -1,0 +1,29 @@
+{
+  "rows": 1000,
+  "cols": 1000,
+  "row_indices": [
+    0,
+    10,
+    100,
+    500,
+    999
+  ],
+  "col_indices": [
+    0,
+    10,
+    100,
+    500,
+    999
+  ],
+  "values": [
+    1.5,
+    2.5,
+    3.5,
+    4.5,
+    5.5
+  ],
+  "metadata": {
+    "description": "Sparse test matrix",
+    "density": "0.000005"
+  }
+}

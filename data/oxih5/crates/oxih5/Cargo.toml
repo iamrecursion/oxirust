@@ -1,0 +1,34 @@
+[package]
+name = "oxih5"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiH5 — Pure-Rust HDF5 reader (no libhdf5 FFI)"
+categories = ["parser-implementations", "science"]
+keywords = ["hdf5", "h5", "pure-rust", "cooljapan", "oxih5"]
+readme = "README.md"
+
+[features]
+default = []
+ndarray  = ["oxih5-core/ndarray"]
+parallel = ["oxih5-format/parallel", "dep:rayon"]
+dhat-heap = ["dep:dhat"]
+# Enable szip (id 4) chunk decoding, including RAW mode. Pure Rust via oxiarc-szip.
+szip = ["oxih5-format/szip"]
+
+[dependencies]
+oxih5-core   = { workspace = true }
+oxih5-format = { workspace = true }
+memmap2      = { workspace = true }
+rayon        = { workspace = true, optional = true }
+dhat         = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "read_bench"
+harness = false

@@ -1,0 +1,43 @@
+[package]
+name = "oxiz-proof"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Proof generation and checking for OxiZ SMT solver"
+readme = "README.md"
+keywords = ["smt", "proof", "drat", "alethe", "verification"]
+categories = ["algorithms", "development-tools::testing"]
+
+[dependencies]
+oxiz-core = { workspace = true, features = ["std"] }
+oxiz-time = { workspace = true, features = ["std"] }
+smallvec.workspace = true
+rustc-hash = { workspace = true, features = ["std"] }
+thiserror = { workspace = true, features = ["std"] }
+bumpalo = { workspace = true, optional = true }
+regex.workspace = true
+num-rational = { workspace = true, features = ["std"] }
+oxiz-sat = { workspace = true, optional = true, features = ["std"] }
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+sat-integration = ["oxiz-sat"]
+serde = ["dep:serde", "smallvec/serde"]
+profiling = ["oxiz-core/profiling"]
+arena = ["dep:bumpalo"]
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+num-bigint = { workspace = true, features = ["std"] }
+
+[[bench]]
+name = "proof_benchmarks"
+harness = false
+
+[lints.clippy]
+unwrap_used = "deny"

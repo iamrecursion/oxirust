@@ -1,0 +1,160 @@
+//! Polynomial arithmetic for non-linear theories.
+//!
+//! This module provides multivariate polynomial representation and operations
+//! for SMT solving, particularly for non-linear real arithmetic (NRA).
+//!
+//! Reference: Z3's `math/polynomial/` directory.
+
+mod advanced_ops;
+mod arithmetic;
+mod constructors;
+mod extended_ops;
+mod helpers;
+pub mod simd;
+mod types;
+
+pub mod factorization;
+pub mod gcd;
+pub mod gcd_advanced;
+pub mod gcd_multivariate;
+pub mod gcd_multivariate_advanced;
+pub mod interpolation;
+pub mod resultant;
+pub mod root_counting;
+pub mod root_isolation;
+pub mod sparse_ops;
+pub mod symbolic_differentiation;
+
+// Re-export all public types
+pub use types::{Monomial, MonomialOrder, NULL_VAR, Term, Var, VarPower};
+
+// Re-export public utility functions
+pub use helpers::rational_sqrt;
+
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::ops::{Add, Mul, Neg, Sub};
+use num_traits::Signed;
+
+/// A multivariate polynomial over rationals.
+/// Represented as a sum of terms, sorted by monomial order.
+#[derive(Clone)]
+pub struct Polynomial {
+    /// Terms in decreasing order (according to monomial order).
+    pub(crate) terms: Vec<Term>,
+    /// The monomial ordering used.
+    pub(crate) order: MonomialOrder,
+}
+
+// Operator trait implementations
+impl Neg for Polynomial {
+    type Output = Polynomial;
+
+    fn neg(self) -> Polynomial {
+        Polynomial::neg(&self)
+    }
+}
+
+impl Neg for &Polynomial {
+    type Output = Polynomial;
+
+    fn neg(self) -> Polynomial {
+        Polynomial::neg(self)
+    }
+}
+
+impl Add for Polynomial {
+    type Output = Polynomial;
+
+    fn add(self, other: Polynomial) -> Polynomial {
+        Polynomial::add(&self, &other)
+    }
+}
+
+impl Add<&Polynomial> for &Polynomial {
+    type Output = Polynomial;
+
+    fn add(self, other: &Polynomial) -> Polynomial {
+        Polynomial::add(self, other)
+    }
+}
+
+impl Sub for Polynomial {
+    type Output = Polynomial;
+
+    fn sub(self, other: Polynomial) -> Polynomial {
+        Polynomial::sub(&self, &other)
+    }
+}
+
+impl Sub<&Polynomial> for &Polynomial {
+    type Output = Polynomial;
+
+    fn sub(self, other: &Polynomial) -> Polynomial {
+        Polynomial::sub(self, other)
+    }
+}
+
+impl Mul for Polynomial {
+    type Output = Polynomial;
+
+    fn mul(self, other: Polynomial) -> Polynomial {
+        Polynomial::mul(&self, &other)
+    }
+}
+
+impl Mul<&Polynomial> for &Polynomial {
+    type Output = Polynomial;
+
+    fn mul(self, other: &Polynomial) -> Polynomial {
+        Polynomial::mul(self, other)
+    }
+}
+
+impl PartialEq for Polynomial {
+    fn eq(&self, other: &Self) -> bool {
+        if self.terms.len() != other.terms.len() {
+            return false;
+        }
+
+        for i in 0..self.terms.len() {
+            if self.terms[i] != other.terms[i] {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl Eq for Polynomial {}
+
+impl core::fmt::Debug for Polynomial {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_zero() {
+            write!(f, "0")
+        } else {
+            for (i, term) in self.terms.iter().enumerate() {
+                if i > 0 {
+                    if term.coeff.is_positive() {
+                        write!(f, " + ")?;
+                    } else {
+                        write!(f, " - ")?;
+                    }
+                    let mut t = term.clone();
+                    t.coeff = t.coeff.abs();
+                    write!(f, "{:?}", t)?;
+                } else {
+                    write!(f, "{:?}", term)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+impl core::fmt::Display for Polynomial {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self, f)
+    }
+}

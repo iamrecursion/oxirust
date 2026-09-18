@@ -1,0 +1,11 @@
+{
+  "name": "patent_aac",
+  "args": ["-i", "in.mp4", "-c:a", "aac", "-b:a", "128k", "out.mkv"],
+  "expect": {
+    "contains_diagnostic_kinds": ["PatentCodecSubstituted"],
+    "contains_diagnostic_messages": ["aac", "opus"],
+    "jobs": 1,
+    "audio_codec": "opus",
+    "audio_bitrate": "128k"
+  }
+}

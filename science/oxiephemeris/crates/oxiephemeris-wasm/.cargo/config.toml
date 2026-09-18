@@ -1,0 +1,9 @@
+# The RDF stack pulls `oxrdf -> rand -> getrandom`. On
+# wasm32-unknown-unknown getrandom 0.3 requires the js backend to be
+# selected via this cfg (in addition to the `wasm_js` cargo feature, set in
+# the workspace Cargo.toml). Our graphs are blank-node-free, so `rand` is
+# never actually called at runtime — this only satisfies the linker.
+#
+# `wasm-pack` runs from this crate directory, so it picks this file up.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

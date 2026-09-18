@@ -1,0 +1,67 @@
+[package]
+name = "scirs2-optimize"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Optimization module for SciRS2 (scirs2-optimize)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["optimization", "minimize", "scientific", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["simd", "parallel", "linalg", "gpu", "random", "array"] }
+scirs2-linalg = { workspace = true }
+scirs2-stats = { workspace = true }
+thiserror = { workspace = true }
+
+# Optimization specific dependencies
+scirs2-sparse = { workspace = true }
+statrs = { workspace = true }
+serde = { workspace = true }
+
+# Async dependencies (optional)
+tokio = { workspace = true, optional = true }
+
+# Symbolic-gradient dependencies (optional)
+scirs2-symbolic = { workspace = true, optional = true }
+
+# Optional NVIDIA-only CUDA acceleration via the pure-Rust oxicuda-* library crates (off by default)
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }
+oxicuda-blas = { workspace = true, optional = true }
+
+[features]
+default = ["parallel"]
+parallel = ["scirs2-core/parallel"]
+async = ["tokio"]
+python = ["scirs2-core/python"] # Python bindings support
+symbolic = ["dep:scirs2-symbolic"] # Symbolic-gradient Newton solver
+wgpu = ["scirs2-core/array_protocol_wgpu"] # GPU-accelerated L-BFGS 2-loop recursion via wgpu
+cuda = ["dep:oxicuda-driver", "dep:oxicuda-memory", "dep:oxicuda-blas"] # Optional NVIDIA-only CUDA Hessian-vector products
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+# Additional scirs2-core features needed only by tests (unions with the
+# [dependencies] feature set above; see gpu_availability test helper usage
+# in tests/*_gpu_smoke.rs).
+scirs2-core = { path = "../scirs2-core", features = ["testing"] }
+
+[[bench]]
+name = "scipy_comparison_bench"
+harness = false
+
+

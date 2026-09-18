@@ -1,0 +1,69 @@
+[package]
+name = "celers-broker-sql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQL database broker implementation for CeleRS (MySQL)"
+readme = "README.md"
+keywords = ["celery", "mysql", "broker", "queue", "sql"]
+categories = ["asynchronous", "database", "network-programming"]
+
+[dependencies]
+celers-core = { workspace = true }
+celers-metrics = { workspace = true, optional = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+
+# SQL client (Pure Rust OxiSQL, MySQL backend).
+#
+# `oxisql-postgres` is also depended on (unused by this crate's own broker
+# logic, which is MySQL-only) solely because `tls_mode.rs` is copied
+# verbatim from the proven dual-backend reference (`celers-cli`'s
+# `tls_mode.rs`) rather than trimmed to a MySQL-only subset, matching the
+# established pattern from the prior `celers-backend-db` migration.
+oxisql-core = { workspace = true }
+oxisql-mysql = { workspace = true }
+oxisql-postgres = { workspace = true }
+oxitls = { workspace = true }
+rustls = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
+oxiarc-deflate = { workspace = true }
+rand = { workspace = true }
+
+[features]
+default = []
+metrics = ["celers-metrics"]
+
+[dev-dependencies]
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which is what
+# lets interval-driven background loops be tested deterministically instead
+# of by sleeping. Test-only: it is inert unless a test pauses the clock.
+tokio = { workspace = true, features = ["test-util"] }
+# Dev-only, and only for the live coexistence test: this crate's broker and
+# `celers-backend-db`'s `MysqlResultBackend` both auto-migrate into the same
+# MySQL database in a normal deployment, and used to collide on a shared
+# `celers_task_results` table (Known gaps #16). The regression test that
+# proves they now coexist has to drive *both* migrations against one
+# database, so it needs the other crate.
+#
+# This direction is the one that compiles: `celers-backend-db` does not
+# depend on `celers-broker-sql`, so there is no cycle. It is a
+# `dev-dependency`, so nothing reaches a published consumer's build.
+celers-backend-db = { workspace = true }
+futures = { workspace = true }
+criterion = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "broker_benchmark"
+harness = false

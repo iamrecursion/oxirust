@@ -1,0 +1,46 @@
+# cargo deny check configuration for the oxisound workspace.
+# Run: cargo deny check
+
+[licenses]
+# Allow common permissive and copyleft licenses used in the Rust ecosystem.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+]
+# Higher confidence reduces false-positives on license detection.
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+
+[bans]
+# Warn on duplicate crate versions rather than failing the build.
+multiple-versions = "warn"
+# Deny known problematic crates (COOLJAPAN Pure-Rust policy: no ASIO/JACK C FFI by default).
+deny = [
+    # No quarantine crate exists for ASIO yet (see workspace Cargo.toml comment on the
+    # `cpal` entry) — banned outright, no wrapper exception.
+    { crate = "asio-sys" },
+    # jack-sys is the raw libjack2 C-FFI. It is confined to the `oxisound-jack`
+    # quarantine crate (Pure Rust Policy v2 §5), reached ONLY via the safe `jack`
+    # binding crate's own dependency on jack-sys (never a direct oxisound-jack dep).
+    # `wrappers` allows it when — and only when — `jack` is its sole direct
+    # dependent, so any *other* future path to jack-sys is still denied.
+    { crate = "jack-sys", wrappers = ["jack"] },
+]
+
+[advisories]
+# Deny crates with known security advisories.
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

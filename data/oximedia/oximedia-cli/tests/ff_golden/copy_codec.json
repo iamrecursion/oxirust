@@ -1,0 +1,10 @@
+{
+  "name": "copy_codec",
+  "args": ["-i", "in.mkv", "-c:v", "copy", "-c:a", "libopus", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_codec": "copy",
+    "audio_codec": "opus"
+  }
+}

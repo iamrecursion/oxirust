@@ -1,0 +1,38 @@
+[package]
+name         = "oxicuda-geometry3d"
+description  = "3D geometry, point-cloud, mesh, and Gaussian-splatting primitives for OxiCUDA: FPS/kNN/KD-tree, PointNet/PointNet++/DGCNN/Point-Transformer, sparse 3D conv, chamfer/EMD, ICP, 3D Gaussian splatting — pure Rust, zero CUDA SDK dependency."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme                 = "README.md"
+keywords   = ["gpu", "point-cloud", "geometry", "pointnet", "gaussian-splatting"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[features]
+# On-device GPU validation harness (JIT-loads the hand-written PTX kernels on a
+# real CUDA device and checks each against a CPU oracle). Off by default so the
+# crate builds and tests on CPU-only machines.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name    = "geom3d_ops"
+harness = false

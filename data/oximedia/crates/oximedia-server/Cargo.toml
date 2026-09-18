@@ -1,0 +1,110 @@
+[package]
+name = "oximedia-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "RESTful media server for OxiMedia"
+keywords = ["server", "multimedia", "api", "streaming", "http"]
+categories = ["multimedia", "web-programming"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+cdn-aws = ["oximedia-storage/s3", "dep:aws-sdk-s3", "dep:aws-config"]
+cdn-azure = ["oximedia-storage/azure"]
+cdn-gcs = ["oximedia-storage/gcs", "dep:google-cloud-storage"]
+cdn-all = ["cdn-aws", "cdn-azure", "cdn-gcs"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-io = { workspace = true }
+oxiarc-deflate = { workspace = true }
+# `vp9` is enabled on top of the default features so the RTMP ingest
+# depacketizer can read a VP9 keyframe's real frame dimensions out of its
+# uncompressed header (`vpcC` does not carry them). See
+# `src/ingest_depacketizer.rs::vp9_dimensions_from_keyframe`.
+oximedia-codec = { workspace = true, default-features = true, features = ["vp9"] }
+oximedia-container = { workspace = true }
+oximedia-audio = { workspace = true }
+oximedia-cv = { workspace = true }
+oximedia-net = { workspace = true }
+oximedia-transcode = { workspace = true }
+oximedia-packager = { workspace = true }
+oximedia-storage = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+nom = { workspace = true }
+bitflags = { workspace = true }
+rayon = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+
+# Database (Pure Rust SQLite via OxiSQL — replaces sqlx + libsqlite3-sys;
+# see crates/oximedia-server/src/db.rs for the compatibility shim and
+# crates/oximedia-rights/src/database/storage.rs for the sibling migration).
+oxisql-core = { workspace = true }
+oxisql-sqlite-compat = { workspace = true }
+
+# Authentication
+# jsonwebtoken 10.x requires an explicit crypto backend; select the Pure Rust
+# `rust_crypto` provider (RustCrypto: hmac/sha2/rsa/p256/p384/ed25519-dalek).
+# Without this, jsonwebtoken installs a panicking CryptoProvider (it does not
+# enable a backend via its default features), and any encode/decode panics with
+# "Could not automatically determine the process-level CryptoProvider". Now
+# supplied via the workspace-level default (see root Cargo.toml).
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+password-hash = { workspace = true }
+rand = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Utilities
+mime_guess = "2"
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex.workspace = true
+walkdir.workspace = true
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+futures.workspace = true
+pin-project = { workspace = true }
+
+# CDN/Cloud storage (optional - require newer Rust versions)
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+google-cloud-storage = { workspace = true, optional = true }
+
+# Monitoring and metrics
+prometheus = { workspace = true }
+tokio-metrics = "0.5"
+
+# HTTP client for webhooks
+reqwest = { workspace = true }
+
+# Memory-mapped I/O for zero-copy HLS/DASH segment serving
+memmap2 = { workspace = true }
+
+# Additional utilities
+url = { workspace = true }
+tempfile.workspace = true

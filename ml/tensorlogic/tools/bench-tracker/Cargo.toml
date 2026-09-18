@@ -1,0 +1,27 @@
+[package]
+name = "bench-tracker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Benchmark regression tracking tool for TensorLogic"
+readme = "README.md"
+keywords = ["benchmark", "regression", "tracking", "performance", "tensorlogic"]
+categories = ["development-tools::profiling"]
+documentation = "https://docs.rs/bench-tracker"
+
+[[bin]]
+name = "bench-tracker"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+colored.workspace = true
+tabled.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"

@@ -1,0 +1,1150 @@
+//! GPU-accelerated distance computations for high-performance neighbor search
+//!
+//! This module provides GPU acceleration for distance computations. All GPU
+//! compute routes through the OxiCUDA stack: pairwise-distance batches use the
+//! GEMM trick via `sklears_core::gpu` (a real `oxicuda-driver` `Context` +
+//! `oxicuda-blas` `BlasHandle`), and approximate k-NN search (see
+//! [`GpuKNeighborsSearch::with_ann`]) uses `oxicuda-manifold`'s HNSW index.
+//! There is no OpenCL or Metal backend -- those were previously
+//! decorative wrappers that dispatched to the exact same CUDA code path
+//! regardless of which one was selected. [`GpuBackend`] now only
+//! distinguishes "use OxiCUDA" ([`GpuBackend::Cuda`]) from "CPU only"
+//! ([`GpuBackend::CpuFallback`]), and [`GpuDistanceCalculator::detect_gpu_devices`]
+//! performs a real `oxicuda-driver` device query -- it never fabricates a
+//! device that isn't actually present. On a host with no CUDA driver,
+//! requesting [`GpuBackend::Cuda`] honestly reports `Ok(None)`, and callers
+//! fall back to the CPU path, exactly like [`sklears_core::gpu::GpuBackend::detect`]
+//! itself. Includes batch processing and memory-usage estimation helpers for
+//! large-scale distance matrix computations.
+
+use crate::distance::Distance;
+use crate::{NeighborsError, NeighborsResult};
+use scirs2_core::ndarray::{Array2, ArrayView2, Axis};
+use sklears_core::types::Float;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "gpu")]
+use oxicuda_manifold::{hnsw_build, hnsw_search, HnswConfig, HnswDistance, ManifoldError};
+#[cfg(feature = "gpu")]
+use sklears_core::gpu::{GpuArray, GpuContext, GpuMatrixOps};
+
+/// GPU backend type.
+///
+/// Collapsed from the pre-0.2.0 `{Cuda, OpenCl, Metal, CpuFallback}` set:
+/// this crate never actually had distinct OpenCL or Metal code paths --
+/// selecting either one dispatched to identical OxiCUDA GEMM logic as
+/// selecting `Cuda`. Only two honest states remain: [`GpuBackend::Cuda`]
+/// ("detect and use a real OxiCUDA device") and
+/// [`GpuBackend::CpuFallback`] ("CPU only, no device requested").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GpuBackend {
+    /// OxiCUDA-backed GPU compute, detected via
+    /// `sklears_core::gpu::GpuContext::detect`/`with_device_id`.
+    Cuda,
+    /// CPU-only fallback (no GPU device requested).
+    CpuFallback,
+}
+
+/// GPU device information
+#[derive(Debug, Clone)]
+pub struct GpuDeviceInfo {
+    pub device_id: u32,
+    pub name: String,
+    pub backend: GpuBackend,
+    pub memory_size: usize,
+    pub compute_units: u32,
+    pub max_work_group_size: usize,
+}
+
+/// GPU computation configuration.
+///
+/// The memory-management knobs that used to live here (`memory_strategy`,
+/// `max_memory_usage`, `enable_async`) were never actually consulted by any
+/// code in this module -- they were accepted and stored, then silently
+/// ignored. `batch_size` is the one knob this module genuinely implements:
+/// [`GpuDistanceCalculator::batch_pairwise_distances`] tiles the computation
+/// into `batch_size × batch_size` blocks, which is the real (and only)
+/// memory-management strategy this crate has.
+#[derive(Debug, Clone)]
+pub struct GpuConfig {
+    pub backend: GpuBackend,
+    pub device_id: Option<u32>,
+    pub batch_size: usize,
+}
+
+impl Default for GpuConfig {
+    fn default() -> Self {
+        Self {
+            backend: GpuBackend::CpuFallback,
+            device_id: None,
+            batch_size: 1024,
+        }
+    }
+}
+
+/// GPU distance computation result
+#[derive(Debug, Clone)]
+pub struct GpuDistanceResult {
+    pub distances: Array2<Float>,
+    pub computation_time: f64,
+    pub memory_usage: usize,
+    pub backend_used: GpuBackend,
+}
+
+/// GPU distance computation statistics
+#[derive(Debug, Clone)]
+pub struct GpuComputationStats {
+    pub total_computations: usize,
+    pub total_time: f64,
+    pub average_time: f64,
+    pub peak_memory_usage: usize,
+    pub backend_distribution: HashMap<GpuBackend, usize>,
+}
+
+/// GPU distance calculator
+pub struct GpuDistanceCalculator {
+    config: GpuConfig,
+    device_info: Option<GpuDeviceInfo>,
+    stats: Arc<Mutex<GpuComputationStats>>,
+}
+
+impl Default for GpuDistanceCalculator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GpuDistanceCalculator {
+    /// Create a new GPU distance calculator
+    pub fn new() -> Self {
+        Self {
+            config: GpuConfig::default(),
+            device_info: None,
+            stats: Arc::new(Mutex::new(GpuComputationStats {
+                total_computations: 0,
+                total_time: 0.0,
+                average_time: 0.0,
+                peak_memory_usage: 0,
+                backend_distribution: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Create a new GPU distance calculator with configuration
+    pub fn with_config(config: GpuConfig) -> Self {
+        Self {
+            config,
+            device_info: None,
+            stats: Arc::new(Mutex::new(GpuComputationStats {
+                total_computations: 0,
+                total_time: 0.0,
+                average_time: 0.0,
+                peak_memory_usage: 0,
+                backend_distribution: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Initialize GPU context and detect available devices
+    pub fn initialize(&mut self) -> NeighborsResult<()> {
+        self.device_info = self.detect_gpu_devices()?;
+        Ok(())
+    }
+
+    /// Detect available GPU devices.
+    ///
+    /// For [`GpuBackend::Cuda`] this performs a *real* `oxicuda-driver` query
+    /// (via `Self::detect_cuda_device`) -- no fabricated device names,
+    /// memory sizes, or compute-unit counts. On a host with no CUDA driver
+    /// (or when the `gpu` feature isn't compiled in), this honestly returns
+    /// `Ok(None)` rather than inventing a mock device.
+    /// [`GpuBackend::CpuFallback`] always reports the (real, queried) CPU
+    /// core count as its "compute units" -- never a hardcoded number.
+    pub fn detect_gpu_devices(&self) -> NeighborsResult<Option<GpuDeviceInfo>> {
+        match self.config.backend {
+            GpuBackend::Cuda => self.detect_cuda_device(),
+            GpuBackend::CpuFallback => Ok(Some(Self::cpu_fallback_device_info())),
+        }
+    }
+
+    /// Real `oxicuda-driver` CUDA device query.
+    ///
+    /// Uses [`GpuContext::detect`]/`with_device_id` for presence -- the same
+    /// `Option`-returning contract `sklears-clustering`'s `gpu_distances.rs`
+    /// builds its `GpuDistanceComputer` context around -- honoring the "no
+    /// GPU ⇒ `Ok(None)`, not `Err`" rule. `context.memory_info()` supplies
+    /// live free/total device memory (mirroring that same
+    /// `gpu_distances.rs`'s `device_info` helper), and this additionally
+    /// reads the device's real name, streaming-multiprocessor count, and
+    /// max-threads-per-block directly off the `oxicuda_driver::Device`
+    /// backing the detected context, since `GpuDeviceInfo` (unlike that
+    /// crate's `HashMap<String, String>` diagnostic) needs those as
+    /// structured fields.
+    #[cfg(feature = "gpu")]
+    fn detect_cuda_device(&self) -> NeighborsResult<Option<GpuDeviceInfo>> {
+        let ctx = match self.config.device_id {
+            Some(id) => GpuContext::with_device_id(id as usize),
+            None => GpuContext::detect(),
+        }
+        .map_err(|e| NeighborsError::InvalidInput(format!("GPU context error: {e}")))?;
+
+        let Some(ctx) = ctx else {
+            return Ok(None);
+        };
+
+        let device = ctx.context().device();
+        let name = device
+            .name()
+            .map_err(|e| NeighborsError::InvalidInput(format!("GPU device name query: {e}")))?;
+        let memory = ctx
+            .memory_info()
+            .map_err(|e| NeighborsError::InvalidInput(format!("GPU memory query: {e}")))?;
+        let compute_units = device.multiprocessor_count().map_err(|e| {
+            NeighborsError::InvalidInput(format!("GPU multiprocessor-count query: {e}"))
+        })?;
+        let max_work_group_size = device.max_threads_per_block().map_err(|e| {
+            NeighborsError::InvalidInput(format!("GPU max-threads-per-block query: {e}"))
+        })?;
+
+        Ok(Some(GpuDeviceInfo {
+            device_id: ctx.device_id() as u32,
+            name,
+            backend: GpuBackend::Cuda,
+            memory_size: memory.total,
+            compute_units: compute_units.max(0) as u32,
+            max_work_group_size: max_work_group_size.max(0) as usize,
+        }))
+    }
+
+    /// Without the `gpu` feature there is no OxiCUDA driver compiled in at
+    /// all, so requesting the CUDA backend always -- and honestly -- reports
+    /// "no device", the same as [`Self::detect_cuda_device`] would on a host
+    /// with no CUDA driver installed.
+    #[cfg(not(feature = "gpu"))]
+    fn detect_cuda_device(&self) -> NeighborsResult<Option<GpuDeviceInfo>> {
+        Ok(None)
+    }
+
+    /// Real (not fabricated) CPU-fallback device description: the compute
+    /// unit count is the actual number of logical CPUs
+    /// [`std::thread::available_parallelism`] reports, rather than a
+    /// hardcoded number.
+    fn cpu_fallback_device_info() -> GpuDeviceInfo {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        GpuDeviceInfo {
+            device_id: 0,
+            name: "CPU Fallback".to_string(),
+            backend: GpuBackend::CpuFallback,
+            // CPU (host) memory size is not a meaningful "GPU memory"
+            // figure and this module has no reliable, dependency-free way
+            // to query it; report it honestly as unknown rather than
+            // fabricating a number.
+            memory_size: 0,
+            compute_units: logical_cpus as u32,
+            max_work_group_size: 1,
+        }
+    }
+
+    /// Compute pairwise distances using GPU acceleration
+    #[allow(non_snake_case)]
+    pub fn pairwise_distances<'a>(
+        &self,
+        X: &ArrayView2<'a, Float>,
+        Y: Option<&ArrayView2<'a, Float>>,
+        distance: Distance,
+    ) -> NeighborsResult<GpuDistanceResult> {
+        let start_time = std::time::Instant::now();
+
+        let Y = Y.unwrap_or(X);
+
+        if X.ncols() != Y.ncols() {
+            return Err(NeighborsError::ShapeMismatch {
+                expected: vec![X.nrows(), X.ncols()],
+                actual: vec![Y.nrows(), Y.ncols()],
+            });
+        }
+
+        let result = match self.config.backend {
+            GpuBackend::Cuda => self.compute_cuda_distances(X, Y, distance)?,
+            GpuBackend::CpuFallback => self.compute_cpu_distances(X, Y, distance)?,
+        };
+
+        let computation_time = start_time.elapsed().as_secs_f64();
+
+        // Update statistics
+        self.update_stats(computation_time, result.1, self.config.backend);
+
+        Ok(GpuDistanceResult {
+            distances: result.0,
+            computation_time,
+            memory_usage: result.1,
+            backend_used: self.config.backend,
+        })
+    }
+
+    /// Compute batch distances for large datasets
+    #[allow(non_snake_case)]
+    pub fn batch_pairwise_distances<'a>(
+        &self,
+        X: &ArrayView2<'a, Float>,
+        Y: Option<&ArrayView2<'a, Float>>,
+        distance: Distance,
+    ) -> NeighborsResult<GpuDistanceResult> {
+        let Y = Y.unwrap_or(X);
+        let batch_size = self.config.batch_size;
+
+        let n_samples_x = X.nrows();
+        let n_samples_y = Y.nrows();
+
+        let mut result_distances = Array2::zeros((n_samples_x, n_samples_y));
+        let mut total_memory_usage = 0;
+        let start_time = std::time::Instant::now();
+
+        // Process in batches
+        for i in (0..n_samples_x).step_by(batch_size) {
+            let end_i = std::cmp::min(i + batch_size, n_samples_x);
+            let X_batch = X.slice(scirs2_core::ndarray::s![i..end_i, ..]);
+
+            for j in (0..n_samples_y).step_by(batch_size) {
+                let end_j = std::cmp::min(j + batch_size, n_samples_y);
+                let Y_batch = Y.slice(scirs2_core::ndarray::s![j..end_j, ..]);
+
+                let batch_result =
+                    self.pairwise_distances(&X_batch, Some(&Y_batch), distance.clone())?;
+
+                result_distances
+                    .slice_mut(scirs2_core::ndarray::s![i..end_i, j..end_j])
+                    .assign(&batch_result.distances);
+
+                total_memory_usage += batch_result.memory_usage;
+            }
+        }
+
+        let computation_time = start_time.elapsed().as_secs_f64();
+
+        Ok(GpuDistanceResult {
+            distances: result_distances,
+            computation_time,
+            memory_usage: total_memory_usage,
+            backend_used: self.config.backend,
+        })
+    }
+
+    /// Compute distances using the OxiCUDA backend.
+    ///
+    /// For `Distance::Euclidean` uses the GEMM trick via `sklears_core::gpu`
+    /// (backed by `oxicuda-driver`/`oxicuda-blas`) when the `gpu` feature is
+    /// enabled; falls back to parallel CPU otherwise.
+    fn compute_cuda_distances<'a>(
+        &self,
+        x_data: &ArrayView2<'a, Float>,
+        y_data: &ArrayView2<'a, Float>,
+        distance: Distance,
+    ) -> NeighborsResult<(Array2<Float>, usize)> {
+        let distances = self.dispatch_gpu_distances(x_data, y_data, distance)?;
+        let memory_usage = distances.len() * std::mem::size_of::<Float>();
+        Ok((distances, memory_usage))
+    }
+
+    /// Shared GPU dispatch: GEMM trick for Euclidean, CPU fallback for others.
+    fn dispatch_gpu_distances<'a>(
+        &self,
+        x_data: &ArrayView2<'a, Float>,
+        y_data: &ArrayView2<'a, Float>,
+        distance: Distance,
+    ) -> NeighborsResult<Array2<Float>> {
+        match distance {
+            Distance::Euclidean => {
+                #[cfg(feature = "gpu")]
+                {
+                    let (m, d) = x_data.dim();
+                    let (n, _) = y_data.dim();
+                    if m * n * d >= 512 {
+                        if let Some(distances) =
+                            Self::compute_gemm_euclidean_distances(x_data, y_data)?
+                        {
+                            return Ok(distances);
+                        }
+                    }
+                }
+                self.compute_parallel_distances(x_data, y_data, distance)
+            }
+            other => self.compute_parallel_distances(x_data, y_data, other),
+        }
+    }
+
+    /// Pairwise Euclidean distances via the GEMM identity:
+    /// `D[i,j] = sqrt(||x_i||² + ||y_j||² - 2 · x_i·y_j)`.
+    ///
+    /// The inner-product matrix `X × Y^T` is computed through
+    /// `sklears_core::gpu`'s `GpuArray::matmul()`.
+    ///
+    /// Returns `Ok(None)` when [`GpuContext::detect`] finds no usable GPU
+    /// (e.g. no CUDA driver on this machine), so the caller can fall back to
+    /// the CPU path instead of hard-erroring just because there is no
+    /// device -- the same "no GPU ⇒ `None`, not `Err`" contract
+    /// `GpuBackend::detect` itself uses.
+    #[cfg(feature = "gpu")]
+    fn compute_gemm_euclidean_distances<'a>(
+        x_data: &ArrayView2<'a, Float>,
+        y_data: &ArrayView2<'a, Float>,
+    ) -> NeighborsResult<Option<Array2<Float>>> {
+        let (m, _d) = x_data.dim();
+        let (n, _) = y_data.dim();
+
+        let Some(ctx) = GpuContext::detect()
+            .map_err(|e| NeighborsError::InvalidInput(format!("GPU context error: {e}")))?
+        else {
+            return Ok(None);
+        };
+
+        let x_owned = x_data.to_owned();
+        let y_owned = y_data.to_owned();
+
+        let x_gpu = GpuArray::<Float>::from_array2(&ctx, &x_owned)
+            .map_err(|e| NeighborsError::InvalidInput(format!("GPU upload X: {e}")))?;
+        let y_gpu = GpuArray::<Float>::from_array2(&ctx, &y_owned)
+            .map_err(|e| NeighborsError::InvalidInput(format!("GPU upload Y: {e}")))?;
+
+        // Y^T[d×n] so that X[m×d] × Y^T[d×n] = D_inner[m×n]
+        let y_t_gpu = y_gpu
+            .transpose()
+            .map_err(|e| NeighborsError::InvalidInput(format!("GPU transpose Y: {e}")))?;
+        let d_inner_gpu = x_gpu
+            .matmul(&y_t_gpu)
+            .map_err(|e| NeighborsError::InvalidInput(format!("GPU matmul: {e}")))?;
+        let d_inner = d_inner_gpu
+            .to_array2()
+            .map_err(|e| NeighborsError::InvalidInput(format!("GPU download: {e}")))?;
+
+        // Squared row norms (cheap CPU computation)
+        let x_norms: Vec<Float> = x_data
+            .rows()
+            .into_iter()
+            .map(|row| row.iter().map(|v| v * v).sum::<Float>())
+            .collect();
+        let y_norms: Vec<Float> = y_data
+            .rows()
+            .into_iter()
+            .map(|row| row.iter().map(|v| v * v).sum::<Float>())
+            .collect();
+
+        // D[i,j] = sqrt(max(0, ||x_i||² + ||y_j||² - 2 * D_inner[i,j]))
+        let mut distances = Array2::<Float>::zeros((m, n));
+        for i in 0..m {
+            for j in 0..n {
+                let sq_dist = x_norms[i] + y_norms[j] - 2.0 * d_inner[[i, j]];
+                distances[[i, j]] = sq_dist.max(0.0).sqrt();
+            }
+        }
+
+        Ok(Some(distances))
+    }
+
+    /// Compute distances using CPU fallback
+    fn compute_cpu_distances<'a>(
+        &self,
+        x_data: &ArrayView2<'a, Float>,
+        y_data: &ArrayView2<'a, Float>,
+        distance: Distance,
+    ) -> NeighborsResult<(Array2<Float>, usize)> {
+        let distances = self.compute_parallel_distances(x_data, y_data, distance)?;
+        let memory_usage = distances.len() * std::mem::size_of::<Float>();
+        Ok((distances, memory_usage))
+    }
+
+    /// Compute distances using parallel CPU computation
+    fn compute_parallel_distances<'a>(
+        &self,
+        x_data: &ArrayView2<'a, Float>,
+        y_data: &ArrayView2<'a, Float>,
+        distance: Distance,
+    ) -> NeighborsResult<Array2<Float>> {
+        let n_samples_x = x_data.nrows();
+        let n_samples_y = y_data.nrows();
+        let mut distances = Array2::zeros((n_samples_x, n_samples_y));
+
+        // Sequential computation across rows
+        for (i, mut row) in distances.axis_iter_mut(Axis(0)).enumerate() {
+            let x_row = x_data.row(i);
+            for j in 0..n_samples_y {
+                let y_row = y_data.row(j);
+                row[j] = distance.calculate(&x_row, &y_row);
+            }
+        }
+
+        Ok(distances)
+    }
+
+    /// Update computation statistics
+    fn update_stats(&self, computation_time: f64, memory_usage: usize, backend: GpuBackend) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.total_computations += 1;
+            stats.total_time += computation_time;
+            stats.average_time = stats.total_time / stats.total_computations as f64;
+            stats.peak_memory_usage = stats.peak_memory_usage.max(memory_usage);
+
+            *stats.backend_distribution.entry(backend).or_insert(0) += 1;
+        }
+    }
+
+    /// Get computation statistics
+    pub fn get_stats(&self) -> GpuComputationStats {
+        // Recover the statistics even if a prior holder of the lock panicked
+        // while it was held, rather than propagating that panic to every
+        // subsequent caller of this getter.
+        self.stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Get device information
+    pub fn get_device_info(&self) -> Option<GpuDeviceInfo> {
+        self.device_info.clone()
+    }
+
+    /// Reset computation statistics
+    pub fn reset_stats(&self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            *stats = GpuComputationStats {
+                total_computations: 0,
+                total_time: 0.0,
+                average_time: 0.0,
+                peak_memory_usage: 0,
+                backend_distribution: HashMap::new(),
+            };
+        }
+    }
+}
+
+/// Row-major flatten of a 2-D view into `Vec<f64>`, matching the layout
+/// `oxicuda_manifold::hnsw_build`/`hnsw_search` expect. Mirrors
+/// `sklears_core::gpu::GpuArray::from_array2`'s handling of non-contiguous
+/// views: take the contiguous slice when one exists, otherwise fall back to
+/// the (always-correct, row-major) element iterator.
+#[cfg(feature = "gpu")]
+fn flatten_row_major(view: &ArrayView2<'_, Float>) -> Vec<Float> {
+    if view.is_standard_layout() {
+        match view.as_slice() {
+            Some(slice) => slice.to_vec(),
+            None => view.iter().copied().collect(),
+        }
+    } else {
+        view.iter().copied().collect()
+    }
+}
+
+/// Maps an `oxicuda-manifold` error to this crate's error type.
+#[cfg(feature = "gpu")]
+fn manifold_err(err: ManifoldError) -> NeighborsError {
+    NeighborsError::InvalidInput(format!("HNSW ANN error: {err}"))
+}
+
+/// GPU-accelerated k-nearest neighbors search
+pub struct GpuKNeighborsSearch {
+    calculator: GpuDistanceCalculator,
+    k: usize,
+    distance: Distance,
+    /// When `true` (and the `gpu` feature is enabled), [`Self::kneighbors`]
+    /// prefers the approximate HNSW backend over the exact brute-force
+    /// distance matrix. See [`Self::with_ann`].
+    use_ann: bool,
+}
+
+impl GpuKNeighborsSearch {
+    /// Create a new GPU k-nearest neighbors search
+    pub fn new(k: usize, config: GpuConfig) -> Self {
+        Self {
+            calculator: GpuDistanceCalculator::with_config(config),
+            k,
+            distance: Distance::Euclidean,
+            use_ann: false,
+        }
+    }
+
+    /// Set the distance metric
+    pub fn with_distance(mut self, distance: Distance) -> Self {
+        self.distance = distance;
+        self
+    }
+
+    /// Opt into approximate nearest-neighbor search via an HNSW index
+    /// (`oxicuda_manifold::{hnsw_build, hnsw_search}`) instead of the exact
+    /// brute-force distance-matrix search.
+    ///
+    /// This only ever *narrows* [`Self::kneighbors`]'s behavior towards
+    /// "maybe faster, approximate": it has no effect unless the `gpu`
+    /// feature is compiled in, and even then [`Self::kneighbors`]
+    /// transparently falls back to the exact path whenever the configured
+    /// [`Distance`] has no native HNSW equivalent (currently only
+    /// `Euclidean` and `Cosine` do -- see `hnsw_distance_for`).
+    /// Correctness-sensitive callers can always reach the exact path
+    /// directly via [`Self::kneighbors_exact`], regardless of this setting.
+    pub fn with_ann(mut self, use_ann: bool) -> Self {
+        self.use_ann = use_ann;
+        self
+    }
+
+    /// Initialize GPU context
+    pub fn initialize(&mut self) -> NeighborsResult<()> {
+        self.calculator.initialize()
+    }
+
+    /// Find k-nearest neighbors.
+    ///
+    /// Uses the approximate HNSW backend when [`Self::with_ann`] was set to
+    /// `true`, the `gpu` feature is enabled, and the configured [`Distance`]
+    /// maps onto an [`HnswDistance`] (see `hnsw_distance_for`);
+    /// otherwise dispatches to the exact brute-force
+    /// [`Self::kneighbors_exact`].
+    #[allow(non_snake_case)]
+    pub fn kneighbors<'a>(
+        &self,
+        X: &ArrayView2<'a, Float>,
+        X_query: Option<&ArrayView2<'a, Float>>,
+    ) -> NeighborsResult<(Array2<usize>, Array2<Float>)> {
+        #[cfg(feature = "gpu")]
+        {
+            if self.use_ann {
+                if let Some(result) = self.kneighbors_ann(X, X_query)? {
+                    return Ok(result);
+                }
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            // `use_ann` only changes behavior when the `gpu` feature (and
+            // therefore the HNSW backend) is compiled in; without it every
+            // search is exact. Read the field so it is never reported dead
+            // in non-`gpu` builds.
+            let _ = self.use_ann;
+        }
+
+        self.kneighbors_exact(X, X_query)
+    }
+
+    /// Exact k-nearest neighbors via a full pairwise distance matrix.
+    ///
+    /// This is the correctness baseline: always available regardless of
+    /// [`Self::with_ann`], and what [`Self::kneighbors`] falls back to
+    /// whenever the approximate HNSW path isn't applicable.
+    #[allow(non_snake_case)]
+    pub fn kneighbors_exact<'a>(
+        &self,
+        X: &ArrayView2<'a, Float>,
+        X_query: Option<&ArrayView2<'a, Float>>,
+    ) -> NeighborsResult<(Array2<usize>, Array2<Float>)> {
+        let X_query = X_query.unwrap_or(X);
+
+        // Compute all pairwise distances using GPU
+        let gpu_result =
+            self.calculator
+                .pairwise_distances(X_query, Some(X), self.distance.clone())?;
+        let distances = gpu_result.distances;
+
+        let n_queries = distances.nrows();
+        let mut indices = Array2::zeros((n_queries, self.k));
+        let mut neighbor_distances = Array2::zeros((n_queries, self.k));
+
+        // For each query, find k nearest neighbors
+        for (i, distance_row) in distances.axis_iter(Axis(0)).enumerate() {
+            let mut indexed_distances: Vec<(usize, Float)> = distance_row
+                .iter()
+                .enumerate()
+                .map(|(j, &d)| (j, d))
+                .collect();
+
+            // Sort by distance
+            indexed_distances
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Take k nearest (excluding self if query is in training set)
+            let mut count = 0;
+            let mut j = 0;
+
+            while count < self.k && j < indexed_distances.len() {
+                let (idx, dist) = indexed_distances[j];
+
+                // Skip self-distance if query point is in training set
+                if X_query.as_ptr() == X.as_ptr() && i == idx {
+                    j += 1;
+                    continue;
+                }
+
+                indices[[i, count]] = idx;
+                neighbor_distances[[i, count]] = dist;
+                count += 1;
+                j += 1;
+            }
+        }
+
+        Ok((indices, neighbor_distances))
+    }
+
+    /// Approximate k-nearest neighbors via an HNSW index
+    /// (`oxicuda_manifold::{hnsw_build, hnsw_search}`).
+    ///
+    /// Returns `Ok(None)` when the configured [`Distance`] has no HNSW
+    /// equivalent (see [`Self::hnsw_distance_for`]) or the input is
+    /// degenerate (`0` points, `0` dimensions, or `k == 0`), signalling
+    /// [`Self::kneighbors`] to fall back to [`Self::kneighbors_exact`] --
+    /// the same "unsupported metric → exact CPU path" pattern
+    /// `GpuDistanceCalculator::dispatch_gpu_distances` already uses for the
+    /// GEMM trick. Genuine shape errors (mismatched dimensionality between
+    /// `X` and `X_query`) are still hard errors, exactly as in
+    /// [`Self::kneighbors_exact`]'s underlying `pairwise_distances`.
+    #[cfg(feature = "gpu")]
+    #[allow(non_snake_case)]
+    fn kneighbors_ann<'a>(
+        &self,
+        X: &ArrayView2<'a, Float>,
+        X_query: Option<&ArrayView2<'a, Float>>,
+    ) -> NeighborsResult<Option<(Array2<usize>, Array2<Float>)>> {
+        let Some(hnsw_distance) = Self::hnsw_distance_for(&self.distance) else {
+            return Ok(None);
+        };
+
+        let n_points = X.nrows();
+        let dim = X.ncols();
+        if n_points == 0 || dim == 0 || self.k == 0 {
+            return Ok(None);
+        }
+
+        let query_view = X_query.unwrap_or(X);
+        if query_view.ncols() != dim {
+            return Err(NeighborsError::ShapeMismatch {
+                expected: vec![n_points, dim],
+                actual: vec![query_view.nrows(), query_view.ncols()],
+            });
+        }
+        let is_self_query = query_view.as_ptr() == X.as_ptr();
+        let n_queries = query_view.nrows();
+
+        let config = HnswConfig {
+            distance: hnsw_distance,
+            ..Default::default()
+        };
+
+        let data = flatten_row_major(X);
+        let index = hnsw_build(&data, n_points, dim, &config).map_err(manifold_err)?;
+
+        // When searching the training set against itself, fetch one extra
+        // neighbor so the self-match can be dropped below without shorting
+        // the result by one -- mirrors `kneighbors_exact`'s self-exclusion.
+        let search_k = (self.k + usize::from(is_self_query)).min(n_points);
+        let query_data = flatten_row_major(query_view);
+        let result = hnsw_search(&index, &query_data, n_queries, search_k).map_err(manifold_err)?;
+
+        let mut indices = Array2::<usize>::zeros((n_queries, self.k));
+        let mut neighbor_distances = Array2::<Float>::zeros((n_queries, self.k));
+
+        for (i, (row_idx, row_dist)) in result
+            .indices
+            .iter()
+            .zip(result.distances.iter())
+            .enumerate()
+        {
+            let mut count = 0;
+            for (&idx, &dist) in row_idx.iter().zip(row_dist.iter()) {
+                if count >= self.k {
+                    break;
+                }
+                if is_self_query && idx == i {
+                    continue;
+                }
+                indices[[i, count]] = idx;
+                neighbor_distances[[i, count]] =
+                    Self::postprocess_hnsw_distance(hnsw_distance, dist);
+                count += 1;
+            }
+        }
+
+        Ok(Some((indices, neighbor_distances)))
+    }
+
+    /// Maps this search's configured [`Distance`] to an [`HnswDistance`],
+    /// for metrics the HNSW backend can represent exactly. `None` covers
+    /// every metric without a native HNSW mode (Manhattan, Chebyshev,
+    /// Minkowski, Mahalanobis, kernels, ...) -- those stay honestly
+    /// CPU/exact-only, same as `GpuDistanceCalculator::dispatch_gpu_distances`
+    /// already treats them for the GEMM trick.
+    #[cfg(feature = "gpu")]
+    fn hnsw_distance_for(distance: &Distance) -> Option<HnswDistance> {
+        match distance {
+            Distance::Euclidean => Some(HnswDistance::Euclidean),
+            Distance::Cosine => Some(HnswDistance::Cosine),
+            _ => None,
+        }
+    }
+
+    /// Converts a raw HNSW distance value back to this crate's convention.
+    ///
+    /// [`HnswDistance::Euclidean`] is *squared* Euclidean distance, while
+    /// every other Euclidean computation in this file (the CPU path and the
+    /// GEMM trick) reports true (square-rooted) distance -- undo the square
+    /// here so exact and approximate results stay comparable. Cosine
+    /// dissimilarity needs no adjustment.
+    #[cfg(feature = "gpu")]
+    fn postprocess_hnsw_distance(metric: HnswDistance, raw: f64) -> Float {
+        match metric {
+            HnswDistance::Euclidean => raw.max(0.0).sqrt(),
+            _ => raw,
+        }
+    }
+
+    /// Get GPU computation statistics
+    pub fn get_stats(&self) -> GpuComputationStats {
+        self.calculator.get_stats()
+    }
+
+    /// Get device information
+    pub fn get_device_info(&self) -> Option<GpuDeviceInfo> {
+        self.calculator.get_device_info()
+    }
+}
+
+/// GPU memory usage estimator
+pub struct GpuMemoryEstimator;
+
+impl GpuMemoryEstimator {
+    /// Estimate memory usage for pairwise distance computation
+    pub fn estimate_pairwise_memory(n_samples_x: usize, n_samples_y: usize) -> usize {
+        // Input data + output distances
+        let input_memory = (n_samples_x + n_samples_y) * std::mem::size_of::<Float>();
+        let output_memory = n_samples_x * n_samples_y * std::mem::size_of::<Float>();
+
+        // Additional GPU memory overhead (buffers, workspace)
+        let overhead = (input_memory + output_memory) / 2;
+
+        input_memory + output_memory + overhead
+    }
+
+    /// Estimate optimal batch size for given memory constraints
+    pub fn estimate_optimal_batch_size(
+        n_samples: usize,
+        n_features: usize,
+        max_memory: usize,
+    ) -> usize {
+        let sample_size = n_features * std::mem::size_of::<Float>();
+        let distance_size = n_samples * std::mem::size_of::<Float>();
+
+        // Account for GPU memory overhead
+        let overhead_factor = 1.5;
+        let effective_memory = (max_memory as f64 / overhead_factor) as usize;
+
+        let max_batch_size = effective_memory / (sample_size + distance_size);
+
+        std::cmp::min(max_batch_size, n_samples).max(1)
+    }
+
+    /// Check if computation fits in GPU memory
+    pub fn can_fit_in_memory(
+        n_samples_x: usize,
+        n_samples_y: usize,
+        available_memory: usize,
+    ) -> bool {
+        let required_memory = Self::estimate_pairwise_memory(n_samples_x, n_samples_y);
+        required_memory <= available_memory
+    }
+}
+
+#[allow(non_snake_case)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scirs2_core::ndarray::Array2;
+
+    fn create_test_data() -> Array2<Float> {
+        Array2::from_shape_vec((100, 4), (0..400).map(|x| x as Float).collect())
+            .expect("operation should succeed")
+    }
+
+    #[test]
+    fn test_gpu_config_default() {
+        let config = GpuConfig::default();
+        assert_eq!(config.backend, GpuBackend::CpuFallback);
+        assert_eq!(config.batch_size, 1024);
+    }
+
+    #[test]
+    fn test_gpu_distance_calculator_creation() {
+        let calculator = GpuDistanceCalculator::new();
+        assert!(calculator.device_info.is_none());
+    }
+
+    #[test]
+    fn test_gpu_distance_calculator_with_config() {
+        let config = GpuConfig {
+            backend: GpuBackend::Cuda,
+            batch_size: 512,
+            ..Default::default()
+        };
+        let calculator = GpuDistanceCalculator::with_config(config);
+        assert_eq!(calculator.config.backend, GpuBackend::Cuda);
+        assert_eq!(calculator.config.batch_size, 512);
+    }
+
+    #[test]
+    fn test_gpu_device_detection() {
+        let calculator = GpuDistanceCalculator::new();
+        let device_info = calculator
+            .detect_gpu_devices()
+            .expect("operation should succeed");
+        assert!(device_info.is_some());
+
+        let device = device_info.expect("operation should succeed");
+        assert_eq!(device.backend, GpuBackend::CpuFallback);
+        assert!(!device.name.is_empty());
+    }
+
+    #[test]
+    fn test_gpu_pairwise_distances_cpu_fallback() {
+        let data = create_test_data();
+        let calculator = GpuDistanceCalculator::new();
+
+        let result = calculator
+            .pairwise_distances(&data.view(), None, Distance::Euclidean)
+            .expect("operation should succeed");
+
+        assert_eq!(result.distances.shape(), &[100, 100]);
+        assert_eq!(result.backend_used, GpuBackend::CpuFallback);
+        assert!(result.computation_time > 0.0);
+        assert!(result.memory_usage > 0);
+    }
+
+    #[test]
+    fn test_gpu_batch_pairwise_distances() {
+        let data = create_test_data();
+        let config = GpuConfig {
+            batch_size: 10,
+            ..Default::default()
+        };
+        let calculator = GpuDistanceCalculator::with_config(config);
+
+        let result = calculator
+            .batch_pairwise_distances(&data.view(), None, Distance::Euclidean)
+            .expect("operation should succeed");
+
+        assert_eq!(result.distances.shape(), &[100, 100]);
+        assert!(result.computation_time > 0.0);
+    }
+
+    #[test]
+    fn test_gpu_kneighbors_search() {
+        let data = create_test_data();
+        let config = GpuConfig {
+            batch_size: 50,
+            ..Default::default()
+        };
+        let search = GpuKNeighborsSearch::new(5, config);
+
+        let (indices, distances) = search
+            .kneighbors(&data.view(), None)
+            .expect("operation should succeed");
+
+        assert_eq!(indices.shape(), &[100, 5]);
+        assert_eq!(distances.shape(), &[100, 5]);
+
+        // Check that distances are in ascending order
+        for i in 0..indices.nrows() {
+            for j in 1..indices.ncols() {
+                assert!(distances[[i, j]] >= distances[[i, j - 1]]);
+            }
+        }
+    }
+
+    /// Small, well-separated clusters (3 clusters of 4 points each) so both
+    /// the exact brute-force path and the approximate HNSW path should
+    /// agree, with high probability, on which cluster each point's nearest
+    /// neighbors fall into -- a "sensible, if approximate" check rather than
+    /// requiring bit-for-bit index equality (HNSW is allowed to disagree on
+    /// tie-breaks / ordering within a cluster).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_kneighbors_ann_matches_brute_force_on_clusters() {
+        #[rustfmt::skip]
+        let data = Array2::from_shape_vec(
+            (12, 2),
+            vec![
+                0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, // cluster A: points 0..4
+                10.0, 10.0, 10.1, 10.0, 10.0, 10.1, 10.1, 10.1, // cluster B: points 4..8
+                20.0, 0.0, 20.1, 0.0, 20.0, 0.1, 20.1, 0.1, // cluster C: points 8..12
+            ],
+        )
+        .expect("operation should succeed");
+
+        let config = GpuConfig::default();
+        let exact_search = GpuKNeighborsSearch::new(3, config.clone());
+        let ann_search = GpuKNeighborsSearch::new(3, config).with_ann(true);
+
+        let (exact_indices, _exact_distances) = exact_search
+            .kneighbors_exact(&data.view(), None)
+            .expect("exact search should succeed");
+        let (ann_indices, ann_distances) = ann_search
+            .kneighbors(&data.view(), None)
+            .expect("ann search should succeed");
+
+        assert_eq!(ann_indices.shape(), &[12, 3]);
+        assert_eq!(ann_distances.shape(), &[12, 3]);
+
+        for i in 0..12 {
+            let cluster_start = (i / 4) * 4;
+            let cluster_end = cluster_start + 4;
+
+            for j in 0..3 {
+                let exact_idx = exact_indices[[i, j]];
+                let ann_idx = ann_indices[[i, j]];
+                assert!(
+                    (cluster_start..cluster_end).contains(&exact_idx),
+                    "exact neighbor {exact_idx} of point {i} escaped its cluster \
+                     [{cluster_start}, {cluster_end})"
+                );
+                assert!(
+                    (cluster_start..cluster_end).contains(&ann_idx),
+                    "ANN neighbor {ann_idx} of point {i} escaped its cluster \
+                     [{cluster_start}, {cluster_end})"
+                );
+            }
+
+            // Same self-exclusion contract as the exact path: a point must
+            // never be reported as its own neighbor.
+            assert!(
+                !ann_indices.row(i).iter().any(|&idx| idx == i),
+                "point {i} was returned as its own ANN neighbor"
+            );
+
+            // Distances sorted ascending, same contract as the exact path.
+            for j in 1..3 {
+                assert!(
+                    ann_distances[[i, j]] >= ann_distances[[i, j - 1]],
+                    "ANN distances not sorted ascending for point {i}"
+                );
+            }
+        }
+    }
+
+    /// `with_ann(true)` combined with a metric that has no HNSW equivalent
+    /// (Manhattan) must transparently fall back to the exact path rather
+    /// than erroring -- exercises the `Ok(None)` branch of
+    /// `hnsw_distance_for` / `kneighbors_ann`.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_kneighbors_ann_falls_back_for_unsupported_metric() {
+        let data = create_test_data();
+        let config = GpuConfig::default();
+        let search = GpuKNeighborsSearch::new(5, config)
+            .with_distance(Distance::Manhattan)
+            .with_ann(true);
+
+        let (indices, distances) = search
+            .kneighbors(&data.view(), None)
+            .expect("should transparently fall back to the exact path");
+
+        assert_eq!(indices.shape(), &[100, 5]);
+        assert_eq!(distances.shape(), &[100, 5]);
+    }
+
+    #[test]
+    fn test_gpu_memory_estimator() {
+        let memory_usage = GpuMemoryEstimator::estimate_pairwise_memory(100, 100);
+        assert!(memory_usage > 0);
+
+        let batch_size = GpuMemoryEstimator::estimate_optimal_batch_size(
+            1000,
+            10,
+            1024 * 1024, // 1MB
+        );
+        assert!(batch_size > 0);
+        assert!(batch_size <= 1000);
+
+        let can_fit = GpuMemoryEstimator::can_fit_in_memory(100, 100, 1024 * 1024);
+        assert!(can_fit);
+    }
+
+    #[test]
+    fn test_gpu_stats_tracking() {
+        let data = create_test_data();
+        let calculator = GpuDistanceCalculator::new();
+
+        // Perform some computations
+        let _ = calculator
+            .pairwise_distances(&data.view(), None, Distance::Euclidean)
+            .expect("operation should succeed");
+        let _ = calculator
+            .pairwise_distances(&data.view(), None, Distance::Manhattan)
+            .expect("operation should succeed");
+
+        let stats = calculator.get_stats();
+        assert_eq!(stats.total_computations, 2);
+        assert!(stats.total_time > 0.0);
+        assert!(stats.average_time > 0.0);
+        assert!(stats.peak_memory_usage > 0);
+        assert_eq!(stats.backend_distribution[&GpuBackend::CpuFallback], 2);
+    }
+
+    #[test]
+    fn test_different_gpu_backends() {
+        let backends = vec![GpuBackend::CpuFallback, GpuBackend::Cuda];
+
+        for backend in backends {
+            let config = GpuConfig {
+                backend,
+                ..Default::default()
+            };
+            let calculator = GpuDistanceCalculator::with_config(config);
+            let device_info = calculator
+                .detect_gpu_devices()
+                .expect("operation should succeed");
+
+            // At least CPU fallback should always be available. `Cuda` on
+            // this (GPU-less) test host honestly reports `None` -- it must
+            // never fabricate a device that isn't there.
+            if backend == GpuBackend::CpuFallback {
+                assert!(device_info.is_some());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn test_gpu_shape_mismatch_error() {
+        let X = Array2::from_shape_vec((10, 4), (0..40).map(|x| x as Float).collect())
+            .expect("operation should succeed");
+        let Y = Array2::from_shape_vec((10, 3), (0..30).map(|x| x as Float).collect())
+            .expect("operation should succeed");
+
+        let calculator = GpuDistanceCalculator::new();
+        let result = calculator.pairwise_distances(&X.view(), Some(&Y.view()), Distance::Euclidean);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            NeighborsError::ShapeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_gpu_reset_stats() {
+        let data = create_test_data();
+        let calculator = GpuDistanceCalculator::new();
+
+        // Perform computation
+        let _ = calculator
+            .pairwise_distances(&data.view(), None, Distance::Euclidean)
+            .expect("operation should succeed");
+
+        let stats_before = calculator.get_stats();
+        assert_eq!(stats_before.total_computations, 1);
+
+        // Reset stats
+        calculator.reset_stats();
+
+        let stats_after = calculator.get_stats();
+        assert_eq!(stats_after.total_computations, 0);
+        assert_eq!(stats_after.total_time, 0.0);
+    }
+}

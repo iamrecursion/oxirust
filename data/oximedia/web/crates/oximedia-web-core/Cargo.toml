@@ -1,0 +1,16 @@
+[package]
+name = "oximedia-web-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Dependency-free, natively testable numeric kernels shared by the OxiMedia web wasm modules"
+keywords = ["multimedia", "video", "wasm", "kernels"]
+categories = ["multimedia::video", "algorithms"]
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]

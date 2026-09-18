@@ -1,0 +1,98 @@
+[package]
+name = "oxirs-vec"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Vector index abstractions for semantic similarity and AI-augmented querying"
+keywords = ["vector-search", "embeddings", "similarity", "hnsw", "rdf"]
+categories = ["algorithms", "data-structures", "science"]
+readme = "README.md"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+# oxirs-vec is now CUDA-free: real CUDA lives in oxirs-vec-adapter-cuda
+# (publish = false). all-features is safe here (no C FFI on the feature surface).
+features = ["simd", "parallel", "gpu", "blas", "images", "content-processing", "python"]
+all-features = false
+
+[dependencies]
+scirs2-core = { workspace = true }
+scirs2-linalg = { workspace = true }
+oxirs-core = { workspace = true, features = ["simd", "parallel"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+oxiarc-zstd = { workspace = true }
+oxiarc-lz4 = { workspace = true }
+oxiarc-brotli = { workspace = true }
+oxiarc-deflate = { workspace = true }
+# rand functionality now provided by scirs2-core (use scirs2_core::random)
+# rand_distr functionality now provided by scirs2-core (use scirs2_core::random::distributions)
+half = "2.7"
+memmap2.workspace = true
+parking_lot.workspace = true
+blake3.workspace = true
+lru.workspace = true
+libc.workspace = true
+nalgebra.workspace = true
+petgraph.workspace = true
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+oxicode.workspace = true  # Replaces bincode per COOLJAPAN Policy
+regex.workspace = true
+pdf-extract = { version = "0.12", optional = true }
+oxiarc-archive = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+base64.workspace = true
+image = { workspace = true, optional = true }
+chrono.workspace = true
+# NOTE: CUDA (`cuda-runtime-sys` C FFI) has been quarantined into the
+# `oxirs-vec-adapter-cuda` crate (publish = false) per the COOLJAPAN Pure Rust
+# Policy v2, keeping this crate's published --all-features surface Pure Rust.
+# Python bindings
+pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
+numpy = { version = "0.29", optional = true }
+uuid.workspace = true
+humantime = "2.4"
+indicatif.workspace = true
+# Tantivy full-text search (upgraded to 0.25 for lru security fix)
+tantivy = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+
+[features]
+default = []
+simd = ["oxirs-core/simd"]
+parallel = ["oxirs-core/parallel"]
+# `gpu` was a vestigial pass-through to the removed `oxirs-core/gpu` feature
+# (oxirs-vec uses its own local GpuMonitor, not oxirs-core's). The oxirs-core
+# `gpu` feature was deleted when NVML was quarantined into oxirs-gpu-monitor
+# (COOLJAPAN Pure Rust Policy v2), so this is now an empty no-op kept for
+# backward compatibility of oxirs-vec's own feature surface.
+gpu = []
+blas = ["oxirs-core/blas"]
+# Real NVIDIA CUDA acceleration is provided by the `oxirs-vec-adapter-cuda`
+# crate (publish = false). The former `cuda` and `gpu-full` features were
+# removed when `cuda-runtime-sys` was quarantined per Pure Rust Policy v2.
+images = ["image"]
+content-processing = ["pdf-extract", "oxiarc-archive", "quick-xml", "images"]
+python = ["pyo3", "numpy"]
+# Tantivy full-text search (Pure Rust, optional)
+tantivy-search = ["tantivy"]
+
+
+[[bench]]
+name = "vector_bench"
+harness = false
+
+[[bench]]
+name = "pit_sla_bench"
+harness = false

@@ -1,0 +1,45 @@
+//! Auto-generated module structure
+
+pub mod embeddingconfig_traits;
+pub mod functions;
+pub mod mockembeddinggenerator_traits;
+pub mod openaiconfig_traits;
+pub mod openaiembeddinggenerator_accessors;
+pub mod openaiembeddinggenerator_accessors_1;
+pub mod openaiembeddinggenerator_caching;
+pub mod openaiembeddinggenerator_caching_1;
+pub mod openaiembeddinggenerator_caching_2;
+pub mod openaiembeddinggenerator_caching_3;
+pub mod openaiembeddinggenerator_caching_4;
+pub mod openaiembeddinggenerator_caching_5;
+pub mod openaiembeddinggenerator_calculate_cost_from_tokens_group;
+pub mod openaiembeddinggenerator_estimate_tokens_group;
+pub mod openaiembeddinggenerator_make_request_group;
+pub mod openaiembeddinggenerator_new_group;
+pub mod openaiembeddinggenerator_reset_metrics_group;
+pub mod openaiembeddinggenerator_traits;
+pub mod openaiembeddinggenerator_type;
+pub mod openaiembeddinggenerator_update_metrics_failure_group;
+pub mod sentencetransformergenerator_accessors;
+pub mod sentencetransformergenerator_builders;
+pub mod sentencetransformergenerator_efficiency_rating_group;
+pub mod sentencetransformergenerator_estimate_inference_time_group;
+pub mod sentencetransformergenerator_generate_embeddings_from_tokens_group;
+pub mod sentencetransformergenerator_model_details_group;
+pub mod sentencetransformergenerator_model_size_mb_group;
+pub mod sentencetransformergenerator_model_type_group;
+pub mod sentencetransformergenerator_new_group;
+pub mod sentencetransformergenerator_preprocess_text_for_model_group;
+pub mod sentencetransformergenerator_simulate_multilingual_tokenization_group;
+pub mod sentencetransformergenerator_simulate_wordpiece_tokenization_group;
+pub mod sentencetransformergenerator_supports_language_group;
+pub mod sentencetransformergenerator_traits;
+pub mod sentencetransformergenerator_type;
+pub mod tfidfembeddinggenerator_traits;
+pub mod types;
+
+// Re-export all types
+pub use functions::*;
+pub use openaiembeddinggenerator_type::*;
+pub use sentencetransformergenerator_type::*;
+pub use types::*;

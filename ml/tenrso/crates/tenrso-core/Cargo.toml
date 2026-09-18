@@ -1,0 +1,61 @@
+[package]
+name = "tenrso-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Core tensor types, views, and axis metadata for TenRSo"
+categories = ["data-structures", "science", "mathematics"]
+keywords = ["tenrso", "tensor", "multidimensional", "ndarray", "reshape"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+# SciRS2-core is MANDATORY (see SCIRS2_INTEGRATION_POLICY.md)
+# NEVER use ndarray, rand, num-traits directly - always through scirs2-core
+scirs2-core.workspace = true
+scirs2-linalg = { workspace = true, optional = true }
+scirs2-fft = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+oxicode = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+parallel = ["scirs2-core/parallel"]
+serde = ["dep:serde", "smallvec/serde", "scirs2-core/serialization"]
+linalg = ["dep:scirs2-linalg"]
+fft = ["dep:scirs2-fft"]
+binary = ["dep:oxicode", "serde"]
+json = ["dep:serde_json", "serde"]
+
+[[example]]
+name = "binary_io"
+required-features = ["binary"]
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "tensor_creation"
+harness = false
+
+[[bench]]
+name = "unfold_fold"
+harness = false
+
+[[bench]]
+name = "reshape_permute"
+harness = false
+
+[[bench]]
+name = "ndarray_baseline"
+harness = false
+
+[[bench]]
+name = "alloc_profile"
+harness = false

@@ -1,0 +1,75 @@
+[package]
+name = "ipfrs-wasm"
+version.workspace = true
+edition.workspace = true
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+description = "WebAssembly bindings for IPFRS distributed content-addressed storage system"
+keywords = ["ipfs", "wasm", "webassembly", "bindings", "distributed"]
+categories = ["api-bindings", "wasm"]
+documentation = "https://docs.rs/ipfrs-wasm"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# wasm-bindgen for WebAssembly
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+
+# Web APIs — includes both IndexedDB and WebRTC feature flags so that a single
+# web-sys dependency entry covers all targets (WebRTC types are gated by
+# #[cfg(target_arch = "wasm32")] in source code).
+web-sys = { workspace = true, features = [
+    # Generic / shared
+    "console",
+    "Window",
+    "Event",
+    "EventTarget",
+    "DomException",
+    "DomStringList",
+    # IndexedDB
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbObjectStore",
+    "IdbKeyRange",
+    # WebRTC peer connection
+    "RtcPeerConnection",
+    "RtcConfiguration",
+    "RtcSessionDescription",
+    "RtcSessionDescriptionInit",
+    "RtcSdpType",
+    "RtcIceCandidate",
+    "RtcIceCandidateInit",
+    "RtcDataChannel",
+    "RtcDataChannelInit",
+    "RtcDataChannelState",
+    "RtcIceConnectionState",
+    "RtcPeerConnectionIceEvent",
+] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Console error handling (WASM only)
+console_error_panic_hook = { workspace = true, optional = true }
+
+# SHA-256 for CID computation (pure Rust, works on all targets)
+sha2.workspace = true
+
+# Hex encoding for CID display
+hex.workspace = true
+
+[dev-dependencies]
+wasm-bindgen-test.workspace = true
+
+[features]
+default = ["console_error_panic_hook"]

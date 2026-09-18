@@ -1,0 +1,87 @@
+[package]
+name = "kizzasi-tokenizer"
+description = "Signal quantization and tokenization for Kizzasi AGSP - VQ-VAE, μ-law, continuous embeddings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["vq-vae", "quantization", "compression", "audio", "tokenization"]
+categories = ["compression", "multimedia::audio"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi-tokenizer"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[features]
+default = ["std"]
+std = []
+# GPU acceleration (optional, off by default). Forwards candle's Metal
+# backend through `kizzasi-core/metal`, which is live on Apple targets and
+# inert -- but still buildable -- everywhere else, so `--all-features` works on
+# every host; the `kizzasi-metal` crate explains how that target gating is
+# done. There is no `cuda` counterpart -- see kizzasi-core's `[features]` for
+# why a CUDA flag cannot be offered without breaking every non-CUDA build.
+metal = ["kizzasi-core/metal"]
+# Tokenizer features
+vqvae = []
+# NOTE: there is no `mulaw` feature. `mod mulaw` (MuLawCodec) is always
+# compiled in, unconditionally — a `mulaw = []` feature used to exist here
+# but gated nothing (every `mulaw.rs` symbol was reachable regardless of
+# whether it was enabled), which looked like an opt-in that didn't exist.
+parallel = ["dep:rayon"]
+# WebAssembly support (opt-in, exposes JS bindings via wasm-bindgen)
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+
+[dependencies]
+# COOLJAPAN Ecosystem
+scirs2-core.workspace = true
+oxifft.workspace = true
+
+# Core dependencies
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+oxicode.workspace = true
+chrono.workspace = true
+safetensors.workspace = true
+
+# Parallel processing (optional)
+rayon = { workspace = true, optional = true }
+
+# WebAssembly bindings (optional, only meaningful for wasm32 target)
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+kizzasi-inference = { path = "../kizzasi-inference" }
+
+# candle and kizzasi-core are not wasm32-compatible (candle uses std::fs /
+# std::thread), so both are native-only. The `metal` feature above turns on
+# candle's Metal backend through kizzasi-core; no target-specific candle
+# entries are needed for that, and CUDA is not offered at all.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+kizzasi-core.workspace = true
+
+# wasm32 requires special RNG backends — uuid needs the `js` feature for wasm32-unknown-unknown
+# getrandom needs `wasm_js` for rand_core. Cargo unifies these features at resolution time.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom.workspace = true
+uuid.workspace = true
+
+[[bench]]
+name = "tokenizer_benchmarks"
+harness = false
+
+[[bench]]
+name = "comprehensive_benchmarks"
+harness = false
+
+[[bench]]
+name = "range_coder_bench"
+harness = false

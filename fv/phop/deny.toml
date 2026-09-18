@@ -1,0 +1,33 @@
+# cargo-deny configuration for phop. Run with `cargo deny check`.
+# See https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Warn (don't hard-fail) on unmaintained crates; fail on security vulnerabilities.
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+# phop is Apache-2.0; permit the usual permissive licenses of the dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Surface accidental duplicate-version bloat as a warning, not a hard error.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

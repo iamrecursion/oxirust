@@ -1,0 +1,28 @@
+[package]
+name = "oximedia-core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Core types and traits for OxiMedia"
+keywords = ["multimedia", "media", "framework", "video", "audio"]
+categories = ["multimedia"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+wasm = ["wasm-bindgen", "console_error_panic_hook"]
+
+[dependencies]
+thiserror.workspace = true
+bitflags.workspace = true
+serde = { workspace = true, features = ["derive"] }
+crossbeam-deque.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }

@@ -1,0 +1,120 @@
+[package]
+name = "oxigaf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigaf"
+description = "Pure Rust Gaussian Avatar Reconstruction — unified API"
+readme = "README.md"
+keywords = ["gaussian-splatting", "3d-reconstruction", "avatar", "flame", "ai"]
+categories = ["graphics", "multimedia", "science"]
+
+[package.metadata.docs.rs]
+# Mirrors oxigaf-cli's list. Deliberately excludes:
+#   `simd` — nightly-only (portable_simd); docs.rs builds on stable.
+#   `npz`  — both the enabled and the disabled `FlameSequence::from_npz` are
+#            compiled and documented, so the rendered page is equivalent either
+#            way; keeping docs.rs builds minimal is the tiebreaker.
+features = ["parallel", "flash_attention", "mixed_precision", "gpu_debug"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxigaf-flame = { workspace = true }
+oxigaf-diffusion = { workspace = true }
+oxigaf-render = { workspace = true }
+oxigaf-trainer = { workspace = true }
+thiserror = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+
+[dev-dependencies]
+# `wgpu` and `pollster` are already in [dependencies] above (pipeline.rs uses
+# both), and Cargo already exposes [dependencies] to examples/tests/benches,
+# so they are intentionally not re-declared here.
+# Logging for examples
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }
+# Image output
+image = { workspace = true }
+# Tensor operations for diffusion example
+candle-core = { workspace = true }
+# `tests/feature_forwarding_tests.rs` calls oxigaf-flame's rayon entry points
+# directly, which take `nalgebra::Point3` / `Vector3` in their signatures.
+nalgebra = { workspace = true }
+
+[features]
+# Default features (none - minimal configuration)
+default = []
+
+# FLAME optimizations
+# Note: `simd` requires nightly Rust; on stable it is accepted but compiled out.
+simd = ["oxigaf-flame/simd"]
+parallel = ["oxigaf-flame/parallel"]
+
+# Diffusion model features
+flash_attention = ["oxigaf-diffusion/flash_attention"]
+mixed_precision = ["oxigaf-diffusion/mixed_precision"]
+
+# Data format features
+# Without this, `FlameSequence::from_npz` compiles but always returns
+# `FlameError::InvalidParams("NPZ support not enabled...")`. Off by default
+# because .npz is a niche input format whose reader is slated to be rebuilt on
+# oxiarc-archive.
+#
+# It does NOT currently gate the banned `zip` crate, despite what
+# oxigaf-flame/Cargo.toml's docs.rs comment and deny.toml's wrapper note claim.
+# Verified with `cargo tree -p oxigaf-flame --no-default-features -i zip@6.0.0`:
+# zip 6.0.0 <- ndarray-npy is in the graph unconditionally, because the root
+# Cargo.toml declares `ndarray-npy = "0.10"` without `default-features = false`
+# and ndarray-npy's own `default` includes `compressed_npz` -> `npz` -> `zip`.
+# Making this feature a real gate requires that root-level change first.
+npz = ["oxigaf-flame/npz"]
+
+# Render features
+# Also forwards to oxigaf-diffusion, whose debug_hooks.rs gates NaN/Inf
+# checking behind this same feature name — without this, `--features
+# gpu_debug` at this crate silently left the diffusion debug hooks off.
+gpu_debug = ["oxigaf-render/gpu_debug", "oxigaf-diffusion/gpu_debug"]
+
+# Convenience feature bundles
+# `npz` is in `all_features` but not in `full_performance`: it is a data
+# format, not a speedup. `all_features` already implies nightly Rust via
+# `simd`, so it is the maximal bundle either way.
+full_performance = ["simd", "parallel", "flash_attention"]
+all_features = ["simd", "parallel", "flash_attention", "mixed_precision", "gpu_debug", "npz"]
+
+# ============================================================================
+# Examples
+# ============================================================================
+
+[[example]]
+name = "basic_flame"
+path = "examples/basic_flame.rs"
+
+[[example]]
+name = "gaussian_render"
+path = "examples/gaussian_render.rs"
+
+[[example]]
+name = "training_loop"
+path = "examples/training_loop.rs"
+
+[[example]]
+name = "diffusion_inference"
+path = "examples/diffusion_inference.rs"
+
+[[example]]
+name = "end_to_end_pipeline"
+path = "examples/end_to_end_pipeline.rs"
+
+[[example]]
+name = "custom_loss"
+path = "examples/custom_loss.rs"
+
+[[example]]
+name = "checkpoint_lifecycle"
+path = "examples/checkpoint_lifecycle.rs"

@@ -1,0 +1,1271 @@
+//! SDK integration layer for voirs-emotion
+//!
+//! This module provides integration with the voirs-sdk crate, allowing
+//! the SDK to use advanced emotion processing capabilities.
+//!
+//! Real integration with voirs-sdk for advanced emotion control features.
+//! This module provides enhanced SDK integration with streaming, real-time processing,
+//! and advanced acoustic model hooks.
+
+use async_trait::async_trait;
+
+// Note: voirs_sdk is not a direct dependency (to avoid cyclic dependency).
+// These types are provided as local stubs when sdk-integration feature is enabled.
+// When the cyclic dependency is resolved in the future, the voirs_sdk import can be restored.
+mod fallback {
+    #[derive(Debug, Clone)]
+    pub struct AudioBuffer {
+        pub samples: Vec<f32>,
+        pub sample_rate: u32,
+        pub channels: u32,
+    }
+
+    impl AudioBuffer {
+        pub fn new(samples: Vec<f32>, sample_rate: u32, channels: u32) -> Self {
+            Self {
+                samples,
+                sample_rate,
+                channels,
+            }
+        }
+
+        pub fn samples(&self) -> &[f32] {
+            &self.samples
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct SdkSynthesisConfig {
+        pub pitch_shift: f32,
+        pub tempo_scale: f32,
+        pub energy_scale: f32,
+        pub voice_style: Option<VoiceStyleConfig>,
+    }
+
+    impl SdkSynthesisConfig {
+        pub fn new() -> Self {
+            Self {
+                pitch_shift: 1.0,
+                tempo_scale: 1.0,
+                energy_scale: 1.0,
+                voice_style: Some(VoiceStyleConfig::default()),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct VoiceStyleConfig {
+        pub breathiness: f32,
+        pub roughness: f32,
+        pub brightness: f32,
+        pub resonance: f32,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct LanguageCode(pub String);
+    #[derive(Debug, Clone)]
+    pub struct SpeakingStyle(pub String);
+    #[derive(Debug, Clone)]
+    pub struct VoiceCharacteristics;
+    #[derive(Debug, Clone)]
+    pub struct SdkError(pub String);
+}
+
+use fallback::*;
+
+use crate::{
+    core::EmotionProcessor,
+    types::{Emotion, EmotionIntensity, EmotionParameters, EmotionVector},
+    Error, Result,
+};
+
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
+use tracing::{debug, info};
+
+/// Processing mode for the emotion controller
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessingMode {
+    /// Low latency mode - prioritizes speed over quality
+    LowLatency,
+    /// High quality mode - prioritizes quality over speed
+    HighQuality,
+    /// Balanced mode - balance between quality and speed
+    Balanced,
+    /// Expressive mode - maximizes emotional expressiveness
+    Expressive,
+}
+
+/// Read the current process's resident set size (RSS) in MB, when the
+/// platform exposes it cheaply. Mirrors the `/proc/self/status` `VmRSS`
+/// parsing pattern already used by `voirs-acoustic::memory`. Returns `None`
+/// on platforms without that file (or if it cannot be parsed), so callers
+/// can fall back to a state-derived estimate instead.
+fn read_process_rss_mb() -> Option<f32> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: f32 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+                return Some(kb / 1024.0);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// SDK-compatible emotion controller
+///
+/// This is the main interface that voirs-sdk uses to control emotion processing.
+/// It bridges the gap between the high-level SDK API and the detailed emotion
+/// processing engine.
+#[derive(Clone)]
+pub struct EmotionController {
+    /// Core emotion processor
+    processor: Arc<EmotionProcessor>,
+    /// Current emotion configuration for synthesis
+    synthesis_config: Arc<RwLock<EmotionSynthesisConfig>>,
+    /// Plugin hooks for acoustic models (stored as type-erased trait objects)
+    acoustic_hooks: Arc<RwLock<Vec<Box<dyn AcousticModelHook + Send + Sync>>>>,
+    /// Current processing mode
+    processing_mode: Arc<RwLock<ProcessingMode>>,
+    /// Performance counters
+    processing_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Total processing time for latency estimation
+    total_latency_ms: Arc<std::sync::Mutex<f32>>,
+}
+
+impl std::fmt::Debug for EmotionController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmotionController")
+            .field("processor", &self.processor)
+            .field("synthesis_config", &"<RwLock<EmotionSynthesisConfig>>")
+            .field(
+                "acoustic_hooks",
+                &"<RwLock<Vec<Box<dyn AcousticModelHook>>>>",
+            )
+            .field("processing_mode", &"<RwLock<ProcessingMode>>")
+            .field(
+                "processing_count",
+                &self
+                    .processing_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl EmotionController {
+    /// Create new emotion controller
+    pub fn new() -> Result<Self> {
+        let processor = EmotionProcessor::new()?;
+
+        Ok(Self {
+            processor: Arc::new(processor),
+            synthesis_config: Arc::new(RwLock::new(EmotionSynthesisConfig::default())),
+            acoustic_hooks: Arc::new(RwLock::new(Vec::new())),
+            processing_mode: Arc::new(RwLock::new(ProcessingMode::Balanced)),
+            processing_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_latency_ms: Arc::new(std::sync::Mutex::new(0.0)),
+        })
+    }
+
+    /// Create emotion controller with custom processor
+    pub fn with_processor(processor: EmotionProcessor) -> Self {
+        Self {
+            processor: Arc::new(processor),
+            synthesis_config: Arc::new(RwLock::new(EmotionSynthesisConfig::default())),
+            acoustic_hooks: Arc::new(RwLock::new(Vec::new())),
+            processing_mode: Arc::new(RwLock::new(ProcessingMode::Balanced)),
+            processing_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_latency_ms: Arc::new(std::sync::Mutex::new(0.0)),
+        }
+    }
+
+    /// Set emotion for synthesis
+    pub async fn set_emotion(&self, emotion: Emotion, intensity: Option<f32>) -> Result<()> {
+        debug!(
+            "Setting emotion for SDK synthesis: {:?} with intensity {:?}",
+            emotion, intensity
+        );
+
+        // Update internal processor
+        self.processor.set_emotion(emotion, intensity).await?;
+
+        // Update synthesis configuration
+        let emotion_params = self.processor.get_current_parameters().await;
+        let mut config = self.synthesis_config.write().await;
+        config.update_from_emotion_parameters(&emotion_params)?;
+
+        info!("Emotion set successfully for SDK synthesis");
+        Ok(())
+    }
+
+    /// Apply emotion to synthesis configuration with real SDK integration
+    pub async fn apply_emotion_to_synthesis(&self) -> Result<SdkSynthesisConfig> {
+        debug!("Applying emotion to SDK synthesis configuration");
+
+        #[cfg(feature = "sdk-integration")]
+        let result = {
+            // Get current emotion parameters
+            let emotion_params = self.processor.get_current_parameters().await;
+            let synthesis_config = self.synthesis_config.read().await;
+
+            // Create SDK synthesis configuration with emotion modifications
+            let mut sdk_config = SdkSynthesisConfig::default();
+
+            // Apply prosodic modifications
+            sdk_config.pitch_shift = emotion_params.pitch_shift;
+            sdk_config.tempo_scale = emotion_params.tempo_scale;
+            sdk_config.energy_scale = emotion_params.energy_scale;
+
+            // Apply voice quality modifications
+            if let Some(voice_style) = sdk_config.voice_style.as_mut() {
+                voice_style.breathiness = synthesis_config.voice_quality.breathiness;
+                voice_style.roughness = synthesis_config.voice_quality.roughness;
+                voice_style.brightness = synthesis_config.voice_quality.brightness;
+                voice_style.resonance = synthesis_config.voice_quality.resonance;
+            }
+
+            // Apply acoustic model hooks
+            let hooks = self.acoustic_hooks.read().await;
+            for hook in hooks.iter() {
+                hook.apply_to_sdk_config(&mut sdk_config).await?;
+            }
+
+            sdk_config
+        };
+
+        #[cfg(not(feature = "sdk-integration"))]
+        let result = {
+            // Fallback: create placeholder configuration
+            SdkSynthesisConfig
+        };
+
+        debug!("Emotion applied to synthesis configuration successfully");
+        Ok(result)
+    }
+
+    /// Process audio with real-time emotion adaptation
+    pub async fn process_audio_streaming(
+        &self,
+        audio_chunk: &[f32],
+        adapt_emotion: bool,
+    ) -> Result<Vec<f32>> {
+        debug!("Processing audio chunk with emotion streaming");
+
+        #[cfg(feature = "sdk-integration")]
+        let result = {
+            // Convert to AudioBuffer for SDK processing
+            let audio_buffer = AudioBuffer::new(audio_chunk.to_vec(), 22050, 1);
+
+            // Apply emotion processing
+            let processed = self.processor.process_audio(audio_chunk).await?;
+
+            // Adapt emotion based on audio characteristics if enabled
+            if adapt_emotion {
+                self.adapt_emotion_from_audio(&audio_buffer).await?;
+            }
+
+            processed
+        };
+
+        #[cfg(not(feature = "sdk-integration"))]
+        let result = {
+            // Fallback: simple processing
+            self.processor.process_audio(audio_chunk).await?
+        };
+
+        debug!("Audio chunk processing completed");
+        Ok(result)
+    }
+
+    /// Adapt emotion parameters based on audio characteristics
+    #[cfg(feature = "sdk-integration")]
+    async fn adapt_emotion_from_audio(&self, audio: &AudioBuffer) -> Result<()> {
+        // Analyze audio characteristics
+        let energy = self.calculate_audio_energy(audio);
+        let pitch_variance = self.calculate_pitch_variance(audio);
+        let _spectral_centroid = self.calculate_spectral_centroid(audio);
+
+        // Determine emotion adaptation
+        let current_params = self.processor.get_current_parameters().await;
+        let mut adapted_params = current_params.clone();
+
+        // Adapt based on audio features
+        if energy > 0.8 {
+            // High energy - boost excitement
+            adapted_params.energy_scale *= 1.1;
+        } else if energy < 0.3 {
+            // Low energy - reduce intensity
+            adapted_params.energy_scale *= 0.9;
+        }
+
+        if pitch_variance > 0.5 {
+            // High pitch variance - increase emotional expressiveness
+            adapted_params.pitch_shift *= 1.05;
+        }
+
+        // Apply adapted parameters
+        self.processor
+            .apply_emotion_parameters(adapted_params)
+            .await?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "sdk-integration")]
+    fn calculate_audio_energy(&self, audio: &AudioBuffer) -> f32 {
+        let samples = audio.samples();
+        samples.iter().map(|&x| x * x).sum::<f32>() / samples.len() as f32
+    }
+
+    /// Real per-frame pitch-variance estimate: slides ~25ms analysis frames
+    /// across `audio`, estimates F0 for each via the same autocorrelation
+    /// estimator used elsewhere in this crate ([`crate::signal_processing`]),
+    /// and returns the coefficient of variation (std-dev / mean) of the
+    /// voiced frames' F0. Returns `0.0` when there are fewer than two voiced
+    /// frames to compare (too short, or entirely unvoiced/silent audio).
+    #[cfg(feature = "sdk-integration")]
+    fn calculate_pitch_variance(&self, audio: &AudioBuffer) -> f32 {
+        let samples = audio.samples();
+        let sample_rate = audio.sample_rate as f32;
+        if sample_rate <= 0.0 {
+            return 0.0;
+        }
+
+        let frame_len = ((sample_rate * 0.025) as usize).clamp(32, samples.len().max(32));
+        if samples.len() < frame_len * 2 {
+            return 0.0;
+        }
+
+        let f0_values: Vec<f32> = samples
+            .chunks(frame_len)
+            .filter(|frame| frame.len() == frame_len)
+            .filter_map(|frame| crate::signal_processing::estimate_fundamental(frame, sample_rate))
+            .collect();
+
+        if f0_values.len() < 2 {
+            return 0.0;
+        }
+
+        let mean = f0_values.iter().sum::<f32>() / f0_values.len() as f32;
+        if mean <= 0.0 {
+            return 0.0;
+        }
+        let variance =
+            f0_values.iter().map(|f| (f - mean).powi(2)).sum::<f32>() / f0_values.len() as f32;
+        (variance.sqrt() / mean).min(2.0)
+    }
+
+    /// Spectral centroid of the buffer, normalized to `[0, 1]` by the Nyquist
+    /// frequency. Uses a Hann-windowed real FFT ([`scirs2_fft::rfft`]).
+    #[cfg(feature = "sdk-integration")]
+    fn calculate_spectral_centroid(&self, audio: &AudioBuffer) -> f32 {
+        use scirs2_fft::rfft;
+
+        let samples = audio.samples();
+        let n = samples.len();
+        if n < 2 || audio.sample_rate == 0 {
+            return 0.0;
+        }
+
+        let windowed: Vec<f64> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos());
+                x as f64 * w
+            })
+            .collect();
+
+        let spectrum = match rfft(&windowed, Some(n)) {
+            Ok(spec) => spec,
+            Err(_) => return 0.0,
+        };
+
+        let bin_hz = audio.sample_rate as f64 / n as f64;
+        let mut weighted = 0.0;
+        let mut total = 0.0;
+        for (k, c) in spectrum.iter().enumerate() {
+            let mag = (c.re * c.re + c.im * c.im).sqrt();
+            weighted += (k as f64 * bin_hz) * mag;
+            total += mag;
+        }
+
+        if total <= 1e-12 {
+            return 0.0;
+        }
+
+        let centroid_hz = weighted / total;
+        let nyquist = audio.sample_rate as f64 / 2.0;
+        (centroid_hz / nyquist).clamp(0.0, 1.0) as f32
+    }
+
+    /// Create audio effect plugin for real-time processing
+    pub fn create_audio_effect_plugin(&self) -> Box<dyn AudioEffectPlugin + Send + Sync> {
+        Box::new(EmotionAudioEffectPlugin::new(self.processor.clone()))
+    }
+
+    /// Register acoustic model hook
+    pub async fn register_acoustic_hook(
+        &self,
+        hook: Box<dyn AcousticModelHook + Send + Sync>,
+    ) -> Result<()> {
+        let mut hooks = self.acoustic_hooks.write().await;
+        hooks.push(hook);
+        debug!("Acoustic model hook registered");
+        Ok(())
+    }
+
+    /// Get current emotion parameters
+    pub async fn get_current_emotion(&self) -> EmotionParameters {
+        self.processor.get_current_parameters().await
+    }
+
+    /// Set cultural context for emotion processing
+    pub async fn set_cultural_context(&self, culture: &str) -> Result<()> {
+        self.processor.set_cultural_context(culture).await
+    }
+
+    /// Enable emotion learning mode
+    pub async fn enable_learning(&self) -> Result<()> {
+        // Enable learning features if available
+        debug!("Enabling emotion learning for SDK integration");
+        Ok(())
+    }
+
+    /// Create streaming emotion processor for real-time applications
+    pub fn create_streaming_processor(&self) -> StreamingEmotionProcessor {
+        StreamingEmotionProcessor::new(self.processor.clone())
+    }
+
+    /// Get performance metrics for monitoring
+    pub async fn get_performance_metrics(&self) -> Result<EmotionProcessingMetrics> {
+        let processing_count = self
+            .processing_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let average_latency = {
+            let total = self
+                .total_latency_ms
+                .lock()
+                .map_err(|e| Error::Processing(format!("Mutex poisoned: {e}")))?;
+            if processing_count > 0 {
+                *total / processing_count as f32
+            } else {
+                0.0
+            }
+        };
+
+        let hooks_active = self.acoustic_hooks.read().await.len();
+
+        Ok(EmotionProcessingMetrics {
+            total_processed: processing_count,
+            average_latency_ms: average_latency,
+            hooks_active,
+            memory_usage_mb: self.estimate_memory_usage(hooks_active),
+        })
+    }
+
+    /// Estimate memory usage for the emotion controller (MB).
+    ///
+    /// Prefers a real process RSS reading (Linux, via `/proc/self/status`,
+    /// matching the pattern already used by `voirs-acoustic::memory`).
+    /// Elsewhere, falls back to a size estimate derived from real live
+    /// state - the actual number of registered acoustic hooks (`hooks_active`,
+    /// not a fixed constant) plus the controller's own in-memory footprint -
+    /// so the value always reflects genuine state rather than a fixed sum.
+    fn estimate_memory_usage(&self, hooks_active: usize) -> f32 {
+        if let Some(rss_mb) = read_process_rss_mb() {
+            return rss_mb;
+        }
+
+        let struct_base_kb = std::mem::size_of::<Self>() as f32 / 1024.0;
+        let config_kb = std::mem::size_of::<EmotionSynthesisConfig>() as f32 / 1024.0;
+        // Heap-allocated trait object + Vec entry overhead per registered hook.
+        const PER_HOOK_KB: f32 = 64.0;
+
+        (struct_base_kb + config_kb + hooks_active as f32 * PER_HOOK_KB) / 1024.0
+    }
+
+    /// Set the processing mode
+    pub async fn set_processing_mode(&self, mode: ProcessingMode) -> Result<()> {
+        let mut current_mode = self.processing_mode.write().await;
+        *current_mode = mode;
+        debug!("Processing mode set to: {:?}", mode);
+        Ok(())
+    }
+
+    /// Optimize performance for specific use case
+    pub async fn optimize_for_use_case(&self, use_case: EmotionUseCase) -> Result<()> {
+        debug!("Optimizing emotion controller for use case: {:?}", use_case);
+
+        match use_case {
+            EmotionUseCase::RealTimeConversation => {
+                // Prioritize low latency
+                self.set_processing_mode(ProcessingMode::LowLatency).await?;
+            }
+            EmotionUseCase::HighQualityNarration => {
+                // Prioritize quality
+                self.set_processing_mode(ProcessingMode::HighQuality)
+                    .await?;
+            }
+            EmotionUseCase::GameCharacterVoice => {
+                // Balance between quality and latency
+                self.set_processing_mode(ProcessingMode::Balanced).await?;
+            }
+            EmotionUseCase::EducationalContent => {
+                // Focus on clarity and expressiveness
+                self.set_processing_mode(ProcessingMode::Expressive).await?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Emotion synthesis configuration
+///
+/// This struct holds emotion parameters in a format suitable for SDK synthesis.
+#[derive(Debug, Clone)]
+pub struct EmotionSynthesisConfig {
+    /// Pitch modification factor
+    pub pitch_shift: f32,
+    /// Tempo modification factor
+    pub tempo_scale: f32,
+    /// Energy scaling factor
+    pub energy_scale: f32,
+    /// Voice quality parameters
+    pub voice_quality: VoiceQualityConfig,
+    /// Prosody modifications
+    pub prosody: ProsodyConfig,
+}
+
+impl Default for EmotionSynthesisConfig {
+    fn default() -> Self {
+        Self {
+            pitch_shift: 1.0,
+            tempo_scale: 1.0,
+            energy_scale: 1.0,
+            voice_quality: VoiceQualityConfig::default(),
+            prosody: ProsodyConfig::default(),
+        }
+    }
+}
+
+impl EmotionSynthesisConfig {
+    /// Update configuration from emotion parameters
+    pub fn update_from_emotion_parameters(&mut self, params: &EmotionParameters) -> Result<()> {
+        self.pitch_shift = params.pitch_shift;
+        self.tempo_scale = params.tempo_scale;
+        self.energy_scale = params.energy_scale;
+
+        // Update voice quality from available fields
+        self.voice_quality.breathiness = params.breathiness;
+        self.voice_quality.roughness = params.roughness;
+        // brightness and resonance are stored in custom_params if present
+        self.voice_quality.brightness = params
+            .custom_params
+            .get("brightness")
+            .copied()
+            .unwrap_or(0.0);
+        self.voice_quality.resonance = params
+            .custom_params
+            .get("resonance")
+            .copied()
+            .unwrap_or(0.0);
+
+        // Update prosody from emotion vector
+        if let Some((dominant_emotion, intensity)) = params.emotion_vector.dominant_emotion() {
+            self.prosody
+                .update_from_emotion(dominant_emotion.as_str(), intensity.value())?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply emotion configuration to SDK synthesis configuration (placeholder)
+    pub fn apply_placeholder(&self) -> Result<()> {
+        // This would apply to voirs_sdk::config::synthesis::SynthesisConfig
+        // when the SDK integration is fully enabled
+        debug!("Applying emotion configuration (placeholder)");
+        Ok(())
+    }
+}
+
+/// Voice quality configuration for SDK integration
+#[derive(Debug, Clone)]
+pub struct VoiceQualityConfig {
+    /// Breathiness level (0.0 = no breathiness, 1.0 = maximum breathiness)
+    pub breathiness: f32,
+    /// Voice roughness level (0.0 = smooth, 1.0 = very rough)
+    pub roughness: f32,
+    /// Brightness of the voice timbre (0.0 = dark, 1.0 = bright)
+    pub brightness: f32,
+    /// Resonance characteristics of the voice (0.0 = minimal, 1.0 = maximum)
+    pub resonance: f32,
+}
+
+impl Default for VoiceQualityConfig {
+    fn default() -> Self {
+        Self {
+            breathiness: 0.0,
+            roughness: 0.0,
+            brightness: 0.0,
+            resonance: 0.0,
+        }
+    }
+}
+
+impl VoiceQualityConfig {
+    /// Apply voice quality configuration (placeholder)
+    pub fn apply_placeholder(&self) -> Result<()> {
+        // This would apply to voirs_sdk::config::synthesis::SynthesisConfig
+        // when the SDK integration is fully enabled
+        debug!("Applying voice quality configuration (placeholder)");
+        Ok(())
+    }
+}
+
+/// Prosody configuration for SDK integration
+#[derive(Debug, Clone)]
+pub struct ProsodyConfig {
+    /// Name of the intonation pattern (e.g. "neutral", "rising", "falling")
+    pub intonation_pattern: String,
+    /// Per-syllable stress weights
+    pub stress_pattern: Vec<f32>,
+    /// Overall rhythm speed modifier (1.0 = normal, <1.0 = slower, >1.0 = faster)
+    pub rhythm_modifier: f32,
+}
+
+impl Default for ProsodyConfig {
+    fn default() -> Self {
+        Self {
+            intonation_pattern: "neutral".to_string(),
+            stress_pattern: vec![1.0],
+            rhythm_modifier: 1.0,
+        }
+    }
+}
+
+impl ProsodyConfig {
+    /// Update prosody from emotion
+    pub fn update_from_emotion(&mut self, emotion: &str, intensity: f32) -> Result<()> {
+        match emotion {
+            "happy" => {
+                self.intonation_pattern = "rising".to_string();
+                self.rhythm_modifier = 1.0 + intensity * 0.2;
+            }
+            "sad" => {
+                self.intonation_pattern = "falling".to_string();
+                self.rhythm_modifier = 1.0 - intensity * 0.2;
+            }
+            "angry" => {
+                self.intonation_pattern = "flat".to_string();
+                self.rhythm_modifier = 1.0 + intensity * 0.3;
+            }
+            "excited" => {
+                self.intonation_pattern = "varied".to_string();
+                self.rhythm_modifier = 1.0 + intensity * 0.4;
+            }
+            _ => {
+                self.intonation_pattern = "neutral".to_string();
+                self.rhythm_modifier = 1.0;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Apply prosody configuration (placeholder)
+    pub fn apply_placeholder(&self) -> Result<()> {
+        // This would apply to voirs_sdk::config::synthesis::SynthesisConfig
+        // when the SDK integration is fully enabled
+        debug!("Applying prosody configuration (placeholder)");
+        Ok(())
+    }
+}
+
+/// Trait for acoustic model hooks with real SDK integration.
+///
+/// This trait uses `async_trait` to ensure dyn-compatibility with boxed trait objects.
+#[async_trait]
+pub trait AcousticModelHook {
+    /// Apply hook to SDK synthesis configuration
+    async fn apply_to_sdk_config(&self, config: &mut SdkSynthesisConfig) -> Result<()>;
+
+    /// Apply hook to synthesis configuration (fallback)
+    async fn apply_placeholder(&self) -> Result<()>;
+
+    /// Get hook name for debugging
+    fn name(&self) -> &str;
+
+    /// Get hook priority (higher numbers execute first)
+    fn priority(&self) -> i32 {
+        0
+    }
+
+    /// Check if hook supports real-time processing
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    /// Process audio chunk in real-time (if supported)
+    async fn process_chunk(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        // Default implementation just returns the input unchanged
+        Ok(audio.to_vec())
+    }
+}
+
+/// Basic acoustic model hook implementation
+pub struct BasicAcousticHook {
+    name: String,
+}
+
+impl BasicAcousticHook {
+    /// Create a new `BasicAcousticHook` with the given name.
+    pub fn new(name: String) -> Self {
+        Self { name }
+    }
+}
+
+#[async_trait]
+impl AcousticModelHook for BasicAcousticHook {
+    async fn apply_to_sdk_config(&self, config: &mut SdkSynthesisConfig) -> Result<()> {
+        debug!("Applying acoustic hook to SDK config: {}", self.name);
+
+        #[cfg(feature = "sdk-integration")]
+        {
+            // Apply basic acoustic modifications to SDK config
+            match self.name.as_str() {
+                "emotion-enhance" => {
+                    config.pitch_shift *= 1.05;
+                    config.energy_scale *= 1.1;
+                }
+                "clarity-boost" => {
+                    if let Some(voice_style) = config.voice_style.as_mut() {
+                        voice_style.brightness += 0.1;
+                    }
+                }
+                "warmth-enhance" => {
+                    if let Some(voice_style) = config.voice_style.as_mut() {
+                        voice_style.breathiness += 0.05;
+                    }
+                }
+                _ => {
+                    debug!("Unknown hook type: {}", self.name);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn apply_placeholder(&self) -> Result<()> {
+        debug!("Applying acoustic hook: {}", self.name);
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn priority(&self) -> i32 {
+        match self.name.as_str() {
+            "emotion-enhance" => 100,
+            "clarity-boost" => 50,
+            "warmth-enhance" => 25,
+            _ => 0,
+        }
+    }
+
+    fn supports_streaming(&self) -> bool {
+        matches!(self.name.as_str(), "emotion-enhance" | "clarity-boost")
+    }
+
+    async fn process_chunk(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        if !self.supports_streaming() {
+            return Ok(audio.to_vec());
+        }
+
+        match self.name.as_str() {
+            "emotion-enhance" => {
+                // Apply subtle dynamic range enhancement
+                let enhanced: Vec<f32> = audio
+                    .iter()
+                    .map(|&sample| {
+                        let enhanced = sample * 1.05;
+                        enhanced.clamp(-1.0, 1.0)
+                    })
+                    .collect();
+                Ok(enhanced)
+            }
+            "clarity-boost" => {
+                // Apply mild high-frequency emphasis
+                let len = audio.len();
+                let boosted: Vec<f32> = audio
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &sample)| {
+                        // Simple high-frequency emphasis (placeholder)
+                        let boost_factor = 1.0 + 0.1 * (i as f32 / len as f32);
+                        (sample * boost_factor).clamp(-1.0, 1.0)
+                    })
+                    .collect();
+                Ok(boosted)
+            }
+            _ => Ok(audio.to_vec()),
+        }
+    }
+}
+
+/// Trait for audio effect plugins (placeholder for SDK integration).
+///
+/// This trait uses `async_trait` to ensure dyn-compatibility with boxed trait objects.
+#[async_trait]
+pub trait AudioEffectPlugin {
+    /// Plugin name
+    fn name(&self) -> &str;
+
+    /// Plugin version
+    fn version(&self) -> &str;
+
+    /// Initialize plugin
+    async fn initialize(&self) -> Result<()>;
+
+    /// Process audio (placeholder)
+    async fn process(&self, audio: &[f32]) -> Result<Vec<f32>>;
+
+    /// Get plugin parameters
+    fn parameters(&self) -> HashMap<String, f32>;
+
+    /// Set plugin parameter
+    async fn set_parameter(&mut self, name: &str, value: f32) -> Result<()>;
+}
+
+/// Audio effect plugin for real-time emotion processing
+pub struct EmotionAudioEffectPlugin {
+    processor: Arc<EmotionProcessor>,
+}
+
+impl EmotionAudioEffectPlugin {
+    /// Create a new `EmotionAudioEffectPlugin` backed by the given processor.
+    pub fn new(processor: Arc<EmotionProcessor>) -> Self {
+        Self { processor }
+    }
+}
+
+#[async_trait]
+impl AudioEffectPlugin for EmotionAudioEffectPlugin {
+    fn name(&self) -> &str {
+        "emotion-processor"
+    }
+
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    async fn initialize(&self) -> Result<()> {
+        debug!("Initializing emotion audio effect plugin");
+        Ok(())
+    }
+
+    async fn process(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        // Process with emotion effects
+        let processed = self.processor.process_audio(audio).await?;
+        Ok(processed)
+    }
+
+    fn parameters(&self) -> HashMap<String, f32> {
+        let mut params = HashMap::new();
+        params.insert("intensity".to_string(), 1.0);
+        params.insert("pitch_shift".to_string(), 1.0);
+        params.insert("tempo_scale".to_string(), 1.0);
+        params.insert("energy_scale".to_string(), 1.0);
+        params
+    }
+
+    async fn set_parameter(&mut self, name: &str, value: f32) -> Result<()> {
+        match name {
+            "intensity" => {
+                debug!("Setting emotion intensity to {}", value);
+            }
+            "pitch_shift" => {
+                debug!("Setting pitch shift to {}", value);
+            }
+            _ => {
+                return Err(Error::Config(format!("Unknown parameter: {}", name)));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Performance metrics for emotion processing
+#[derive(Debug, Clone)]
+pub struct EmotionProcessingMetrics {
+    /// Total number of processed audio chunks
+    pub total_processed: u64,
+    /// Average processing latency in milliseconds
+    pub average_latency_ms: f32,
+    /// Number of active acoustic hooks
+    pub hooks_active: usize,
+    /// Estimated memory usage in MB
+    pub memory_usage_mb: f32,
+}
+
+/// Use case optimization profiles
+#[derive(Debug, Clone)]
+pub enum EmotionUseCase {
+    /// Real-time conversation (prioritize low latency)
+    RealTimeConversation,
+    /// High-quality narration (prioritize quality)
+    HighQualityNarration,
+    /// Game character voice (balance quality and latency)
+    GameCharacterVoice,
+    /// Educational content (focus on clarity and expressiveness)
+    EducationalContent,
+}
+
+/// Streaming emotion processor for real-time applications
+#[derive(Debug, Clone)]
+pub struct StreamingEmotionProcessor {
+    /// Core emotion processor
+    processor: Arc<EmotionProcessor>,
+    /// Streaming buffer size
+    buffer_size: usize,
+    /// Processing latency target (ms)
+    latency_target: f32,
+}
+
+impl StreamingEmotionProcessor {
+    /// Create new streaming processor
+    pub fn new(processor: Arc<EmotionProcessor>) -> Self {
+        Self {
+            processor,
+            buffer_size: 1024,    // Default buffer size
+            latency_target: 10.0, // 10ms target latency
+        }
+    }
+
+    /// Set buffer size for streaming
+    pub fn with_buffer_size(mut self, size: usize) -> Self {
+        self.buffer_size = size;
+        self
+    }
+
+    /// Set latency target
+    pub fn with_latency_target(mut self, target_ms: f32) -> Self {
+        self.latency_target = target_ms;
+        self
+    }
+
+    /// Process streaming audio chunk
+    pub async fn process_chunk(&self, chunk: &[f32]) -> Result<Vec<f32>> {
+        let start_time = std::time::Instant::now();
+
+        // Process with emotion
+        let result = self.processor.process_audio(chunk).await?;
+
+        let elapsed = start_time.elapsed().as_millis() as f32;
+        if elapsed > self.latency_target {
+            tracing::warn!(
+                "Processing latency ({:.1}ms) exceeded target ({:.1}ms)",
+                elapsed,
+                self.latency_target
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Get current buffer size
+    pub fn buffer_size(&self) -> usize {
+        self.buffer_size
+    }
+
+    /// Get latency target
+    pub fn latency_target(&self) -> f32 {
+        self.latency_target
+    }
+}
+
+/// Advanced acoustic hook with SDK integration
+#[derive(Debug)]
+pub struct AdvancedAcousticHook {
+    name: String,
+    priority: i32,
+    streaming_enabled: bool,
+    parameters: std::collections::HashMap<String, f32>,
+}
+
+impl AdvancedAcousticHook {
+    /// Create new advanced hook
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            priority: 0,
+            streaming_enabled: false,
+            parameters: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Set hook priority
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Enable streaming support
+    pub fn with_streaming(mut self, enabled: bool) -> Self {
+        self.streaming_enabled = enabled;
+        self
+    }
+
+    /// Add parameter
+    pub fn with_parameter(mut self, name: String, value: f32) -> Self {
+        self.parameters.insert(name, value);
+        self
+    }
+}
+
+#[async_trait]
+impl AcousticModelHook for AdvancedAcousticHook {
+    async fn apply_to_sdk_config(&self, config: &mut SdkSynthesisConfig) -> Result<()> {
+        debug!(
+            "Applying advanced acoustic hook to SDK config: {}",
+            self.name
+        );
+
+        #[cfg(feature = "sdk-integration")]
+        {
+            // Apply parameters to SDK config
+            for (param_name, value) in &self.parameters {
+                match param_name.as_str() {
+                    "pitch_multiplier" => config.pitch_shift *= value,
+                    "energy_multiplier" => config.energy_scale *= value,
+                    "tempo_multiplier" => config.tempo_scale *= value,
+                    "brightness" => {
+                        if let Some(voice_style) = config.voice_style.as_mut() {
+                            voice_style.brightness += value;
+                        }
+                    }
+                    "breathiness" => {
+                        if let Some(voice_style) = config.voice_style.as_mut() {
+                            voice_style.breathiness += value;
+                        }
+                    }
+                    _ => {
+                        debug!("Unknown parameter: {}", param_name);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn apply_placeholder(&self) -> Result<()> {
+        debug!("Applying advanced acoustic hook: {}", self.name);
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.streaming_enabled
+    }
+
+    async fn process_chunk(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        if !self.supports_streaming() {
+            return Ok(audio.to_vec());
+        }
+
+        // Apply parameter-based processing
+        let mut result = audio.to_vec();
+
+        if let Some(&gain) = self.parameters.get("gain") {
+            for sample in result.iter_mut() {
+                *sample = (*sample * gain).clamp(-1.0, 1.0);
+            }
+        }
+
+        if let Some(&high_freq_boost) = self.parameters.get("high_freq_boost") {
+            // Simple high-frequency boost implementation
+            // Capture result.len() before the mutable borrow
+            let result_len = result.len();
+            for (i, sample) in result.iter_mut().enumerate() {
+                let boost_factor = 1.0 + high_freq_boost * (i as f32 / result_len as f32);
+                *sample = (*sample * boost_factor).clamp(-1.0, 1.0);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+// Re-export for SDK compatibility (when feature is enabled)
+// #[cfg(feature = "sdk-integration")]
+// pub use EmotionController as EmotionConfig;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_emotion_synthesis_config_default() {
+        let config = EmotionSynthesisConfig::default();
+        assert_eq!(config.pitch_shift, 1.0);
+        assert_eq!(config.tempo_scale, 1.0);
+        assert_eq!(config.energy_scale, 1.0);
+    }
+
+    #[test]
+    fn test_voice_quality_config_default() {
+        let config = VoiceQualityConfig::default();
+        assert_eq!(config.breathiness, 0.0);
+        assert_eq!(config.roughness, 0.0);
+        assert_eq!(config.brightness, 0.0);
+        assert_eq!(config.resonance, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_prosody_config_emotion_update() {
+        let mut config = ProsodyConfig::default();
+
+        config.update_from_emotion("happy", 0.8).unwrap();
+        assert_eq!(config.intonation_pattern, "rising");
+        assert!(config.rhythm_modifier > 1.0);
+
+        config.update_from_emotion("sad", 0.6).unwrap();
+        assert_eq!(config.intonation_pattern, "falling");
+        assert!(config.rhythm_modifier < 1.0);
+    }
+
+    #[test]
+    fn test_emotion_controller_creation() {
+        let controller = EmotionController::new();
+        assert!(controller.is_ok());
+    }
+
+    #[test]
+    fn test_emotion_audio_effect_plugin_creation() {
+        let processor = EmotionProcessor::new().unwrap();
+        let plugin = EmotionAudioEffectPlugin::new(Arc::new(processor));
+        assert_eq!(plugin.name(), "emotion-processor");
+        assert!(!plugin.version().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_basic_acoustic_hook() {
+        let hook = BasicAcousticHook::new("test-hook".to_string());
+        assert_eq!(hook.name(), "test-hook");
+        assert!(hook.apply_placeholder().await.is_ok());
+    }
+
+    #[cfg(feature = "sdk-integration")]
+    #[test]
+    fn test_sdk_spectral_centroid_normalized() {
+        let controller = EmotionController::new().unwrap();
+        let sr = 44100u32;
+
+        let tone = |freq: f32| -> Vec<f32> {
+            (0..8192)
+                .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sr as f32).sin() * 0.5)
+                .collect()
+        };
+
+        let lf = AudioBuffer::new(tone(400.0), sr, 1);
+        let hf = AudioBuffer::new(tone(8000.0), sr, 1);
+
+        let c_lf = controller.calculate_spectral_centroid(&lf);
+        let c_hf = controller.calculate_spectral_centroid(&hf);
+
+        // Normalized centroid must lie in [0, 1] and rank HF above LF.
+        assert!((0.0..=1.0).contains(&c_lf));
+        assert!((0.0..=1.0).contains(&c_hf));
+        assert!(c_hf > c_lf, "hf {c_hf} should exceed lf {c_lf}");
+    }
+
+    #[cfg(feature = "sdk-integration")]
+    #[test]
+    fn test_pitch_variance_real_not_hardcoded() {
+        let controller = EmotionController::new().unwrap();
+        let sr = 16000u32;
+
+        // A steady, constant-pitch tone should have near-zero pitch variance.
+        let steady: Vec<f32> = (0..sr * 2)
+            .map(|i| (2.0 * std::f32::consts::PI * 200.0 * i as f32 / sr as f32).sin() * 0.6)
+            .collect();
+        // A tone that sweeps across a wide pitch range should have high
+        // pitch variance.
+        let sweeping: Vec<f32> = (0..sr * 2)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let freq = 100.0 + 250.0 * (t * 2.0).sin().abs();
+                (2.0 * std::f32::consts::PI * freq * t).sin() * 0.6
+            })
+            .collect();
+
+        let steady_buf = AudioBuffer::new(steady, sr, 1);
+        let sweeping_buf = AudioBuffer::new(sweeping, sr, 1);
+
+        let steady_variance = controller.calculate_pitch_variance(&steady_buf);
+        let sweeping_variance = controller.calculate_pitch_variance(&sweeping_buf);
+
+        // The old code returned exactly 0.3 for any input whatsoever.
+        assert_ne!(steady_variance, 0.3);
+        assert!(
+            steady_variance < 0.15,
+            "steady tone variance was {steady_variance}"
+        );
+        assert!(
+            sweeping_variance > steady_variance,
+            "sweeping ({sweeping_variance}) should have higher pitch variance than steady \
+             ({steady_variance})"
+        );
+    }
+
+    #[cfg(feature = "sdk-integration")]
+    #[tokio::test]
+    async fn test_memory_usage_reflects_registered_hooks() {
+        let controller = EmotionController::new().unwrap();
+
+        let before = controller.get_performance_metrics().await.unwrap();
+        assert_eq!(before.hooks_active, 0);
+
+        controller
+            .register_acoustic_hook(Box::new(BasicAcousticHook::new("hook-1".to_string())))
+            .await
+            .unwrap();
+        controller
+            .register_acoustic_hook(Box::new(BasicAcousticHook::new("hook-2".to_string())))
+            .await
+            .unwrap();
+
+        let after = controller.get_performance_metrics().await.unwrap();
+        assert_eq!(after.hooks_active, 2);
+        // On non-Linux platforms (no real RSS reading available), the
+        // fallback estimate must actually grow with the real hook count -
+        // the old code returned a fixed 13.0 regardless of state.
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            after.memory_usage_mb > before.memory_usage_mb,
+            "memory estimate should grow with registered hooks: before={}, after={}",
+            before.memory_usage_mb,
+            after.memory_usage_mb
+        );
+    }
+}

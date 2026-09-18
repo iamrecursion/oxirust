@@ -1,0 +1,27 @@
+[package]
+name = "oxiphysics-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "File I/O and serialization for the OxiPhysics engine"
+readme = "README.md"
+categories = ["science", "filesystem"]
+keywords = ["physics", "io", "vtk", "hdf5", "serialization"]
+
+[dependencies]
+thiserror = { workspace = true }
+oxiphysics-core = { workspace = true }
+oxiphysics-articulated = { workspace = true }
+oxiarc-zstd = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxixml-xml = { workspace = true }
+# `float_roundtrip` makes the JSON reader parse every f64 correctly rounded, so
+# restart files round-trip bit-exactly.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+# Derive support for the scene and checkpoint JSON documents (simulation_io).
+serde = { workspace = true }
+
+[dev-dependencies]
+oxiarc-zstd = { workspace = true }

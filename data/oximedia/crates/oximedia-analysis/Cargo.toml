@@ -1,0 +1,40 @@
+[package]
+name = "oximedia-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Comprehensive media analysis and quality assessment tools for OxiMedia"
+readme = "README.md"
+keywords = ["media", "analysis", "quality", "scene-detection", "audio-analysis"]
+categories = ["multimedia::video", "multimedia::audio"]
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-audio = { workspace = true }
+oximedia-graph = { workspace = true }
+oximedia-metering = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+oxifft = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+criterion.workspace = true
+
+[[bench]]
+name = "analysis_benchmarks"
+harness = false
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

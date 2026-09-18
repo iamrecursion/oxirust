@@ -1,0 +1,41 @@
+[package]
+name = "oximedia-container"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Container demuxer/muxer for OxiMedia"
+keywords = ["container", "muxer", "demuxer", "mp4", "mkv"]
+categories = ["multimedia", "parser-implementations"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+## Enable memory-mapped I/O for large file demuxing.
+## Provides `MmapDemuxSource` which maps the file into the process address
+## space and avoids kernel-space copies on read-heavy workloads.
+mmap = ["dep:memmap2"]
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-io.workspace = true
+bytes.workspace = true
+bitflags.workspace = true
+async-trait.workspace = true
+nom.workspace = true
+md-5.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+memmap2 = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

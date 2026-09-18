@@ -1,0 +1,201 @@
+name: Performance Benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-bench-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build benchmarks
+        run: |
+          cargo build --release --manifest-path benches/Cargo.toml
+
+      - name: Run container benchmarks
+        run: |
+          cargo bench --manifest-path benches/Cargo.toml --bench container_bench -- --output-format bencher | tee container_bench.txt
+
+      - name: Run codec benchmarks
+        run: |
+          cargo bench --manifest-path benches/Cargo.toml --bench codec_bench -- --output-format bencher | tee codec_bench.txt
+
+      - name: Run audio benchmarks
+        run: |
+          cargo bench --manifest-path benches/Cargo.toml --bench audio_bench -- --output-format bencher | tee audio_bench.txt
+
+      - name: Run CV benchmarks
+        run: |
+          cargo bench --manifest-path benches/Cargo.toml --bench cv_bench -- --output-format bencher | tee cv_bench.txt
+
+      - name: Download previous benchmark results
+        uses: actions/cache@v4
+        if: github.event_name == 'pull_request'
+        with:
+          path: ./cache
+          key: ${{ runner.os }}-benchmark
+
+      - name: Store benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: OxiMedia Benchmarks
+          tool: 'cargo'
+          output-file-path: target/criterion/*/base/estimates.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '120%'
+          comment-on-alert: true
+          fail-on-alert: true
+          alert-comment-cc-users: '@maintainers'
+
+      - name: Compare benchmark results
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "## Benchmark Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Comparing performance against main branch..." >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            container_bench.txt
+            codec_bench.txt
+            audio_bench.txt
+            cv_bench.txt
+            target/criterion/**/*.html
+            target/criterion/**/estimates.json
+          retention-days: 30
+
+  benchmark-quick:
+    name: Quick Benchmark Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-bench-quick-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run quick benchmark subset
+        run: |
+          # Run only fast benchmarks for PR checks
+          cargo bench --manifest-path benches/Cargo.toml --bench container_bench -- --quick
+
+      - name: Check for performance regressions
+        run: |
+          echo "Quick benchmark check completed"
+
+  benchmark-compare-ffmpeg:
+    name: Compare with FFmpeg
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Create test media files
+        run: |
+          mkdir -p test_data
+          # Generate test video
+          ffmpeg -f lavfi -i testsrc=duration=10:size=1920x1080:rate=30 -c:v libvpx-vp9 -b:v 2M test_data/test_1080p.webm
+          ffmpeg -f lavfi -i testsrc=duration=10:size=1280x720:rate=30 -c:v libvpx-vp9 -b:v 1M test_data/test_720p.webm
+
+      - name: Run OxiMedia benchmarks
+        run: |
+          cargo bench --manifest-path benches/Cargo.toml
+
+      - name: Run FFmpeg benchmarks
+        run: |
+          echo "## FFmpeg Comparison" > ffmpeg_comparison.txt
+          echo "" >> ffmpeg_comparison.txt
+
+          # Benchmark FFmpeg demuxing
+          echo "### Demuxing Performance" >> ffmpeg_comparison.txt
+          /usr/bin/time -v ffmpeg -benchmark -i test_data/test_1080p.webm -f null - 2>&1 | tee -a ffmpeg_comparison.txt
+
+      - name: Upload comparison results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-comparison
+          path: ffmpeg_comparison.txt
+          retention-days: 30

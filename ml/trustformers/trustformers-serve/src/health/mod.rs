@@ -1,0 +1,391 @@
+//! Health Check and High Availability Module
+//!
+//! Provides health monitoring, circuit breaker patterns, and high availability
+//! features for production deployment of the inference server.
+
+pub mod circuit_breaker;
+pub mod failover;
+pub mod health_check;
+pub mod retry;
+
+pub use health_check::{
+    ComponentHealth, HealthCheck, HealthCheckResult, HealthCheckService, HealthEndpoint,
+    HealthStatus, SystemHealth,
+};
+
+pub use circuit_breaker::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitBreakerState,
+    CircuitBreakerStats, FailureThreshold,
+};
+
+pub use retry::{
+    ExponentialBackoff, FixedDelay, LinearBackoff, RetryConfig, RetryPolicy, RetryStats,
+    RetryStrategy,
+};
+
+pub use failover::{
+    FailoverConfig, FailoverManager, FailoverStats, FailoverStrategy, LoadBalancer, NodeHealth,
+};
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::RwLock;
+
+/// High availability service orchestrator
+#[derive(Clone)]
+pub struct HighAvailabilityService {
+    config: HAConfig,
+    health_service: Arc<HealthCheckService>,
+    circuit_breakers: Arc<RwLock<std::collections::HashMap<String, CircuitBreaker>>>,
+    failover_manager: Arc<FailoverManager>,
+    retry_policies: Arc<RwLock<std::collections::HashMap<String, RetryPolicy>>>,
+    metrics: Arc<HAMetrics>,
+}
+
+impl HighAvailabilityService {
+    /// Create a new high availability service
+    pub fn new(config: HAConfig) -> Self {
+        Self {
+            config: config.clone(),
+            health_service: Arc::new(HealthCheckService::new(config.health_config)),
+            circuit_breakers: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            failover_manager: Arc::new(FailoverManager::new(config.failover_config)),
+            retry_policies: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            metrics: Arc::new(HAMetrics::new()),
+        }
+    }
+
+    /// Start the HA service
+    pub async fn start(&self) -> Result<()> {
+        // Start health monitoring
+        self.health_service.start_monitoring().await?;
+
+        // Start circuit breaker monitoring
+        self.start_circuit_breaker_monitoring().await?;
+
+        // Start failover monitoring
+        self.failover_manager.start_monitoring().await?;
+
+        Ok(())
+    }
+
+    /// Get or create circuit breaker for service
+    pub async fn get_circuit_breaker(&self, service_name: String) -> CircuitBreaker {
+        let mut breakers = self.circuit_breakers.write().await;
+
+        breakers
+            .entry(service_name.clone())
+            .or_insert_with(|| {
+                CircuitBreaker::new(service_name, self.config.circuit_breaker_config.clone())
+            })
+            .clone()
+    }
+
+    /// Execute operation with circuit breaker protection
+    pub async fn execute_protected<F, T, E>(&self, service_name: String, operation: F) -> Result<T>
+    where
+        F: FnMut() -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::result::Result<T, E>> + Send>,
+            > + Send,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let circuit_breaker = self.get_circuit_breaker(service_name.clone()).await;
+
+        // Check circuit breaker state
+        if !circuit_breaker.can_execute().await {
+            // The breaker stopped a call that would have hit a failing service.
+            self.metrics.record_failure_prevented().await;
+            return Err(anyhow::anyhow!(
+                "Circuit breaker open for service: {}",
+                service_name
+            ));
+        }
+
+        self.metrics.record_request_protected().await;
+
+        // Execute with retry policy
+        let retry_policy = self.get_retry_policy(service_name.clone()).await;
+        let result = retry_policy.execute(operation).await;
+
+        // Update circuit breaker based on result
+        match &result {
+            Ok(_) => circuit_breaker.record_success().await,
+            Err(_) => {
+                circuit_breaker.record_failure().await;
+                self.metrics.record_retry_attempt().await;
+            },
+        }
+
+        result.map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    /// Counters accumulated by this service.
+    ///
+    /// 0.2.1: the `metrics` field was constructed and never touched again, so
+    /// `HAMetrics`' four `record_*` methods had no callers and every counter
+    /// was permanently zero. They are recorded on the real protected-execution
+    /// path now, and this accessor exposes them.
+    pub async fn metrics_snapshot(&self) -> HAMetricsSnapshot {
+        self.metrics.snapshot().await
+    }
+
+    /// Get or create retry policy for service
+    async fn get_retry_policy(&self, service_name: String) -> RetryPolicy {
+        let mut policies = self.retry_policies.write().await;
+
+        policies
+            .entry(service_name)
+            .or_insert_with(|| RetryPolicy::new(self.config.retry_config.clone()))
+            .clone()
+    }
+
+    /// Get overall system health
+    pub async fn get_system_health(&self) -> SystemHealth {
+        self.health_service.get_system_health().await
+    }
+
+    /// Fail over to `target_node`.
+    ///
+    /// Delegates to the real failover manager: an unknown or unhealthy target is
+    /// an error, and the returned outcome names the node that was actually
+    /// active before and after the switch.
+    pub async fn trigger_failover(&self, target_node: &str) -> Result<FailoverOutcome> {
+        let previous_node = self.failover_manager.get_primary_node().await;
+        self.failover_manager.force_failover(target_node.to_string()).await?;
+        let active_node = self.failover_manager.get_primary_node().await;
+        Ok(FailoverOutcome {
+            previous_node,
+            active_node,
+        })
+    }
+
+    /// The node currently serving as primary, if one has been elected.
+    pub async fn primary_node(&self) -> Option<String> {
+        self.failover_manager.get_primary_node().await
+    }
+
+    /// Register a node with the failover manager.
+    pub async fn register_node(&self, node_id: String, endpoint: String) -> Result<()> {
+        self.failover_manager.register_node(node_id, endpoint).await
+    }
+
+    /// Get HA statistics
+    pub async fn get_stats(&self) -> HAStats {
+        HAStats {
+            health_checks: self.health_service.get_stats().await,
+            circuit_breakers: self.get_circuit_breaker_stats().await,
+            failover: self.failover_manager.get_stats().await,
+            retry_stats: self.get_retry_stats().await,
+        }
+    }
+
+    /// Start circuit breaker monitoring
+    async fn start_circuit_breaker_monitoring(&self) -> Result<()> {
+        let breakers = self.circuit_breakers.clone();
+        let interval = self.config.monitoring_interval;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval);
+
+            loop {
+                interval.tick().await;
+
+                // Check circuit breaker states
+                let breakers_read = breakers.read().await;
+                for (name, breaker) in breakers_read.iter() {
+                    if let Err(e) = breaker.check_health().await {
+                        tracing::warn!("Circuit breaker {} health check failed: {}", name, e);
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Get circuit breaker statistics
+    async fn get_circuit_breaker_stats(
+        &self,
+    ) -> std::collections::HashMap<String, CircuitBreakerStats> {
+        let mut stats = std::collections::HashMap::new();
+        let breakers = self.circuit_breakers.read().await;
+
+        for (name, breaker) in breakers.iter() {
+            stats.insert(name.clone(), breaker.get_stats().await);
+        }
+
+        stats
+    }
+
+    /// Get retry statistics
+    async fn get_retry_stats(&self) -> std::collections::HashMap<String, RetryStats> {
+        let mut stats = std::collections::HashMap::new();
+        let policies = self.retry_policies.read().await;
+
+        for (name, policy) in policies.iter() {
+            stats.insert(name.clone(), policy.get_stats().await);
+        }
+
+        stats
+    }
+}
+
+/// High availability configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HAConfig {
+    /// Health check configuration
+    pub health_config: health_check::HealthConfig,
+
+    /// Circuit breaker configuration
+    pub circuit_breaker_config: CircuitBreakerConfig,
+
+    /// Retry configuration
+    pub retry_config: RetryConfig,
+
+    /// Failover configuration
+    pub failover_config: failover::FailoverConfig,
+
+    /// Monitoring interval
+    pub monitoring_interval: Duration,
+
+    /// Enable graceful shutdown
+    pub enable_graceful_shutdown: bool,
+
+    /// Shutdown timeout
+    pub shutdown_timeout: Duration,
+}
+
+impl Default for HAConfig {
+    fn default() -> Self {
+        Self {
+            health_config: health_check::HealthConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            retry_config: RetryConfig::default(),
+            failover_config: failover::FailoverConfig::default(),
+            monitoring_interval: Duration::from_secs(30),
+            enable_graceful_shutdown: true,
+            shutdown_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Result of a manual failover.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverOutcome {
+    /// Node that was primary before the switch, if any.
+    pub previous_node: Option<String>,
+    /// Node that is primary after the switch.
+    pub active_node: Option<String>,
+}
+
+/// High availability statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HAStats {
+    pub health_checks: health_check::HealthStats,
+    pub circuit_breakers: std::collections::HashMap<String, CircuitBreakerStats>,
+    pub failover: failover::FailoverStats,
+    pub retry_stats: std::collections::HashMap<String, RetryStats>,
+}
+
+/// HA metrics collector
+#[derive(Debug)]
+pub struct HAMetrics {
+    requests_protected: Arc<RwLock<u64>>,
+    failures_prevented: Arc<RwLock<u64>>,
+    successful_failovers: Arc<RwLock<u64>>,
+    retry_attempts: Arc<RwLock<u64>>,
+}
+
+impl Default for HAMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HAMetrics {
+    pub fn new() -> Self {
+        Self {
+            requests_protected: Arc::new(RwLock::new(0)),
+            failures_prevented: Arc::new(RwLock::new(0)),
+            successful_failovers: Arc::new(RwLock::new(0)),
+            retry_attempts: Arc::new(RwLock::new(0)),
+        }
+    }
+
+    pub async fn record_request_protected(&self) {
+        *self.requests_protected.write().await += 1;
+    }
+
+    pub async fn record_failure_prevented(&self) {
+        *self.failures_prevented.write().await += 1;
+    }
+
+    pub async fn record_successful_failover(&self) {
+        *self.successful_failovers.write().await += 1;
+    }
+
+    pub async fn record_retry_attempt(&self) {
+        *self.retry_attempts.write().await += 1;
+    }
+
+    /// Read all four counters at once.
+    pub async fn snapshot(&self) -> HAMetricsSnapshot {
+        HAMetricsSnapshot {
+            requests_protected: *self.requests_protected.read().await,
+            failures_prevented: *self.failures_prevented.read().await,
+            successful_failovers: *self.successful_failovers.read().await,
+            retry_attempts: *self.retry_attempts.read().await,
+        }
+    }
+}
+
+/// A point-in-time read of [`HAMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HAMetricsSnapshot {
+    /// Calls admitted through a closed circuit breaker.
+    pub requests_protected: u64,
+    /// Calls refused by an open circuit breaker.
+    pub failures_prevented: u64,
+    /// Failovers that completed successfully.
+    pub successful_failovers: u64,
+    /// Protected calls that ended in failure after the retry policy ran.
+    pub retry_attempts: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_ha_service() {
+        let config = HAConfig::default();
+        let service = HighAvailabilityService::new(config);
+
+        // Test circuit breaker creation
+        let cb = service.get_circuit_breaker("test_service".to_string()).await;
+        assert!(cb.can_execute().await);
+
+        // Test system health
+        let health = service.get_system_health().await;
+        assert!(matches!(
+            health.status,
+            HealthStatus::Healthy | HealthStatus::Degraded
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_protected_execution() {
+        let config = HAConfig::default();
+        let service = HighAvailabilityService::new(config);
+
+        // Test successful operation
+        let result = service
+            .execute_protected("test".to_string(), || {
+                Box::pin(async { Ok::<_, std::io::Error>("success") })
+            })
+            .await;
+
+        assert!(result.is_ok());
+    }
+}

@@ -1,0 +1,40 @@
+[package]
+name = "chie-desktop"
+version = "0.2.0"
+description = "CHIE Protocol Desktop Client"
+authors = ["COOLJAPAN OU"]
+license.workspace = true
+repository = "https://github.com/cool-japan/chie"
+edition = "2021"
+rust-version = "1.83"
+publish = false
+
+[lib]
+name = "chie_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+tauri = { version = "2.11", features = [] }
+tauri-plugin-shell = "2.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.52", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
+hex = "0.4"
+dirs = "6.0"
+open = "5.3"
+
+# CHIE Protocol crates
+chie-core = { path = "../../../crates/chie-core" }
+chie-p2p = { path = "../../../crates/chie-p2p" }
+chie-crypto = { path = "../../../crates/chie-crypto" }
+chie-shared = { path = "../../../crates/chie-shared" }
+
+[features]
+default = []

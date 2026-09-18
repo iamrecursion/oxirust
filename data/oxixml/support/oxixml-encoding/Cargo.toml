@@ -1,0 +1,22 @@
+[package]
+name = "oxixml-encoding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Character-encoding decoders/encoders and XML-prologue encoding sniffing: UTF-8, UTF-16, Latin-1/windows-125x, Shift_JIS/EUC-JP/ISO-2022-JP, and GBK/gb18030/Big5/EUC-KR (pure-Rust encoding_rs-style replacement for XML)."
+keywords = ["xml", "encoding", "utf-8", "utf-16", "charset"]
+categories = ["encoding", "text-processing", "parsing"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[lints]
+workspace = true

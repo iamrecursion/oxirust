@@ -1,0 +1,43 @@
+[package]
+name = "oxiproto-build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust .proto → Rust codegen (no protoc required)"
+readme = "README.md"
+keywords = ["protobuf", "codegen", "build"]
+categories = ["development-tools"]
+
+[features]
+default = ["native-parser"]
+native-parser = ["dep:prost-reflect"]
+# Enable `Builder::native_impl()` which also generates `OxiMessage` / `OxiName`
+# implementations via `oxiproto-codegen`.
+native-codegen = ["dep:oxiproto-codegen"]
+
+[dependencies]
+prost.workspace = true
+prost-build.workspace = true
+prost-types.workspace = true
+prost-reflect = { workspace = true, optional = true }
+protox.workspace = true
+oxiproto-core.workspace = true
+oxiproto-codegen = { workspace = true, optional = true }
+
+[dev-dependencies]
+oxiproto-codegen.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "parse"
+harness = false
+required-features = ["native-parser"]
+
+[[bench]]
+name = "parse_bench"
+harness = false
+required-features = ["native-parser"]

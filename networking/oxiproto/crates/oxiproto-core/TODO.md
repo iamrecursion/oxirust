@@ -1,0 +1,139 @@
+# oxiproto-core TODO
+
+## Status
+Re-export facade over `prost` (`Message`, `Name`, `prost_types`) PLUS a complete
+native wire format module (`oxiproto_core::wire`). The wire module provides
+varint/zigzag/tag/fixed/length-delimited codecs, `DecodeBuffer`/`EncodeBuffer`,
+and `UnknownFields` — ~1900 SLOC including tests. Error type now has
+`WireFormatError`, `From<std::io::Error>`, `#[non_exhaustive]`, and
+`OxiProtoResult<T>`. Goal: build a native `Message` trait on top of the wire
+module to fully replace `prost`. 0.1.4 adds a shared recursion-depth budget
+(`DecodeBuffer::nested`/`depth`, `wire::MAX_DECODE_DEPTH`) closing a
+stack-overflow DoS on deeply-nested decode input, plus a message-level fuzz
+suite (`tests/fuzz_message_decode.rs`). 341 tests passing (default features) /
+346 (all features).
+
+## Core Implementation
+- [x] Implement native `WireType` enum: Varint(0), I64(1), Len(2), SGroup(3), EGroup(4), I32(5)
+- [x] Implement varint encoding (LEB128) for u32/u64/i32/i64 with overflow detection
+- [x] Implement zigzag encoding for sint32/sint64
+- [x] Implement field tag encoding/decoding: (field_number << 3) | wire_type
+- [x] Implement length-delimited field encoding/decoding
+- [x] Implement fixed32/fixed64 encoding/decoding (little-endian) + float/double/sfixed
+- [x] Implement `DecodeBuffer` for zero-copy wire format reading from `&[u8]` (was: BufReader)
+- [x] Implement `EncodeBuffer` for wire format writing to `Vec<u8>` (was: BufWriter)
+- [x] Implement `UnknownFields` storage for preserving unrecognized fields during decode
+- [x] Implement native `OxiMessage` trait: `encode_raw`, `decode`, `encoded_len`, `merge`, `clear`, `encode_to_vec` (200-220 SLOC) (done 2026-05-29)
+  - **Goal:** Define `oxiproto_core::OxiMessage` trait on top of the existing `wire` module. Named `OxiMessage` to avoid collision with existing `pub use prost::Message`. KEEP `pub use prost::Message` re-export UNCHANGED.
+  - **Design:** Trait in `src/message.rs`. Methods: `encoded_len() -> usize`, `encode_raw(&self, buf: &mut wire::EncodeBuffer)`, `merge(&mut self, buf: &mut wire::DecodeBuffer) -> OxiProtoResult<()>`, `clear(&mut self)`. Default impls: `decode_raw`, `encode_to_vec`, `decode`. Add `pub mod message; pub use message::OxiMessage;` to lib.rs (KEEP existing prost re-exports!).
+  - **Files:** crates/oxiproto-core/src/message.rs (new); crates/oxiproto-core/src/lib.rs (modified: add module + re-export, kept prost re-exports)
+  - **Tests:** Hand-written TestFoo {id: i32, name: String, tags: Vec<String>} impl OxiMessage; round-trip through encode_to_vec → decode; byte cross-validation against a prost-derived equivalent — bytes are identical.
+- [x] Implement native `OxiName` trait: `full_name`, `type_url` (50 SLOC) (done 2026-05-29)
+  - **Goal:** `oxiproto_core::OxiName` with `const NAME: &'static str`, `const PACKAGE: &'static str`, `fn full_name() -> String`, `fn type_url() -> String`. Distinct from `prost::Name` re-export.
+  - **Design:** Trait in `src/name.rs`. Defaults: full_name concatenates PACKAGE + "." + NAME (skips "." if PACKAGE is empty). type_url = "type.googleapis.com/" + full_name().
+  - **Files:** crates/oxiproto-core/src/name.rs (new); crates/oxiproto-core/src/lib.rs (modified)
+- [x] Implement `Extensions` registry for proto2 extension field support (160 SLOC) (done 2026-05-29)
+  - **Goal:** `oxiproto_core::Extensions` struct backed by `BTreeMap<u32, Vec<u8>>` for proto2 extension storage.
+  - **Design:** Struct in `src/extensions.rs`. Methods: `get_extension<T: OxiMessage>`, `set_extension<T: OxiMessage>`, `has_extension`, `clear_extension`, `is_empty`, `len`, `merge_raw`, `encode_raw`, `encoded_len`.
+  - **Files:** crates/oxiproto-core/src/extensions.rs (new); crates/oxiproto-core/src/lib.rs (modified)
+  - **Tests:** set/get round-trip, has/clear, is_empty/len, overwrite, encode_raw + merge_raw round-trip, encoded_len matches actual.
+- [x] Implement `OxiOneof` trait for oneof field group representation (90 SLOC) (done 2026-05-29)
+  - **Goal:** `oxiproto_core::OxiOneof` trait for generated oneof enums. Enables field-number-dispatch during merge().
+  - **Design:** Trait in `src/oneof.rs`. Methods: `discriminant(&self) -> u32`, `encoded_len(&self) -> usize`, `encode(&self, buf: &mut wire::EncodeBuffer)`, `merge_field(field_number, wire_type, buf, slot) -> OxiProtoResult<bool>`.
+  - **Files:** crates/oxiproto-core/src/oneof.rs (new); crates/oxiproto-core/src/lib.rs (modified)
+  - **Tests:** 3-variant enum (int, str, bool); each round-trips; last-write-wins; unknown field_number → Ok(false); encoded_len matches actual.
+- [x] Add `WireFormatError` variant to `OxiProtoError` for decode failures
+- [x] Add `UnexpectedEof`, `InvalidWireType`, `InvalidFieldNumber`, `Overflow` error variants (in `WireError`)
+- [x] Implement a shared recursion-depth budget for nested-message/group decoding (done 2026-07-27)
+  - **Goal:** Close a stack-overflow denial-of-service: decoding a maliciously deeply-nested message or group (thousands of levels) could previously exhaust the stack before ever reaching application code.
+  - **Design:** New public `DecodeBuffer::nested(&self, payload: &[u8]) -> Result<DecodeBuffer, WireError>` is the single choke point every nested-message/group decode path in the workspace now descends through; new public `DecodeBuffer::depth(&self) -> u32` exposes the current nesting level. New public constant `wire::MAX_DECODE_DEPTH: u32 = 100` (matching the de-facto protobuf/prost norm — `protobuf`'s `CodedInputStream` default and prost's `RECURSION_LIMIT`) bounds it; exceeding it returns the new `WireError::RecursionLimitExceeded` variant instead of recursing further. `skip_field`'s internal group-skipping was rewritten as `skip_field_at` to thread depth tracking through its own recursion.
+  - **Files:** `src/wire/buf.rs` (`MAX_DECODE_DEPTH`, `DecodeBuffer::depth`/`nested`, `skip_field_at`); `src/wire/mod.rs` (`WireError::RecursionLimitExceeded`, `MAX_DECODE_DEPTH` re-export).
+  - **Tests:** `skip_field_group_recursion_is_bounded`, `skip_field_shallow_group_still_works`, `nested_rejects_beyond_max_depth` (in `src/wire/buf.rs`); see also the Testing section below for the message-level fuzz suite that exercises this through `OxiMessage::decode`.
+
+## API Improvements
+- [x] Make `OxiProtoError` implement `From<std::io::Error>` instead of storing `ErrorKind`
+- [x] Add `#[non_exhaustive]` to `OxiProtoError`
+- [x] Add `OxiProtoResult<T>` type alias
+- [x] Implement `serde::Serialize` / `Deserialize` for wire-format types behind feature (done 2026-05-29)
+  - **Goal:** Optional `serde` feature deriving `Serialize`/`Deserialize` on public wire-format data types (`WireType`, `UnknownFields`/unknown-field entries, and other public wire structs). NOT on transient `EncodeBuffer`/`DecodeBuffer`.
+  - **Design:** `Cargo.toml`: `serde = { workspace = true, optional = true, default-features = false, features = ["derive", "alloc"] }` + feature `serde = ["dep:serde"]`. Gated via `#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]` on public types. **Dual-build gate:** both `--no-default-features --features alloc` (serde off, no_std preserved) AND `--features serde` must build.
+  - **Files:** `Cargo.toml` (serde optional dep + feature), `src/wire/*.rs` (cfg_attr derives), `src/lib.rs` (feature plumbing if needed), `tests/serde_wire.rs` (new — serde_json round-trip for WireType/UnknownFields).
+  - **Tests:** `cargo nextest -p oxiproto-core --all-features` green; `cargo build -p oxiproto-core --no-default-features --features alloc` still passes; `cargo build -p oxiproto-core --features serde` passes; serde_json round-trip test for WireType/UnknownFields.
+  - **Risk:** Low. Main risk = serde feature accidentally breaking no_std+alloc build → mitigated by dual-build gate.
+- [x] Add `no_std` support with `alloc` feature for embedded use (done 2026-05-29)
+  - **Goal:** `oxiproto-core` builds under `#![no_std]` + `alloc`. Default stays `std`. Proven by `cargo build -p oxiproto-core --no-default-features --features alloc`.
+  - **Design:** Added `[features]` `default=["std"]`, `std=["prost/std","prost-types/std"]`, `alloc=[]`. Mechanical swaps: `std::fmt`->`core::fmt`, `std::str`->`core::str`, `std::slice`->`core::slice`, `std::error::Error`->`core::error::Error`, `std::collections::BTreeMap`->`prost::alloc::collections::BTreeMap`. `String`/`Vec`/`format!`/`vec!` all use `prost::alloc::*`. Gated `OxiProtoError::IoError` + `From<std::io::Error>` behind `#[cfg(feature="std")]`. prost and prost-types support no_std natively (their `std` feature propagated from ours). Added `WireError::InvalidUtf8(core::str::Utf8Error)` variant for alloc-free UTF-8 error reporting.
+  - **Files:** `Cargo.toml` (features), `src/lib.rs`, `src/wire/mod.rs`, `src/wire/buf.rs`, `src/wire/fixed.rs`, `src/wire/length_delimited.rs`, `src/wire/tag.rs`, `src/wire/unknown.rs`, `src/wire/varint.rs`, `src/wire/wire_type.rs`, `src/message.rs`, `src/name.rs`, `src/extensions.rs` (std->core/alloc), `tests/no_std_smoke.rs` (new, 8 tests)
+  - **Tests:** All 118 tests pass under `--all-features`. `cargo build -p oxiproto-core --no-default-features --features alloc` succeeds. Clippy clean under both configurations.
+
+## Testing
+- [x] Test varint encoding/decoding round-trip for edge values (0, 1, 127, 128, u64::MAX)
+- [x] Test zigzag encoding: 0->0, -1->1, 1->2, -2->3, i32::MIN, i32::MAX
+- [x] Test field tag encoding/decoding for all wire types
+- [x] Test unknown field preservation: encode unknown fields, decode, verify preserved
+- [x] Test OxiMessage round-trip: encode_to_vec → decode, field preservation, empty message = 0 bytes
+- [x] Test OxiMessage byte cross-validation: OxiMessage bytes == prost::Message bytes for TestFoo
+- [x] Test OxiMessage encoded_len matches actual encoded byte count
+- [x] Test OxiOneof: 3-variant round-trip, last-write-wins, unknown field → Ok(false), encoded_len matches actual
+- [x] Test Extensions: set/get round-trip, has/clear, is_empty/len, overwrite, encode_raw+merge_raw round-trip, encoded_len
+- [x] Add property-based round-trip tests (proptest) for varint, zigzag, length-delimited, and tag codecs (done 2026-05-29)
+- [x] Fuzz varint decoder with arbitrary byte sequences (done 2026-05-29)
+  - **Goal:** Proptest no-panic harness feeding arbitrary/malformed bytes into the decoder, asserting graceful `Err` (never panic). The existing `proptest_wire.rs` only feeds *valid* encodings.
+  - **Design:** `tests/fuzz_decode.rs`: proptest strategies generating arbitrary `Vec<u8>` (and structured-but-adversarial: valid header + truncated body, oversized lengths, etc.) fed to `DecodeBuffer::read_varint`, tag decode, length-delimited, full-message decode paths. Assert `Ok|Err` without panic. Pure Rust (no cargo-fuzz/libFuzzer which is C++, violating Pure-Rust Policy).
+  - **Files:** `tests/fuzz_decode.rs` (new).
+  - **Tests:** All proptest cases pass; clippy clean; no `should_panic` (use `Result` assertion).
+  - **Risk:** Low. Proptest already a dev-dep.
+- [x] Message-level decode fuzz/property suite (done 2026-07-27)
+  - **Goal:** Fuzz one layer above the low-level buffer primitives (`fuzz_decode.rs`/`fuzz_corpus.rs`): exercise `OxiMessage::decode` itself on a hand-written message shaped like real `oxiproto-codegen` output (nested messages, repeated fields, unknown-field preservation), so the recursion-depth budget and merge()-level decode logic are covered end to end, not just the wire primitives.
+  - **Design:** `tests/fuzz_message_decode.rs` — hand-written `FuzzNode` message (scalar + string + repeated self-nested message + repeated scalar + `UnknownFields`). (1) Decoding arbitrary bytes never panics, only `Ok` or a typed `WireFormatError`. (2) Encode→decode round-trips exactly for arbitrarily-generated valid messages. (3) A seeded-PRNG (xorshift64) bit-flip mutation sweep over valid encodings never panics. (4) A dedicated regression proves deeply self-nested input is rejected via `WireError::RecursionLimitExceeded` rather than overflowing the stack. Proptest-based, no cargo-fuzz/libFuzzer, per COOLJAPAN Pure-Rust policy.
+  - **Files:** `tests/fuzz_message_decode.rs` (new, ~430 SLOC).
+  - **Tests:** `fuzz_decode_arbitrary_bytes_never_panics`, `fuzz_decode_tag_prefixed_bytes_never_panics`, `fuzz_encode_decode_round_trip`, `fuzz_encoded_len_matches_actual`, `fuzz_bit_flip_mutation_never_panics`, `seeded_adversarial_decode_sweep_never_panics`, `deeply_nested_children_rejected_not_overflowed`.
+
+## Performance
+- [x] Benchmark varint encoding/decoding against prost's implementation (done 2026-05-29)
+  - **Goal:** Criterion harness comparing native varint/zigzag/fixed vs prost equivalents.
+  - **Design:** `benches/wire.rs` — criterion benchmarks for varint encode/decode (vs `prost::encoding::encode_varint`/`decode_varint`), zigzag (i32/i64), fixed32/64, length-delimited. Representative value distributions.
+  - **Files:** `crates/oxiproto-core/benches/wire.rs` (new ~140 SLOC), `Cargo.toml` (criterion dev-dep + `[[bench]]` entries)
+  - **Tests:** `cargo bench -p oxiproto-core --no-run` compiles. clippy clean on bench targets.
+- [x] Benchmark full message encode/decode against prost (done 2026-05-29)
+  - **Goal:** Compare OxiMessage encode/decode vs prost::Message on a representative message.
+  - **Design:** `benches/message.rs` — hand-written benchmark message (scalars+repeated+string) implementing OxiMessage + a `#[derive(prost::Message)]` equivalent; benchmark `encode_to_vec` + `decode` both ways; assert byte-equal payloads once before timing.
+  - **Files:** `crates/oxiproto-core/benches/message.rs` (new ~160 SLOC), `Cargo.toml` (same criterion dev-dep)
+  - **Tests:** Covered by `cargo bench --no-run` gate.
+- [x] Profile allocation patterns in decode path (done 2026-06-03)
+  - **Goal:** Track allocation count + bytes for string/bytes/repeated fields during decode without touching the global allocator.
+  - **Design:** `src/wire/alloc_profile.rs` — `DecodeStats` counter struct, `ProfiledDecodeBuffer<'buf,'stats>` wrapper, `AllocReport` (derived metrics: avg_bytes_per_alloc, heap_fraction_pct), `AllocBudget` guard, `EncodeAllocProfile` trait. Wire-codec round-trip for `AllocReport` (field 1–9 varint encoding). 20 tests.
+  - **Files:** `src/wire/alloc_profile.rs` (new, ~540 SLOC); `src/wire/mod.rs` (added `pub mod alloc_profile`); `src/lib.rs` (no change — accessed via `wire::alloc_profile`).
+- [x] Consider arena allocation for repeated message fields (done 2026-06-03)
+  - **Goal:** Reduce per-entry heap allocation for `repeated bytes` / `repeated string` / `repeated message` fields in hot decode paths.
+  - **Design:** `src/arena.rs` — `ArenaVec<T>` (slab-sized pre-allocation, avoids 2× doubling), `StringPool` (intern/dedup for repeated string fields, O(unique) memory), `BytesArena` (contiguous slab + handle table for repeated bytes fields, O(1) retrieval), `ArenaDecoder<T>` (combined element + bytes store, designed for use by generated code). All pure Rust, no_std+alloc compatible. 36 tests.
+  - **Files:** `src/arena.rs` (new, ~570 SLOC); `src/lib.rs` (added `pub mod arena`).
+  - **Status note (2026-08-03):** these types are complete, tested, standalone public API, but `oxiproto-codegen` does not (yet) construct any of them — generated `OxiMessage::merge` implementations decode `repeated` fields into plain `Vec`s regardless. "Done" above means the allocator module itself, not its integration into codegen; see `src/arena.rs`'s module docs for the corrected status.
+
+## Integration
+- [x] Ensure oxiproto-build generates code that uses native Message trait instead of prost::Message
+  - **Done:** Added `native_impl()` builder method and `native-codegen` feature to `oxiproto-build`.
+    When enabled, `Builder::native_impl(true)` calls `oxiproto_codegen::generate_with_options` with
+    `emit_oxi_message_impl = true` and writes per-package `*_oxi.rs` files containing `OxiMessage`
+    + `OxiName` impls alongside the prost-generated `.rs` files.
+  - **Files:** `crates/oxiproto-build/Cargo.toml` (native-codegen feature + optional dep),
+    `crates/oxiproto-build/src/builder.rs` (new `native_impl` field + methods + compile step).
+- [x] Ensure oxiproto-reflect can work with both prost-backed and native messages
+  - **Done:** Added `src/reflect_bridge.rs` to `oxiproto-core` with three components:
+    1. `OxiReflect` blanket trait (auto-implemented for all `OxiMessage + OxiName` types):
+       `reflect_handle()` → `OxiReflectHandle` (type-erased wire bytes + full proto name / type URL).
+    2. `decode_handle<T>()` free function: decode an `OxiReflectHandle` back to a concrete `T`.
+    3. `MessageRegistry`: a lightweight BTreeMap-backed registry of `OxiMessage` types with
+       `register<T>()`, `validate_by_name()`, `encode_by_name()`, `metadata()`, `names()`.
+    4. `ReflectMetadata`: static type info without an instance (`name`, `package`, `full_name`, `type_url`).
+  - **Tests:** `tests/reflect_bridge_tests.rs` — 35 tests covering all structs and methods.
+  - **Files:** `src/reflect_bridge.rs` (new, ~340 SLOC); `src/lib.rs` (`pub mod reflect_bridge`).
+- [x] Ensure wire format compatibility with canonical protobuf implementations (Go, C++, Java)
+  - **Done:** Added `tests/wire_compat.rs` with 57 golden-byte tests derived from the canonical
+    protobuf binary encoding specification (protobuf.dev/programming-guides/encoding/):
+    varint (0, 1, 127, 128, 150, 300, u64::MAX), zigzag (all spec examples, i32::MIN/MAX),
+    field tags (all 5 wire types, multi-byte tags), fixed32/64 little-endian, sfixed32/64,
+    float/double IEEE 754, length-delimited (empty, 128-byte payload), complete message examples
+    (Test1/Test2/Test3/Test4 from the encoding guide), unknown-field skip, and cross-validation
+    against prost (native→prost and prost→native round-trips).
+  - **Files:** `tests/wire_compat.rs` (new, 57 tests, 350 SLOC).

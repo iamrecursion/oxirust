@@ -1,0 +1,39 @@
+[package]
+name = "oximedia-scene"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Scene understanding and AI-powered video analysis for OxiMedia"
+keywords = ["machine-learning", "ai", "multimedia", "neural", "inference"]
+categories = ["multimedia", "science"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+## Opt-in ML-assisted scene classification via the Pure-Rust `oximedia-ml`
+## pipeline. Enabling `onnx` pulls in `oximedia-ml` with its
+## `scene-classifier` + `onnx` features so callers can actually run
+## inference on a real ONNX model.
+onnx = [
+    "dep:oximedia-ml",
+    "oximedia-ml/scene-classifier",
+    "oximedia-ml/onnx",
+]
+## Enable CUDA dispatch for the ML-assisted scene classifier.
+cuda = ["onnx", "oximedia-ml/cuda"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-cv = { workspace = true }
+oximedia-ml = { workspace = true, optional = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+scirs2-core = { workspace = true }
+rayon = { workspace = true }

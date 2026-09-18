@@ -1,0 +1,92 @@
+[package]
+name = "voirs-singing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Singing voice synthesis for VoiRS"
+readme = "README.md"
+homepage.workspace = true
+documentation = "https://docs.rs/voirs-singing"
+repository.workspace = true
+categories = ["multimedia::audio", "science"]
+keywords = ["voice", "singing", "synthesis", "music", "audio"]
+rust-version.workspace = true
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core = { workspace = true }
+scirs2-fft = { workspace = true }
+
+# Core dependencies
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Audio processing
+dasp = { workspace = true }
+hound = { workspace = true }
+
+# Musical processing
+musicxml = { workspace = true, optional = true }
+# Compressed MusicXML (.mxl) container reading, Pure Rust (OxiARC)
+oxiarc-archive = { workspace = true, optional = true }
+oxiarc-core = { workspace = true, optional = true }
+oxiarc-deflate = { workspace = true, optional = true }
+midly = { workspace = true, optional = true }
+
+# Utilities
+num_cpus = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+# ONNX inference backend
+oxionnx = { workspace = true, optional = true }
+chrono = { workspace = true, features = ["serde"] }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+fastrand = { workspace = true }
+
+# WebAssembly support
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true, features = [
+    "console",
+    "AudioContext",
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioDestinationNode",
+    "AudioNode",
+] }
+js-sys = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+futures = { workspace = true }
+wasm-bindgen-test = { workspace = true }
+
+
+[features]
+default = []
+onnx = ["dep:oxionnx"]
+gpu = ["oxionnx?/gpu"]
+musicxml-support = ["musicxml", "dep:oxiarc-archive", "dep:oxiarc-core", "dep:oxiarc-deflate"]
+midi-support = ["midly"]
+advanced-effects = []
+wasm-support = [
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "web-sys",
+    "js-sys",
+    "console_error_panic_hook",
+]
+
+[lints]
+workspace = true

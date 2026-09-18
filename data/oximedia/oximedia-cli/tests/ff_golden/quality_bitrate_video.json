@@ -1,0 +1,9 @@
+{
+  "name": "quality_bitrate_video",
+  "args": ["-i", "in.mkv", "-b:v", "4M", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_bitrate": "4M"
+  }
+}

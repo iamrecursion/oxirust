@@ -1,0 +1,61 @@
+[package]
+name = "oxify-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Model Context Protocol (MCP) server implementation for OxiFY"
+repository = "https://github.com/cool-japan/oxify"
+categories = ["network-programming", "web-programming", "development-tools"]
+keywords = ["mcp", "mcp-server", "context-protocol", "ai"]
+
+[dependencies]
+oxify-model = { version = "0.2.0", path = "../oxify-model" }
+tokio = { workspace = true, features = ["process", "io-util"] }
+async-trait = { workspace = true }
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+oxihttp = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+# Pure-Rust HTML parsing / CSS-selector extraction for the `web_scrape` tool.
+oxixml-html = { workspace = true }
+oxixml-dom = { workspace = true }
+
+# Database support (optional) — Pure-Rust OxiSQL stack (replaces sqlx)
+oxisql-core = { workspace = true, optional = true }
+oxisql-sqlite-compat = { workspace = true, optional = true }
+oxisql-pool = { workspace = true, optional = true }
+
+# GitHub API support (optional)
+octocrab = { workspace = true, optional = true }
+
+# Headless-browser support (optional, off by default) — async CDP client for the
+# `web_screenshot` tool. Drives an external Chrome/Chromium binary; gated so default
+# builds stay lean. `futures` is needed only to drive chromiumoxide's event handler.
+chromiumoxide = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+[features]
+default = []
+database = ["dep:oxisql-core", "dep:oxisql-sqlite-compat", "dep:oxisql-pool"]
+github = ["octocrab"]
+github-actions = []
+gitlab = []
+jira = []
+linear = []
+# Headless-browser screenshot support for the `web_screenshot` tool. Off by default:
+# requires a local Chrome/Chromium binary at runtime. Pure-Rust crate (chromiumoxide)
+# that speaks CDP to an external browser process.
+headless-browser = ["dep:chromiumoxide", "dep:futures"]
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+# Required for tests that construct GitHubServer —
+# octocrab's TLS stack (reqwest-backed) needs a process-level rustls CryptoProvider.
+rustls = { version = "0.23", features = ["ring"] }
+wiremock = { workspace = true }

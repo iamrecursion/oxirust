@@ -1,0 +1,10 @@
+{
+  "name": "filter_crop",
+  "args": ["-i", "in.mkv", "-vf", "crop=640:480:100:100", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_filters": 1,
+    "audio_filters": 0
+  }
+}

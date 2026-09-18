@@ -1,0 +1,25 @@
+[package]
+name = "oxiphysics-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "Core types, traits, and abstractions for the OxiPhysics engine"
+readme = "README.md"
+categories = ["science", "mathematics", "algorithms"]
+keywords = ["physics", "mathematics", "numerics", "linear-algebra"]
+
+[dependencies]
+thiserror = { workspace = true }
+nalgebra = { workspace = true }
+rand = { workspace = true }
+oxifft = { workspace = true }
+scirs2-integrate = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+
+[features]
+scirs2 = ["dep:scirs2-integrate", "dep:ndarray"]
+
+[dev-dependencies]
+proptest = { workspace = true }

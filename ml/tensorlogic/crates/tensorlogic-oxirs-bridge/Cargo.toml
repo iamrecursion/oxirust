@@ -1,0 +1,47 @@
+[package]
+name = "tensorlogic-oxirs-bridge"
+version.workspace = true
+description = "RDF/GraphQL/SHACL integration and provenance tracking for TensorLogic"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tensorlogic-oxirs-bridge"
+readme = "README.md"
+keywords = ["tensor", "logic", "rdf", "knowledge-graph", "sparql"]
+categories = ["science", "algorithms", "data-structures"]
+
+[dependencies]
+tensorlogic-ir.workspace = true
+tensorlogic-adapters.workspace = true
+tensorlogic-compiler.workspace = true
+tensorlogic-infer.workspace = true
+tensorlogic-scirs-backend.workspace = true
+
+# OxiRS integration - RDF/Knowledge Graph/SPARQL
+oxirs-core.workspace = true
+oxirs-gql.workspace = true
+
+# Low-level RDF types (for compatibility with existing code)
+oxrdf.workspace = true
+oxttl.workspace = true
+
+# Random number generation
+scirs2-core = { workspace = true, features = ["random"] }
+
+# Utilities
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+approx.workspace = true
+
+[[bench]]
+name = "parsing_benchmarks"
+harness = false

@@ -1,0 +1,769 @@
+# VoiRS Recognizer
+
+[![Crates.io](https://img.shields.io/crates/v/voirs-recognizer)](https://crates.io/crates/voirs-recognizer)
+[![Documentation](https://docs.rs/voirs-recognizer/badge.svg)](https://docs.rs/voirs-recognizer)
+[![License](https://img.shields.io/crates/l/voirs-recognizer)](LICENSE)
+
+**Automatic Speech Recognition (ASR) and phoneme alignment for VoiRS**
+
+VoiRS Recognizer provides comprehensive speech recognition capabilities for the VoiRS ecosystem, enabling accurate transcription, phoneme alignment, and audio analysis for speech synthesis evaluation and training.
+
+## Features
+
+### 🎤 Multi-Model ASR Support
+
+Every backend needs real pretrained weights, which VoiRS neither ships nor
+fabricates. A backend with no usable weights fails closed with a typed error; it
+never returns an invented transcript.
+
+| Backend | Feature | Status |
+|---------|---------|--------|
+| `OnnxWhisper` | `onnx` | **Runs.** Needs Whisper exported to ONNX. |
+| `OnnxWav2Vec2` / `OnnxConformer` | `onnx` | **Runs.** Needs an exported ONNX graph. |
+| `PureRustWhisper` | `whisper-pure` | **Runs** from a `safetensors` checkpoint plus `vocab.json` — but only in the OpenAI-style tensor naming, **not** the `openai/whisper-*` layout published on the Hugging Face Hub. A mismatched checkpoint is refused with a message saying so. Use `OnnxWhisper` for stock HF weights. |
+| `ConformerModel` | `conformer` | **Runs** from a `safetensors` checkpoint; refuses to transcribe on untrained parameters. |
+| `DeepSpeechModel` | `deepspeech` | **Inspects and validates** real `.pbmm`/`.tflite` files, then reports that no pure-Rust decoder exists for them. Use the ONNX path. |
+| `Wav2Vec2Model` | `wav2vec2` | Same: validates real checkpoints, then defers to `OnnxWav2Vec2` for inference. |
+
+### 🔤 Phoneme Recognition & Alignment
+- **Forced Alignment** (`forced-align`): real MFCC extraction plus DTW, entirely
+  in Rust — no external tools and no model files needed.
+- **Montreal Forced Alignment** (`mfa`): drives the real `mfa` executable as a
+  subprocess and parses the real `TextGrid` it writes. Requires MFA to be
+  installed; otherwise every call fails closed naming what is missing.
+- **Custom Phoneme Sets**: support for multiple languages and dialects.
+- **Confidence Scoring**: measured from the audio, never a fixed constant.
+
+> Both aligners are *forced* aligners: they place a phoneme sequence you supply.
+> Neither offers reference-free phoneme recognition, and
+> `recognize_phonemes()` returns `FeatureNotSupported` rather than guessing.
+
+### 📊 Audio Analysis
+- **Quality Assessment**: SNR, THD, and spectral analysis
+- **Prosody Analysis**: Pitch, rhythm, stress, and intonation
+- **Speaker Characteristics**: Gender, age, emotion detection
+- **Artifact Detection**: Clipping, distortion, and noise identification
+
+## Quick Start
+
+Add VoiRS Recognizer to your `Cargo.toml`:
+
+```toml
+[dependencies]
+# The ONNX backends are the ones that run real pretrained weights.
+voirs-recognizer = { version = "0.1.0", features = ["onnx", "forced-align"] }
+```
+
+### Basic Speech Recognition
+
+Speech recognition requires real pretrained model weights. VoiRS never ships or
+fabricates them: every backend fails closed with a typed error when the weights
+it needs are not present on disk. Export Whisper to ONNX (for example with
+`optimum-cli export onnx --model openai/whisper-tiny whisper-tiny-onnx/`) and
+point the config at the resulting files.
+
+```rust
+use voirs_recognizer::asr::whisper_onnx::{OnnxWhisper, OnnxWhisperConfig};
+use voirs_recognizer::prelude::*;
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize the ONNX Whisper backend with real exported weights.
+    let asr = OnnxWhisper::new(OnnxWhisperConfig {
+        encoder_path: PathBuf::from("whisper-tiny-onnx/encoder_model.onnx"),
+        decoder_path: PathBuf::from("whisper-tiny-onnx/decoder_model.onnx"),
+        ..Default::default()
+    })?;
+
+    // Load an audio file (WAV/FLAC/OGG/MP3 are auto-detected).
+    let audio = load_audio("speech.wav")?;
+
+    // Recognize speech.
+    let transcript = asr.transcribe(&audio, None).await?;
+    println!("Transcript: {}", transcript.text);
+
+    // Word-level timestamps.
+    for word in &transcript.word_timestamps {
+        println!("{}: {:.2}s - {:.2}s", word.word, word.start_time, word.end_time);
+    }
+
+    Ok(())
+}
+```
+
+### Phoneme Alignment
+
+`ForcedAlignModel` performs real MFCC extraction plus DTW alignment in pure
+Rust, so it works from a pronunciation dictionary alone.
+
+```rust
+use voirs_recognizer::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize the forced-alignment phoneme recognizer (requires the
+    // `forced-align` feature). The dictionary argument is optional.
+    let recognizer = ForcedAlignModel::new("align-model.bin".to_string(), None).await?;
+
+    // Align audio with its transcript.
+    let audio = load_audio("speech.wav")?;
+    let alignment = recognizer
+        .align_text(&audio, "Hello world, this is a test.", None)
+        .await?;
+
+    // Print phoneme-level alignment.
+    for phoneme in &alignment.phonemes {
+        println!("{}: {:.3}s - {:.3}s (confidence: {:.2})",
+                 phoneme.phoneme.symbol,
+                 phoneme.start_time,
+                 phoneme.end_time,
+                 phoneme.confidence);
+    }
+
+    Ok(())
+}
+```
+
+### Audio Quality Analysis
+
+```rust
+use voirs_recognizer::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize audio analyzer
+    let analyzer = AudioAnalyzer::new().await?;
+    
+    // Analyze audio quality
+    let audio = load_audio("speech.wav")?;
+    let analysis = analyzer.analyze_quality(&audio, None).await?;
+    
+    println!("SNR: {:.1} dB", analysis.snr);
+    println!("THD: {:.2}%", analysis.thd);
+    println!("Spectral centroid: {:.1} Hz", analysis.spectral_centroid);
+    
+    // Check for artifacts
+    if analysis.clipping_detected {
+        println!("⚠️  Audio clipping detected");
+    }
+    
+    Ok(())
+}
+```
+
+## Supported ASR Models
+
+### Whisper
+- **`OnnxWhisper`** (feature `onnx`) — the recommended path. Export any Whisper
+  checkpoint with `optimum-cli export onnx --model openai/whisper-tiny ...` and
+  point the config at the resulting graphs.
+- **`PureRustWhisper`** (feature `whisper-pure`) — reads a `safetensors`
+  checkpoint plus `vocab.json`, supplied via `WhisperConfig::with_assets` or the
+  `VOIRS_WHISPER_ASSETS` directory.
+
+  Its layers are named in the OpenAI style
+  (`encoder.blocks.N.attn.query.weight`, `decoder.token_embedding.weight`,
+  `...mlp.c_fc.weight`). The Hugging Face `openai/whisper-*` checkpoints use the
+  `transformers` naming (`model.encoder.layers.N.self_attn.q_proj.weight`,
+  `...fc1.weight`) and are **rejected** rather than loaded with uninitialised
+  layers — `whisper::assets::check_layout` detects the scheme and reports it.
+  Rename the tensors, or use `OnnxWhisper` /
+  `candle_transformers::models::whisper` (already a dependency) for stock
+  Hugging Face weights.
+- **Use Case**: General-purpose, multilingual applications.
+
+### DeepSpeech
+- **Status**: model files are really opened, size-checked and format-detected
+  (`.pbmm` TensorFlow graphs and `.tflite` flatbuffers are told apart from their
+  magic bytes), but decoding them needs a TensorFlow runtime, which is not pure
+  Rust. `transcribe()` therefore returns `FeatureNotSupported` naming the
+  detected format.
+- **Use Case**: validating a DeepSpeech asset you already have; export it to
+  ONNX to actually run it.
+
+### Wav2Vec2
+- **Status**: `Wav2Vec2Model` validates real checkpoints; `OnnxWav2Vec2`
+  (feature `onnx`) runs them.
+- **Use Case**: research applications, custom domain adaptation.
+
+## Feature Flags
+
+Enable specific functionality through feature flags:
+
+```toml
+[dependencies]
+voirs-recognizer = { 
+    version = "0.1.0", 
+    features = [
+        "whisper",      # OpenAI Whisper support
+        "deepspeech",   # Mozilla DeepSpeech support  
+        "wav2vec2",     # Facebook Wav2Vec2 support
+        "forced-align", # Basic forced alignment
+        "mfa",          # Montreal Forced Alignment
+        "all-models",   # Enable all ASR models
+        "gpu",          # GPU acceleration support
+    ]
+}
+```
+
+## Performance Optimization
+
+VoiRS Recognizer is designed to meet strict performance requirements:
+- **Real-time factor (RTF) < 0.3** on modern CPUs
+- **Memory usage < 2GB** for largest models
+- **Startup time < 5 seconds**
+- **Streaming latency < 200ms**
+
+### Performance Validation
+
+Use the built-in performance validator to ensure your configuration meets requirements:
+
+```rust
+use voirs_recognizer::prelude::*;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let validator = PerformanceValidator::new().with_verbose(true);
+    
+    // Set custom requirements if needed
+    let requirements = PerformanceRequirements {
+        max_rtf: 0.25,                    // Stricter than default 0.3
+        max_memory_usage: 1_500_000_000,  // 1.5GB instead of 2GB
+        max_startup_time_ms: 3000,        // 3 seconds instead of 5
+        max_streaming_latency_ms: 150,    // 150ms instead of 200ms
+    };
+    
+    let custom_validator = PerformanceValidator::with_requirements(requirements);
+    
+    // Validate your ASR system
+    let audio = load_audio("test_audio.wav")?;
+    let startup_fn = || async {
+        let _asr = OnnxWhisper::new(OnnxWhisperConfig::default())?;
+        Ok(())
+    };
+    
+    let processing_time = Duration::from_millis(150); // Your actual processing time
+    let streaming_latency = Some(Duration::from_millis(120));
+    
+    let validation = validator
+        .validate_comprehensive(&audio, startup_fn, processing_time, streaming_latency)
+        .await?;
+    
+    if validation.passed {
+        println!("✅ All performance requirements met!");
+        println!("RTF: {:.3}", validation.metrics.rtf);
+        println!("Memory: {:.1} MB", validation.metrics.memory_usage as f64 / (1024.0 * 1024.0));
+        println!("Throughput: {:.0} samples/sec", validation.metrics.throughput_samples_per_sec);
+    } else {
+        println!("❌ Performance requirements not met");
+        for (test, passed) in &validation.test_results {
+            println!("{}: {}", test, if *passed { "PASS" } else { "FAIL" });
+        }
+    }
+    
+    Ok(())
+}
+```
+
+### Model Selection for Performance
+
+Choose the appropriate model size based on your performance requirements:
+
+```rust
+use voirs_recognizer::prelude::*;
+
+// Ultra-fast processing (RTF ~0.1, lower accuracy)
+let fast_config = WhisperConfig {
+    model_size: "tiny".to_string(),
+    compute_type: ComputeType::Int8,     // Quantized for speed
+    beam_size: 1,                        // Greedy decoding
+    ..Default::default()
+};
+
+// Balanced performance and accuracy (RTF ~0.3)
+let balanced_config = WhisperConfig {
+    model_size: "base".to_string(),
+    compute_type: ComputeType::Float16,
+    beam_size: 3,
+    ..Default::default()
+};
+
+// High accuracy (RTF ~0.8, higher latency)
+let accurate_config = WhisperConfig {
+    model_size: "small".to_string(),
+    compute_type: ComputeType::Float32,
+    beam_size: 5,
+    temperature: 0.0,                    // Deterministic output
+    ..Default::default()
+};
+```
+
+### GPU Acceleration
+
+Enable GPU acceleration for significant performance gains:
+
+```rust
+use voirs_recognizer::prelude::*;
+
+// NVIDIA GPU acceleration
+let cuda_config = WhisperConfig {
+    model_size: "base".to_string(),
+    device: Device::Cuda(0),             // Use first GPU
+    compute_type: ComputeType::Float16,  // FP16 for memory efficiency
+    memory_fraction: 0.8,                // Use 80% of GPU memory
+    ..Default::default()
+};
+
+// Apple Silicon GPU acceleration  
+let metal_config = WhisperConfig {
+    model_size: "base".to_string(),
+    device: Device::Metal,
+    compute_type: ComputeType::Float16,
+    ..Default::default()
+};
+
+// CPU with optimizations
+let optimized_cpu_config = WhisperConfig {
+    model_size: "tiny".to_string(),
+    device: Device::Cpu,
+    num_threads: num_cpus::get(),        // Use all CPU cores
+    compute_type: ComputeType::Int8,     // Quantization for speed
+    ..Default::default()
+};
+```
+
+### Memory Optimization
+
+Reduce memory usage with these techniques:
+
+```rust
+use voirs_recognizer::prelude::*;
+
+// Memory-efficient configuration
+let memory_config = WhisperConfig {
+    model_size: "tiny".to_string(),      // Smallest model
+    compute_type: ComputeType::Int8,     // 8-bit quantization
+    enable_memory_pooling: true,         // Reuse memory allocations
+    cache_size_mb: 100,                  // Limit cache size
+    ..Default::default()
+};
+
+// Enable dynamic quantization for further memory savings
+let quantized_config = WhisperConfig {
+    model_size: "base".to_string(),
+    compute_type: ComputeType::Dynamic,  // Dynamic quantization
+    quantization_mode: QuantizationMode::Int8,
+    ..Default::default()
+};
+```
+
+### Real-time Processing Optimization
+
+Configure for ultra-low latency streaming:
+
+```rust
+use voirs_recognizer::prelude::*;
+use voirs_recognizer::integration::config::{StreamingConfig, LatencyMode};
+
+// Ultra-low latency configuration
+let streaming_config = StreamingConfig {
+    latency_mode: LatencyMode::UltraLow,
+    chunk_size: 1600,                    // 100ms chunks at 16kHz
+    overlap: 400,                        // 25ms overlap
+    buffer_duration: 2.0,                // 2 second buffer
+    vad_enabled: true,                   // Voice activity detection
+    noise_suppression: true,             // Real-time noise reduction
+    echo_cancellation: false,            // Disable for lowest latency
+};
+
+// Balanced latency/accuracy configuration
+let balanced_streaming = StreamingConfig {
+    latency_mode: LatencyMode::Balanced,
+    chunk_size: 4800,                    // 300ms chunks
+    overlap: 800,                        // 50ms overlap
+    buffer_duration: 5.0,                // 5 second buffer
+    vad_enabled: true,
+    noise_suppression: true,
+    echo_cancellation: true,
+};
+
+// Create streaming ASR with optimized config
+let streaming_asr = StreamingASR::with_config(streaming_config).await?;
+```
+
+### Batch Processing
+
+Process multiple files efficiently:
+
+```rust
+use voirs_recognizer::prelude::*;
+
+// Optimal batch processing
+let batch_config = BatchProcessingConfig {
+    batch_size: 8,                       // Process 8 files at once
+    max_memory_usage: 1_500_000_000,     // 1.5GB memory limit
+    parallel_workers: 4,                 // Use 4 worker threads
+    enable_gpu_batching: true,           // Batch GPU operations
+    ..Default::default()
+};
+
+let audio_files = vec![
+    "file1.wav", "file2.wav", "file3.wav", "file4.wav",
+    "file5.wav", "file6.wav", "file7.wav", "file8.wav",
+];
+
+// Load audio files
+let audio_buffers: Vec<AudioBuffer> = audio_files
+    .iter()
+    .map(load_audio)
+    .collect::<Result<Vec<_>, _>>()?;
+
+// Process batch efficiently
+let batch_processor = BatchProcessor::with_config(batch_config).await?;
+let transcripts = batch_processor.process_batch(&audio_buffers).await?;
+
+// Results are returned in the same order as input
+for (i, transcript) in transcripts.iter().enumerate() {
+    println!("File {}: {}", audio_files[i], transcript.text);
+}
+```
+
+### Performance Monitoring
+
+Monitor your application's performance in real-time:
+
+```rust
+use voirs_recognizer::prelude::*;
+use std::time::Instant;
+
+// Enable performance monitoring
+let monitor = PerformanceMonitor::new()
+    .with_metrics_collection(true)
+    .with_real_time_reporting(true);
+
+// Monitor ASR performance
+let start = Instant::now();
+let audio = load_audio("speech.wav")?;
+
+let transcript = asr.transcribe(&audio, None).await?;
+let processing_time = start.elapsed();
+
+// Validate performance
+let validator = PerformanceValidator::new().with_verbose(true);
+let (rtf, rtf_passed) = validator.validate_rtf(&audio, processing_time);
+let (memory_usage, memory_passed) = validator.estimate_memory_usage()?;
+
+println!("Performance Metrics:");
+println!("  RTF: {:.3} ({})", rtf, if rtf_passed { "✅" } else { "❌" });
+println!("  Memory: {:.1} MB ({})", 
+         memory_usage as f64 / (1024.0 * 1024.0),
+         if memory_passed { "✅" } else { "❌" });
+println!("  Processing time: {:?}", processing_time);
+println!("  Audio duration: {:.2}s", audio.duration());
+
+// Log performance metrics for analysis
+monitor.log_performance_metrics(&PerformanceMetrics {
+    rtf,
+    memory_usage,
+    startup_time_ms: 0, // Already started
+    streaming_latency_ms: 0, // Not applicable for batch
+    throughput_samples_per_sec: validator.calculate_throughput(audio.samples().len(), processing_time),
+    cpu_utilization: (processing_time.as_secs_f32() / audio.duration() * 100.0).min(100.0),
+});
+```
+
+### Platform-Specific Optimizations
+
+#### SIMD Acceleration (Automatic)
+VoiRS automatically detects and uses SIMD instructions:
+- **Intel/AMD**: AVX2, AVX-512 when available
+- **ARM**: NEON instructions on ARM64
+- **Apple**: Apple Silicon optimizations
+
+No manual configuration required - optimizations are applied automatically.
+
+#### Multi-threading
+Optimize thread usage for your hardware:
+
+```rust
+use voirs_recognizer::config::{PerformanceConfig, RecognizerConfig};
+
+// `PerformanceConfig::default()` already auto-detects the core count.
+let mut config = RecognizerConfig::default();
+
+// Manual tuning.
+config.performance = PerformanceConfig {
+    num_threads: num_cpus::get(), // All cores for inference
+    enable_simd: true,            // SIMD kernels for feature extraction
+    memory_limit_mb: Some(2048),  // Cap resident model memory
+    ..PerformanceConfig::default()
+};
+```
+
+### Troubleshooting Performance Issues
+
+Common performance problems and solutions:
+
+#### High Memory Usage
+```rust
+// If memory usage exceeds limits, try:
+let low_memory_config = WhisperConfig {
+    model_size: "tiny".to_string(),      // Use smaller model
+    compute_type: ComputeType::Int8,     // Enable quantization
+    cache_size_mb: 50,                   // Reduce cache size
+    enable_memory_pooling: true,         // Reuse allocations
+    gradient_checkpointing: true,        // Trade compute for memory
+    ..Default::default()
+};
+```
+
+#### Poor RTF Performance
+```rust
+// If RTF is too high, try:
+let fast_config = WhisperConfig {
+    model_size: "tiny".to_string(),      // Smallest/fastest model
+    beam_size: 1,                        // Greedy decoding
+    compute_type: ComputeType::Int8,     // Quantization for speed
+    enable_cuda: true,                   // GPU acceleration if available
+    num_threads: num_cpus::get(),        // Use all CPU cores
+    ..Default::default()
+};
+```
+
+#### High Streaming Latency
+```rust
+// If streaming latency is too high, try:
+let low_latency_config = StreamingConfig {
+    latency_mode: LatencyMode::UltraLow,
+    chunk_size: 800,                     // Smaller chunks (50ms at 16kHz)
+    overlap: 160,                        // Minimal overlap (10ms)
+    buffer_duration: 1.0,                // Smaller buffer
+    preprocessing_enabled: false,        // Disable preprocessing
+    ..Default::default()
+};
+```
+
+## Language Support
+
+Which languages a backend handles is a property of the checkpoint you load, not
+of this crate. A multilingual Whisper checkpoint covers 99 languages; an
+English-only fine-tune covers one, through exactly the same code.
+
+Ask the loaded model at runtime rather than consulting a static table:
+
+```rust,no_run
+# use voirs_recognizer::traits::ASRModel;
+# fn show(model: &dyn ASRModel) {
+for language in model.supported_languages() {
+    println!("{language:?}");
+}
+# }
+```
+
+For MFA, the answer is whichever acoustic models and dictionaries are really
+installed; `MFAModel::list_available_models()` asks the aligner itself.
+
+## Configuration
+
+### Custom ASR Configuration
+```rust
+use voirs_recognizer::prelude::*;
+
+let config = ASRConfig {
+    // Model selection
+    preferred_models: vec![ASRBackend::Whisper, ASRBackend::DeepSpeech],
+    
+    // Language settings
+    language: Some(LanguageCode::EnUs),
+    auto_detect_language: true,
+    
+    // Quality settings
+    enable_vad: true,           // Voice Activity Detection
+    noise_suppression: true,    // Noise reduction
+    
+    // Performance settings
+    chunk_duration_ms: 30000,  // 30 second chunks
+    overlap_duration_ms: 1000, // 1 second overlap
+    
+    // Output settings
+    include_word_timestamps: true,
+    include_confidence_scores: true,
+    normalize_text: true,
+};
+
+let asr = ASRSystem::with_config(config).await?;
+```
+
+### Phoneme Alignment Configuration
+```rust
+use voirs_recognizer::prelude::*;
+
+let config = PhonemeConfig {
+    // Alignment precision
+    time_resolution_ms: 10,    // 10ms resolution
+    confidence_threshold: 0.5, // Minimum confidence
+    
+    // Language model
+    acoustic_model: "english_us".to_string(),
+    pronunciation_dict: "cmudict".to_string(),
+    
+    // Processing options
+    enable_speaker_adaptation: true,
+    enable_pronunciation_variants: true,
+};
+
+let recognizer = PhonemeRecognizer::with_config(config).await?;
+```
+
+## Error Handling
+
+VoiRS Recognizer provides comprehensive error handling:
+
+```rust
+use voirs_recognizer::prelude::*;
+
+match asr.transcribe(&audio, None).await {
+    Ok(transcript) => {
+        println!("Success: {}", transcript.text);
+    }
+    Err(ASRError::ModelNotFound { model }) => {
+        eprintln!("Model not available: {}", model);
+    }
+    Err(ASRError::AudioTooShort { duration }) => {
+        eprintln!("Audio too short: {:.1}s", duration);
+    }
+    Err(ASRError::LanguageNotSupported { language }) => {
+        eprintln!("Language not supported: {:?}", language);
+    }
+    Err(e) => {
+        eprintln!("Recognition failed: {}", e);
+    }
+}
+```
+
+## Examples
+
+Check out the [examples](examples/) directory for more comprehensive usage examples:
+
+- [`basic_recognition.rs`](examples/basic_recognition.rs) - Simple speech recognition
+- [`phoneme_alignment.rs`](examples/phoneme_alignment.rs) - Detailed phoneme alignment
+- [`audio_analysis.rs`](examples/audio_analysis.rs) - Audio quality analysis
+- [`batch_processing.rs`](examples/batch_processing.rs) - Efficient batch processing
+- [`streaming_recognition.rs`](examples/streaming_recognition.rs) - Real-time recognition
+- [`multilingual.rs`](examples/multilingual.rs) - Multi-language support
+
+## Benchmarks
+
+VoiRS publishes no WER or RTF table here, because accuracy and speed depend
+entirely on the checkpoint you supply and the machine you run it on — a number
+measured elsewhere would say nothing about your setup.
+
+Measure your own, on your own hardware and weights:
+
+```rust,no_run
+use voirs_recognizer::asr::whisper::{BenchmarkConfig, WhisperBenchmark};
+
+# async fn run(model: &impl voirs_recognizer::traits::ASRModel) -> Result<(), Box<dyn std::error::Error>> {
+let benchmark = WhisperBenchmark::new(BenchmarkConfig::default());
+// Runs real transcriptions and times them; memory comes from the real RSS of
+// this process.
+let performance = benchmark.quick_benchmark(model).await?;
+println!("RTF {:.3}, peak {:.0} MiB", performance.average_rtf, performance.peak_memory_mb);
+# Ok(())
+# }
+```
+
+`ASRModel::metadata()` reports `inference_speed: 0.0` and an empty
+`wer_benchmarks` map for backends whose figures have not been measured — that is
+"not measured", not "zero".
+
+*RTF = Real Time Factor (processing time / audio duration)*
+
+## Community Support
+
+### 🆘 Getting Help
+
+- **GitHub Issues**: For bug reports and feature requests
+  - 🐛 [Bug Report](https://github.com/cool-japan/voirs/issues/new?template=bug_report.md)
+  - ✨ [Feature Request](https://github.com/cool-japan/voirs/issues/new?template=feature_request.md)
+  - 📖 [Documentation Request](https://github.com/cool-japan/voirs/issues/new?template=documentation.md)
+
+- **GitHub Discussions**: For questions, ideas, and community chat
+  - 💬 [General Discussion](https://github.com/cool-japan/voirs/discussions)
+  - 🤝 [Help & Questions](https://github.com/cool-japan/voirs/discussions/categories/q-a)
+  - 🎯 [Ideas & Suggestions](https://github.com/cool-japan/voirs/discussions/categories/ideas)
+
+### 🌟 Connect with the Community
+
+- **Discord Server**: Real-time chat and support
+  - 🔗 [Join VoiRS Community Discord](https://discord.gg/voirs-community)
+  - Channels: `#general`, `#help`, `#showcase`, `#development`
+
+- **Matrix**: Bridged with Discord for matrix users
+  - 🔗 [#voirs:matrix.org](https://matrix.to/#/#voirs:matrix.org)
+
+### 📚 Learning Resources
+
+- **Documentation**: [docs.rs/voirs-recognizer](https://docs.rs/voirs-recognizer)
+- **Examples**: [GitHub Examples](https://github.com/cool-japan/voirs/tree/main/crates/voirs-recognizer/examples)
+- **Tutorials**: [VoiRS Learning Hub](https://github.com/cool-japan/voirs/wiki)
+- **Blog**: [Medium @voirs-dev](https://medium.com/@voirs-dev)
+
+### 🚀 Professional Support
+
+For commercial deployments and enterprise support:
+- **Email**: support@voirs.dev
+- **Consulting**: Available for integration assistance, performance optimization, and custom development
+
+### 🎯 Roadmap & Planning
+
+- **Project Board**: [GitHub Projects](https://github.com/orgs/cool-japan/projects/voirs)
+- **Milestones**: [GitHub Milestones](https://github.com/cool-japan/voirs/milestones)
+- **Changelog**: [CHANGELOG.md](../../CHANGELOG.md)
+
+### 🏆 Recognition
+
+- **Contributors**: [All Contributors](https://github.com/cool-japan/voirs/graphs/contributors)
+- **Sponsors**: [GitHub Sponsors](https://github.com/sponsors/cool-japan)
+- **Citations**: See [Citation](#citation) section for academic references
+
+## Contributing
+
+We welcome contributions! Please see our [Contributing Guide](../../CONTRIBUTING.md) for details.
+
+### Development Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/cool-japan/voirs.git
+cd voirs/crates/voirs-recognizer
+
+# Install dependencies
+cargo build --all-features
+
+# Run tests
+cargo test --all-features
+
+# Run benchmarks
+cargo bench --all-features
+```
+
+## License
+
+This project is licensed under the Apache License, Version 2.0 ([LICENSE](../../LICENSE) or http://www.apache.org/licenses/LICENSE-2.0).
+
+## Citation
+
+If you use VoiRS Recognizer in your research, please cite:
+
+```bibtex
+@software{voirs_recognizer,
+  title = {VoiRS Recognizer: Advanced Speech Recognition for Neural TTS},
+  author = {Tetsuya Kitahata},
+  organization = {Cool Japan Co., Ltd.},
+  year = {2024},
+  url = {https://github.com/cool-japan/voirs}
+}
+```

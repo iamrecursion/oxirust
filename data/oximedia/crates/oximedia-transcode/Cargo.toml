@@ -1,0 +1,53 @@
+[package]
+name = "oximedia-transcode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "High-level transcoding pipeline for OxiMedia"
+keywords = ["transcoding", "encoding", "video", "audio", "multimedia"]
+categories = ["multimedia::encoding"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = ["mjpeg", "apv", "mpeg2", "ffv1", "prores"]
+## Enable MJPEG (Motion JPEG) intra-frame codec via `make_video_encoder`.
+mjpeg = ["oximedia-codec/mjpeg"]
+## Enable APV (Advanced Professional Video) intra-frame codec via `make_video_encoder`.
+apv = ["oximedia-codec/apv"]
+## Enable MPEG-2 intra-frame video encoding (raw .m2v elementary-stream output).
+mpeg2 = ["oximedia-codec/mpeg2"]
+## Enable FFV1 lossless video encoding via `make_video_encoder`.
+ffv1 = ["oximedia-codec/ffv1"]
+## Enable ProRes video encoding via `make_video_encoder` (10-bit input).
+prores = ["oximedia-codec/prores"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-codec = { workspace = true, features = ["image-io"] }
+oximedia-container = { workspace = true }
+oximedia-io = { workspace = true }
+oximedia-graph = { workspace = true }
+oximedia-metering = { workspace = true }
+oximedia-subtitle = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+rayon = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+oximedia-audio = { workspace = true }
+async-trait = { workspace = true }

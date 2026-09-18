@@ -1,0 +1,1160 @@
+//! Auto-generated module
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+
+use crate::math::{Mat3, Real, Vec3};
+
+pub(super) const EPS: Real = 1e-14;
+/// Determinant of a 3x3 matrix.
+pub fn det3(m: Mat3) -> Real {
+    m.m11 * (m.m22 * m.m33 - m.m23 * m.m32) - m.m12 * (m.m21 * m.m33 - m.m23 * m.m31)
+        + m.m13 * (m.m21 * m.m32 - m.m22 * m.m31)
+}
+/// Trace of a 3x3 matrix.
+pub fn trace3(m: Mat3) -> Real {
+    m.m11 + m.m22 + m.m33
+}
+/// Frobenius norm of a 3x3 matrix.
+pub fn frobenius_norm3(m: Mat3) -> Real {
+    (m.m11 * m.m11
+        + m.m12 * m.m12
+        + m.m13 * m.m13
+        + m.m21 * m.m21
+        + m.m22 * m.m22
+        + m.m23 * m.m23
+        + m.m31 * m.m31
+        + m.m32 * m.m32
+        + m.m33 * m.m33)
+        .sqrt()
+}
+/// 1-norm of a 3x3 matrix (maximum column sum of absolute values).
+pub fn norm1_3(m: Mat3) -> Real {
+    let c0 = m.m11.abs() + m.m21.abs() + m.m31.abs();
+    let c1 = m.m12.abs() + m.m22.abs() + m.m32.abs();
+    let c2 = m.m13.abs() + m.m23.abs() + m.m33.abs();
+    c0.max(c1).max(c2)
+}
+/// Infinity-norm of a 3x3 matrix (maximum row sum of absolute values).
+pub fn norm_inf3(m: Mat3) -> Real {
+    let r0 = m.m11.abs() + m.m12.abs() + m.m13.abs();
+    let r1 = m.m21.abs() + m.m22.abs() + m.m23.abs();
+    let r2 = m.m31.abs() + m.m32.abs() + m.m33.abs();
+    r0.max(r1).max(r2)
+}
+/// Check if a matrix is approximately symmetric (max |M - M^T| < tol).
+pub fn is_symmetric3(m: Mat3, tol: Real) -> bool {
+    (m.m12 - m.m21).abs() < tol && (m.m13 - m.m31).abs() < tol && (m.m23 - m.m32).abs() < tol
+}
+/// Check if a matrix is approximately the identity.
+pub fn is_identity3(m: Mat3, tol: Real) -> bool {
+    (m - Mat3::identity()).abs().max() < tol
+}
+/// Check if a matrix is approximately orthogonal: M^T * M ~ I.
+pub fn is_orthogonal3(m: Mat3, tol: Real) -> bool {
+    is_identity3(m.transpose() * m, tol)
+}
+/// Inverse of a 3x3 matrix. Returns `None` if the matrix is singular.
+pub fn inv3(m: Mat3) -> Option<Mat3> {
+    let d = det3(m);
+    if d.abs() < EPS {
+        return None;
+    }
+    let inv_d = 1.0 / d;
+    Some(Mat3::new(
+        (m.m22 * m.m33 - m.m23 * m.m32) * inv_d,
+        (m.m13 * m.m32 - m.m12 * m.m33) * inv_d,
+        (m.m12 * m.m23 - m.m13 * m.m22) * inv_d,
+        (m.m23 * m.m31 - m.m21 * m.m33) * inv_d,
+        (m.m11 * m.m33 - m.m13 * m.m31) * inv_d,
+        (m.m13 * m.m21 - m.m11 * m.m23) * inv_d,
+        (m.m21 * m.m32 - m.m22 * m.m31) * inv_d,
+        (m.m12 * m.m31 - m.m11 * m.m32) * inv_d,
+        (m.m11 * m.m22 - m.m12 * m.m21) * inv_d,
+    ))
+}
+/// Solve a 3x3 linear system `M * x = b` via Cramer's rule.
+/// Returns `None` if the matrix is singular.
+pub fn solve3(m: Mat3, b: Vec3) -> Option<Vec3> {
+    let d = det3(m);
+    if d.abs() < EPS {
+        return None;
+    }
+    let inv_d = 1.0 / d;
+    let d0 = b.x * (m.m22 * m.m33 - m.m23 * m.m32) - m.m12 * (b.y * m.m33 - m.m23 * b.z)
+        + m.m13 * (b.y * m.m32 - m.m22 * b.z);
+    let d1 = m.m11 * (b.y * m.m33 - m.m23 * b.z) - b.x * (m.m21 * m.m33 - m.m23 * m.m31)
+        + m.m13 * (m.m21 * b.z - b.y * m.m31);
+    let d2 = m.m11 * (m.m22 * b.z - b.y * m.m32) - m.m12 * (m.m21 * b.z - b.y * m.m31)
+        + b.x * (m.m21 * m.m32 - m.m22 * m.m31);
+    Some(Vec3::new(d0 * inv_d, d1 * inv_d, d2 * inv_d))
+}
+/// Characteristic polynomial coefficients of a 3x3 matrix.
+///
+/// det(lambda*I - M) = lambda^3 - c2*lambda^2 + c1*lambda - c0
+/// Returns `(c0, c1, c2)`.
+pub fn characteristic_poly3(m: Mat3) -> (Real, Real, Real) {
+    let c2 = trace3(m);
+    let c1 = (m.m11 * m.m22 - m.m12 * m.m21)
+        + (m.m11 * m.m33 - m.m13 * m.m31)
+        + (m.m22 * m.m33 - m.m23 * m.m32);
+    let c0 = det3(m);
+    (c0, c1, c2)
+}
+/// `2π/3`, the phase between the three trigonometric roots of a depressed cubic.
+const TWO_THIRDS_PI: Real = 2.0 * std::f64::consts::PI / 3.0;
+/// Largest power of two not exceeding the finite positive number `x`.
+///
+/// Dividing by it is exact.  Subnormal numbers, whose exponent field is zero,
+/// fall back to `x` itself.
+fn power_of_two_scale(x: Real) -> Real {
+    let scale = Real::from_bits(x.to_bits() & 0x7ff0_0000_0000_0000);
+    if scale > 0.0 { scale } else { x }
+}
+/// Eigenvalues `(low, high)` of the 2x2 compression of the symmetric matrix
+/// `c` onto the plane orthogonal to the eigenvector of its eigenvalue
+/// `isolated`.
+///
+/// The eigenvector spans the null space of `c − isolated·I`; it is obtained as
+/// the longest cross product of two columns of that rank-2 matrix.  Returns
+/// `None` if no usable cross product exists, which cannot happen when
+/// `isolated` is separated from the rest of the spectrum.
+fn deflated_pair(c: Mat3, isolated: Real) -> Option<(Real, Real)> {
+    let shifted = c - Mat3::identity() * isolated;
+    let columns = [
+        shifted.column(0).into_owned(),
+        shifted.column(1).into_owned(),
+        shifted.column(2).into_owned(),
+    ];
+    let mut axis = Vec3::zeros();
+    let mut best = 0.0_f64;
+    for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+        let cross = columns[i].cross(&columns[j]);
+        let norm_sq = cross.norm_squared();
+        if norm_sq > best {
+            best = norm_sq;
+            axis = cross;
+        }
+    }
+    if !best.is_finite() || best <= 0.0 {
+        return None;
+    }
+    let u = axis / best.sqrt();
+    // Orthonormal basis (v, w) of the plane orthogonal to the unit vector `u`.
+    let v = if u.x.abs() > u.y.abs() {
+        let inv_len = 1.0 / u.x.hypot(u.z);
+        Vec3::new(-u.z * inv_len, 0.0, u.x * inv_len)
+    } else {
+        let inv_len = 1.0 / u.y.hypot(u.z);
+        Vec3::new(0.0, u.z * inv_len, -u.y * inv_len)
+    };
+    let w = u.cross(&v);
+    let cv = c * v;
+    let cw = c * w;
+    let m00 = v.dot(&cv);
+    let m01 = v.dot(&cw);
+    let m11 = w.dot(&cw);
+    let centre = 0.5 * (m00 + m11);
+    let radius = (0.5 * (m00 - m11)).hypot(m01);
+    Some((centre - radius, centre + radius))
+}
+/// Eigenvalues of a symmetric 3x3 matrix in closed form, in ascending order.
+///
+/// Only the symmetric part `(M + Mᵀ)/2` of `m` is used.  Non-finite entries
+/// give `NaN` eigenvalues.
+///
+/// The matrix is scaled by a power of two, shifted by its mean eigenvalue
+/// `tr(M)/3` and normalised to `C` with `Σ λᵢ(C)² = 6`.  The characteristic
+/// polynomial of `C` is `β³ − 3β − det C = 0`, with Cardano's trigonometric
+/// roots `β_k = 2 cos(acos(det C / 2)/3 + 2πk/3)`.  The root that is farthest
+/// from the others is taken from this formula, where it is well conditioned.
+/// The remaining two are *not* read off the polynomial: as roots of a cubic
+/// they would be perturbed by `O(√ε)` whenever they (nearly) coincide.  They
+/// are the eigenvalues of the 2x2 compression of `C` onto the orthogonal
+/// complement of the isolated eigenvector, which keeps the error at rounding
+/// level for every spectrum, including double and triple eigenvalues.
+pub fn symmetric_eigenvalues3(m: Mat3) -> Vec3 {
+    let a01 = 0.5 * (m.m12 + m.m21);
+    let a02 = 0.5 * (m.m13 + m.m31);
+    let a12 = 0.5 * (m.m23 + m.m32);
+    let entries = [m.m11, m.m22, m.m33, a01, a02, a12];
+    if entries.iter().any(|v| !v.is_finite()) {
+        return Vec3::new(Real::NAN, Real::NAN, Real::NAN);
+    }
+    let magnitude = entries.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    if magnitude == 0.0 {
+        return Vec3::zeros();
+    }
+    let scale = power_of_two_scale(magnitude);
+    let [s00, s11, s22, s01, s02, s12] = entries.map(|v| v / scale);
+    let mean = (s00 + s11 + s22) / 3.0;
+    let (d0, d1, d2) = (s00 - mean, s11 - mean, s22 - mean);
+    let spread_sq = (d0 * d0 + d1 * d1 + d2 * d2 + 2.0 * (s01 * s01 + s02 * s02 + s12 * s12)) / 6.0;
+    let spread = spread_sq.sqrt();
+    if spread == 0.0 {
+        let lambda = mean * scale;
+        return Vec3::new(lambda, lambda, lambda);
+    }
+    let c = Mat3::new(d0, s01, s02, s01, d1, s12, s02, s12, d2) / spread;
+    let r = (0.5 * det3(c)).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    let beta_top = 2.0 * phi.cos();
+    let beta_bottom = 2.0 * (phi + TWO_THIRDS_PI).cos();
+    // For r >= 0 the largest root is separated from the others by at least half
+    // of the spectral spread, otherwise the smallest one is.
+    let (isolated, opposite) = if r >= 0.0 {
+        (beta_top, beta_bottom)
+    } else {
+        (beta_bottom, beta_top)
+    };
+    let (low, high) = deflated_pair(c, isolated).unwrap_or((opposite, -(isolated + opposite)));
+    let mut betas = [isolated, low, high];
+    betas.sort_by(|a, b| a.total_cmp(b));
+    Vec3::new(
+        (mean + spread * betas[0]) * scale,
+        (mean + spread * betas[1]) * scale,
+        (mean + spread * betas[2]) * scale,
+    )
+}
+/// Symmetric 3x3 matrix eigendecomposition via Jacobi iterations.
+///
+/// Returns `(eigenvalues, eigenvectors)` where columns of `eigenvectors` are
+/// the corresponding unit eigenvectors. Input `m` should be symmetric.
+/// Eigenvalues are returned in ascending order.
+///
+/// Algorithm: cyclic Jacobi -- for each off-diagonal element (p,q), compute a
+/// Givens rotation J that zeroes it, then update A <- J^T A J and accumulate
+/// V <- V J.  After convergence the diagonal of A holds the eigenvalues and
+/// the columns of V are the eigenvectors.
+pub fn symmetric_eigen3(m: Mat3) -> (Vec3, Mat3) {
+    pub(super) const MAX_SWEEPS: usize = 50;
+    let mut a = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            a[i][j] = m[(i, j)];
+        }
+    }
+    let mut v = [[0.0_f64; 3]; 3];
+    v[0][0] = 1.0;
+    v[1][1] = 1.0;
+    v[2][2] = 1.0;
+    let pairs = [(0, 1), (0, 2), (1, 2)];
+    'outer: for _ in 0..MAX_SWEEPS {
+        let off = a[0][1].abs() + a[0][2].abs() + a[1][2].abs();
+        if off < EPS {
+            break 'outer;
+        }
+        for &(p, q) in &pairs {
+            let apq = a[p][q];
+            if apq.abs() < EPS {
+                continue;
+            }
+            let app = a[p][p];
+            let aqq = a[q][q];
+            let tau = (aqq - app) / (2.0 * apq);
+            let t = if tau >= 0.0 {
+                1.0 / (tau + (1.0 + tau * tau).sqrt())
+            } else {
+                1.0 / (tau - (1.0 + tau * tau).sqrt())
+            };
+            let c = 1.0 / (1.0 + t * t).sqrt();
+            let s = t * c;
+            a[p][p] = app - t * apq;
+            a[q][q] = aqq + t * apq;
+            a[p][q] = 0.0;
+            a[q][p] = 0.0;
+            let r = 3 - p - q;
+            let arp = a[r][p];
+            let arq = a[r][q];
+            let new_arp = c * arp - s * arq;
+            let new_arq = s * arp + c * arq;
+            a[r][p] = new_arp;
+            a[p][r] = new_arp;
+            a[r][q] = new_arq;
+            a[q][r] = new_arq;
+            for row in &mut v {
+                let vkp = row[p];
+                let vkq = row[q];
+                row[p] = c * vkp - s * vkq;
+                row[q] = s * vkp + c * vkq;
+            }
+        }
+    }
+    let diag = [a[0][0], a[1][1], a[2][2]];
+    let mut pairs_sorted: [(Real, usize); 3] = [(diag[0], 0), (diag[1], 1), (diag[2], 2)];
+    pairs_sorted.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    let eigenvalues = Vec3::new(pairs_sorted[0].0, pairs_sorted[1].0, pairs_sorted[2].0);
+    let col = |i: usize| -> Vec3 { Vec3::new(v[0][i], v[1][i], v[2][i]) };
+    let eigenvectors = Mat3::from_columns(&[
+        col(pairs_sorted[0].1),
+        col(pairs_sorted[1].1),
+        col(pairs_sorted[2].1),
+    ]);
+    (eigenvalues, eigenvectors)
+}
+/// LU decomposition of a 3x3 matrix with partial pivoting.
+///
+/// Returns `(L, U, perm)` where `P * M = L * U`.
+/// `perm` is the row permutation \[p0, p1, p2\] such that row `perm[i]` of `M`
+/// becomes row `i` of `P * M`.
+///
+/// Returns `None` if the matrix is singular.
+pub fn lu_decomp3(m: Mat3) -> Option<(Mat3, Mat3, [usize; 3])> {
+    let mut a = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            a[i][j] = m[(i, j)];
+        }
+    }
+    let mut perm = [0usize, 1, 2];
+    for k in 0..3 {
+        let mut max_val = a[k][k].abs();
+        let mut max_row = k;
+        for (offset, row) in a[(k + 1)..3].iter().enumerate() {
+            let i = k + 1 + offset;
+            if row[k].abs() > max_val {
+                max_val = row[k].abs();
+                max_row = i;
+            }
+        }
+        if max_val < EPS {
+            return None;
+        }
+        if max_row != k {
+            a.swap(k, max_row);
+            perm.swap(k, max_row);
+        }
+        let ak_copy: [f64; 3] = a[k];
+        let akk = a[k][k];
+        for row_i in a[(k + 1)..3].iter_mut() {
+            let factor = row_i[k] / akk;
+            row_i[k] = factor;
+            for j in (k + 1)..3 {
+                row_i[j] -= factor * ak_copy[j];
+            }
+        }
+    }
+    let l = Mat3::new(1.0, 0.0, 0.0, a[1][0], 1.0, 0.0, a[2][0], a[2][1], 1.0);
+    let u = Mat3::new(
+        a[0][0], a[0][1], a[0][2], 0.0, a[1][1], a[1][2], 0.0, 0.0, a[2][2],
+    );
+    Some((l, u, perm))
+}
+/// Solve `M * x = b` using LU decomposition.
+///
+/// Returns `None` if the matrix is singular.
+pub fn lu_solve3(m: Mat3, b: Vec3) -> Option<Vec3> {
+    let (l, u, perm) = lu_decomp3(m)?;
+    let pb = Vec3::new(b[perm[0]], b[perm[1]], b[perm[2]]);
+    let y = forward_substitute3(l, pb)?;
+    backward_substitute3(u, y)
+}
+/// QR decomposition of a 3x3 matrix via modified Gram-Schmidt.
+///
+/// Returns `(Q, R)` where `Q` is orthogonal and `R` is upper triangular.
+/// If a column becomes near-zero, a fallback direction is used.
+pub fn qr_decomp3(m: Mat3) -> (Mat3, Mat3) {
+    let cols: [Vec3; 3] = [
+        Vec3::new(m[(0, 0)], m[(1, 0)], m[(2, 0)]),
+        Vec3::new(m[(0, 1)], m[(1, 1)], m[(2, 1)]),
+        Vec3::new(m[(0, 2)], m[(1, 2)], m[(2, 2)]),
+    ];
+    let mut q_cols = [Vec3::zeros(); 3];
+    let mut r = Mat3::zeros();
+    for j in 0..3 {
+        let mut u = cols[j];
+        for i in 0..j {
+            let proj = q_cols[i].dot(&cols[j]);
+            r[(i, j)] = proj;
+            u -= q_cols[i] * proj;
+        }
+        let norm = u.norm();
+        r[(j, j)] = norm;
+        if norm > EPS {
+            q_cols[j] = u / norm;
+        } else {
+            q_cols[j] = fallback_orthogonal(j, &q_cols);
+        }
+    }
+    let q = Mat3::from_columns(&q_cols);
+    (q, r)
+}
+/// QR decomposition via Householder reflections.
+///
+/// Returns `(Q, R)` where `Q` is orthogonal and `R` is upper triangular.
+/// Householder is more numerically stable than Gram-Schmidt for ill-conditioned
+/// matrices.
+pub fn qr_householder3(m: Mat3) -> (Mat3, Mat3) {
+    let mut a = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            a[i][j] = m[(i, j)];
+        }
+    }
+    let mut q = [[0.0_f64; 3]; 3];
+    q[0][0] = 1.0;
+    q[1][1] = 1.0;
+    q[2][2] = 1.0;
+    for k in 0..2 {
+        let mut x = [0.0_f64; 3];
+        let mut norm_x = 0.0_f64;
+        for i in k..3 {
+            x[i] = a[i][k];
+            norm_x += x[i] * x[i];
+        }
+        norm_x = norm_x.sqrt();
+        if norm_x < EPS {
+            continue;
+        }
+        let sign = if a[k][k] >= 0.0 { 1.0 } else { -1.0 };
+        let mut v = [0.0_f64; 3];
+        v[k..3].copy_from_slice(&x[k..3]);
+        v[k] += sign * norm_x;
+        let v_norm: f64 = v[k..3].iter().map(|vi| vi * vi).sum();
+        if v_norm < EPS {
+            continue;
+        }
+        for j in k..3 {
+            let dot_val: f64 = v[k..3]
+                .iter()
+                .zip(a[k..3].iter())
+                .map(|(vi, ai)| vi * ai[j])
+                .sum();
+            let factor = 2.0 * dot_val / v_norm;
+            for (vi, ai) in v[k..3].iter().zip(a[k..3].iter_mut()) {
+                ai[j] -= factor * vi;
+            }
+        }
+        for row_q in &mut q {
+            let dot_val: f64 = row_q[k..3]
+                .iter()
+                .zip(v[k..3].iter())
+                .map(|(qi, vi)| qi * vi)
+                .sum();
+            let factor = 2.0 * dot_val / v_norm;
+            for (qi, vi) in row_q[k..3].iter_mut().zip(v[k..3].iter()) {
+                *qi -= factor * vi;
+            }
+        }
+    }
+    let q_mat = Mat3::new(
+        q[0][0], q[0][1], q[0][2], q[1][0], q[1][1], q[1][2], q[2][0], q[2][1], q[2][2],
+    );
+    let r_mat = Mat3::new(
+        a[0][0], a[0][1], a[0][2], a[1][0], a[1][1], a[1][2], a[2][0], a[2][1], a[2][2],
+    );
+    (q_mat, r_mat)
+}
+/// Return a unit vector orthogonal to the first `j` columns of `q_cols`.
+pub(super) fn fallback_orthogonal(j: usize, q_cols: &[Vec3; 3]) -> Vec3 {
+    let candidates = [
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    ];
+    for c in &candidates {
+        let mut u = *c;
+        for qk in q_cols[..j].iter() {
+            u -= *qk * qk.dot(c);
+        }
+        let n = u.norm();
+        if n > EPS {
+            return u / n;
+        }
+    }
+    Vec3::new(0.0, 0.0, 1.0)
+}
+/// Forward substitution: solve L * x = b where L is lower triangular 3x3.
+///
+/// Returns `None` if a diagonal element is zero.
+pub fn forward_substitute3(l: Mat3, b: Vec3) -> Option<Vec3> {
+    let mut x = [0.0_f64; 3];
+    for i in 0..3 {
+        let mut sum = b[i];
+        for j in 0..i {
+            sum -= l[(i, j)] * x[j];
+        }
+        if l[(i, i)].abs() < EPS {
+            return None;
+        }
+        x[i] = sum / l[(i, i)];
+    }
+    Some(Vec3::new(x[0], x[1], x[2]))
+}
+/// Backward substitution: solve U * x = b where U is upper triangular 3x3.
+///
+/// Returns `None` if a diagonal element is zero.
+pub fn backward_substitute3(u: Mat3, b: Vec3) -> Option<Vec3> {
+    let mut x = [0.0_f64; 3];
+    for i in (0..3).rev() {
+        let mut sum = b[i];
+        for j in (i + 1)..3 {
+            sum -= u[(i, j)] * x[j];
+        }
+        if u[(i, i)].abs() < EPS {
+            return None;
+        }
+        x[i] = sum / u[(i, i)];
+    }
+    Some(Vec3::new(x[0], x[1], x[2]))
+}
+/// Relative orthogonality threshold that ends the one-sided Jacobi sweeps of
+/// [`svd3`]: a column pair counts as orthogonal once
+/// `|w_p . w_q| <= SVD3_ORTHO_TOL * |w_p| |w_q|`.
+const SVD3_ORTHO_TOL: Real = 8.0 * Real::EPSILON;
+/// Relative threshold below which a singular value of [`svd3`] is treated as
+/// numerically zero (`sigma_i <= SVD3_NULL_TOL * sigma_max`).
+const SVD3_NULL_TOL: Real = 64.0 * Real::EPSILON;
+/// Sweep cap for the one-sided Jacobi iteration of [`svd3`]; convergence is
+/// quadratic, so a handful of sweeps suffices in practice.
+const SVD3_MAX_SWEEPS: usize = 64;
+/// Multiply `x` by `2^e` exactly (two steps so `2^e` itself never overflows).
+fn scale_by_pow2(x: Real, e: i32) -> Real {
+    let half = e / 2;
+    x * Real::from(half).exp2() * Real::from(e - half).exp2()
+}
+/// Deterministic unit vector orthogonal to the unit vector `u`.
+///
+/// Projects the coordinate axis least aligned with `u` onto the orthogonal
+/// complement of `u`; that axis has `|u_k| <= 1/sqrt(3)`, so the projection has
+/// norm at least `sqrt(2/3)` and the normalisation is always well conditioned.
+fn svd3_orthogonal_completion(u: Vec3) -> Vec3 {
+    let (ax, ay, az) = (u.x.abs(), u.y.abs(), u.z.abs());
+    let axis = if ax <= ay && ax <= az {
+        Vec3::x()
+    } else if ay <= az {
+        Vec3::y()
+    } else {
+        Vec3::z()
+    };
+    let r = axis - u * u.dot(&axis);
+    r / r.norm()
+}
+/// 3x3 SVD: M = U Sigma V^T.
+///
+/// Returns `(U, singular_values, V)` where `singular_values` are non-negative
+/// and in **descending** order, and U and V are orthonormal to round-off.
+///
+/// Orientation convention:
+/// - `det(V) = +1` always (V is a proper rotation).
+/// - `det(U) = sign(det M)` when M is numerically non-singular, so
+///   `det(U) = -1` exactly when M contains a reflection.
+/// - When M is numerically singular (`sigma_min <= 64 eps sigma_max`), the
+///   missing left singular vectors are completed with an orthonormal basis of
+///   the left null space and `det(U) = +1`. The zero matrix returns
+///   `(I, 0, I)`.
+/// - Non-finite input returns `(I, [NaN; 3], I)`.
+///
+/// `U * diag(sigma) * V^T` reproduces M to a few ulps of `sigma_max` for every
+/// numerically non-singular input. For numerically singular input the
+/// orientation choice above may flip the sign of `u_3`, which bounds the
+/// error by `2 sigma_min <= 128 eps sigma_max`. This holds for rank 0/1/2
+/// matrices, repeated singular values and entries anywhere in the normal or
+/// subnormal range.
+///
+/// Algorithm: the input is scaled by a power of two (exact) so its largest
+/// entry lies in `[1, 2)`, then one-sided (Hestenes) Jacobi rotations are
+/// applied on the right until all columns of `W = M V` are mutually orthogonal.
+/// The singular values are the column norms of W (no squaring of M, so small
+/// singular values keep their relative accuracy). U is assembled from the
+/// normalised columns by Gram-Schmidt, with `u_3 = +-(u_1 x u_2)`, which makes
+/// it orthonormal by construction even for degenerate columns.
+pub fn svd3(m: Mat3) -> (Mat3, Vec3, Mat3) {
+    if m.iter().any(|x| !x.is_finite()) {
+        return (Mat3::identity(), Vec3::repeat(Real::NAN), Mat3::identity());
+    }
+    let max_entry = m.iter().fold(0.0, |acc: Real, x| acc.max(x.abs()));
+    if max_entry == 0.0 {
+        return (Mat3::identity(), Vec3::zeros(), Mat3::identity());
+    }
+    // `max_entry` is finite and non-zero here, so its exponent fits in an i32.
+    let exponent = max_entry.log2().floor() as i32;
+    let col = |i: usize| -> Vec3 {
+        Vec3::new(
+            scale_by_pow2(m[(0, i)], -exponent),
+            scale_by_pow2(m[(1, i)], -exponent),
+            scale_by_pow2(m[(2, i)], -exponent),
+        )
+    };
+    let mut w = [col(0), col(1), col(2)];
+    let mut v = [Vec3::x(), Vec3::y(), Vec3::z()];
+    for _ in 0..SVD3_MAX_SWEEPS {
+        let mut rotated = false;
+        for &(p, q) in &[(0_usize, 1_usize), (0, 2), (1, 2)] {
+            let alpha = w[p].norm_squared();
+            let beta = w[q].norm_squared();
+            let gamma = w[p].dot(&w[q]);
+            if alpha == 0.0
+                || beta == 0.0
+                || gamma.abs() <= SVD3_ORTHO_TOL * alpha.sqrt() * beta.sqrt()
+            {
+                continue;
+            }
+            // Rotation [c s; -s c] on columns (p, q) that zeroes w_p . w_q;
+            // the smaller root keeps |angle| <= pi/4.
+            let zeta = (beta - alpha) / (2.0 * gamma);
+            let t = zeta.signum() / (zeta.abs() + zeta.hypot(1.0));
+            let c = 1.0 / t.hypot(1.0);
+            let s = c * t;
+            let (wp, wq) = (w[p], w[q]);
+            w[p] = wp * c - wq * s;
+            w[q] = wp * s + wq * c;
+            let (vp, vq) = (v[p], v[q]);
+            v[p] = vp * c - vq * s;
+            v[q] = vp * s + vq * c;
+            rotated = true;
+        }
+        if !rotated {
+            break;
+        }
+    }
+    let norms = [w[0].norm(), w[1].norm(), w[2].norm()];
+    let mut order = [0_usize, 1, 2];
+    order.sort_by(|&a, &b| norms[b].total_cmp(&norms[a]));
+    let sig = [norms[order[0]], norms[order[1]], norms[order[2]]];
+    let ws = [w[order[0]], w[order[1]], w[order[2]]];
+    let mut vs = [v[order[0]], v[order[1]], v[order[2]]];
+    // Odd permutations flip det(V); negating v_3 (together with the sign of
+    // the third left vector chosen below) restores det(V) = +1.
+    let mut flip_third = false;
+    if Mat3::from_columns(&vs).determinant() < 0.0 {
+        vs[2] = -vs[2];
+        flip_third = true;
+    }
+    // sig[0] >= ||M_scaled||_F / sqrt(3) >= 1 / sqrt(3) > 0.
+    let s0 = sig[0];
+    let u0 = ws[0] / s0;
+    // Use the actual direction of the second column whenever it can be
+    // normalised accurately (even for tiny sigma_2); only a vanishing column
+    // falls back to a deterministic completion.
+    let r = ws[1] - u0 * u0.dot(&ws[1]);
+    let r_norm = r.norm();
+    let u1 = if r_norm >= Real::MIN_POSITIVE {
+        r / r_norm
+    } else {
+        svd3_orthogonal_completion(u0)
+    };
+    let mut u2 = u0.cross(&u1);
+    u2 /= u2.norm();
+    if sig[2] > SVD3_NULL_TOL * s0 {
+        let w2 = if flip_third { -ws[2] } else { ws[2] };
+        if u2.dot(&w2) < 0.0 {
+            u2 = -u2;
+        }
+    }
+    let u = Mat3::from_columns(&[u0, u1, u2]);
+    let sigma = Vec3::new(
+        scale_by_pow2(sig[0], exponent),
+        scale_by_pow2(sig[1], exponent),
+        scale_by_pow2(sig[2], exponent),
+    );
+    (u, sigma, Mat3::from_columns(&vs))
+}
+/// Estimate the condition number of a 3x3 matrix using the 1-norm.
+///
+/// kappa(M) = ||M||_1 * ||M^{-1}||_1
+/// Returns `f64::INFINITY` if the matrix is singular.
+pub fn condition_number_1(m: Mat3) -> Real {
+    let n = norm1_3(m);
+    match inv3(m) {
+        Some(inv) => n * norm1_3(inv),
+        None => f64::INFINITY,
+    }
+}
+/// Estimate the condition number using the Frobenius norm.
+///
+/// kappa_F(M) = ||M||_F * ||M^{-1}||_F
+/// Returns `f64::INFINITY` if the matrix is singular.
+pub fn condition_number_frobenius(m: Mat3) -> Real {
+    let n = frobenius_norm3(m);
+    match inv3(m) {
+        Some(inv) => n * frobenius_norm3(inv),
+        None => f64::INFINITY,
+    }
+}
+/// Estimate the 2-norm condition number using SVD.
+///
+/// kappa_2(M) = sigma_max / sigma_min
+/// Returns `f64::INFINITY` if the matrix is singular (sigma_min ~ 0).
+pub fn condition_number_2(m: Mat3) -> Real {
+    let (_, sigma, _) = svd3(m);
+    if sigma.z < EPS {
+        f64::INFINITY
+    } else {
+        sigma.x / sigma.z
+    }
+}
+/// Polar decomposition: M = R * S.
+///
+/// R is orthogonal (a rotation/reflection) and S is symmetric positive
+/// semi-definite (stretch).  Uses SVD: M = U Sigma V^T -> R = U V^T, S = V Sigma V^T.
+///
+/// Used in corotational FEM and shape matching.
+pub fn polar_decomp3(m: Mat3) -> (Mat3, Mat3) {
+    let (u, sigma, v) = svd3(m);
+    let r = u * v.transpose();
+    let sigma_mat = Mat3::from_diagonal(&sigma);
+    let s = v * sigma_mat * v.transpose();
+    (r, s)
+}
+/// Matrix exponential of a symmetric 3x3 matrix via eigendecomposition.
+///
+/// exp(M) = V * diag(exp(lambda_i)) * V^T
+pub fn symmetric_matrix_exp3(m: Mat3) -> Mat3 {
+    let (evals, evecs) = symmetric_eigen3(m);
+    let exp_evals = Vec3::new(evals.x.exp(), evals.y.exp(), evals.z.exp());
+    let d = Mat3::from_diagonal(&exp_evals);
+    evecs * d * evecs.transpose()
+}
+/// Matrix logarithm of a symmetric positive-definite 3x3 matrix.
+///
+/// log(M) = V * diag(ln(lambda_i)) * V^T
+/// Returns `None` if any eigenvalue is non-positive.
+pub fn symmetric_matrix_log3(m: Mat3) -> Option<Mat3> {
+    let (evals, evecs) = symmetric_eigen3(m);
+    if evals.x <= 0.0 || evals.y <= 0.0 || evals.z <= 0.0 {
+        return None;
+    }
+    let log_evals = Vec3::new(evals.x.ln(), evals.y.ln(), evals.z.ln());
+    let d = Mat3::from_diagonal(&log_evals);
+    Some(evecs * d * evecs.transpose())
+}
+/// Matrix square root of a symmetric positive-semidefinite 3x3 matrix.
+///
+/// sqrt(M) = V * diag(sqrt(lambda_i)) * V^T
+pub fn symmetric_matrix_sqrt3(m: Mat3) -> Mat3 {
+    let (evals, evecs) = symmetric_eigen3(m);
+    let sqrt_evals = Vec3::new(
+        evals.x.max(0.0).sqrt(),
+        evals.y.max(0.0).sqrt(),
+        evals.z.max(0.0).sqrt(),
+    );
+    let d = Mat3::from_diagonal(&sqrt_evals);
+    evecs * d * evecs.transpose()
+}
+/// LU factorisation with partial pivoting for an n×n matrix (stored row-major).
+///
+/// Returns `(lu, perm)` where `lu` is the in-place LU factorisation (L below
+/// diagonal, U on and above) and `perm[i]` is the row permuted to position `i`.
+/// Returns `None` if the matrix is (near-)singular.
+pub fn lu_factor_n(a: &[Vec<f64>]) -> Option<(Vec<Vec<f64>>, Vec<usize>)> {
+    let n = a.len();
+    let mut lu: Vec<Vec<f64>> = a.to_vec();
+    let mut perm: Vec<usize> = (0..n).collect();
+    for k in 0..n {
+        let mut max_val = lu[k][k].abs();
+        let mut max_row = k;
+        for (offset, row) in lu[(k + 1)..n].iter().enumerate() {
+            let i = k + 1 + offset;
+            if row[k].abs() > max_val {
+                max_val = row[k].abs();
+                max_row = i;
+            }
+        }
+        if max_val < EPS {
+            return None;
+        }
+        if max_row != k {
+            lu.swap(k, max_row);
+            perm.swap(k, max_row);
+        }
+        let luk_copy: Vec<f64> = lu[k].clone();
+        let lukk = lu[k][k];
+        for row_i in lu[(k + 1)..n].iter_mut() {
+            let factor = row_i[k] / lukk;
+            row_i[k] = factor;
+            for j in (k + 1)..n {
+                let lkj = luk_copy[j];
+                row_i[j] -= factor * lkj;
+            }
+        }
+    }
+    Some((lu, perm))
+}
+/// Forward substitution for n×n lower-triangular system L * x = b.
+///
+/// `lu` is the compact LU array (diagonal of L is implicitly 1).
+pub fn forward_sub_n(lu: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+    let n = lu.len();
+    let mut x = vec![0.0f64; n];
+    for i in 0..n {
+        let mut s = b[i];
+        for j in 0..i {
+            s -= lu[i][j] * x[j];
+        }
+        x[i] = s;
+    }
+    x
+}
+/// Backward substitution for n×n upper-triangular system U * x = b.
+///
+/// `lu` is the compact LU array; the diagonal and upper part hold U.
+/// Returns `None` if a diagonal element is zero.
+pub fn backward_sub_n(lu: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    let n = lu.len();
+    let mut x = vec![0.0f64; n];
+    for i in (0..n).rev() {
+        if lu[i][i].abs() < EPS {
+            return None;
+        }
+        let mut s = b[i];
+        for j in (i + 1)..n {
+            s -= lu[i][j] * x[j];
+        }
+        x[i] = s / lu[i][i];
+    }
+    Some(x)
+}
+/// Solve A * x = b for general n×n system using LU with partial pivoting.
+///
+/// Returns `None` if the matrix is singular.
+pub fn lu_solve_n(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    let n = a.len();
+    assert_eq!(b.len(), n, "lu_solve_n: dimension mismatch");
+    let (lu, perm) = lu_factor_n(a)?;
+    let pb: Vec<f64> = (0..n).map(|i| b[perm[i]]).collect();
+    let y = forward_sub_n(&lu, &pb);
+    backward_sub_n(&lu, &y)
+}
+/// QR factorisation of an m×n matrix (m ≥ n) via Householder reflections.
+///
+/// Returns `(q, r)` where `q` is m×m orthogonal and `r` is m×n upper triangular,
+/// satisfying A = Q * R.
+/// Stored as `Vec<Vec`f64`>` (row-major).
+pub fn qr_factor_n(a: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let m = a.len();
+    let n = if m > 0 { a[0].len() } else { 0 };
+    assert!(m >= n, "qr_factor_n: requires m >= n");
+    let mut r: Vec<Vec<f64>> = a.to_vec();
+    let mut q: Vec<Vec<f64>> = (0..m)
+        .map(|i| {
+            let mut row = vec![0.0f64; m];
+            row[i] = 1.0;
+            row
+        })
+        .collect();
+    for k in 0..n {
+        let norm_x: f64 = (k..m).map(|i| r[i][k] * r[i][k]).sum::<f64>().sqrt();
+        if norm_x < EPS {
+            continue;
+        }
+        let sign = if r[k][k] >= 0.0 { 1.0 } else { -1.0 };
+        let mut v = vec![0.0f64; m];
+        for (vi, ri) in v[k..m].iter_mut().zip(r[k..m].iter()) {
+            *vi = ri[k];
+        }
+        v[k] += sign * norm_x;
+        let v_norm_sq: f64 = (k..m).map(|i| v[i] * v[i]).sum();
+        if v_norm_sq < EPS {
+            continue;
+        }
+        for j in k..n {
+            let dot: f64 = v[k..m]
+                .iter()
+                .zip(r[k..m].iter())
+                .map(|(vi, ri)| vi * ri[j])
+                .sum();
+            let factor = 2.0 * dot / v_norm_sq;
+            for (ri, vi) in r[k..m].iter_mut().zip(v[k..m].iter()) {
+                ri[j] -= factor * vi;
+            }
+        }
+        for q_row in &mut q {
+            let dot: f64 = q_row[k..m]
+                .iter()
+                .zip(v[k..m].iter())
+                .map(|(qi, vi)| qi * vi)
+                .sum();
+            let factor = 2.0 * dot / v_norm_sq;
+            for (qi, vi) in q_row[k..m].iter_mut().zip(v[k..m].iter()) {
+                *qi -= factor * vi;
+            }
+        }
+    }
+    (q, r)
+}
+/// Solve the least-squares problem min ||A x - b||_2 via QR factorisation.
+///
+/// `a` is m×n (m ≥ n), `b` has length m.
+/// Returns the length-n solution vector.
+pub fn qr_solve_n(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    let m = a.len();
+    let n = if m > 0 { a[0].len() } else { 0 };
+    assert_eq!(b.len(), m, "qr_solve_n: b length must equal number of rows");
+    let (q, r) = qr_factor_n(a);
+    let qtb: Vec<f64> = (0..m)
+        .map(|i| (0..m).map(|j| q[j][i] * b[j]).sum())
+        .collect();
+    let r_sq: Vec<Vec<f64>> = (0..n).map(|i| r[i][..n].to_vec()).collect();
+    let rhs: Vec<f64> = qtb[..n].to_vec();
+    backward_sub_n(&r_sq, &rhs)
+}
+/// Frobenius norm of an n×n (or m×n) matrix stored as `Vec<Vec`f64`>`.
+pub fn frobenius_norm_n(a: &[Vec<f64>]) -> f64 {
+    a.iter()
+        .flat_map(|row| row.iter())
+        .map(|x| x * x)
+        .sum::<f64>()
+        .sqrt()
+}
+/// Matrix-vector multiply for a dense m×n matrix: y = A * x.
+pub fn matvec_n(a: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
+    a.iter()
+        .map(|row| row.iter().zip(x.iter()).map(|(a, b)| a * b).sum())
+        .collect()
+}
+/// Compute A^T * A for a dense m×n matrix.
+pub fn ata_n(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let m = a.len();
+    let n = if m > 0 { a[0].len() } else { 0 };
+    let mut ata = vec![vec![0.0f64; n]; n];
+    for row in a {
+        for (i, ata_row) in ata.iter_mut().enumerate() {
+            let ri = row[i];
+            for (j, cell) in ata_row.iter_mut().enumerate() {
+                *cell += ri * row[j];
+            }
+        }
+    }
+    ata
+}
+/// Power iteration to find the dominant eigenvalue/eigenvector of an n×n matrix.
+///
+/// Returns `(eigenvalue, eigenvector)`. Converges to the largest-magnitude eigenvalue.
+/// Returns `(0.0, zero_vec)` if the starting vector is zero or n=0.
+pub fn power_iteration_n(a: &[Vec<f64>], max_iter: usize, tol: f64) -> (f64, Vec<f64>) {
+    let n = a.len();
+    if n == 0 {
+        return (0.0, Vec::new());
+    }
+    let mut v = vec![1.0f64; n];
+    let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    for vi in v.iter_mut() {
+        *vi /= norm;
+    }
+    let mut lambda = 0.0f64;
+    for _ in 0..max_iter {
+        let av = matvec_n(a, &v);
+        let new_lambda: f64 = av.iter().zip(v.iter()).map(|(ai, vi)| ai * vi).sum();
+        let norm: f64 = av.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm < EPS {
+            break;
+        }
+        let new_v: Vec<f64> = av.iter().map(|x| x / norm).collect();
+        if (new_lambda - lambda).abs() < tol {
+            lambda = new_lambda;
+            v = new_v;
+            break;
+        }
+        lambda = new_lambda;
+        v = new_v;
+    }
+    (lambda, v)
+}
+/// Inverse iteration (shift-invert) to find eigenvalue closest to `shift`.
+///
+/// Solves `(A - shift*I) * v = v_old` at each step.
+/// Returns `(eigenvalue, eigenvector)`.
+pub fn inverse_iteration_n(
+    a: &[Vec<f64>],
+    shift: f64,
+    max_iter: usize,
+    tol: f64,
+) -> (f64, Vec<f64>) {
+    let n = a.len();
+    if n == 0 {
+        return (0.0, Vec::new());
+    }
+    let mut as_ = a.to_vec();
+    for (idx, row) in as_.iter_mut().enumerate() {
+        row[idx] -= shift;
+    }
+    let mut v = vec![1.0f64; n];
+    let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    for vi in v.iter_mut() {
+        *vi /= norm;
+    }
+    let mut lambda = shift;
+    for _ in 0..max_iter {
+        let new_v_opt = lu_solve_n(&as_, &v);
+        let new_v_raw = match new_v_opt {
+            Some(x) => x,
+            None => break,
+        };
+        let norm: f64 = new_v_raw.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm < EPS {
+            break;
+        }
+        let new_v: Vec<f64> = new_v_raw.iter().map(|x| x / norm).collect();
+        let av = matvec_n(a, &new_v);
+        let new_lambda: f64 = av.iter().zip(new_v.iter()).map(|(ai, vi)| ai * vi).sum();
+        if (new_lambda - lambda).abs() < tol {
+            lambda = new_lambda;
+            v = new_v;
+            break;
+        }
+        lambda = new_lambda;
+        v = new_v;
+    }
+    (lambda, v)
+}
+/// Arnoldi iteration: builds an orthonormal Krylov basis Q and upper Hessenberg H.
+///
+/// Given matrix `a` (n×n) and starting vector `b`, runs `k` steps.
+/// Returns `(Q, H)` where Q is n×k orthonormal and H is (k+1)×k upper Hessenberg.
+pub fn arnoldi_n(a: &[Vec<f64>], b: &[f64], k: usize) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let n = a.len();
+    let k = k.min(n);
+    let mut q: Vec<Vec<f64>> = vec![vec![0.0f64; k]; n];
+    let mut h: Vec<Vec<f64>> = vec![vec![0.0f64; k]; k + 1];
+    let norm: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm < EPS {
+        return (q, h);
+    }
+    for i in 0..n {
+        q[i][0] = b[i] / norm;
+    }
+    for j in 0..k {
+        let qj: Vec<f64> = (0..n).map(|i| q[i][j]).collect();
+        let mut z = matvec_n(a, &qj);
+        for i in 0..=j {
+            let qi: Vec<f64> = (0..n).map(|row| q[row][i]).collect();
+            let dot: f64 = z.iter().zip(qi.iter()).map(|(zi, qi)| zi * qi).sum();
+            h[i][j] = dot;
+            for row in 0..n {
+                z[row] -= dot * qi[row];
+            }
+        }
+        let norm: f64 = z.iter().map(|x| x * x).sum::<f64>().sqrt();
+        h[j + 1][j] = norm;
+        if j + 1 < k && norm > EPS {
+            for row in 0..n {
+                q[row][j + 1] = z[row] / norm;
+            }
+        }
+    }
+    (q, h)
+}
+/// GMRES (Generalised Minimal Residual) solver for A x = b.
+///
+/// Restarts after `max_iter` iterations if not converged.
+/// Returns `None` if the algorithm stagnates or fails.
+pub fn gmres_n(a: &[Vec<f64>], b: &[f64], max_iter: usize, tol: f64) -> Option<Vec<f64>> {
+    let n = a.len();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let mut x = vec![0.0f64; n];
+    let k = max_iter.min(n);
+    let ax = matvec_n(a, &x);
+    let r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
+    let beta: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if beta < tol {
+        return Some(x);
+    }
+    let mut q_cols: Vec<Vec<f64>> = Vec::with_capacity(k + 1);
+    q_cols.push(r.iter().map(|v| v / beta).collect());
+    let mut h: Vec<Vec<f64>> = vec![vec![0.0f64; k]; k + 1];
+    let mut cs = vec![0.0f64; k];
+    let mut sn = vec![0.0f64; k];
+    let mut e1 = vec![0.0f64; k + 1];
+    e1[0] = beta;
+    let mut j_final = k;
+    for j in 0..k {
+        let qj = q_cols[j].clone();
+        let mut w = matvec_n(a, &qj);
+        for i in 0..=j {
+            let dot: f64 = w.iter().zip(q_cols[i].iter()).map(|(wi, qi)| wi * qi).sum();
+            h[i][j] = dot;
+            for row in 0..n {
+                w[row] -= dot * q_cols[i][row];
+            }
+        }
+        let norm: f64 = w.iter().map(|v| v * v).sum::<f64>().sqrt();
+        h[j + 1][j] = norm;
+        if norm > EPS {
+            q_cols.push(w.iter().map(|v| v / norm).collect());
+        } else {
+            q_cols.push(vec![0.0f64; n]);
+        }
+        for i in 0..j {
+            let t = cs[i] * h[i][j] + sn[i] * h[i + 1][j];
+            h[i + 1][j] = -sn[i] * h[i][j] + cs[i] * h[i + 1][j];
+            h[i][j] = t;
+        }
+        let r_val = (h[j][j] * h[j][j] + h[j + 1][j] * h[j + 1][j]).sqrt();
+        if r_val < EPS {
+            j_final = j;
+            break;
+        }
+        cs[j] = h[j][j] / r_val;
+        sn[j] = h[j + 1][j] / r_val;
+        h[j][j] = r_val;
+        h[j + 1][j] = 0.0;
+        e1[j + 1] = -sn[j] * e1[j];
+        e1[j] *= cs[j];
+        if e1[j + 1].abs() < tol {
+            j_final = j + 1;
+            break;
+        }
+    }
+    let m = j_final.min(k);
+    if m == 0 {
+        return Some(x);
+    }
+    let h_sq: Vec<Vec<f64>> = (0..m).map(|i| h[i][..m].to_vec()).collect();
+    let rhs: Vec<f64> = e1[..m].to_vec();
+    let y = backward_sub_n(&h_sq, &rhs)?;
+    for i in 0..m {
+        for row in 0..n {
+            x[row] += y[i] * q_cols[i][row];
+        }
+    }
+    Some(x)
+}
+/// Diagonal (Jacobi) preconditioner: returns the diagonal of `a`.
+pub fn diagonal_preconditioner_n(a: &[Vec<f64>]) -> Vec<f64> {
+    (0..a.len()).map(|i| a[i][i]).collect()
+}
+/// Apply diagonal preconditioner: z = D^{-1} r.
+pub fn apply_diagonal_preconditioner(diag: &[f64], r: &[f64]) -> Vec<f64> {
+    r.iter()
+        .zip(diag.iter())
+        .map(|(ri, di)| if di.abs() > EPS { ri / di } else { *ri })
+        .collect()
+}
+/// ILU(0) incomplete LU factorisation preserving the sparsity pattern.
+///
+/// Returns `(L, U)` where L is strictly lower triangular with unit diagonal
+/// and U is upper triangular, both stored as dense `Vec<Vec`f64`>`.
+pub fn ilu0_n(a: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let n = a.len();
+    let mut l: Vec<Vec<f64>> = vec![vec![0.0f64; n]; n];
+    let mut u: Vec<Vec<f64>> = a.to_vec();
+    for (idx, l_row) in l.iter_mut().enumerate() {
+        l_row[idx] = 1.0;
+    }
+    for k in 0..n {
+        let uk_copy: Vec<f64> = u[k].clone();
+        let ukk = u[k][k].max(EPS);
+        for (offset, (l_row_i, u_row_i)) in l[(k + 1)..n]
+            .iter_mut()
+            .zip(u[(k + 1)..n].iter_mut())
+            .enumerate()
+        {
+            let i = k + 1 + offset;
+            if a[i][k].abs() < EPS {
+                continue;
+            }
+            let factor = u_row_i[k] / ukk;
+            l_row_i[k] = factor;
+            for j in k..n {
+                if a[i][j].abs() < EPS && j != k {
+                    continue;
+                }
+                u_row_i[j] -= factor * uk_copy[j];
+            }
+            u_row_i[k] = 0.0;
+        }
+    }
+    (l, u)
+}

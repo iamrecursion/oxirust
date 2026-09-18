@@ -1,0 +1,43 @@
+[package]
+name = "oxirs-rule"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Forward/backward rule engine for RDFS, OWL, and SWRL reasoning"
+keywords = ["inference", "reasoning", "rules", "owl", "rdfs"]
+categories = ["algorithms", "science", "data-structures"]
+readme = "README.md"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+scirs2-core = { workspace = true }
+oxirs-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+regex.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+once_cell.workspace = true
+oxicode.workspace = true  # Replaces bincode per COOLJAPAN Policy
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber.workspace = true
+
+[features]
+default = ["rdfs"]
+rdfs = []
+owl = []
+swrl = []
+

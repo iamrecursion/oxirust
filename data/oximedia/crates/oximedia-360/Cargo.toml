@@ -1,0 +1,33 @@
+[package]
+name = "oximedia-360"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "360° VR video processing — equirectangular/cubemap projections, stereo 3D, spatial metadata for OxiMedia"
+readme = "README.md"
+keywords = ["360-video", "vr", "equirectangular", "cubemap", "spatial-media"]
+categories = ["multimedia", "mathematics", "rendering"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+## Enable fast-math approximations for `sin`/`cos`/`atan2` in hot projection loops.
+## Trades ≤1.3 × 10⁻³ absolute error for faster execution (no libm calls).
+fast_math = []
+
+[dependencies]
+thiserror.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "cubemap_bench"
+harness = false

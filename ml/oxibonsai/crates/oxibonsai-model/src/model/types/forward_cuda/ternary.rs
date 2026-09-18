@@ -1,0 +1,447 @@
+//! TQ2 ternary CUDA path helpers and dedicated batch-prefill methods.
+
+use super::super::q1_slots::SlotNamespace;
+use super::super::{BonsaiModel, OutputWeight};
+use crate::block::blocks_as_bytes_ternary;
+
+impl<'a> BonsaiModel<'a> {
+    /// Get or build this model's cached per-layer ternary Q‖K‖V byte
+    /// concatenations for the CUDA ternary path (the ternary twin of the Q1
+    /// path's `get_or_build_cuda_qkv_cache`).
+    ///
+    /// Each layer's Q, K, V TQ2 block bytes are concatenated in that order,
+    /// **once per model**: the first call builds and stores them in
+    /// `cuda_ternary_qkv_cache`, every later call (every decode token, every
+    /// prefill chunk) returns the same allocation.
+    ///
+    /// This used to be rebuilt on every call (~6.7 MB per layer, ~240 MB per
+    /// token for `Ternary-Bonsai-8B`), and the kernels' weight-set fingerprint
+    /// hashed the concatenation's heap address. On a streaming worker thread
+    /// (`oxibonsai run`) `malloc` put it somewhere else on every call, so every
+    /// decode token evicted, re-uploaded (1.85 GB) and re-captured the whole
+    /// cached CUDA weight set. The fingerprint no longer hashes that address
+    /// (`oxibonsai-kernels`' `ternary_model_weights_fingerprint`); caching here
+    /// also makes the address stable — the invariant the Q1 path always had —
+    /// and drops the per-token allocation and copy.
+    ///
+    /// Kept separate from the Q1 `cuda_qkv_cache` so a Q1 and a ternary layer
+    /// set can never be handed each other's bytes.
+    pub(super) fn get_or_build_cuda_ternary_qkv_cache(
+        &self,
+    ) -> Result<std::sync::Arc<Vec<Vec<u8>>>, Box<dyn std::error::Error>> {
+        let mut guard = self
+            .cuda_ternary_qkv_cache
+            .lock()
+            .map_err(|e| format!("cuda_ternary_qkv_cache lock: {e}"))?;
+        if let Some(ref cache) = *guard {
+            return Ok(std::sync::Arc::clone(cache));
+        }
+        let n_layers = self.blocks.len();
+        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
+        for block in &self.blocks {
+            let q_bytes = blocks_as_bytes_ternary(
+                block
+                    .attn_q_blocks_ternary()
+                    .ok_or("attn_q: not a ternary layer")?,
+            );
+            let k_bytes = blocks_as_bytes_ternary(
+                block
+                    .attn_k_blocks_ternary()
+                    .ok_or("attn_k: not a ternary layer")?,
+            );
+            let v_bytes = blocks_as_bytes_ternary(
+                block
+                    .attn_v_blocks_ternary()
+                    .ok_or("attn_v: not a ternary layer")?,
+            );
+            let mut concat = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
+            concat.extend_from_slice(q_bytes);
+            concat.extend_from_slice(k_bytes);
+            concat.extend_from_slice(v_bytes);
+            qkv_concats.push(concat);
+        }
+        let arc = std::sync::Arc::new(qkv_concats);
+        *guard = Some(std::sync::Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// This model's CUDA ternary slot namespace: the composition over its
+    /// `cuda_model_epoch`, shared with the Q1 slot namespace
+    /// ([`BonsaiModel::cuda_q1_slots`](super::super::q1::BonsaiModel::cuda_q1_slots))
+    /// so a model with mixed-format layers (none exist today, but the
+    /// namespace makes no such assumption) never collides a ternary layer's
+    /// slots with a Q1 one's.
+    fn cuda_ternary_slots(&self) -> SlotNamespace {
+        SlotNamespace::new(self.cuda_model_epoch)
+    }
+
+    /// Build per-layer `CudaFullForwardLayerParamsTernary` for the CUDA ternary path.
+    ///
+    /// Handle namespaces: every norm / weight handle is composed over this
+    /// model's `cuda_model_epoch` via [`SlotNamespace::ternary_norm_base`] /
+    /// [`SlotNamespace::ternary_weight_base`] — distinct from the Q1 ranges
+    /// ([`SlotNamespace::norm_base`]/[`SlotNamespace::weight_fallback_base`])
+    /// composed under the same namespace, and from every other model's
+    /// namespace.
+    pub(super) fn build_cuda_ternary_layer_params<'b>(
+        &'b self,
+        qkv_concats: &'b [Vec<u8>],
+    ) -> Result<
+        Vec<oxibonsai_kernels::CudaFullForwardLayerParamsTernary<'b>>,
+        Box<dyn std::error::Error>,
+    > {
+        let n_layers = self.blocks.len();
+        if n_layers == 0 {
+            return Err("no blocks".into());
+        }
+        SlotNamespace::check_layer_count(n_layers)?;
+        let slots = self.cuda_ternary_slots();
+        let mut layer_params: Vec<oxibonsai_kernels::CudaFullForwardLayerParamsTernary<'b>> =
+            Vec::with_capacity(n_layers);
+        for (i, block) in self.blocks.iter().enumerate() {
+            let norm_handle_base = slots.ternary_norm_base(block.layer_index());
+            let weight_handle_base = slots.ternary_weight_base(block.layer_index());
+            layer_params.push(oxibonsai_kernels::CudaFullForwardLayerParamsTernary {
+                attn_norm_handle: norm_handle_base,
+                attn_norm_bytes: block.attn_norm_weight(),
+                fused_qkv_handle: weight_handle_base,
+                fused_qkv_bytes: &qkv_concats[i],
+                q_norm_handle: norm_handle_base + 1,
+                q_norm_bytes: block.q_norm_weight(),
+                k_norm_handle: norm_handle_base + 2,
+                k_norm_bytes: block.k_norm_weight(),
+                attn_proj_handle: weight_handle_base + 1,
+                attn_proj_bytes: blocks_as_bytes_ternary(
+                    block
+                        .attn_output_blocks_ternary()
+                        .ok_or("attn_output: not a ternary layer")?,
+                ),
+                ffn_norm_handle: norm_handle_base + 3,
+                ffn_norm_bytes: block.ffn_norm_weight(),
+                gate_up_handle: weight_handle_base + 2,
+                gate_bytes: blocks_as_bytes_ternary(
+                    block
+                        .ffn_gate_blocks_ternary()
+                        .ok_or("ffn_gate: not a ternary layer")?,
+                ),
+                up_bytes: blocks_as_bytes_ternary(
+                    block
+                        .ffn_up_blocks_ternary()
+                        .ok_or("ffn_up: not a ternary layer")?,
+                ),
+                down_handle: weight_handle_base + 3,
+                down_bytes: blocks_as_bytes_ternary(
+                    block
+                        .ffn_down_blocks_ternary()
+                        .ok_or("ffn_down: not a ternary layer")?,
+                ),
+            });
+        }
+        Ok(layer_params)
+    }
+
+    /// GPU batch prefill for TQ2 ternary models (CUDA): all layers + final norm + LM head.
+    ///
+    /// Returns the last token's logits.  Mirrors `try_cuda_prefill_with_lm_head` but
+    /// uses TQ2 GEMM/GEMV kernels throughout.
+    ///
+    /// Enabled via the dispatcher in `forward_cuda/q1.rs`: the CUDA prefill KV
+    /// cache is unified with the decode KV cache (`cuda_prefill` delegates to
+    /// `cuda_full_layer::acquire_kv_cache`), so the prompt K/V written here is the
+    /// same buffer per-token decode reads.
+    pub(super) fn try_cuda_prefill_with_lm_head_ternary(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let batch_size = token_ids.len();
+        let n_layers = self.blocks.len();
+        if n_layers == 0 {
+            return Err("no blocks".into());
+        }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()`).
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
+        let lm_head_ternary = match &self.output_weight {
+            OutputWeight::Ternary(ref t) => t,
+            _ => return Err("try_cuda_prefill_with_lm_head_ternary: not a ternary model".into()),
+        };
+        let eps = self.blocks[0].attn_norm_eps();
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let nq = self.config.num_attention_heads;
+        let nkv = self.config.num_kv_heads;
+        let hd = self.config.head_dim;
+        let half_dim = hd / 2;
+        let heads_per_group = nq.checked_div(nkv).unwrap_or(1);
+        let max_seq_len = self.kv_cache.max_seq_len();
+
+        let mut hidden_batch = vec![0.0f32; batch_size * h];
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
+
+        let mut cos_table = vec![0.0f32; batch_size * half_dim];
+        let mut sin_table = vec![0.0f32; batch_size * half_dim];
+        for t in 0..batch_size {
+            let pos = pos_start + t;
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
+            cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
+            sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
+        }
+
+        let final_norm_handle = self.cuda_ternary_slots().ternary_final_norm();
+        let final_norm_bytes = self.output_norm.weight();
+        let final_norm_eps = self.output_norm.eps();
+        let lm_head_handle = self.cuda_ternary_slots().ternary_lm_head();
+        let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
+        let lm_head_out_features = lm_head_ternary.out_features();
+
+        let qkv_concats = self.get_or_build_cuda_ternary_qkv_cache()?;
+        let layer_params = self.build_cuda_ternary_layer_params(&qkv_concats)?;
+
+        let mut logits = vec![0.0f32; lm_head_out_features];
+        oxibonsai_kernels::try_cuda_prefill_ternary(
+            &hidden_batch,
+            batch_size,
+            pos_start,
+            n_layers,
+            &layer_params,
+            &cos_table,
+            &sin_table,
+            h,
+            inter,
+            nq,
+            nkv,
+            hd,
+            heads_per_group,
+            eps,
+            max_seq_len,
+            Some(final_norm_handle),
+            Some(final_norm_bytes),
+            final_norm_eps,
+            Some(lm_head_handle),
+            Some(lm_head_bytes),
+            lm_head_out_features,
+            Some(&mut logits),
+            None,
+        )
+        .map_err(|e| {
+            tracing::warn!(error = %e, "CUDA ternary batch prefill failed");
+            Box::new(e) as Box<dyn std::error::Error>
+        })?;
+        Ok(logits)
+    }
+
+    /// GPU batch prefill verify for TQ2 ternary models (CUDA): greedy argmax per position.
+    ///
+    /// Returns the greedy argmax token ID for each input position.
+    pub(super) fn try_cuda_prefill_verify_ternary(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let batch_size = token_ids.len();
+        let n_layers = self.blocks.len();
+        if n_layers == 0 {
+            return Err("no blocks".into());
+        }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()`).
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary prefill-verify sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
+        let lm_head_ternary = match &self.output_weight {
+            OutputWeight::Ternary(ref t) => t,
+            _ => return Err("try_cuda_prefill_verify_ternary: not a ternary model".into()),
+        };
+        let eps = self.blocks[0].attn_norm_eps();
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let nq = self.config.num_attention_heads;
+        let nkv = self.config.num_kv_heads;
+        let hd = self.config.head_dim;
+        let heads_per_group = nq.checked_div(nkv).unwrap_or(1);
+        let max_seq_len = self.kv_cache.max_seq_len();
+
+        let final_norm_handle = self.cuda_ternary_slots().ternary_final_norm();
+        let final_norm_bytes = self.output_norm.weight();
+        let final_norm_eps = self.output_norm.eps();
+        let lm_head_handle = self.cuda_ternary_slots().ternary_lm_head();
+        let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
+        let lm_head_out_features = lm_head_ternary.out_features();
+
+        let qkv_concats = self.get_or_build_cuda_ternary_qkv_cache()?;
+        let layer_params = self.build_cuda_ternary_layer_params(&qkv_concats)?;
+
+        let mut token_ids_out: Vec<u32> = Vec::with_capacity(batch_size);
+        for (t, &tok_id) in token_ids.iter().enumerate().take(batch_size) {
+            // M-02: one row, decoded from the quantized table.
+            let mut single_hidden = vec![0.0f32; h];
+            self.token_embd.copy_row(tok_id, &mut single_hidden)?;
+            let pos = pos_start + t;
+            let cos_single = self.rope.cos_at_checked(pos)?;
+            let sin_single = self.rope.sin_at_checked(pos)?;
+
+            let mut greedy_id: u32 = 0;
+            oxibonsai_kernels::try_cuda_prefill_ternary(
+                &single_hidden,
+                1,
+                pos,
+                n_layers,
+                &layer_params,
+                cos_single,
+                sin_single,
+                h,
+                inter,
+                nq,
+                nkv,
+                hd,
+                heads_per_group,
+                eps,
+                max_seq_len,
+                Some(final_norm_handle),
+                Some(final_norm_bytes),
+                final_norm_eps,
+                Some(lm_head_handle),
+                Some(lm_head_bytes),
+                lm_head_out_features,
+                None,
+                Some(&mut greedy_id),
+            )
+            .map_err(|e| {
+                tracing::warn!(error = %e, "CUDA ternary prefill verify at pos {pos}: {e}");
+                Box::new(e) as Box<dyn std::error::Error>
+            })?;
+            token_ids_out.push(greedy_id);
+        }
+        Ok(token_ids_out)
+    }
+}
+
+/// Host-only: none of these touch a CUDA device (building the concatenation
+/// and the layer parameters is pure host work, and `BonsaiModel`'s CUDA
+/// `Drop` returns early when no CUDA context was ever opened).
+#[cfg(test)]
+mod tests {
+    use super::super::super::prefill_cpu::tests::{ternary_fixture, tiny_config};
+    use super::super::super::BonsaiModel;
+    use crate::block::blocks_as_bytes_ternary;
+    use std::sync::Arc;
+
+    /// Ternary decode thrash regression, model half (`oxibonsai run` on
+    /// `Ternary-Bonsai-8B`: every decode token re-uploaded the 1.85 GB weight
+    /// set and re-captured the CUDA graph). The Q‖K‖V concatenation the CUDA
+    /// ternary path hands the kernels must be built once per model, so every
+    /// call sees the same buffers at the same addresses under the same
+    /// epoch-composed handles — while another load of the same file gets its
+    /// own buffers and handles, so a model swap still rebuilds (F-M1/F-M3).
+    #[test]
+    fn ternary_qkv_cache_is_built_once_and_address_stable() {
+        let model = ternary_fixture(tiny_config(3));
+        let first = model
+            .get_or_build_cuda_ternary_qkv_cache()
+            .expect("ternary model builds its Q‖K‖V cache");
+        let second = model
+            .get_or_build_cuda_ternary_qkv_cache()
+            .expect("second call hits the cache");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the concatenation must be built once per model, not per call"
+        );
+        assert_eq!(first.len(), model.blocks.len());
+
+        // Content: each layer's Q, K, V block bytes, in that order.
+        for (block, concat) in model.blocks.iter().zip(first.iter()) {
+            let q = blocks_as_bytes_ternary(block.attn_q_blocks_ternary().expect("ternary q"));
+            let k = blocks_as_bytes_ternary(block.attn_k_blocks_ternary().expect("ternary k"));
+            let v = blocks_as_bytes_ternary(block.attn_v_blocks_ternary().expect("ternary v"));
+            assert_eq!(concat.len(), q.len() + k.len() + v.len());
+            assert_eq!(&concat[..q.len()], q);
+            assert_eq!(&concat[q.len()..q.len() + k.len()], k);
+            assert_eq!(&concat[q.len() + k.len()..], v);
+        }
+
+        // Two "decode tokens": identical weight-set identity.
+        let call_a = model
+            .build_cuda_ternary_layer_params(&first)
+            .expect("layer params, call a");
+        let call_b = model
+            .build_cuda_ternary_layer_params(&second)
+            .expect("layer params, call b");
+        assert_eq!(call_a.len(), call_b.len());
+        for (a, b) in call_a.iter().zip(&call_b) {
+            assert_eq!(a.fused_qkv_bytes.as_ptr(), b.fused_qkv_bytes.as_ptr());
+            assert_eq!(a.fused_qkv_bytes.len(), b.fused_qkv_bytes.len());
+            assert_eq!(
+                [
+                    a.fused_qkv_handle,
+                    a.attn_proj_handle,
+                    a.gate_up_handle,
+                    a.down_handle
+                ],
+                [
+                    b.fused_qkv_handle,
+                    b.attn_proj_handle,
+                    b.gate_up_handle,
+                    b.down_handle
+                ]
+            );
+            assert_eq!(
+                [
+                    a.attn_norm_handle,
+                    a.q_norm_handle,
+                    a.k_norm_handle,
+                    a.ffn_norm_handle
+                ],
+                [
+                    b.attn_norm_handle,
+                    b.q_norm_handle,
+                    b.k_norm_handle,
+                    b.ffn_norm_handle
+                ]
+            );
+        }
+
+        // Another load: its own buffers and its own handle namespace.
+        let other = ternary_fixture(tiny_config(3));
+        let other_cache = other
+            .get_or_build_cuda_ternary_qkv_cache()
+            .expect("second model builds its own cache");
+        assert!(!Arc::ptr_eq(&first, &other_cache));
+        let other_params = other
+            .build_cuda_ternary_layer_params(&other_cache)
+            .expect("layer params, other model");
+        for (a, o) in call_a.iter().zip(&other_params) {
+            assert_ne!(a.fused_qkv_handle, o.fused_qkv_handle);
+            assert_ne!(a.attn_norm_handle, o.attn_norm_handle);
+        }
+    }
+
+    /// A non-ternary model is refused, and the refusal is not cached: the
+    /// slot stays empty rather than holding a partial concatenation.
+    #[test]
+    fn ternary_qkv_cache_refuses_a_q1_model_without_caching() {
+        let model = BonsaiModel::new_for_testing_with_blocks(tiny_config(2));
+        assert!(model.get_or_build_cuda_ternary_qkv_cache().is_err());
+        assert!(model
+            .cuda_ternary_qkv_cache
+            .lock()
+            .expect("cache lock")
+            .is_none());
+    }
+}

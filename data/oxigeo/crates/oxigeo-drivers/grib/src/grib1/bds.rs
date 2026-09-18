@@ -1,0 +1,185 @@
+//! GRIB1 Binary Data Section (BDS).
+//!
+//! The BDS contains the actual meteorological data in packed binary format.
+
+use crate::error::{GribError, Result};
+use byteorder::{BigEndian, ReadBytesExt};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::Read;
+
+/// GRIB1 Binary Data Section
+#[derive(Debug, Clone)]
+pub struct BinaryDataSection {
+    /// Reference value (minimum value)
+    pub reference_value: f32,
+    /// Binary scale factor
+    pub binary_scale: i16,
+    /// Number of bits per data value
+    pub num_bits: u8,
+    /// Packed data bytes
+    pub packed_data: Vec<u8>,
+}
+
+impl BinaryDataSection {
+    /// Parse BDS from reader
+    pub fn from_reader<R: Read>(reader: &mut R) -> Result<Self> {
+        // Read section length (3 bytes)
+        let length_bytes = [reader.read_u8()?, reader.read_u8()?, reader.read_u8()?];
+        let length = ((length_bytes[0] as usize) << 16)
+            | ((length_bytes[1] as usize) << 8)
+            | (length_bytes[2] as usize);
+
+        if length < 11 {
+            return Err(GribError::InvalidSectionLength {
+                expected: 11,
+                actual: length,
+            });
+        }
+
+        // Flag and unused bits
+        let flag = reader.read_u8()?;
+        let num_bits = flag & 0x0F; // Lower 4 bits
+
+        // Check for unsupported features
+        if (flag & 0x80) != 0 {
+            return Err(GribError::UnsupportedPacking(
+                "Spherical harmonics not supported".to_string(),
+            ));
+        }
+        if (flag & 0x40) != 0 {
+            return Err(GribError::UnsupportedPacking(
+                "Complex packing not supported".to_string(),
+            ));
+        }
+
+        // Binary scale factor. WMO GRIB1 (Manual on Codes / FM 92-XI Ext.
+        // GRIB) defines this as `signed[2]` (confirmed against eccodes'
+        // definitions/grib1/section.4.def), i.e. sign-and-magnitude: the
+        // MSB is a sign flag and the low 15 bits are the magnitude. This is
+        // NOT two's complement, so it must not be read with `read_i16`.
+        let raw_scale = reader.read_u16::<BigEndian>()?;
+        let binary_scale = if raw_scale & 0x8000 != 0 {
+            -((raw_scale & 0x7FFF) as i16)
+        } else {
+            raw_scale as i16
+        };
+
+        // Reference value (IEEE 754 32-bit float, big endian)
+        let reference_value = reader.read_f32::<BigEndian>()?;
+
+        // Read packed data. `packed_data_length` derives from the BDS section
+        // length header; read it incrementally via `take(..).read_to_end(..)`
+        // rather than preallocating `vec![0u8; packed_data_length]`, so a
+        // truncated section cannot force an oversized speculative allocation.
+        let packed_data_length = length.saturating_sub(11);
+        let mut packed_data = Vec::new();
+        let got = reader
+            .by_ref()
+            .take(packed_data_length as u64)
+            .read_to_end(&mut packed_data)?;
+        if got != packed_data_length {
+            return Err(GribError::TruncatedMessage {
+                expected: packed_data_length,
+                actual: got,
+            });
+        }
+
+        Ok(Self {
+            reference_value,
+            binary_scale,
+            num_bits,
+            packed_data,
+        })
+    }
+
+    /// Get the scale factor as a multiplier
+    pub fn scale_multiplier(&self) -> f32 {
+        2.0f32.powi(self.binary_scale as i32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scale_multiplier() {
+        let bds = BinaryDataSection {
+            reference_value: 0.0,
+            binary_scale: 0,
+            num_bits: 12,
+            packed_data: vec![],
+        };
+        assert_eq!(bds.scale_multiplier(), 1.0);
+
+        let bds = BinaryDataSection {
+            reference_value: 0.0,
+            binary_scale: -3,
+            num_bits: 12,
+            packed_data: vec![],
+        };
+        assert_eq!(bds.scale_multiplier(), 0.125);
+
+        let bds = BinaryDataSection {
+            reference_value: 0.0,
+            binary_scale: 2,
+            num_bits: 12,
+            packed_data: vec![],
+        };
+        assert_eq!(bds.scale_multiplier(), 4.0);
+    }
+
+    /// Regression test driving a negative binary scale factor through
+    /// `from_reader` (not the struct-literal shortcut), confirming the
+    /// sign-and-magnitude decode is applied during actual parsing.
+    #[test]
+    fn test_from_reader_negative_binary_scale() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&11u32.to_be_bytes()[1..]); // section length = 11 (3 bytes)
+        data.push(0x00); // flag: num_bits=0, no spherical harmonics/complex packing
+        data.extend_from_slice(&[0x80, 0x03]); // binary scale = sign-magnitude -3
+        data.extend_from_slice(&0.0f32.to_be_bytes()); // reference value
+
+        let mut cursor = Cursor::new(data);
+        let bds =
+            BinaryDataSection::from_reader(&mut cursor).expect("failed to parse BDS from_reader");
+
+        assert_eq!(bds.binary_scale, -3);
+        assert_eq!(bds.scale_multiplier(), 0.125);
+    }
+
+    /// A BDS header that declares a huge section length but supplies no packed
+    /// data must fail fast with a truncation error instead of speculatively
+    /// allocating the multi-megabyte buffer the header claims.
+    #[test]
+    fn test_from_reader_rejects_truncated_oversized_section() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // section length = 16 MB
+        data.push(0x00); // flag: simple packing
+        data.extend_from_slice(&[0x00, 0x00]); // binary scale
+        data.extend_from_slice(&0.0f32.to_be_bytes()); // reference value
+        // ...and then nothing: the ~16 MB of packed data the header promises
+        // is absent.
+
+        let mut cursor = Cursor::new(data);
+        let result = BinaryDataSection::from_reader(&mut cursor);
+        assert!(matches!(result, Err(GribError::TruncatedMessage { .. })));
+    }
+
+    #[test]
+    fn test_from_reader_positive_binary_scale() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&11u32.to_be_bytes()[1..]);
+        data.push(0x00);
+        data.extend_from_slice(&[0x00, 0x03]); // binary scale = +3 (sign bit clear)
+        data.extend_from_slice(&0.0f32.to_be_bytes());
+
+        let mut cursor = Cursor::new(data);
+        let bds =
+            BinaryDataSection::from_reader(&mut cursor).expect("failed to parse BDS from_reader");
+
+        assert_eq!(bds.binary_scale, 3);
+        assert_eq!(bds.scale_multiplier(), 8.0);
+    }
+}

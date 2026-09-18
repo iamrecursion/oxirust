@@ -1,0 +1,35 @@
+[package]
+name = "phop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/phop-cli"
+description = "Command-line interface for phop: `phop discover data.csv`"
+readme = "README.md"
+keywords = ["symbolic-regression", "equation-discovery", "machine-learning", "cli", "eml"]
+categories = ["command-line-utilities", "science", "mathematics"]
+
+[[bin]]
+name = "phop"
+path = "src/main.rs"
+
+[dependencies]
+phop-core.workspace = true
+clap.workspace = true
+csv.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+# Build the CUDA backend into the CLI so `--gpu cuda` runs constant fitting on the GPU.
+gpu-cuda = ["phop-core/gpu-cuda"]
+# Build the Apple Metal backend into the CLI so `--gpu metal` runs constant fitting on the GPU (macOS).
+gpu-metal = ["phop-core/gpu-metal"]
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"

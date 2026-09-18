@@ -1,0 +1,39 @@
+[package]
+name = "oximedia-clips"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional clip management and logging system for OxiMedia"
+keywords = ["clips", "logging", "media", "management", "multimedia"]
+categories = ["multimedia", "data-structures"]
+readme = "README.md"
+
+[features]
+audio-decode = ["dep:oximedia-container", "dep:oximedia-io"]
+default = ["audio-decode"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-timecode = { workspace = true }
+oximedia-edl = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+# Pure-Rust SQLite (COOLJAPAN OxiSQL) — replaces sqlx/libsqlite3-sys (C).
+oxisql-core = { workspace = true }
+oxisql-sqlite-compat = { workspace = true }
+oximedia-audio = { workspace = true }
+oximedia-container = { workspace = true, optional = true }
+oximedia-io = { workspace = true, optional = true }
+
+[lints]
+workspace = true

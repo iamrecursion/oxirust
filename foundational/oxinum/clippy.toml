@@ -1,0 +1,8 @@
+# clippy configuration for the oxinum workspace.
+#
+# `msrv` matches `workspace.package.rust-version` in the root Cargo.toml.
+# Setting it activates `clippy::incompatible_msrv` (and other msrv-aware
+# lints), which flags any standard-library API newer than this version —
+# keeping the crate's actual minimum-supported-Rust-version claim honest
+# rather than lint-flag-dependent.
+msrv = "1.80"

@@ -1,0 +1,42 @@
+[package]
+name = "oxiui-slint"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiUI slint adapter (NON-PURE: slint pulls yeslogic-fontconfig-sys on Linux; not in the Pure-Rust L1 set; GPL-gated)"
+readme = "README.md"
+categories = ["gui", "rendering"]
+keywords = ["gui", "slint", "cooljapan", "pure-rust", "oxiui"]
+
+# IMPORTANT — LICENSING NOTE:
+# slint 1.16.1 is licensed under GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0
+# OR LicenseRef-Slint-Software-3.0.
+# This crate is Apache-2.0, but enabling the `slint` feature transitively brings
+# in the slint crate. Downstream consumers must ensure their license is compatible
+# with one of slint's three license options (GPL-3.0, Royalty-free, or Commercial).
+# oxiui itself remains Apache-2.0; slint is only pulled in when explicitly
+# requested via `--features slint`.
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["slint"]  # optional dep for M6 native run_event_loop(); only referenced in doc comments and commented-out code today
+
+[features]
+default = []
+slint = ["dep:slint"]
+
+[dependencies]
+oxiui-core = { workspace = true }
+
+[dependencies.slint]
+workspace = true
+optional = true
+
+[dev-dependencies]
+oxiui-theme = { path = "../oxiui-theme" }
+
+[[example]]
+name = "hello_slint"
+required-features = ["slint"]

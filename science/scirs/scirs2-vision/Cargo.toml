@@ -1,0 +1,100 @@
+[package]
+name = "scirs2-vision"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Computer vision module for SciRS2 (scirs2-vision)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["vision", "image-processing", "scientific", "ai", "machine-learning"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["parallel", "gpu", "random", "array"] }
+scirs2-linalg = { workspace = true }
+# scirs2-ndimage = { workspace = true }
+thiserror = { workspace = true }
+statrs = { workspace = true }
+
+# Vision specific dependencies
+image = { workspace = true }
+ordered-float = { workspace = true }
+num_cpus = { workspace = true }
+crossbeam-channel = { workspace = true }
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }
+oxicuda-dnn = { workspace = true, optional = true }
+# rayon = { workspace = true }  # Now use scirs2-core parallel abstractions
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+
+[features]
+default = []
+# Enable real GPU (WebGPU/wgpu) execution for accelerated vision kernels.
+# Without this feature the high-level `scirs2-core` GPU abstraction is still
+# compiled, but kernel dispatch transparently falls back to the CPU/SIMD path.
+wgpu = ["scirs2-core/wgpu"]
+cuda = ["dep:oxicuda-driver", "dep:oxicuda-memory", "dep:oxicuda-dnn"]
+
+[[example]]
+name = "feature_detection"
+path = "examples/feature_detection.rs"
+
+[[example]]
+name = "color_transformations"
+path = "examples/color_transformations.rs"
+
+[[example]]
+name = "image_segmentation"
+path = "examples/image_segmentation.rs"
+
+[[example]]
+name = "morphological_operations"
+path = "examples/morphological_operations.rs"
+
+[[example]]
+name = "canny_edge_detection"
+path = "examples/canny_edge_detection.rs"
+
+[[example]]
+name = "edge_detection_comparison"
+path = "examples/edge_detection_comparison.rs"
+
+[[example]]
+name = "corner_detection_comparison"
+path = "examples/corner_detection_comparison.rs"
+
+[[example]]
+name = "non_rigid_transformations"
+path = "examples/non_rigid_transformations.rs"
+
+[[example]]
+name = "noise_reduction"
+path = "examples/noise_reduction.rs"
+
+[[example]]
+name = "feature_tracking"
+path = "examples/feature_tracking.rs"
+
+[[example]]
+name = "image_registration"
+path = "examples/image_registration.rs"
+
+[[example]]
+name = "simple_registration"
+path = "examples/simple_registration.rs"
+
+[[bench]]
+name = "opencv_comparison"
+harness = false

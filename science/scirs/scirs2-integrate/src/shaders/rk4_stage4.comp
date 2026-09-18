@@ -1,0 +1,60 @@
+#version 430
+
+// Runge-Kutta 4th order - Stage 4 compute shader
+// Computes k4 = h * f(t + h, y + k3)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer YBuffer {
+    float y[];
+};
+
+layout(std430, binding = 1) buffer K3Buffer {
+    float k3[];
+};
+
+layout(std430, binding = 2) buffer K4Buffer {
+    float k4[];
+};
+
+uniform float t;
+uniform float h;
+uniform int n;
+
+// Example ODE function: dy/dt = f(t, y)
+vec4 ode_function(float time, vec4 state) {
+    return vec4(state.y, -state.x, 0.0, 0.0);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    
+    if (index >= n) return;
+    
+    // Load current state and k3
+    vec4 current_state = vec4(
+        y[index * 4 + 0],
+        y[index * 4 + 1], 
+        y[index * 4 + 2],
+        y[index * 4 + 3]
+    );
+    
+    vec4 k3_val = vec4(
+        k3[index * 4 + 0],
+        k3[index * 4 + 1],
+        k3[index * 4 + 2],
+        k3[index * 4 + 3]
+    );
+    
+    // Compute final intermediate state: y + k3
+    vec4 intermediate_state = current_state + k3_val;
+    
+    // Compute derivative at final intermediate state
+    vec4 derivative = ode_function(t + h, intermediate_state);
+    
+    // Store k4 = h * f(t + h, y + k3)
+    k4[index * 4 + 0] = h * derivative.x;
+    k4[index * 4 + 1] = h * derivative.y;
+    k4[index * 4 + 2] = h * derivative.z;
+    k4[index * 4 + 3] = h * derivative.w;
+}

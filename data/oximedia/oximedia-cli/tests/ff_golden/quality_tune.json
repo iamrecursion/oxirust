@@ -1,0 +1,9 @@
+{
+  "name": "quality_tune",
+  "args": ["-i", "in.mkv", "-tune", "film", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "tune": "film"
+  }
+}

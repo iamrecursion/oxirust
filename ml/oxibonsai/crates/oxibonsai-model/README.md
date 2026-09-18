@@ -1,0 +1,101 @@
+# oxibonsai-model
+
+Dense Qwen3 and hybrid Qwen3.5 transformer forward passes for sub-2-bit Bonsai inference
+(1-bit, ternary, and the Bonsai 2 27B hybrid).
+
+Implements the full autoregressive forward pass for the dense Qwen3 architecture family
+(Bonsai-8B/4B/1.7B in Q1_0_g128 and TernaryBonsai-8B/4B/1.7B in TQ2) — token
+embedding, Grouped Query Attention with RoPE, SwiGLU MLP, RMSNorm, paged
+KV-cache, and Metal/CUDA full-forward integration via `oxibonsai-kernels` — and for
+the Qwen3.5 hybrid of Bonsai 2 27B (`hybrid/`: Gated-DeltaNet linear attention
+interleaved with gated full attention, Hadamard-rotated PTQ1_0 / PQ2_0 / group-64 Q2_0
+weights, M-RoPE and a recurrent-state cache) together with its optional vision tower
+(`vision/`).
+
+**Status:** Stable — 1,972 tests (`cargo nextest list -p oxibonsai-model --all-features`; the real-model ones self-skip without the weights)
+**Version:** 0.2.4
+
+Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
+
+## Features
+
+### Core Transformer
+- `BonsaiModel` — full Qwen3 forward pass: token embedding → N transformer blocks → final RMSNorm → LM head
+- `TransformerBlock` — attention sublayer + SwiGLU FFN sublayer with residual connections (`block/`)
+- RMSNorm, RoPE (base=1M), Grouped Query Attention (32 Q / 8 KV heads, head_dim=128)
+- SwiGLU FFN (gate/up → SiLU × gate → down projection)
+- `CausalMask` — causal attention masking
+
+### Model Variants & Registry
+- `ModelVariant::Bonsai{8B, 4B, 1_7B}` — Q1_0_g128 1-bit weights
+- `ModelVariant::TernaryBonsai{8B, 4B, 1_7B}` — TQ2 ternary weights
+- `ModelVariant::Bonsai27B` (previous-generation 27B) and `ModelVariant::TernaryBonsai227b{Pq2, Ptq1, Q2g64}` (Bonsai 2 27B) — `qwen35` hybrids; `ModelVariant::Bonsai227bMmproj` is the vision projector
+- `ModelSpec`, `CapabilityProfile`, `all_specs()` in `model_variants.rs`
+- Architecture auto-detection from GGUF metadata in `model_registry.rs`
+- `Qwen3Config` + `ModelConfigBuilder` for custom configs
+
+### Weight Loading
+- GGUF loader with tensor-name mapping (`gguf_loader.rs`, `convert/name_map.rs`)
+- Q1 loader path via `oxibonsai-kernels` blocks
+- `LinearTernary` layer + `load_ternary_blocks` + `OutputWeight::Ternary` (TQ2)
+- Q4_0/Q8_0 (standard GGUF) + K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K) weight loading — `LinearQ4_0`/`LinearQ8_0` (`layers/linear_standard.rs`), `LinearQ2K`/`LinearQ3K`/`LinearQ4K`/`LinearQ5K`/`LinearQ6K`/`LinearQ8K` (`layers/linear_kquant_full.rs`, `layers/linear_kquant_ext.rs`); `forward()` tries the native-CUDA / Metal GEMV kernel first (via `oxibonsai-kernels`), then falls back to CPU
+- Safetensors loading support
+
+### KV Cache
+- Standard `KvCache` with position-indexed storage
+- `PagedKvCache` — vLLM-style block-based cache for high utilization
+- `KvCacheFp16` — K/V stored in f16 (halves cache memory)
+- `KvCacheQuant` — Q8/Q4 quantized KV cache
+
+### Advanced Attention
+- Flash attention / fused kernel (`attention_fused.rs`)
+- Flash decoding (`flash_decode.rs`)
+- Attention sink (`attention_sink.rs`)
+- Cross-attention (`cross_attention.rs`)
+- Sparse attention: local window, BigBird, Longformer, dilated (`sparse_attention.rs`)
+- ALiBi and YaRN RoPE variants
+- RoPE scaling: YaRN, linear, DynamicNTK, LLaMA 3.1, LongRoPE
+- Sliding-window attention (`layers/sliding_window.rs`)
+
+### Training & Fine-tuning Utilities
+- LoRA + LoRA trainer (`lora.rs`, `lora_trainer.rs`)
+- Mixture-of-Experts: `MoeRouter`, `MoeExpert`, Mixture-of-Depths
+- Optimizers, LR schedulers, losses, gradient / gradient checkpointing
+- Pruning, calibration
+
+### Quantization & Export
+- Dynamic quantization: DynamicQ8_0, DynamicQ4_0, DynamicQ4_1
+- `quantize_int8.rs`, `quantize_ternary.rs` exporters
+- `ExportFormat::TernaryG128` in `export.rs`
+- Checkpoint save/load (OXCK binary format)
+
+### Model Conversion
+- ONNX MatMulNBits (bits=2) ingestion via `oxibonsai convert --onnx` — reads onnx-community Ternary releases and repacks as GGUF TQ2_0_g128
+- Qwen3 ONNX tensor role mapping: automatically maps ONNX node names to the Qwen3 weight layout (embedding, QKV projections, gate/up/down FFN, RMSNorm scales)
+
+### Scaling & Inference
+- Tensor parallelism, pipeline parallelism, multi-GPU utilities
+- Chunked prefill, prefix cache, disk cache
+- Weight tying (`TiedEmbedding`) for embedding/LM head sharing
+- Model merging: SLERP, TIES, DARE, task vector
+- Speculative draft model support
+- Compression utilities
+
+## Feature Flags
+
+| Flag | Description |
+|------|-------------|
+| `wasm` | WASM-safe build |
+| `metal` | Metal GPU backend (macOS) — full-forward integration with oxibonsai-kernels |
+| `native-cuda` | CUDA GPU backend (NVIDIA) |
+
+## Usage
+
+```toml
+[dependencies]
+oxibonsai-model = "0.2.4"
+```
+
+## License
+
+Apache-2.0 — COOLJAPAN OU

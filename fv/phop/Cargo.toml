@@ -1,0 +1,56 @@
+[workspace]
+members = [
+    "crates/phop",
+    "crates/phop-core",
+    "crates/phop-cli",
+    "crates/phop-examples",
+    "crates/phop-bench",
+    "crates/phop-py",
+    "crates/phop-wasm",
+]
+# Plain `cargo build`/`cargo test` (no --workspace) operates on native library/binary crates only.
+# `phop-py` (PyO3 extension module) and `phop-wasm` (wasm32 cdylib) produce non-native artifacts
+# that are built explicitly via maturin / wasm-pack, so they are excluded from the default set.
+default-members = [
+    "crates/phop",
+    "crates/phop-core",
+    "crates/phop-cli",
+    "crates/phop-examples",
+    "crates/phop-bench",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["COOLJAPAN OÜ (Team KitaSan) <contact@cooljapan.tech>"]
+repository = "https://github.com/cool-japan/phop"
+homepage = "https://github.com/cool-japan/phop"
+description = "Differentiable symbolic discovery on a single binary operator (EML) via tensorized forests"
+
+[workspace.dependencies]
+# Pure-Rust scientific stack (SciRS2)
+scirs2-core = "0.6.5"
+scirs2-autograd = "0.6.5"
+scirs2-optimize = "0.6.5"
+scirs2-symbolic = "0.6.5"
+scirs2-linalg = "0.6.5"
+# Canonical EML-tree implementation
+oxieml = "0.1.3"
+# Pure-Rust Lean kernel (proof-carrying tier; opt-in via the `lean` feature)
+oxilean-kernel = "0.1.3"
+# Portable GPU forward backend (opt-in via the `gpu-wgpu` feature). Pinned to the same wgpu 29 that
+# scirs2-core's `wgpu` feature uses so device/buffer types unify across the dependency graph.
+wgpu = "29.0"
+# TensorLogic IR (opt-in via the `tensorlogic` feature): the neuro-symbolic target a discovered law
+# is mapped into as a weighted logic rule. Matches the version oxieml's `tensorlogic` feature uses.
+tensorlogic-ir = "0.1.2"
+# General
+rayon = "1.12"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1"
+clap = { version = "4", features = ["derive"] }
+phop-core = { path = "crates/phop-core", version = "0.1.1" }

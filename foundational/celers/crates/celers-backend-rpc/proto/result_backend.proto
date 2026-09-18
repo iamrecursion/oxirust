@@ -1,0 +1,192 @@
+syntax = "proto3";
+
+package result_backend;
+
+// Result backend service for task result storage and chord synchronization
+service ResultBackendService {
+  // Store task result
+  rpc StoreResult(StoreResultRequest) returns (StoreResultResponse);
+
+  // Get task result
+  rpc GetResult(GetResultRequest) returns (GetResultResponse);
+
+  // Delete task result
+  rpc DeleteResult(DeleteResultRequest) returns (DeleteResultResponse);
+
+  // Set result expiration
+  rpc SetExpiration(SetExpirationRequest) returns (SetExpirationResponse);
+
+  // Initialize chord state
+  rpc ChordInit(ChordInitRequest) returns (ChordInitResponse);
+
+  // Persist a mutated chord state (cancellation, callback change, timeout
+  // update, ...) WITHOUT resetting the completion counter. Unlike
+  // ChordInit, which is a create-or-reset primitive, this must be used for
+  // any update that should preserve tasks that already completed.
+  rpc ChordUpdateState(ChordUpdateStateRequest) returns (ChordUpdateStateResponse);
+
+  // Complete chord task (increment counter)
+  rpc ChordCompleteTask(ChordCompleteTaskRequest) returns (ChordCompleteTaskResponse);
+
+  // Get chord state
+  rpc ChordGetState(ChordGetStateRequest) returns (ChordGetStateResponse);
+}
+
+// Task result state
+enum TaskResultState {
+  PENDING = 0;
+  STARTED = 1;
+  SUCCESS = 2;
+  FAILURE = 3;
+  REVOKED = 4;
+  RETRY = 5;
+}
+
+// Task metadata
+message TaskMeta {
+  string task_id = 1;
+  string task_name = 2;
+  TaskResultState result_state = 3;
+  optional string result_data = 4;  // JSON string
+  optional string error_message = 5;
+  optional uint32 retry_count = 6;
+  int64 created_at = 7;  // Unix timestamp (seconds)
+  optional int64 started_at = 8;
+  optional int64 completed_at = 9;
+  optional string worker = 10;
+  // Nanosecond component (0..=999_999_999) of the corresponding timestamp
+  // field above, preserving sub-second precision across the wire. Always 0
+  // (and safe to ignore) when the parent seconds field is absent. Added
+  // after the original fields so messages from older writers that don't
+  // set them still decode correctly, at whole-second precision exactly as
+  // before these fields existed.
+  uint32 created_at_nanos = 11;
+  uint32 started_at_nanos = 12;
+  uint32 completed_at_nanos = 13;
+  // JSON-encoded tail carrying the extended TaskMeta fields that have no
+  // dedicated proto field of their own: progress, version, tags, metadata,
+  // worker_hostname, runtime_ms, memory_bytes, retries, queue, ignored_error.
+  // Kept as one opaque blob (mirroring celers-backend-db's `extra` column)
+  // so future extended fields don't each need a new proto field and a
+  // version bump here. Optional so messages from writers that predate this
+  // field still decode to an all-default extended-fields set instead of
+  // failing.
+  optional string extra_json = 14;
+  // Compressed form of `result_data`, present only when the writer had
+  // compression enabled and the payload was large enough to be worth it.
+  // When set, this is the authoritative result payload and `result_data`
+  // is left unset; a reader must check this field first. `bytes` (not a
+  // base64 string): unlike a JSON/JSONB column, a protobuf field can hold
+  // arbitrary binary directly. Absent on every message written with
+  // compression disabled, below threshold, or by a writer that predates
+  // this field -- all three decode via the plain `result_data` string
+  // exactly as before, with no version flag needed.
+  optional bytes result_data_compressed = 15;
+  // Algorithm that produced `result_data_compressed` (e.g. "zstd", "gzip",
+  // "zlib" -- see `celers_core::result::compression`'s table). Always
+  // present when `result_data_compressed` is set; meaningless otherwise.
+  optional string result_compression_algorithm = 16;
+}
+
+// Chord state
+message ChordState {
+  string chord_id = 1;
+  uint32 total = 2;
+  uint32 completed = 3;
+  optional string callback = 4;
+  repeated string task_ids = 5;  // Array of task UUIDs
+  int64 created_at = 6;  // Unix timestamp (seconds)
+  optional uint64 timeout_seconds = 7;
+  bool cancelled = 8;
+  optional string cancellation_reason = 9;
+  // Nanosecond component of `created_at` (see TaskMeta.created_at_nanos).
+  uint32 created_at_nanos = 10;
+  // Bare, name-only successor task to enqueue once the chord's callback
+  // task completes. See `ChordState::callback_on_success_link` in
+  // celers-backend-redis for the full semantics. Added after the original
+  // fields so older writers that never set it still decode correctly (as
+  // "no successor").
+  optional string callback_on_success_link = 11;
+  // Number of retry attempts already made. Added after the original
+  // fields; always 0 on messages from writers that predate it.
+  uint32 retry_count = 12;
+  // Maximum retry attempts allowed, if any. Added after the original
+  // fields; absent (rather than defaulting to 0) on messages from writers
+  // that predate it, matching "no retry limit configured" rather than
+  // "zero retries allowed".
+  optional uint32 max_retries = 13;
+}
+
+// Store result request/response
+message StoreResultRequest {
+  string task_id = 1;
+  TaskMeta meta = 2;
+}
+
+message StoreResultResponse {
+  bool success = 1;
+}
+
+// Get result request/response
+message GetResultRequest {
+  string task_id = 1;
+}
+
+message GetResultResponse {
+  optional TaskMeta meta = 1;
+}
+
+// Delete result request/response
+message DeleteResultRequest {
+  string task_id = 1;
+}
+
+message DeleteResultResponse {
+  bool success = 1;
+}
+
+// Set expiration request/response
+message SetExpirationRequest {
+  string task_id = 1;
+  uint64 ttl_seconds = 2;
+}
+
+message SetExpirationResponse {
+  bool success = 1;
+}
+
+// Chord init request/response
+message ChordInitRequest {
+  ChordState state = 1;
+}
+
+message ChordInitResponse {
+  bool success = 1;
+}
+
+// Chord update state request/response
+message ChordUpdateStateRequest {
+  ChordState state = 1;
+}
+
+message ChordUpdateStateResponse {
+  bool success = 1;
+}
+
+// Chord complete task request/response
+message ChordCompleteTaskRequest {
+  string chord_id = 1;
+}
+
+message ChordCompleteTaskResponse {
+  uint32 completed_count = 1;
+}
+
+// Chord get state request/response
+message ChordGetStateRequest {
+  string chord_id = 1;
+}
+
+message ChordGetStateResponse {
+  optional ChordState state = 1;
+}

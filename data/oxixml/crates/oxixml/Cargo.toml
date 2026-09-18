@@ -1,0 +1,288 @@
+[package]
+name = "oxixml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Pure-Rust XML + RDF + SPARQL foundation; umbrella crate over ~40 feature-gated crates (replaces quick-xml and the Oxigraph toolchain)."
+keywords = ["xml", "rdf", "sparql", "xpath", "xslt"]
+categories = ["parser-implementations", "text-processing", "data-structures"]
+readme = "README.md"
+
+[dependencies]
+oxixml-support = { workspace = true, optional = true }
+oxixml-unicode = { workspace = true, optional = true }
+oxixml-encoding = { workspace = true, optional = true }
+oxixml-text = { workspace = true, optional = true }
+oxixml-regex = { workspace = true, optional = true }
+oxixml-iri = { workspace = true, optional = true }
+oxixml-langtag = { workspace = true, optional = true }
+oxixml-xsd = { workspace = true, optional = true }
+oxixml-qname = { workspace = true, optional = true }
+oxixml-xml = { workspace = true, optional = true }
+oxixml-quickxml-compat = { workspace = true, optional = true }
+oxixml-dom = { workspace = true, optional = true }
+oxixml-sax = { workspace = true, optional = true }
+oxixml-infoset = { workspace = true, optional = true }
+oxixml-html = { workspace = true, optional = true }
+oxixml-svg = { workspace = true, optional = true }
+oxixml-dtd = { workspace = true, optional = true }
+oxixml-schema = { workspace = true, optional = true }
+oxixml-relaxng = { workspace = true, optional = true }
+oxixml-schematron = { workspace = true, optional = true }
+oxixml-catalog = { workspace = true, optional = true }
+oxixml-xinclude = { workspace = true, optional = true }
+oxixml-fn = { workspace = true, optional = true }
+oxixml-xpath = { workspace = true, optional = true }
+oxixml-xquery = { workspace = true, optional = true }
+oxixml-xslt = { workspace = true, optional = true }
+oxixml-c14n = { workspace = true, optional = true }
+oxixml-dsig = { workspace = true, optional = true }
+oxixml-enc = { workspace = true, optional = true }
+oxixml-fo = { workspace = true, optional = true }
+oxixml-model = { workspace = true, optional = true }
+oxixml-json = { workspace = true, optional = true }
+oxixml-turtle = { workspace = true, optional = true }
+oxixml-rdfxml = { workspace = true, optional = true }
+oxixml-jsonld = { workspace = true, optional = true }
+oxixml-rdfa = { workspace = true, optional = true }
+oxixml-trix = { workspace = true, optional = true }
+oxixml-hdt = { workspace = true, optional = true }
+oxixml-canon = { workspace = true, optional = true }
+oxixml-io = { workspace = true, optional = true }
+oxixml-vocab = { workspace = true, optional = true }
+oxixml-sparql-results = { workspace = true, optional = true }
+oxixml-sparql-syntax = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["rt", "macros", "io-util"] }
+
+[features]
+default = []
+
+## Zero-dependency substrate: SWAR byte scanning, line/column tracking, FIPS 180-4 SHA/HMAC,
+## and a minimal unsigned bigint.
+support = ["dep:oxixml-support"]
+## Unicode property data, character classes, and NFC/NFD/NFKC/NFKD normalization.
+unicode = ["dep:oxixml-unicode"]
+## Character-encoding decoders/encoders (UTF-8/16/32, Latin-1, windows-1252, legacy Japanese).
+##
+## When `xml` (or `quickxml-compat`) is also on, this turns on their non-UTF-8 support too, so
+## `oxixml::xml::reader::Reader` sniffs and decodes legacy encodings instead of rejecting them.
+encoding = [
+    "dep:oxixml-encoding",
+    "oxixml-xml?/encoding",
+    "oxixml-quickxml-compat?/encoding",
+]
+## Text codecs shared across the stack: base64, hex, percent-encoding, XSD/ECMAScript numbers.
+text = ["dep:oxixml-text"]
+## The XML-Schema (`pattern` facet) and XPath (`fn:matches`) regular-expression engine.
+regex = ["dep:oxixml-regex"]
+## RFC 3987 Internationalized Resource Identifiers: parse, resolve, relativize.
+iri = ["dep:oxixml-iri"]
+## RFC 5646 language tags: parse, normalize, compare.
+langtag = ["dep:oxixml-langtag"]
+## The XML Schema Part 2 built-in datatypes (`decimal`, `dateTime`, `duration`, …).
+xsd = ["dep:oxixml-xsd"]
+## XML names: `NCName`/`QName`, `ExpandedName`, and the namespace-binding stack.
+qname = ["dep:oxixml-qname"]
+## The XML 1.0/1.1 pull parser and writer, quick-xml 0.41-compatible.
+xml = ["dep:oxixml-xml"]
+## A drop-in `quick-xml` compatibility shim over `xml`.
+quickxml-compat = ["dep:oxixml-quickxml-compat", "xml"]
+## An arena-based DOM Level 3 Core document tree, built on `xml`.
+dom = ["dep:oxixml-dom", "xml"]
+## A SAX2-style push (`ContentHandler`) parser API, built on `xml`.
+sax = ["dep:oxixml-sax", "xml"]
+## The XDM (XPath/XQuery/XSLT Data Model) tree that `xpath`/`xquery`/`xslt`/`schema` evaluate over.
+infoset = ["dep:oxixml-infoset", "xml"]
+## An HTML5 tokenizer and tree constructor producing an ordinary `dom` document.
+html = ["dep:oxixml-html", "dom"]
+## A typed SVG document model, microsyntax toolkit, geometry engine, builder, and linter, built on `dom`.
+svg = ["dep:oxixml-svg", "dom"]
+## DTD parsing, content-model compilation, and instance validation.
+dtd = ["dep:oxixml-dtd", "xml"]
+## W3C XML Schema (XSD) 1.0/1.1 assembly and validation.
+schema = ["dep:oxixml-schema", "dom", "xpath"]
+## RELAX NG, both the XML and the compact syntax.
+relaxng = ["dep:oxixml-relaxng", "dom"]
+## ISO Schematron rules, compiled and run over `xpath`.
+schematron = ["dep:oxixml-schematron", "xml", "xpath"]
+## OASIS XML Catalogs: `public`/`system`/URI resolution and rewriting.
+catalog = ["dep:oxixml-catalog", "xml"]
+## XInclude processing over a `dom` tree.
+xinclude = ["dep:oxixml-xinclude", "dom"]
+## The XPath/XQuery/XSLT Functions & Operators (F&O) library, over `infoset`.
+functions = ["dep:oxixml-fn", "infoset"]
+## XPath 1.0-3.1, evaluated over `infoset`.
+xpath = ["dep:oxixml-xpath", "infoset"]
+## XQuery 3.1, built on `xpath`.
+xquery = ["dep:oxixml-xquery", "xpath"]
+## XSLT 1.0, plus the essentials of 2.0/3.0, built on `xpath` and `dom`.
+xslt = ["dep:oxixml-xslt", "xpath", "dom"]
+## Canonical XML 1.0/1.1/2.0 and Exclusive XML Canonicalization, over `dom`.
+c14n = ["dep:oxixml-c14n", "dom"]
+## XML Signature (XML-DSig) generation and verification, over `c14n`.
+dsig = ["dep:oxixml-dsig", "c14n"]
+## XML Encryption (XML-ENC) element/content encryption and decryption, over `dom`.
+enc = ["dep:oxixml-enc", "dom"]
+## An XSL-FO 1.1 formatting-object tree, property refinement, and area-model primitives.
+fo = ["dep:oxixml-fo", "xml"]
+## The core RDF/RDF-star data model: `NamedNode`, `BlankNode`, `Literal`, `Triple`, `Quad`, `Dataset`.
+rdf = ["dep:oxixml-model"]
+## A streaming JSON event parser/serializer, shared by `jsonld` and `sparql-results`.
+json = ["dep:oxixml-json"]
+## Turtle, TriG, N-Triples, N-Quads, and N3.
+turtle = ["dep:oxixml-turtle", "rdf"]
+## RDF/XML.
+rdfxml = ["dep:oxixml-rdfxml", "rdf", "xml"]
+## JSON-LD 1.1: expand, compact, flatten, and the `toRdf`/`fromRdf` algorithms.
+jsonld = ["dep:oxixml-jsonld", "rdf", "json"]
+## RDFa 1.1 Core, extracted from an `html` document.
+rdfa = ["dep:oxixml-rdfa", "rdf", "html"]
+## TriX, the XML serialization of an RDF dataset.
+trix = ["dep:oxixml-trix", "rdf", "xml"]
+## HDT (Header-Dictionary-Triples), a compact binary RDF representation.
+hdt = ["dep:oxixml-hdt", "rdf"]
+## RDF Dataset Canonicalization (RDFC-1.0 / URDNA2015).
+canon = ["dep:oxixml-canon", "rdf"]
+## Unified RDF format detection, parsing, and serialization across `turtle`/`rdfxml`/`jsonld`/`trix`.
+rdfio = ["dep:oxixml-io", "turtle", "rdfxml", "jsonld", "trix"]
+## Constants for RDF, RDFS, OWL, SKOS, Dublin Core, and a dozen other well-known vocabularies.
+vocab = ["dep:oxixml-vocab", "rdf"]
+## The SPARQL 1.1 Query Results XML/JSON/CSV/TSV formats.
+sparql-results = ["dep:oxixml-sparql-results", "rdf", "xml", "json"]
+## SPARQL 1.1/1.2 Query and Update grammars.
+sparql-syntax = ["dep:oxixml-sparql-syntax", "rdf"]
+
+# -------------------------------------------------------------------------------------------------
+# Cross-cutting modifiers.
+#
+# These do not pull in a crate of their own: they forward a leaf crate's own Cargo feature through
+# the facade with `pkg?/feature` syntax, so they only take effect on whichever wrapped crates are
+# already enabled. Combine them with the crate features above, e.g. `["turtle", "rdf-12"]`.
+# -------------------------------------------------------------------------------------------------
+
+## RDF 1.2 / RDF-star: triple terms and base-direction language strings, across the data model,
+## the Turtle/TriG/N-Triples/N-Quads parsers, canonicalization, `rdfio`, and the SPARQL result
+## formats.
+rdf-12 = [
+    "oxixml-model?/rdf-12",
+    "oxixml-turtle?/rdf-12",
+    "oxixml-canon?/rdf-12",
+    "oxixml-io?/rdf-12",
+    "oxixml-sparql-results?/rdf-12",
+]
+## The [RDF Canonicalization algorithm 1.0](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0) built into
+## the `rdf` data model, i.e. `model::dataset::CanonicalizationAlgorithm::Rdfc10`.
+rdfc-10 = ["oxixml-model?/rdfc-10"]
+## SPARQL 1.2: the `VERSION` declaration and triple-term/reifier syntax in `sparql-syntax`.
+sparql-12 = ["oxixml-sparql-syntax?/sparql-12"]
+
+## serde `Serialize`/`Deserialize` support in `xml` (`xml::de`, `xml::se`).
+serialize = [
+    "xml",
+    "oxixml-xml/serialize",
+    "oxixml-quickxml-compat?/serialize",
+]
+## Ready-made serde helpers and newtypes in `xml::serde_helpers`.
+serde-types = [
+    "xml",
+    "oxixml-xml/serde-types",
+    "oxixml-quickxml-compat?/serde-types",
+]
+## `tokio`-based asynchronous reading and writing, across `xml` and every RDF
+## and SPARQL-results format that is enabled: `for_tokio_async_reader` /
+## `for_tokio_async_writer` on the Turtle-family, RDF/XML, JSON-LD, TriX and
+## umbrella parsers and serializers, plus the asynchronous SPARQL query-results
+## parser and serializer.
+async-tokio = [
+    "xml",
+    "oxixml-xml/async-tokio",
+    "oxixml-quickxml-compat?/async-tokio",
+    "oxixml-json?/async-tokio",
+    "oxixml-turtle?/async-tokio",
+    "oxixml-rdfxml?/async-tokio",
+    "oxixml-jsonld?/async-tokio",
+    "oxixml-trix?/async-tokio",
+    "oxixml-io?/async-tokio",
+    "oxixml-sparql-results?/async-tokio",
+]
+## Recognize the full set of HTML5 character references when unescaping in `xml`.
+escape-html = [
+    "xml",
+    "oxixml-xml/escape-html",
+    "oxixml-quickxml-compat?/escape-html",
+]
+## Allow non-contiguous repeated fields when deserializing sequences with `xml`'s serde support.
+overlapped-lists = [
+    "xml",
+    "oxixml-xml/overlapped-lists",
+    "oxixml-quickxml-compat?/overlapped-lists",
+]
+
+## Every feature in one shot.
+full = [
+    "support",
+    "unicode",
+    "encoding",
+    "text",
+    "regex",
+    "iri",
+    "langtag",
+    "xsd",
+    "qname",
+    "xml",
+    "quickxml-compat",
+    "dom",
+    "sax",
+    "infoset",
+    "html",
+    "svg",
+    "dtd",
+    "schema",
+    "relaxng",
+    "schematron",
+    "catalog",
+    "xinclude",
+    "functions",
+    "xpath",
+    "xquery",
+    "xslt",
+    "c14n",
+    "dsig",
+    "enc",
+    "fo",
+    "rdf",
+    "json",
+    "turtle",
+    "rdfxml",
+    "jsonld",
+    "rdfa",
+    "trix",
+    "hdt",
+    "canon",
+    "rdfio",
+    "vocab",
+    "sparql-results",
+    "sparql-syntax",
+    "rdf-12",
+    "rdfc-10",
+    "sparql-12",
+    "serialize",
+    "serde-types",
+    "async-tokio",
+    "escape-html",
+    "overlapped-lists",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

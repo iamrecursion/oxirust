@@ -1,0 +1,23 @@
+[package]
+name = "oxiui-text"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiText/OxiFont bridge for OxiUI text rendering"
+readme = "README.md"
+categories = ["text-processing", "gui"]
+keywords = ["text", "oxiui", "oxitext", "cooljapan", "pure-rust"]
+
+[features]
+default = []
+## Emoji rendering: detect emoji codepoints, route them to oxifont color glyph
+## extraction (CBDT/COLR), and scale them to match the current text size.
+emoji = ["dep:oxifont"]
+
+[dependencies]
+oxiui-core.workspace = true
+oxitext.workspace = true
+oxifont = { workspace = true, optional = true }

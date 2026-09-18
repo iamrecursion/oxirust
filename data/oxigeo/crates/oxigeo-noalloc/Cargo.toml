@@ -1,0 +1,21 @@
+[package]
+name = "oxigeo-noalloc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "no_std, no_alloc fixed-size geometry primitives for OxiGeo"
+keywords = ["geospatial", "geometry", "no_std", "embedded"]
+categories = ["no-std", "science::geo"]
+
+[features]
+default = []
+std = []
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

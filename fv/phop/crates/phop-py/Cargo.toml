@@ -1,0 +1,27 @@
+[package]
+name = "phop-py"
+# Ships to PyPI via maturin (pypi-publish.yml); not published to crates.io
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Python bindings (PyO3) for phop: differentiable symbolic discovery on the EML operator"
+readme = "README.md"
+keywords = ["symbolic-regression", "machine-learning", "python", "pyo3", "eml"]
+categories = ["science", "api-bindings", "mathematics"]
+
+[lib]
+name = "phop"
+crate-type = ["cdylib", "rlib"]
+# No unit-test harness: this crate links against the host Python interpreter at load time
+# (pyo3 `extension-module`), so a standalone `cargo test` binary would have no `_Py*` symbols
+# to resolve at runtime. Python-side behavior is exercised via maturin + pytest instead.
+test = false
+
+[dependencies]
+phop-core.workspace = true
+scirs2-core.workspace = true
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
+numpy = "0.29"

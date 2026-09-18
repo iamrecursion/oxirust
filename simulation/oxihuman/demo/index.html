@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="description"
+        content="OxiHuman BodyLab — a privacy-first human body generator that runs entirely in your browser. Zero bytes uploaded.">
+  <title>OxiHuman BodyLab — client-side human body generator</title>
+
+  <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧍</text></svg>">
+  <link rel="stylesheet" href="./styles.css">
+
+  <!-- Resolve the bare specifier `three` (used by the vendored OrbitControls)
+       to the locally vendored ESM build. No CDN, no bundler. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three.module.min.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#controls">Skip to controls</a>
+
+  <div class="app" id="app">
+
+    <!-- ── Header ─────────────────────────────────────────────────────── -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">🧍</span>
+        <span class="brand-name">OxiHuman</span>
+        <span class="brand-sub">BodyLab</span>
+      </div>
+      <p class="topbar-tag">A human body, generated entirely in your browser.</p>
+      <div class="spacer"></div>
+      <div class="privacy-pill" title="This page makes no uploads. All morphing, measuring and export run on-device in WebAssembly.">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="privacy-badge">0&nbsp;bytes uploaded</span>
+      </div>
+    </header>
+
+    <!-- ── Stage (3-D canvas) ─────────────────────────────────────────── -->
+    <main class="stage">
+      <canvas id="stage-canvas" aria-label="Interactive 3-D preview of the generated human body. Drag to orbit."></canvas>
+
+      <!-- Live honest metrics overlay -->
+      <div class="hud" role="status" aria-live="off">
+        <span class="hud-chip"><strong id="hud-fps">–</strong> fps</span>
+        <span class="hud-chip"><strong id="hud-verts">–</strong> verts</span>
+        <span class="hud-chip hud-wasm"><strong id="hud-wasm">–</strong> wasm</span>
+        <span class="hud-chip hud-pack"><strong id="hud-pack">–</strong> pack</span>
+      </div>
+
+      <!-- Loading overlay -->
+      <div class="overlay" id="loading" role="status" aria-live="polite">
+        <div class="spinner" aria-hidden="true"></div>
+        <p class="overlay-title" id="loading-title">Starting OxiHuman…</p>
+        <div class="progress" aria-hidden="true"><div class="progress-bar" id="loading-bar"></div></div>
+        <p class="overlay-sub" id="loading-sub">Loading the WebAssembly engine.</p>
+      </div>
+
+      <!-- Error panel (hidden by default) -->
+      <div class="overlay overlay-error" id="error-panel" hidden>
+        <h2 class="overlay-title">Demo assets are not built yet</h2>
+        <p class="overlay-sub" id="error-detail">The WebAssembly package or the core pack could not be loaded.</p>
+        <p class="overlay-sub">From the repository root, run:</p>
+        <pre class="build-cmd"><code>scripts/build_demo.sh</code></pre>
+        <p class="overlay-sub">then reload this page (served via <code>python3 -m http.server</code> from <code>demo/</code>).</p>
+      </div>
+    </main>
+
+    <!-- ── Controls ───────────────────────────────────────────────────── -->
+    <aside class="panel" id="controls" aria-label="Body controls">
+
+      <!-- 1. Measurement fit -->
+      <section class="card" aria-labelledby="fit-h">
+        <h2 class="card-h" id="fit-h">Fit to measurements</h2>
+        <p class="card-note">Type real centimetres, then fit. The engine re-measures the
+          resulting mesh and reports the honest Δ.</p>
+
+        <div class="measure-grid">
+          <label class="field">
+            <span>Height</span>
+            <span class="input-cm"><input type="number" id="m-height" inputmode="decimal"
+                   min="120" max="230" step="0.5" value="172"><em>cm</em></span>
+          </label>
+          <label class="field">
+            <span>Chest</span>
+            <span class="input-cm"><input type="number" id="m-chest" inputmode="decimal"
+                   min="60" max="160" step="0.5" value="96"><em>cm</em></span>
+          </label>
+          <label class="field">
+            <span>Waist</span>
+            <span class="input-cm"><input type="number" id="m-waist" inputmode="decimal"
+                   min="50" max="160" step="0.5" value="82"><em>cm</em></span>
+          </label>
+          <label class="field">
+            <span>Hip</span>
+            <span class="input-cm"><input type="number" id="m-hip" inputmode="decimal"
+                   min="60" max="170" step="0.5" value="98"><em>cm</em></span>
+          </label>
+        </div>
+
+        <button class="btn btn-primary" id="btn-fit" type="button" disabled>
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Fit body</span>
+        </button>
+
+        <table class="readout" id="fit-readout" hidden>
+          <thead>
+            <tr><th scope="col">Measure</th><th scope="col">Target</th><th scope="col">Measured</th><th scope="col">Δ</th></tr>
+          </thead>
+          <tbody id="fit-readout-body"></tbody>
+        </table>
+        <p class="fit-meta" id="fit-meta" hidden></p>
+      </section>
+
+      <!-- 2. Live parameters -->
+      <section class="card" aria-labelledby="param-h">
+        <h2 class="card-h" id="param-h">Shape parameters</h2>
+        <p class="card-note">Drag for a live 60&nbsp;fps morph.</p>
+        <div class="sliders" id="sliders"><!-- built by controls.js --></div>
+      </section>
+
+      <!-- 3. Presets -->
+      <section class="card" aria-labelledby="preset-h">
+        <h2 class="card-h" id="preset-h">Presets</h2>
+        <div class="preset-row" id="presets">
+          <button class="btn btn-ghost" type="button" data-preset="average"  disabled>Average</button>
+          <button class="btn btn-ghost" type="button" data-preset="athletic" disabled>Athletic</button>
+          <button class="btn btn-ghost" type="button" data-preset="slender"  disabled>Slender</button>
+          <button class="btn btn-ghost" type="button" data-preset="heavy"    disabled>Heavy</button>
+          <button class="btn btn-ghost" type="button" data-preset="tall"     disabled>Tall</button>
+          <button class="btn btn-ghost" type="button" data-preset="__reset"  disabled>Reset</button>
+        </div>
+      </section>
+
+      <!-- 4. Export -->
+      <section class="card" aria-labelledby="export-h">
+        <h2 class="card-h" id="export-h">Export</h2>
+        <p class="card-note">Generated on-device. Files download straight from memory.</p>
+        <div class="export-grid">
+          <button class="btn btn-export" type="button" id="ex-glb" disabled>GLB</button>
+          <button class="btn btn-export" type="button" id="ex-vrm" disabled>VRM</button>
+          <button class="btn btn-export" type="button" id="ex-stl" disabled>STL</button>
+          <button class="btn btn-export" type="button" id="ex-obj" disabled>OBJ</button>
+        </div>
+        <p class="export-status" id="export-status" aria-live="polite"></p>
+      </section>
+
+      <footer class="panel-foot">
+        <span id="foot-version">OxiHuman</span> ·
+        <a href="https://github.com/cool-japan/oxihuman" target="_blank" rel="noopener">source</a> ·
+        Apache-2.0
+      </footer>
+    </aside>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

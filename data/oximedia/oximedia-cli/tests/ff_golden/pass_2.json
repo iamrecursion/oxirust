@@ -1,0 +1,8 @@
+{
+  "name": "pass_2",
+  "args": ["-i", "in.mkv", "-pass", "2", "-passlogfile", "/tmp/log", "out.mkv"],
+  "expect": {
+    "jobs": 1,
+    "pass": 2
+  }
+}

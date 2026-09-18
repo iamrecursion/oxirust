@@ -1,0 +1,60 @@
+[package]
+name = "optirs-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly bindings for OptiRS - High-performance optimizer and scheduler library for the browser"
+keywords = ["optimization", "wasm", "webassembly", "machine-learning", "deep-learning"]
+categories = ["wasm", "science", "mathematics"]
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+optirs-core = { workspace = true }
+scirs2-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# WASM dependencies (optional, enabled via `wasm` feature)
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true, features = ["console", "Window", "Performance"] }
+serde-wasm-bindgen = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+
+# Force getrandom 0.2 (transitive via rand/statrs/scirs2) to use js backend on wasm32
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_02 = { workspace = true }
+
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
+[features]
+default = []
+wasm = [
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:serde-wasm-bindgen",
+    "dep:console_error_panic_hook",
+    "dep:getrandom",
+]
+# `navigator.gpu` and the WebGPU interfaces are still a W3C "unstable" API in
+# web-sys (typed bindings need per-type crate features *and* a
+# `--cfg=web_sys_unstable_apis` RUSTFLAG most consumers won't have set), so
+# `src/webgpu.rs` reaches them dynamically via `js_sys::Reflect` instead.
+# `Navigator` (stable) is the only extra web-sys type actually needed.
+webgpu = [
+    "wasm",
+    "web-sys/Navigator",
+]

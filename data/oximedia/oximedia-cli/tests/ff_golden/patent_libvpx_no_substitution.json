@@ -1,0 +1,9 @@
+{
+  "name": "patent_libvpx_no_substitution",
+  "args": ["-i", "in.webm", "-c:v", "libvpx", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_codec": "vp8"
+  }
+}

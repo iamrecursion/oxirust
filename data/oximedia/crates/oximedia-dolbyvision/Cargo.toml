@@ -1,0 +1,32 @@
+[package]
+name = "oximedia-dolbyvision"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Dolby Vision RPU metadata parser/writer for OxiMedia (metadata-only, respects Dolby IP)"
+keywords = ["dolby-vision", "hdr", "color", "video", "multimedia"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+thiserror.workspace = true
+bitflags.workspace = true
+bytes.workspace = true
+
+# Bitstream I/O for RPU parsing/writing
+oximedia-bitstream.workspace = true
+
+# Serialization for metadata structures
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

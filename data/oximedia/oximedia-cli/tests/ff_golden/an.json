@@ -1,0 +1,9 @@
+{
+  "name": "an",
+  "args": ["-i", "in.mkv", "-an", "video.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "no_audio": true
+  }
+}

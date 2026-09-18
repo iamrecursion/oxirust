@@ -1,0 +1,55 @@
+[package]
+name = "oxixml-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Command-line XML/RDF toolkit: fmt, lint, validate, transform, query, canon, convert, hdt, sparql, svg (replaces xmllint/xsltproc/rapper)."
+keywords = ["xml", "cli", "rdf", "xslt", "validate"]
+categories = ["command-line-utilities", "parser-implementations"]
+readme = "README.md"
+default-run = "oxixml"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bin]]
+name = "oxixml"
+path = "src/main.rs"
+# The rustdoc output path for this bin collides with the `oxixml` library crate
+# (rust-lang/cargo#6313); the binary's rustdoc adds nothing over `--help`.
+doc = false
+
+[dependencies]
+oxixml-iri = { workspace = true }
+oxixml-xml = { workspace = true }
+oxixml-dom = { workspace = true }
+oxixml-sax = { workspace = true }
+oxixml-infoset = { workspace = true }
+oxixml-dtd = { workspace = true }
+oxixml-schema = { workspace = true }
+oxixml-relaxng = { workspace = true }
+oxixml-schematron = { workspace = true }
+oxixml-catalog = { workspace = true }
+oxixml-xinclude = { workspace = true }
+oxixml-fn = { workspace = true }
+oxixml-xpath = { workspace = true }
+oxixml-xquery = { workspace = true }
+oxixml-xslt = { workspace = true }
+oxixml-c14n = { workspace = true }
+oxixml-model = { workspace = true }
+oxixml-canon = { workspace = true }
+oxixml-hdt = { workspace = true }
+oxixml-io = { workspace = true }
+oxixml-sparql-results = { workspace = true }
+oxixml-sparql-syntax = { workspace = true }
+oxixml-svg = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

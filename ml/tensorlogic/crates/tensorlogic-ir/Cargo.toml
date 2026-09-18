@@ -1,0 +1,23 @@
+[package]
+name = "tensorlogic-ir"
+version.workspace = true
+description = "Intermediate representation (IR) and AST types for TensorLogic"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tensorlogic-ir"
+readme = "README.md"
+keywords = ["tensor", "logic", "compiler-ir", "type-system", "compiler"]
+categories = ["science", "algorithms", "mathematics"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+oxicode.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true

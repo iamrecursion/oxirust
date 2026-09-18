@@ -1,0 +1,175 @@
+[package]
+name = "oximedia-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Command-line interface for OxiMedia"
+categories = ["multimedia", "command-line-utilities"]
+keywords = ["oximedia", "video", "audio", "cli", "transcode"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+# doc = false on every [[bin]]: the `oximedia` bin's rustdoc output would
+# collide with the workspace's `oximedia` facade *library* docs under
+# target/doc/oximedia (cargo #6313 — bin/lib doc name collisions are
+# last-write-wins); the other bins are excluded for consistency (binary
+# docs carry no API surface).
+[[bin]]
+name = "oximedia"
+path = "src/main.rs"
+doc = false
+
+[[bin]]
+name = "oximedia-ff"
+path = "src/bin/oximedia-ff.rs"
+doc = false
+
+[[bin]]
+name = "oximedia-cv2"
+path = "src/bin/oximedia-cv2.rs"
+doc = false
+
+[dependencies]
+oximedia-compat-cv2.workspace = true
+oximedia-compat-ffmpeg.workspace = true
+oximedia-plugin.workspace = true
+oximedia-mir.workspace = true
+oximedia-core.workspace = true
+oximedia-distributed.workspace = true
+oximedia-farm.workspace = true
+oximedia-renderfarm.workspace = true
+oximedia-net.workspace = true
+oximedia-access.workspace = true
+oximedia-rights.workspace = true
+oximedia-auto.workspace = true
+oximedia-transcode.workspace = true
+oximedia-io.workspace = true
+oximedia-container.workspace = true
+oximedia-codec = { workspace = true, default-features = true, features = ["av1", "vp9", "vp8"] }
+oximedia-graph.workspace = true
+oximedia-quality.workspace = true
+oximedia-scene.workspace = true
+oximedia-shots.workspace = true
+oximedia-audio-analysis.workspace = true
+oximedia-metering.workspace = true
+oximedia-normalize.workspace = true
+oximedia-subtitle.workspace = true
+oximedia-lut.workspace = true
+oximedia-denoise.workspace = true
+oximedia-scopes.workspace = true
+oximedia-stabilize.workspace = true
+oximedia-graphics.workspace = true
+oximedia-multicam.workspace = true
+oximedia-edl.workspace = true
+oximedia-packager.workspace = true
+oximedia-forensics.workspace = true
+oximedia-monitor.workspace = true
+oximedia-restore.workspace = true
+oximedia-audio.workspace = true
+oximedia-captions.workspace = true
+oximedia-timecode.workspace = true
+oximedia-search.workspace = true
+oximedia-repair.workspace = true
+oximedia-colormgmt.workspace = true
+oximedia-playlist.workspace = true
+oximedia-conform.workspace = true
+oximedia-storage.workspace = true
+oximedia-metadata.workspace = true
+oximedia-archive.workspace = true
+oximedia-watermark.workspace = true
+oximedia-image.workspace = true
+oximedia-imf.workspace = true
+oximedia-qc = { workspace = true, features = ["database"] }
+oximedia-aaf.workspace = true
+oximedia-mixer.workspace = true
+oximedia-audiopost.workspace = true
+oximedia-gaming.workspace = true
+oximedia-virtual.workspace = true
+oximedia-profiler.workspace = true
+oximedia-recommend.workspace = true
+oximedia-scaling.workspace = true
+oximedia-playout.workspace = true
+oximedia-switcher.workspace = true
+oximedia-workflow = { workspace = true, features = ["sqlite"] }
+oximedia-ndi.workspace = true
+oximedia-videoip.workspace = true
+oximedia-drm.workspace = true
+oximedia-dedup.workspace = true
+oximedia-batch = { workspace = true, features = ["sqlite"] }
+oximedia-archive-pro.workspace = true
+oximedia-proxy.workspace = true
+oximedia-dolbyvision.workspace = true
+oximedia-ml = { workspace = true, optional = true }
+oximedia-caption-gen = { workspace = true, optional = true, features = ["onnx"] }
+# Provides `ndarray::Array2`, the pixel-plane container used by
+# `oximedia-stabilize::Frame` for the `restore video --mode stabilize` path.
+scirs2-core = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+# Stream a local file into `oximedia_storage::ByteStream` for the real
+# `cloud upload --multipart` path (see cloud_cmd.rs::file_byte_stream).
+bytes.workspace = true
+futures.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+crossterm = "0.29"
+indicatif = "0.18"
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap_complete.workspace = true
+clap_mangen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+colored = "3"
+rayon.workspace = true
+num_cpus.workspace = true
+chrono.workspace = true
+humantime = "2"
+dirs = { workspace = true }
+
+[features]
+default = []
+# Enable the cv2.dnn family in the `oximedia-cv2` binary (`dnn-forward`
+# subcommand). Pulls in `oxionnx` via the `oximedia-compat-cv2/dnn`
+# passthrough; without this feature the subcommand is compiled out so the
+# binary still builds with no extra runtime cost.
+dnn = ["oximedia-compat-cv2/dnn"]
+# Enable the S3 cloud upload/download backend (pulls in aws-sdk-s3 via oximedia-storage).
+s3 = ["oximedia-storage/s3"]
+# Enable the Azure Blob Storage cloud upload/download backend.
+azure = ["oximedia-storage/azure"]
+# Enable the Google Cloud Storage cloud upload/download backend.
+gcs = ["oximedia-storage/gcs"]
+# Enable the `oximedia ml ...` subcommand family.
+#
+# Without this feature, the `ml` subcommand is still wired into the clap
+# dispatcher so users get a friendly "--features ml" error message rather
+# than `clap` treating the verb as unknown. Turning this on pulls in the
+# Pure-Rust `oximedia-ml` crate (with serde, for --json output).
+ml = ["dep:oximedia-ml", "oximedia-ml/serde"]
+# Enable every built-in pipeline in the `ml` command surface.
+ml-all-pipelines = ["ml", "oximedia-ml/all-pipelines"]
+# Enable the real ASR-driven `captions generate` pipeline.
+#
+# Without this feature, `captions generate` returns an informative error
+# directing the user to rebuild with `--features caption-gen`.
+# Enabling this pulls in `oximedia-caption-gen` with its ONNX runtime.
+# At runtime the user must also supply `--model <encoder.onnx>` and
+# `--vocab <vocab.json>` to the `captions generate` subcommand.
+caption-gen = ["dep:oximedia-caption-gen", "dep:oximedia-ml"]
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd = "2"
+predicates = "3"
+serde.workspace = true
+serde_json.workspace = true

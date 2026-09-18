@@ -1,0 +1,26 @@
+[package]
+name = "tensorlogic-oxicuda-solver"
+version.workspace = true
+description = "OxiCUDA linear solver wrapper for TensorLogic (GPU + CPU fallback)"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["solver", "linear-algebra", "gpu", "cuda", "decomposition"]
+categories = ["science", "algorithms", "mathematics"]
+
+[features]
+default = ["cpu"]
+cpu = []
+gpu = ["dep:oxicuda-solver", "dep:oxicuda-driver", "dep:oxicuda-memory"]
+
+[dependencies]
+thiserror.workspace = true
+scirs2-core.workspace = true
+oxicuda-solver = { workspace = true, optional = true }
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx.workspace = true

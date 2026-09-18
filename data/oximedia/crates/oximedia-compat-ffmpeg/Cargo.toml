@@ -1,0 +1,26 @@
+[package]
+name = "oximedia-compat-ffmpeg"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "FFmpeg CLI argument compatibility layer for OxiMedia"
+keywords = ["ffmpeg", "compatibility", "transcoding", "multimedia", "codec"]
+categories = ["multimedia::encoding"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-transcode.workspace = true
+oximedia-graph.workspace = true
+oximedia-lut.workspace = true
+oximedia-subtitle.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

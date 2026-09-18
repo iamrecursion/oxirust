@@ -1,0 +1,1437 @@
+//! Auto-generated module
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+
+use crate::GpuOptimError;
+use scirs2_core::ndarray::Array2;
+use scirs2_core::numeric::Float;
+use std::fmt::Debug;
+
+/// Adam optimizer hyperparameters
+#[derive(Debug, Clone)]
+pub struct AdamParams<T: Float> {
+    /// Learning rate
+    pub lr: T,
+    /// First moment decay rate
+    pub beta1: T,
+    /// Second moment decay rate
+    pub beta2: T,
+    /// Epsilon for numerical stability
+    pub eps: T,
+    /// Weight decay coefficient
+    pub weight_decay: T,
+    /// Current optimization step
+    pub step: i32,
+}
+impl<T: Float> AdamParams<T> {
+    /// Create new Adam parameters with the usual default hyper-parameters.
+    ///
+    /// Returns [`GpuOptimError::InvalidState`] if the target float type cannot
+    /// represent one of the default constants — which never happens for `f32`
+    /// or `f64`, but is reported honestly instead of panicking.
+    pub fn new(lr: T) -> Result<Self, GpuOptimError> {
+        let cvt = |value: f64| {
+            T::from(value).ok_or_else(|| {
+                GpuOptimError::InvalidState(format!(
+                    "cannot represent {value} in the target float type"
+                ))
+            })
+        };
+        Ok(Self {
+            lr,
+            beta1: cvt(0.9)?,
+            beta2: cvt(0.999)?,
+            eps: cvt(1e-8)?,
+            weight_decay: cvt(0.0)?,
+            step: 0,
+        })
+    }
+}
+/// Resource requirements for workload
+#[derive(Debug, Clone)]
+pub struct ResourceRequirements {
+    /// Memory requirements (bytes)
+    pub memory_bytes: usize,
+    /// Compute requirements (FLOPS)
+    pub compute_flops: f64,
+    /// Bandwidth requirements (GB/s)
+    pub bandwidth_gbps: f64,
+    /// Number of tensor cores needed
+    pub tensor_cores: usize,
+}
+/// Memory layout change descriptor
+#[derive(Debug, Clone)]
+pub struct LayoutChange {
+    /// Operation index
+    pub operation_index: usize,
+    /// Old layout
+    pub old_layout: MatrixLayout,
+    /// New layout
+    pub new_layout: MatrixLayout,
+    /// Transformation cost
+    pub transformation_cost: f64,
+}
+/// Sparse tensor core matrix with 2:4 structured sparsity
+#[derive(Debug, Clone)]
+pub struct SparseTensorCoreMatrix<T: Float + Debug + Send + Sync + 'static> {
+    /// Non-zero values in 2:4 sparse format
+    values: Vec<T>,
+    /// Sparse metadata for tensor cores
+    metadata: Vec<u8>,
+    /// Original dense shape
+    dense_m: usize,
+    dense_n: usize,
+    /// Sparsity ratio (should be ~0.5 for 2:4)
+    sparsity_ratio: f32,
+}
+impl<T: Float + Debug + Send + Sync + 'static> SparseTensorCoreMatrix<T> {
+    /// Create sparse matrix from dense matrix using 2:4 structured sparsity.
+    ///
+    /// Each contiguous group of four columns keeps its (up to) two
+    /// largest-magnitude entries. `values[i]` and `metadata[i]` are parallel:
+    /// `metadata[i]` is the in-group column offset (`0..=3`) of `values[i]`, and
+    /// the kept pair is stored in ascending column order so the layout is
+    /// canonical and round-trips through [`to_dense`](Self::to_dense). The
+    /// magnitude comparison is NaN-safe (NaNs sort as equal rather than
+    /// panicking).
+    pub fn from_dense(dense: &Array2<T>) -> Self {
+        let (m, n) = dense.dim();
+        let mut values = Vec::new();
+        let mut metadata = Vec::new();
+        for row in 0..m {
+            for col_group in (0..n).step_by(4) {
+                let mut indexed_values: Vec<(usize, T)> = (0..4)
+                    .filter(|offset| col_group + offset < n)
+                    .map(|offset| (offset, dense[[row, col_group + offset]]))
+                    .collect();
+                // Keep the (up to) two largest-magnitude entries — that is what
+                // 2:4 structured pruning means. NaN-safe: a failed comparison
+                // orders the pair as equal instead of panicking.
+                indexed_values.sort_by(|a, b| {
+                    b.1.abs()
+                        .partial_cmp(&a.1.abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                indexed_values.truncate(2);
+                // Emit in ascending column order for a canonical, reconstructable
+                // metadata stream.
+                indexed_values.sort_by_key(|&(offset, _)| offset);
+                for (offset, val) in indexed_values {
+                    values.push(val);
+                    metadata.push(offset as u8);
+                }
+            }
+        }
+        let sparsity_ratio = 1.0 - (values.len() as f32 / (m * n) as f32);
+        Self {
+            values,
+            metadata,
+            dense_m: m,
+            dense_n: n,
+            sparsity_ratio,
+        }
+    }
+
+    /// Reconstruct the pruned dense matrix (pruned entries become zero).
+    ///
+    /// Mirrors [`from_dense`](Self::from_dense)'s grouping exactly, so
+    /// `from_dense(&a).to_dense()` reproduces `a` with every non-kept entry
+    /// zeroed — the check that proves the `values`/`metadata` pair is usable.
+    pub fn to_dense(&self) -> Array2<T> {
+        let mut dense = Array2::zeros((self.dense_m, self.dense_n));
+        let mut cursor = 0;
+        for row in 0..self.dense_m {
+            for col_group in (0..self.dense_n).step_by(4) {
+                let group_len = (self.dense_n - col_group).min(4);
+                let kept = group_len.min(2);
+                for _ in 0..kept {
+                    if cursor >= self.values.len() {
+                        return dense;
+                    }
+                    let offset = self.metadata[cursor] as usize;
+                    dense[[row, col_group + offset]] = self.values[cursor];
+                    cursor += 1;
+                }
+            }
+        }
+        dense
+    }
+    /// Get dense shape
+    pub fn denseshape(&self) -> (usize, usize) {
+        (self.dense_m, self.dense_n)
+    }
+    /// Get pointer to values for GPU kernels
+    pub fn values_ptr(&self) -> *const T {
+        self.values.as_ptr()
+    }
+    /// Get pointer to metadata for GPU kernels
+    pub fn metadata_ptr(&self) -> *const u8 {
+        self.metadata.as_ptr()
+    }
+    /// Get sparsity ratio
+    pub fn sparsity_ratio(&self) -> f32 {
+        self.sparsity_ratio
+    }
+}
+/// Mixed precision training manager with automatic loss scaling
+#[derive(Debug)]
+pub struct MixedPrecisionTrainer {
+    /// Current loss scale factor
+    loss_scale: f32,
+    /// Dynamic loss scaling enabled
+    dynamic_scaling: bool,
+    /// Growth factor for loss scale
+    growth_factor: f32,
+    /// Backoff factor for loss scale
+    backoff_factor: f32,
+    /// Growth interval (steps)
+    growth_interval: usize,
+    /// Current step count
+    step_count: usize,
+    /// Consecutive successful steps
+    successful_steps: usize,
+    /// Tensor core capabilities
+    tensor_core_info: TensorCoreInfo,
+    /// Automatic precision selection
+    auto_precision: bool,
+    /// Loss scale history for analysis
+    loss_scale_history: Vec<f32>,
+}
+impl MixedPrecisionTrainer {
+    /// Create new mixed precision trainer
+    pub fn new(
+        tensor_core_info: TensorCoreInfo,
+        config: &TensorCoreConfig,
+    ) -> Result<Self, GpuOptimError> {
+        Ok(Self {
+            loss_scale: 65536.0,
+            dynamic_scaling: true,
+            growth_factor: 2.0,
+            backoff_factor: 0.5,
+            growth_interval: 2000,
+            step_count: 0,
+            successful_steps: 0,
+            tensor_core_info,
+            auto_precision: config.auto_layout_optimization,
+            loss_scale_history: Vec::new(),
+        })
+    }
+    /// Update loss scale based on gradient overflow detection
+    pub fn update_loss_scale(&mut self, hasoverflow: bool) {
+        self.step_count += 1;
+        self.loss_scale_history.push(self.loss_scale);
+        if !self.dynamic_scaling {
+            return;
+        }
+        if hasoverflow {
+            self.loss_scale *= self.backoff_factor;
+            self.successful_steps = 0;
+        } else {
+            self.successful_steps += 1;
+            if self.successful_steps >= self.growth_interval {
+                self.loss_scale *= self.growth_factor;
+                self.successful_steps = 0;
+            }
+        }
+        self.loss_scale = self.loss_scale.clamp(1.0, 65536.0);
+    }
+    /// Get current loss scale
+    pub fn get_loss_scale(&self) -> f32 {
+        self.loss_scale
+    }
+
+    /// Multiply `values` by the current loss scale in place.
+    ///
+    /// This is the forward half of AMP loss scaling: the loss (or its
+    /// gradients) is scaled up before the reduced-precision backward pass so
+    /// that small gradients survive `binary16` rounding.
+    pub fn scale(&self, values: &mut [f32]) {
+        for value in values.iter_mut() {
+            *value *= self.loss_scale;
+        }
+    }
+
+    /// Divide `grads` by the current loss scale and report whether the scaled
+    /// gradients overflowed (contained a non-finite value).
+    ///
+    /// On overflow the step must be discarded; either way the loss-scale
+    /// schedule is advanced through [`update_loss_scale`](Self::update_loss_scale)
+    /// so the scale grows on healthy runs and backs off after an overflow.
+    /// Returns `true` when an overflow was detected.
+    pub fn unscale_and_check(&mut self, grads: &mut [f32]) -> bool {
+        let inv_scale = if self.loss_scale != 0.0 {
+            1.0 / self.loss_scale
+        } else {
+            1.0
+        };
+        let mut overflow = false;
+        for grad in grads.iter_mut() {
+            if !grad.is_finite() {
+                overflow = true;
+            }
+            *grad *= inv_scale;
+        }
+        self.update_loss_scale(overflow);
+        overflow
+    }
+
+    /// Cast an `f32` slice to IEEE-754 `binary16` bit patterns, saturating to
+    /// the `binary16` finite range first.
+    ///
+    /// Delegates the conversion to [`crate::mixed_precision`], the crate's
+    /// single real `binary16` implementation, rather than reimplementing it.
+    pub fn cast_to_f16(&self, values: &[f32]) -> Vec<u16> {
+        values
+            .iter()
+            .map(|&v| {
+                crate::mixed_precision::f32_to_f16_bits(
+                    crate::mixed_precision::saturate_to_f16_range(v),
+                )
+            })
+            .collect()
+    }
+
+    /// Cast `binary16` bit patterns back to `f32`.
+    pub fn cast_from_f16(&self, bits: &[u16]) -> Vec<f32> {
+        bits.iter()
+            .copied()
+            .map(crate::mixed_precision::f16_bits_to_f32)
+            .collect()
+    }
+
+    /// Select optimal precision for current operation
+    pub fn select_optimal_precision(
+        &self,
+        operation_type: TensorCoreOperationType,
+    ) -> TensorCorePrecision {
+        if !self.auto_precision {
+            return TensorCorePrecision::FP16;
+        }
+        match operation_type {
+            TensorCoreOperationType::GEMM => {
+                if self.tensor_core_info.supports_bf16 {
+                    TensorCorePrecision::BF16
+                } else if self.tensor_core_info.supports_fp16 {
+                    TensorCorePrecision::FP16
+                } else {
+                    TensorCorePrecision::TF32
+                }
+            }
+            TensorCoreOperationType::Convolution => {
+                if self.tensor_core_info.supports_tf32 {
+                    TensorCorePrecision::TF32
+                } else {
+                    TensorCorePrecision::FP16
+                }
+            }
+            TensorCoreOperationType::Attention => {
+                if self.tensor_core_info.supports_fp8 {
+                    TensorCorePrecision::FP8
+                } else if self.tensor_core_info.supports_bf16 {
+                    TensorCorePrecision::BF16
+                } else {
+                    TensorCorePrecision::FP16
+                }
+            }
+        }
+    }
+    /// Get training statistics
+    pub fn get_statistics(&self) -> MixedPrecisionStats {
+        let average_loss_scale = if self.loss_scale_history.is_empty() {
+            self.loss_scale
+        } else {
+            self.loss_scale_history.iter().sum::<f32>() / self.loss_scale_history.len() as f32
+        };
+        MixedPrecisionStats {
+            current_loss_scale: self.loss_scale,
+            step_count: self.step_count,
+            successful_steps: self.successful_steps,
+            average_loss_scale,
+            loss_scale_updates: self.loss_scale_history.len(),
+        }
+    }
+}
+/// Types of memory access patterns
+#[derive(Debug, Clone, Copy)]
+pub enum AccessPatternType {
+    Sequential,
+    Strided,
+    Random,
+    Broadcast,
+    Gather,
+    Scatter,
+}
+/// Matrix memory layout options
+#[derive(Debug, Clone, Copy)]
+pub enum MatrixLayout {
+    RowMajor,
+    ColumnMajor,
+    TensorCoreOptimized,
+    HierarchicalTiling,
+}
+/// Load balancing strategies for pipeline optimization
+#[derive(Debug, Clone, Copy)]
+pub enum LoadBalancingStrategy {
+    RoundRobin,
+    WorkStealing,
+    PriorityBased,
+    AdaptiveLoad,
+}
+/// Types of tensor core operations
+#[derive(Debug, Clone)]
+pub enum TensorCoreOpType<T: Float + Debug + Send + Sync + 'static> {
+    GEMM {
+        a: Array2<T>,
+        b: Array2<T>,
+        alpha: T,
+        beta: T,
+    },
+    SparseGEMM {
+        a: Array2<T>,
+        b_sparse: SparseTensorCoreMatrix<T>,
+        alpha: T,
+        beta: T,
+    },
+    FusedAdam {
+        params: Array2<T>,
+        grads: Array2<T>,
+        exp_avg: Array2<T>,
+        exp_avg_sq: Array2<T>,
+        lr: T,
+        beta1: T,
+        beta2: T,
+        eps: T,
+        weight_decay: T,
+        step: i32,
+    },
+}
+/// Detailed tensor core operation descriptor
+#[derive(Debug, Clone)]
+pub struct TensorCoreOperation<T: Float + Debug + Send + Sync + 'static> {
+    /// Operation type and parameters
+    pub op_type: TensorCoreOpType<T>,
+    /// Output dimensions
+    pub output_dims: (usize, usize),
+    /// Precision to use
+    pub precision: TensorCorePrecision,
+    /// Operation priority (higher = more important)
+    pub priority: i32,
+    /// Dependencies on other operations
+    pub dependencies: Vec<usize>,
+    /// Estimated compute cost
+    pub compute_cost: f64,
+    /// Memory bandwidth requirement
+    pub memory_bandwidth: f64,
+}
+/// Types of tensor core operations for precision selection
+#[derive(Debug, Clone, Copy)]
+pub enum TensorCoreOperationType {
+    GEMM,
+    Convolution,
+    Attention,
+}
+/// Hardware utilization state
+#[derive(Debug, Clone)]
+pub struct HardwareUtilizationState {
+    /// GPU utilization (%)
+    pub gpu_utilization: f32,
+    /// Memory utilization (%)
+    pub memory_utilization: f32,
+    /// Tensor core utilization (%)
+    pub tensor_core_utilization: f32,
+    /// Memory bandwidth utilization (%)
+    pub bandwidth_utilization: f32,
+    /// Temperature (Celsius)
+    pub temperature: f32,
+    /// Power consumption (Watts)
+    pub power_consumption: f32,
+}
+
+impl HardwareUtilizationState {
+    /// Conservative "assume nothing is under load" baseline.
+    ///
+    /// `scirs2-core` 0.6.x exposes no NVML/real device-telemetry API — even
+    /// its own [`scirs2_core::gpu::GpuContext::get_available_memory`] is a
+    /// documented placeholder — so this crate has no way to *measure* GPU
+    /// utilization, temperature or power. Rather than fabricate plausible
+    /// numbers, [`TensorCoreOptimizer::adaptive_tensor_core_scheduling`] uses
+    /// this all-idle baseline by default; callers with a real telemetry
+    /// source (e.g. `nvidia-smi`/NVML polled out of band) can supply actual
+    /// measurements through
+    /// [`TensorCoreOptimizer::adaptive_tensor_core_scheduling_with_state`]
+    /// instead.
+    pub fn unknown_baseline() -> Self {
+        Self {
+            gpu_utilization: 0.0,
+            memory_utilization: 0.0,
+            tensor_core_utilization: 0.0,
+            bandwidth_utilization: 0.0,
+            temperature: 25.0, // ambient room temperature, not a measurement
+            power_consumption: 0.0,
+        }
+    }
+}
+/// Tensor core capability information
+#[derive(Debug, Clone)]
+pub struct TensorCoreInfo {
+    pub compute_capability: (u32, u32),
+    pub supports_fp16: bool,
+    pub supports_bf16: bool,
+    pub supports_tf32: bool,
+    pub supports_fp8: bool,
+    pub supports_int8: bool,
+    pub supports_sparse: bool,
+    pub max_tensor_ops_per_second: f64,
+}
+/// Single performance measurement result
+#[derive(Debug, Clone)]
+pub struct TensorCorePerformanceResult {
+    pub avg_time_ms: f64,
+    pub tflops: f64,
+    pub memory_bandwidth_gb_s: f64,
+    pub tensor_core_utilization: f64,
+}
+/// Tensor core enhanced optimizer.
+///
+/// The struct carries no device handle: literal NVIDIA tensor-core execution is
+/// not reachable through `scirs2-core` on any backend this crate can open, so
+/// the real work this type does is CPU-side planning — matrix-layout
+/// optimization, precision selection and loss scaling. The WMMA GEMM entry
+/// points (`tensor_core_gemm`, `fused_adam_tensor_core`, ...) report
+/// [`GpuOptimError::UnsupportedOperation`] rather than fabricating a result.
+pub struct TensorCoreOptimizer {
+    /// Tensor core configuration
+    config: TensorCoreConfig,
+    /// Compute capability of the device. Always `(0, 0)`: `scirs2-core` 0.6.x
+    /// exposes no NVIDIA compute-capability probe, so no tensor-core hardware is
+    /// ever detected and every capability query is honestly negative.
+    compute_capability: (u32, u32),
+    /// Matrix layout optimization cache
+    layout_cache: std::collections::HashMap<(usize, usize, usize), OptimalLayout>,
+}
+impl TensorCoreOptimizer {
+    /// Create a new tensor core optimizer.
+    ///
+    /// Construction always succeeds. The CPU-side planning helpers are fully
+    /// functional; the device GEMM paths return
+    /// [`GpuOptimError::UnsupportedOperation`] because no reachable backend
+    /// exposes NVIDIA tensor cores.
+    pub fn new(config: TensorCoreConfig) -> Result<Self, GpuOptimError> {
+        Ok(Self {
+            config,
+            compute_capability: (0, 0),
+            layout_cache: std::collections::HashMap::new(),
+        })
+    }
+    /// Optimize matrix layout for tensor core operations
+    pub fn optimize_layout(&mut self, m: usize, n: usize, k: usize) -> OptimalLayout {
+        let cache_key = (m, n, k);
+        if let Some(cached) = self.layout_cache.get(&cache_key) {
+            return cached.clone();
+        }
+        let layout = self.compute_optimal_layout(m, n, k);
+        self.layout_cache.insert(cache_key, layout.clone());
+        layout
+    }
+    fn compute_optimal_layout(&self, m: usize, n: usize, k: usize) -> OptimalLayout {
+        let tile_m = self.config.wmma_tile_m;
+        let tile_n = self.config.wmma_tile_n;
+        let tile_k = self.config.wmma_tile_k;
+        let padding_m = (m.div_ceil(tile_m) * tile_m) - m;
+        let padding_n = (n.div_ceil(tile_n) * tile_n) - n;
+        let padding_k = (k.div_ceil(tile_k) * tile_k) - k;
+        let alignment_factor = if padding_m + padding_n + padding_k == 0 {
+            3.0
+        } else {
+            2.0
+        };
+        let tensor_core_factor = match self.compute_capability {
+            (major, _minor) if major >= 9 => 8.0,
+            (major, _minor) if major >= 8 => 6.0,
+            (major, minor) if major >= 7 && minor >= 5 => 4.0,
+            (major, _minor) if major >= 7 => 3.0,
+            _ => 1.5,
+        };
+        let speedup_factor = alignment_factor * tensor_core_factor;
+        let original_size = m * n + n * k + m * k;
+        let padded_size = (m + padding_m) * (n + padding_n)
+            + (n + padding_n) * (k + padding_k)
+            + (m + padding_m) * (k + padding_k);
+        let memory_overhead = (padded_size as f32 / original_size as f32) - 1.0;
+        OptimalLayout {
+            layout: MatrixLayout::TensorCoreOptimized,
+            padding_m,
+            padding_n,
+            padding_k,
+            speedup_factor,
+            memory_overhead,
+        }
+    }
+    /// Perform tensor core optimized matrix multiplication
+    ///
+    /// No reachable backend (CUDA/Metal/OpenCL/wgpu) has a real WMMA/tensor-
+    /// core dispatch path behind it yet, so every input is intentionally
+    /// unused and this always returns an honest `Err` rather than silently
+    /// falling back to a CPU matmul or fabricating a result — see
+    /// `test_tensor_core_batch_operations` and the sibling
+    /// `*_tensor_core_*` methods below, which are the same documented gap
+    /// (a genuine "not yet implemented" stub, not dead code: it is called
+    /// and tested).
+    pub fn tensor_core_gemm<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        _a: &Array2<T>,
+        _b: &Array2<T>,
+        _c: &mut Array2<T>,
+        _alpha: T,
+        _beta: T,
+        _precision: TensorCorePrecision,
+    ) -> Result<(), GpuOptimError> {
+        #[cfg(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        ))]
+        {
+            Err(GpuOptimError::UnsupportedOperation(
+                "Tensor core GEMM not yet implemented".to_string(),
+            ))
+        }
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        )))]
+        {
+            Err(GpuOptimError::CudaNotAvailable)
+        }
+    }
+    /// Fused Adam update with tensor core optimization
+    ///
+    /// Same documented gap as [`Self::tensor_core_gemm`]: no reachable
+    /// backend implements this fast path yet, so it always returns an
+    /// honest `Err` and every input is intentionally unused.
+    pub fn fused_adam_tensor_core<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        _params: &mut Array2<T>,
+        _grads: &Array2<T>,
+        _exp_avg: &mut Array2<T>,
+        _exp_avg_sq: &mut Array2<T>,
+        _adam_params: &AdamParams<T>,
+    ) -> Result<(), GpuOptimError> {
+        #[cfg(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        ))]
+        {
+            Err(GpuOptimError::UnsupportedOperation(
+                "Fused Adam tensor core not yet implemented".to_string(),
+            ))
+        }
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        )))]
+        {
+            Err(GpuOptimError::CudaNotAvailable)
+        }
+    }
+    /// Get tensor core capability information
+    pub fn get_tensor_core_info(&self) -> TensorCoreInfo {
+        TensorCoreInfo {
+            compute_capability: self.compute_capability,
+            supports_fp16: self.compute_capability >= (7, 0),
+            supports_bf16: self.compute_capability >= (8, 0),
+            supports_tf32: self.compute_capability >= (8, 0),
+            supports_fp8: self.compute_capability >= (9, 0),
+            supports_int8: self.compute_capability >= (7, 5),
+            supports_sparse: self.compute_capability >= (8, 0),
+            max_tensor_ops_per_second: self.estimate_tensor_ops_throughput(),
+        }
+    }
+    /// Automatic mixed precision trainer for optimizers
+    pub fn create_mixed_precision_trainer(&self) -> Result<MixedPrecisionTrainer, GpuOptimError> {
+        MixedPrecisionTrainer::new(self.get_tensor_core_info(), &self.config)
+    }
+    /// Sparse tensor core optimization for 2:4 structured sparsity
+    ///
+    /// Same documented gap as [`Self::tensor_core_gemm`]: no reachable
+    /// backend implements this fast path yet, so it always returns an
+    /// honest `Err` and every input is intentionally unused.
+    pub fn sparse_tensor_core_gemm<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        _a: &Array2<T>,
+        _b_sparse: &SparseTensorCoreMatrix<T>,
+        _c: &mut Array2<T>,
+        _alpha: T,
+        _beta: T,
+    ) -> Result<(), GpuOptimError> {
+        #[cfg(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        ))]
+        {
+            Err(GpuOptimError::UnsupportedOperation(
+                "Sparse tensor core GEMM not yet implemented".to_string(),
+            ))
+        }
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        )))]
+        {
+            Err(GpuOptimError::CudaNotAvailable)
+        }
+    }
+    /// Multi-batch tensor core operations for large-scale training
+    ///
+    /// Same documented gap as [`Self::tensor_core_gemm`]: no reachable
+    /// backend implements this fast path yet, so it always returns an
+    /// honest `Err` and every input is intentionally unused (see
+    /// `test_tensor_core_batch_operations`).
+    pub fn multi_batch_tensor_core_ops<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        _batches: &[TensorCoreBatch<T>],
+        _precision: TensorCorePrecision,
+    ) -> Result<Vec<Array2<T>>, GpuOptimError> {
+        #[cfg(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        ))]
+        {
+            Err(GpuOptimError::UnsupportedOperation(
+                "Multi-batch tensor core ops not yet implemented".to_string(),
+            ))
+        }
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        )))]
+        {
+            Err(GpuOptimError::CudaNotAvailable)
+        }
+    }
+    /// Advanced pipeline optimization for tensor core operations
+    ///
+    /// Same documented gap as [`Self::tensor_core_gemm`]: no reachable
+    /// backend implements this fast path yet, so it always returns an
+    /// honest `Err` and every input is intentionally unused.
+    pub fn optimized_pipeline_gemm<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        _operations: &[TensorCoreOperation<T>],
+        _pipeline_config: PipelineOptimizationConfig,
+    ) -> Result<Vec<Array2<T>>, GpuOptimError> {
+        #[cfg(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        ))]
+        {
+            Err(GpuOptimError::UnsupportedOperation(
+                "Optimized pipeline GEMM not yet implemented".to_string(),
+            ))
+        }
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        )))]
+        {
+            Err(GpuOptimError::CudaNotAvailable)
+        }
+    }
+    /// Dynamic memory coalescing optimization
+    pub fn optimize_memory_access_patterns<T: Float + Debug + Send + Sync + 'static>(
+        &mut self,
+        matrices: &[Array2<T>],
+    ) -> Result<Vec<OptimizedMatrix<T>>, GpuOptimError> {
+        let mut optimized_matrices = Vec::with_capacity(matrices.len());
+        for matrix in matrices {
+            let access_pattern = self.analyze_memory_access_pattern(matrix);
+            let optimized = self.apply_memory_coalescing(matrix, &access_pattern)?;
+            optimized_matrices.push(optimized);
+        }
+        Ok(optimized_matrices)
+    }
+    fn analyze_memory_access_pattern<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        matrix: &Array2<T>,
+    ) -> MemoryAccessPattern {
+        let (rows, cols) = matrix.dim();
+        let stride_x = if cols > 1 { 1 } else { 0 };
+        let stride_y = cols;
+        let pattern_type = if rows == 1 || cols == 1 {
+            AccessPatternType::Sequential
+        } else if stride_x == 1 {
+            AccessPatternType::Strided
+        } else {
+            AccessPatternType::Random
+        };
+        let coalescing_efficiency = match pattern_type {
+            AccessPatternType::Sequential => 1.0,
+            AccessPatternType::Strided => {
+                if stride_y % 128 == 0 {
+                    0.8
+                } else {
+                    0.4
+                }
+            }
+            _ => 0.2,
+        };
+        let cache_hit_ratio = match pattern_type {
+            AccessPatternType::Sequential => 0.95,
+            AccessPatternType::Strided => 0.7,
+            _ => 0.3,
+        };
+        let bank_conflicts = if stride_y % 32 == 0 { stride_y / 32 } else { 0 };
+        MemoryAccessPattern {
+            pattern_type,
+            stride_x,
+            stride_y,
+            coalescing_efficiency,
+            cache_hit_ratio,
+            bank_conflicts,
+        }
+    }
+    fn apply_memory_coalescing<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        matrix: &Array2<T>,
+        access_pattern: &MemoryAccessPattern,
+    ) -> Result<OptimizedMatrix<T>, GpuOptimError> {
+        let (rows, cols) = matrix.dim();
+        let layout = match access_pattern.pattern_type {
+            AccessPatternType::Sequential => MatrixLayout::RowMajor,
+            AccessPatternType::Strided => {
+                if access_pattern.stride_y > access_pattern.stride_x {
+                    MatrixLayout::ColumnMajor
+                } else {
+                    MatrixLayout::RowMajor
+                }
+            }
+            _ => MatrixLayout::TensorCoreOptimized,
+        };
+        let alignment = 128;
+        let element_size = std::mem::size_of::<T>();
+        let elements_per_line = alignment / element_size;
+        let padding_rows = if rows % elements_per_line != 0 {
+            elements_per_line - (rows % elements_per_line)
+        } else {
+            0
+        };
+        let padding_cols = if cols % elements_per_line != 0 {
+            elements_per_line - (cols % elements_per_line)
+        } else {
+            0
+        };
+        let mut optimized_data = matrix.clone();
+        if padding_rows > 0 || padding_cols > 0 {
+            let new_rows = rows + padding_rows;
+            let new_cols = cols + padding_cols;
+            let mut padded = Array2::zeros((new_rows, new_cols));
+            padded
+                .slice_mut(scirs2_core::ndarray::s![..rows, ..cols])
+                .assign(matrix);
+            optimized_data = padded;
+        }
+        let strides = (1, optimized_data.ncols());
+        Ok(OptimizedMatrix {
+            data: optimized_data,
+            layout,
+            padding: (padding_rows, padding_cols),
+            strides,
+            alignment,
+        })
+    }
+    /// Adaptive tensor core scheduling using the honest all-idle baseline
+    /// (see [`HardwareUtilizationState::unknown_baseline`]: this crate has no
+    /// way to measure real GPU utilization). To schedule against real
+    /// telemetry, use
+    /// [`Self::adaptive_tensor_core_scheduling_with_state`] instead.
+    pub fn adaptive_tensor_core_scheduling<T: Float + Debug + Send + Sync + 'static>(
+        &mut self,
+        workload: &TensorCoreWorkload<T>,
+    ) -> Result<SchedulingPlan, GpuOptimError> {
+        self.adaptive_tensor_core_scheduling_with_state(
+            workload,
+            HardwareUtilizationState::unknown_baseline(),
+        )
+    }
+
+    /// Adaptive tensor core scheduling against an explicit hardware state.
+    ///
+    /// The scheduling heuristics (priority ordering, stream assignment,
+    /// precision selection, layout-change cost/benefit) are real and operate
+    /// on whatever `hardware_state` says; this crate simply has no sensor of
+    /// its own to produce that state, so the caller supplies it.
+    pub fn adaptive_tensor_core_scheduling_with_state<T: Float + Debug + Send + Sync + 'static>(
+        &mut self,
+        workload: &TensorCoreWorkload<T>,
+        hardware_state: HardwareUtilizationState,
+    ) -> Result<SchedulingPlan, GpuOptimError> {
+        let optimal_config = self.compute_optimal_scheduling(workload, &hardware_state)?;
+        Ok(SchedulingPlan {
+            operation_order: optimal_config.operation_order,
+            stream_assignments: optimal_config.stream_assignments,
+            memory_layout_changes: optimal_config.memory_layout_changes,
+            precision_assignments: optimal_config.precision_assignments,
+            estimated_performance: optimal_config.estimated_performance,
+        })
+    }
+    fn compute_optimal_scheduling<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        workload: &TensorCoreWorkload<T>,
+        hardware_state: &HardwareUtilizationState,
+    ) -> Result<OptimalSchedulingConfig, GpuOptimError> {
+        let operations = &workload.operations;
+        let mut operation_order = Vec::new();
+        let mut stream_assignments = Vec::new();
+        let mut memory_layout_changes = Vec::new();
+        let mut precision_assignments = Vec::new();
+        let mut sorted_indices: Vec<usize> = (0..operations.len()).collect();
+        sorted_indices.sort_by(|&a, &b| {
+            let op_a = &operations[a];
+            let op_b = &operations[b];
+            let priority_cmp = op_b.priority.cmp(&op_a.priority);
+            if priority_cmp != std::cmp::Ordering::Equal {
+                return priority_cmp;
+            }
+            op_b.compute_cost
+                .partial_cmp(&op_a.compute_cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let num_streams = if hardware_state.gpu_utilization < 50.0 {
+            4
+        } else {
+            2
+        };
+        let mut current_stream = 0;
+        for &op_idx in sorted_indices.iter() {
+            operation_order.push(op_idx);
+            stream_assignments.push(current_stream);
+            current_stream = (current_stream + 1) % num_streams;
+            let operation = &operations[op_idx];
+            let optimal_precision = self.select_optimal_precision_for_op(operation, hardware_state);
+            precision_assignments.push(optimal_precision);
+            if self.should_change_layout(operation, hardware_state) {
+                memory_layout_changes.push(LayoutChange {
+                    operation_index: op_idx,
+                    old_layout: MatrixLayout::RowMajor,
+                    new_layout: MatrixLayout::TensorCoreOptimized,
+                    transformation_cost: self.estimate_layout_transformation_cost(operation),
+                });
+            }
+        }
+        let estimated_performance = self.estimate_workload_performance(
+            workload,
+            &operation_order,
+            &stream_assignments,
+            &precision_assignments,
+            hardware_state,
+        );
+        Ok(OptimalSchedulingConfig {
+            operation_order,
+            stream_assignments,
+            memory_layout_changes,
+            precision_assignments,
+            estimated_performance,
+        })
+    }
+    fn select_optimal_precision_for_op<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        operation: &TensorCoreOperation<T>,
+        hardware_state: &HardwareUtilizationState,
+    ) -> TensorCorePrecision {
+        if hardware_state.memory_utilization > 80.0 {
+            if self.get_tensor_core_info().supports_fp8 {
+                TensorCorePrecision::FP8
+            } else {
+                TensorCorePrecision::FP16
+            }
+        } else if operation.compute_cost > 1e9 {
+            if self.get_tensor_core_info().supports_bf16 {
+                TensorCorePrecision::BF16
+            } else {
+                TensorCorePrecision::FP16
+            }
+        } else {
+            if self.get_tensor_core_info().supports_tf32 {
+                TensorCorePrecision::TF32
+            } else if self.get_tensor_core_info().supports_bf16 {
+                TensorCorePrecision::BF16
+            } else {
+                TensorCorePrecision::FP16
+            }
+        }
+    }
+    fn should_change_layout<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        operation: &TensorCoreOperation<T>,
+        hardware_state: &HardwareUtilizationState,
+    ) -> bool {
+        let matrix_size = operation.output_dims.0 * operation.output_dims.1;
+        hardware_state.bandwidth_utilization > 75.0 && matrix_size > 1000000
+    }
+    fn estimate_layout_transformation_cost<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        operation: &TensorCoreOperation<T>,
+    ) -> f64 {
+        let matrix_size = operation.output_dims.0 * operation.output_dims.1;
+        matrix_size as f64 * 0.1
+    }
+    fn estimate_workload_performance<T: Float + Debug + Send + Sync + 'static>(
+        &self,
+        workload: &TensorCoreWorkload<T>,
+        operation_order: &[usize],
+        stream_assignments: &[usize],
+        precision_assignments: &[TensorCorePrecision],
+        hardware_state: &HardwareUtilizationState,
+    ) -> PerformanceEstimate {
+        let mut total_flops = 0.0;
+        let mut total_time_ms = 0.0;
+        let mut total_memory = 0;
+        for (idx, &op_idx) in operation_order.iter().enumerate() {
+            let operation = &workload.operations[op_idx];
+            let precision = precision_assignments[idx];
+            let base_time = operation.compute_cost / self.estimate_tensor_ops_throughput();
+            let precision_factor = match precision {
+                TensorCorePrecision::FP8 => 0.5,
+                TensorCorePrecision::FP16 => 0.7,
+                TensorCorePrecision::BF16 => 0.8,
+                TensorCorePrecision::TF32 => 1.0,
+            };
+            let utilization_factor = 1.0 - (hardware_state.gpu_utilization / 100.0) as f64 * 0.3;
+            let op_time = base_time * precision_factor * utilization_factor;
+            total_flops += operation.compute_cost;
+            total_time_ms += op_time * 1000.0;
+            total_memory +=
+                operation.output_dims.0 * operation.output_dims.1 * std::mem::size_of::<T>();
+        }
+        let num_streams = stream_assignments.iter().max().unwrap_or(&0) + 1;
+        let parallelization_factor = (num_streams as f64).min(4.0) / 4.0;
+        total_time_ms *= 1.0 - parallelization_factor * 0.5;
+        let throughput_tflops = total_flops / (total_time_ms / 1000.0) / 1e12;
+        let efficiency_percent =
+            (throughput_tflops / (self.estimate_tensor_ops_throughput() / 1e12)) * 100.0;
+        PerformanceEstimate {
+            total_time_ms,
+            throughput_tflops,
+            efficiency_percent: efficiency_percent as f32,
+            memory_usage: total_memory,
+            power_consumption: hardware_state.power_consumption * efficiency_percent as f32 / 100.0,
+        }
+    }
+    /// Benchmark tensor core performance for different configurations
+    pub fn benchmark_tensor_core_performance(
+        &self,
+    ) -> Result<TensorCorePerformanceBenchmark, GpuOptimError> {
+        let mut benchmark = TensorCorePerformanceBenchmark::new();
+        let test_sizes = vec![
+            (512, 512, 512),
+            (1024, 1024, 1024),
+            (2048, 2048, 2048),
+            (4096, 4096, 4096),
+        ];
+        let precisions = vec![
+            TensorCorePrecision::FP16,
+            TensorCorePrecision::BF16,
+            TensorCorePrecision::TF32,
+        ];
+        for &(m, n, k) in &test_sizes {
+            for &precision in &precisions {
+                let perf = self.benchmark_single_configuration(m, n, k, precision)?;
+                benchmark.add_result(m, n, k, precision, perf);
+            }
+        }
+        Ok(benchmark)
+    }
+    fn benchmark_single_configuration(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        precision: TensorCorePrecision,
+    ) -> Result<TensorCorePerformanceResult, GpuOptimError> {
+        #[cfg(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        ))]
+        {
+            let a = Array2::<f32>::ones((m, k));
+            let b = Array2::<f32>::ones((k, n));
+            let mut c = Array2::<f32>::zeros((m, n));
+            let start_time = std::time::Instant::now();
+            let iterations = 10;
+            for _ in 0..iterations {
+                self.tensor_core_gemm(&a, &b, &mut c, 1.0, 0.0, precision)?;
+            }
+            let elapsed = start_time.elapsed();
+            let avg_time_ms = elapsed.as_millis() as f64 / iterations as f64;
+            let flops = 2.0 * m as f64 * n as f64 * k as f64;
+            let tflops = (flops / (avg_time_ms / 1000.0)) / 1e12;
+            Ok(TensorCorePerformanceResult {
+                avg_time_ms,
+                tflops,
+                memory_bandwidth_gb_s: self.estimate_memory_bandwidth(m, n, k, avg_time_ms),
+                tensor_core_utilization: self.estimate_tensor_core_utilization(m, n, k, precision),
+            })
+        }
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "opencl",
+            feature = "wgpu"
+        )))]
+        {
+            // With no GPU backend feature enabled there is no compute path to
+            // benchmark at all, so `m`/`n`/`k`/`precision` (used above by the
+            // real, feature-gated branch) go unused here.
+            let _ = (m, n, k, precision);
+            Ok(TensorCorePerformanceResult {
+                avg_time_ms: 0.0,
+                tflops: 0.0,
+                memory_bandwidth_gb_s: 0.0,
+                tensor_core_utilization: 0.0,
+            })
+        }
+    }
+    /// Only reachable from the feature-gated branch of
+    /// `benchmark_single_configuration` above.
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "opencl",
+        feature = "wgpu"
+    ))]
+    fn estimate_memory_bandwidth(&self, m: usize, n: usize, k: usize, timems: f64) -> f64 {
+        let bytes_transferred = (m * k + k * n + m * n) * 4;
+        let bytes_per_second = bytes_transferred as f64 / (timems / 1000.0);
+        bytes_per_second / 1e9
+    }
+    /// Estimate WMMA tile utilization for an `m x n x k` GEMM.
+    ///
+    /// `precision` is accepted (real hardware's tile throughput does vary by
+    /// precision, e.g. FP8 packs more elements per tile than FP16 on
+    /// Hopper) but not yet folded into the estimate: this is only reachable
+    /// from `benchmark_single_configuration`, which itself always returns
+    /// early via [`Self::tensor_core_gemm`]'s honest `Err` (see that
+    /// method's docs), so no precision-dependent scaling would currently be
+    /// observable. Underscored rather than implemented against a path that
+    /// cannot run yet.
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "opencl",
+        feature = "wgpu"
+    ))]
+    fn estimate_tensor_core_utilization(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        _precision: TensorCorePrecision,
+    ) -> f64 {
+        let tile_m = self.config.wmma_tile_m;
+        let tile_n = self.config.wmma_tile_n;
+        let tile_k = self.config.wmma_tile_k;
+        let utilized_tiles_m = m.div_ceil(tile_m);
+        let utilized_tiles_n = n.div_ceil(tile_n);
+        let utilized_tiles_k = k.div_ceil(tile_k);
+        let total_tensor_cores = utilized_tiles_m * utilized_tiles_n * utilized_tiles_k;
+        let theoretical_max = self.estimate_max_tensor_cores();
+        (total_tensor_cores as f64 / theoretical_max as f64).min(1.0) * 100.0
+    }
+    /// Only reachable from `estimate_tensor_core_utilization` above.
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "opencl",
+        feature = "wgpu"
+    ))]
+    fn estimate_max_tensor_cores(&self) -> usize {
+        match self.compute_capability {
+            (major, _minor) if major >= 9 => 528,
+            (major, _minor) if major >= 8 => 432,
+            (major, minor) if major >= 7 && minor >= 5 => 272,
+            (major, _minor) if major >= 7 => 640,
+            _ => 1,
+        }
+    }
+    fn estimate_tensor_ops_throughput(&self) -> f64 {
+        match self.compute_capability {
+            (major, _minor) if major >= 9 => 1000e12,
+            (major, _minor) if major >= 8 => 312e12,
+            (major, minor) if major >= 7 && minor >= 5 => 130e12,
+            (major, _minor) if major >= 7 => 125e12,
+            _ => 0.0,
+        }
+    }
+}
+/// Tensor core precision options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TensorCorePrecision {
+    FP16,
+    BF16,
+    TF32,
+    FP8,
+}
+/// Tensor core matrix multiplication configuration
+#[derive(Debug, Clone)]
+pub struct TensorCoreConfig {
+    /// Use Volta tensor cores (mixed precision GEMM)
+    pub use_volta_cores: bool,
+    /// Use Turing tensor cores (INT8/INT4 support)
+    pub use_turing_cores: bool,
+    /// Use Ampere tensor cores (BF16/TF32 support)
+    pub use_ampere_cores: bool,
+    /// Use Hopper tensor cores (FP8 support)
+    pub use_hopper_cores: bool,
+    /// Warp matrix multiply tile size
+    pub wmma_tile_m: usize,
+    pub wmma_tile_n: usize,
+    pub wmma_tile_k: usize,
+    /// Enable automatic layout optimization
+    pub auto_layout_optimization: bool,
+    /// Use TensorFloat-32 mode for FP32 operations
+    pub use_tf32: bool,
+    /// Sparsity level for structured sparse operations
+    pub sparsity_ratio: f32,
+    /// Enable asynchronous execution
+    pub async_execution: bool,
+}
+/// Optimal configuration computed by scheduling
+#[derive(Debug, Clone)]
+pub struct OptimalSchedulingConfig {
+    /// Operation order
+    pub operation_order: Vec<usize>,
+    /// Stream assignments
+    pub stream_assignments: Vec<usize>,
+    /// Memory layout changes
+    pub memory_layout_changes: Vec<LayoutChange>,
+    /// Precision assignments
+    pub precision_assignments: Vec<TensorCorePrecision>,
+    /// Estimated performance
+    pub estimated_performance: PerformanceEstimate,
+}
+/// Batch operation for tensor cores
+#[derive(Debug)]
+pub struct TensorCoreBatch<T: Float + Debug + Send + Sync + 'static> {
+    pub a: Array2<T>,
+    pub b: Array2<T>,
+    pub alpha: T,
+    pub beta: T,
+    pub output_m: usize,
+    pub output_n: usize,
+}
+/// Workload constraints
+#[derive(Debug, Clone)]
+pub struct WorkloadConstraints {
+    /// Memory limit (bytes)
+    pub memory_limit: usize,
+    /// Time limit (milliseconds)
+    pub time_limit_ms: u64,
+    /// Power limit (Watts)
+    pub power_limit: f32,
+    /// Precision requirements
+    pub precision_requirements: Vec<TensorCorePrecision>,
+}
+/// Performance benchmark results for tensor cores
+#[derive(Debug)]
+pub struct TensorCorePerformanceBenchmark {
+    results: std::collections::HashMap<
+        (usize, usize, usize, TensorCorePrecision),
+        TensorCorePerformanceResult,
+    >,
+}
+impl TensorCorePerformanceBenchmark {
+    pub fn new() -> Self {
+        Self {
+            results: std::collections::HashMap::new(),
+        }
+    }
+    pub fn add_result(
+        &mut self,
+        m: usize,
+        n: usize,
+        k: usize,
+        precision: TensorCorePrecision,
+        result: TensorCorePerformanceResult,
+    ) {
+        self.results.insert((m, n, k, precision), result);
+    }
+    pub fn get_best_precision_for_size(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Option<TensorCorePrecision> {
+        let mut best_precision = None;
+        let mut best_tflops = 0.0;
+        for precision in [
+            TensorCorePrecision::FP16,
+            TensorCorePrecision::BF16,
+            TensorCorePrecision::TF32,
+            TensorCorePrecision::FP8,
+        ] {
+            if let Some(result) = self.results.get(&(m, n, k, precision)) {
+                if result.tflops > best_tflops {
+                    best_tflops = result.tflops;
+                    best_precision = Some(precision);
+                }
+            }
+        }
+        best_precision
+    }
+    pub fn generate_report(&self) -> String {
+        let mut report = String::from("Tensor Core Performance Benchmark Report\n");
+        report.push_str("==========================================\n\n");
+        for ((m, n, k, precision), result) in &self.results {
+            report.push_str(&format!(
+                "Size: {}x{}x{}, Precision: {:?}\n",
+                m, n, k, precision
+            ));
+            report.push_str(&format!(
+                "  Time: {:.2}ms, TFLOPS: {:.2}, Bandwidth: {:.2}GB/s, Utilization: {:.1}%\n\n",
+                result.avg_time_ms,
+                result.tflops,
+                result.memory_bandwidth_gb_s,
+                result.tensor_core_utilization
+            ));
+        }
+        report
+    }
+}
+/// Optimized matrix with memory layout information
+#[derive(Debug, Clone)]
+pub struct OptimizedMatrix<T: Float + Debug + Send + Sync + 'static> {
+    /// Matrix data
+    pub data: Array2<T>,
+    /// Memory layout used
+    pub layout: MatrixLayout,
+    /// Padding applied
+    pub padding: (usize, usize),
+    /// Stride information
+    pub strides: (usize, usize),
+    /// Memory alignment
+    pub alignment: usize,
+}
+/// Tensor core workload descriptor
+#[derive(Debug, Clone)]
+pub struct TensorCoreWorkload<T: Float + Debug + Send + Sync + 'static> {
+    /// Operations to perform
+    pub operations: Vec<TensorCoreOperation<T>>,
+    /// Resource requirements
+    pub resource_requirements: ResourceRequirements,
+    /// Performance targets
+    pub performance_targets: PerformanceTargets,
+    /// Constraints
+    pub constraints: WorkloadConstraints,
+}
+/// Configuration for pipeline optimization
+#[derive(Debug, Clone)]
+pub struct PipelineOptimizationConfig {
+    /// Number of parallel streams
+    pub num_streams: usize,
+    /// Enable dependency tracking
+    pub dependency_tracking: bool,
+    /// Memory prefetch distance
+    pub prefetch_distance: usize,
+    /// Load balancing strategy
+    pub load_balancing: LoadBalancingStrategy,
+    /// Priority scheduling enabled
+    pub priority_scheduling: bool,
+}
+/// Scheduling plan for tensor core operations
+#[derive(Debug, Clone)]
+pub struct SchedulingPlan {
+    /// Ordered list of operations
+    pub operation_order: Vec<usize>,
+    /// Stream assignments
+    pub stream_assignments: Vec<usize>,
+    /// Memory layout changes required
+    pub memory_layout_changes: Vec<LayoutChange>,
+    /// Precision assignments
+    pub precision_assignments: Vec<TensorCorePrecision>,
+    /// Estimated performance
+    pub estimated_performance: PerformanceEstimate,
+}
+/// Matrix layout optimization information
+#[derive(Debug, Clone)]
+pub struct OptimalLayout {
+    /// Recommended memory layout
+    pub layout: MatrixLayout,
+    /// Padding requirements
+    pub padding_m: usize,
+    pub padding_n: usize,
+    pub padding_k: usize,
+    /// Expected performance improvement
+    pub speedup_factor: f32,
+    /// Memory overhead ratio
+    pub memory_overhead: f32,
+}
+/// Mixed precision training statistics
+#[derive(Debug, Clone)]
+pub struct MixedPrecisionStats {
+    pub current_loss_scale: f32,
+    pub step_count: usize,
+    pub successful_steps: usize,
+    pub average_loss_scale: f32,
+    pub loss_scale_updates: usize,
+}
+/// Memory access pattern analysis
+#[derive(Debug, Clone)]
+pub struct MemoryAccessPattern {
+    /// Access pattern type
+    pub pattern_type: AccessPatternType,
+    /// Stride information
+    pub stride_x: usize,
+    pub stride_y: usize,
+    /// Coalescing efficiency
+    pub coalescing_efficiency: f32,
+    /// Cache hit ratio
+    pub cache_hit_ratio: f32,
+    /// Bank conflicts detected
+    pub bank_conflicts: usize,
+}
+/// Performance targets
+#[derive(Debug, Clone)]
+pub struct PerformanceTargets {
+    /// Target throughput (operations/sec)
+    pub target_throughput: f64,
+    /// Maximum latency (milliseconds)
+    pub max_latency_ms: f64,
+    /// Target efficiency (%)
+    pub target_efficiency: f32,
+    /// Energy budget (Watts)
+    pub energy_budget: f32,
+}
+/// Performance estimate
+#[derive(Debug, Clone)]
+pub struct PerformanceEstimate {
+    /// Estimated total time (milliseconds)
+    pub total_time_ms: f64,
+    /// Estimated throughput (TFLOPS)
+    pub throughput_tflops: f64,
+    /// Estimated efficiency (%)
+    pub efficiency_percent: f32,
+    /// Estimated memory usage (bytes)
+    pub memory_usage: usize,
+    /// Estimated power consumption (Watts)
+    pub power_consumption: f32,
+}

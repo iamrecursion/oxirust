@@ -1,0 +1,29 @@
+[package]
+name = "oxixml-relaxng"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "RELAX NG validation (XML and compact syntax)."
+keywords = ["relaxng", "xml", "validation", "schema", "rnc"]
+categories = ["parser-implementations", "text-processing", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-xml = { workspace = true }
+oxixml-qname = { workspace = true }
+oxixml-dom = { workspace = true }
+oxixml-iri = { workspace = true }
+oxixml-regex = { workspace = true }
+oxixml-xsd = { workspace = true }
+
+[lints]
+workspace = true

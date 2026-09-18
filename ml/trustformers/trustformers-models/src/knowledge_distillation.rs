@@ -1,0 +1,1437 @@
+//! # Knowledge Distillation Framework
+//!
+//! This module provides a comprehensive framework for knowledge distillation,
+//! enabling efficient transfer of knowledge from large teacher models to smaller student models.
+//!
+//! ## Features
+//!
+//! - **Multiple Distillation Strategies**: Response-based, feature-based, and attention-based distillation
+//! - **Temperature Control**: Configurable temperature scaling for soft targets
+//! - **Loss Combinations**: Flexible combination of distillation and task-specific losses
+//! - **Multi-layer Feature Matching**: Deep feature alignment between teacher and student
+//! - **Attention Transfer**: Transfer attention patterns from teacher to student
+//! - **Progressive Knowledge Transfer**: Gradual knowledge transfer strategies
+//!
+//! ## Usage
+//!
+//! ```rust,no_run
+//! use trustformers_models::knowledge_distillation::{
+//!     KnowledgeDistillationTrainer, DistillationConfig, DistillationStrategy,
+//!     TeacherOutputs, StudentOutputs,
+//! };
+//! use trustformers_core::{traits::{Config, Model}, tensor::Tensor, Result};
+//! use serde::{Deserialize, Serialize};
+//!
+//! # #[derive(Debug, Clone, Serialize, Deserialize)]
+//! # struct DocConfig;
+//! # impl Config for DocConfig {
+//! #     fn architecture(&self) -> &'static str { "doc" }
+//! # }
+//! # struct DocModel;
+//! # impl Model for DocModel {
+//! #     type Config = DocConfig;
+//! #     type Input = Tensor;
+//! #     type Output = Tensor;
+//! #     fn forward(&self, input: Tensor) -> Result<Tensor> { Ok(input) }
+//! #     fn load_pretrained(&mut self, _r: &mut dyn std::io::Read) -> Result<()> { Ok(()) }
+//! #     fn get_config(&self) -> &DocConfig { &DocConfig }
+//! #     fn num_parameters(&self) -> usize { 0 }
+//! # }
+//!
+//! # fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+//! let config = DistillationConfig {
+//!     temperature: 4.0,
+//!     alpha: 0.7,
+//!     strategy: DistillationStrategy::ResponseBased,
+//!     ..Default::default()
+//! };
+//!
+//! # let teacher_model = DocModel;
+//! # let student_model = DocModel;
+//! let trainer = KnowledgeDistillationTrainer::new(teacher_model, student_model, config)?;
+//!
+//! # let teacher_outputs = TeacherOutputs { logits: Tensor::zeros(&[1, 4])?, hidden_states: vec![], attentions: vec![] };
+//! # let student_outputs = StudentOutputs { logits: Tensor::zeros(&[1, 4])?, hidden_states: vec![], attentions: vec![] };
+//! let _loss = trainer.compute_distillation_loss(&teacher_outputs, &student_outputs, None)?;
+//! # Ok(())
+//! # }
+//! ```
+
+use scirs2_core::ndarray::{ArrayD, Axis, IxDyn}; // SciRS2 Integration Policy
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use trustformers_core::{
+    errors::{tensor_op_error, TrustformersError},
+    layers::Linear,
+    tensor::Tensor,
+    traits::{Layer, Model},
+    Result,
+};
+
+/// Configuration for knowledge distillation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillationConfig {
+    /// Temperature for softmax in distillation loss (higher = softer)
+    pub temperature: f32,
+    /// Weight for distillation loss vs. hard target loss (0.0-1.0)
+    pub alpha: f32,
+    /// Distillation strategy to use
+    pub strategy: DistillationStrategy,
+    /// Whether to use feature matching
+    pub use_feature_matching: bool,
+    /// Layers to match features (teacher_layer -> student_layer)
+    pub feature_matching_layers: HashMap<usize, usize>,
+    /// Whether to use attention transfer
+    pub use_attention_transfer: bool,
+    /// Weight for attention transfer loss
+    pub attention_loss_weight: f32,
+    /// Whether to use progressive distillation
+    pub progressive: bool,
+    /// Number of progressive stages
+    pub progressive_stages: usize,
+    /// Minimum temperature for progressive cooling
+    pub min_temperature: f32,
+}
+
+impl Default for DistillationConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 4.0,
+            alpha: 0.7,
+            strategy: DistillationStrategy::ResponseBased,
+            use_feature_matching: false,
+            feature_matching_layers: HashMap::new(),
+            use_attention_transfer: false,
+            attention_loss_weight: 0.1,
+            progressive: false,
+            progressive_stages: 5,
+            min_temperature: 1.0,
+        }
+    }
+}
+
+/// Different strategies for knowledge distillation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DistillationStrategy {
+    /// Standard response-based distillation using soft targets
+    ResponseBased,
+    /// Feature-based distillation matching intermediate representations
+    FeatureBased,
+    /// Attention-based distillation transferring attention patterns
+    AttentionBased,
+    /// Combined approach using multiple strategies
+    Combined {
+        response_weight: f32,
+        feature_weight: f32,
+        attention_weight: f32,
+    },
+    /// Progressive distillation with curriculum learning
+    Progressive { stages: Vec<ProgressiveStage> },
+}
+
+/// Configuration for a progressive distillation stage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressiveStage {
+    /// Duration of this stage (in training steps)
+    pub duration: usize,
+    /// Temperature for this stage
+    pub temperature: f32,
+    /// Alpha weight for this stage
+    pub alpha: f32,
+    /// Whether to freeze teacher layers
+    pub freeze_teacher: bool,
+}
+
+/// Output from distillation loss computation
+#[derive(Debug, Clone)]
+pub struct DistillationOutput {
+    /// Total distillation loss
+    pub total_loss: Tensor,
+    /// Individual loss components
+    pub loss_components: HashMap<String, Tensor>,
+    /// Soft predictions from teacher
+    pub teacher_predictions: Tensor,
+    /// Predictions from student
+    pub student_predictions: Tensor,
+    /// Feature matching losses (if used)
+    pub feature_losses: Option<HashMap<String, Tensor>>,
+    /// Attention transfer losses (if used)
+    pub attention_losses: Option<HashMap<String, Tensor>>,
+}
+
+/// Knowledge distillation trainer
+pub struct KnowledgeDistillationTrainer<T, S> {
+    /// Teacher model (typically larger, pre-trained)
+    #[allow(dead_code)]
+    teacher: T,
+    /// Student model (typically smaller, being trained)
+    #[allow(dead_code)]
+    student: S,
+    /// Distillation configuration
+    config: DistillationConfig,
+    /// Feature matching projections
+    feature_projections: HashMap<usize, Linear>,
+    /// Current training stage (for progressive distillation)
+    current_stage: usize,
+    /// Current training step
+    current_step: usize,
+}
+
+impl<T, S> KnowledgeDistillationTrainer<T, S>
+where
+    T: Model,
+    S: Model,
+{
+    /// Create a new knowledge distillation trainer
+    pub fn new(teacher: T, student: S, config: DistillationConfig) -> Result<Self> {
+        let mut feature_projections = HashMap::new();
+
+        // Initialize feature projection layers if needed
+        if config.use_feature_matching {
+            for (&_teacher_layer, &student_layer) in &config.feature_matching_layers {
+                // Note: In practice, you'd need to get the actual hidden sizes
+                // This is a simplified example
+                let projection = Linear::new(768, 768, true); // Assuming 768 hidden size
+                feature_projections.insert(student_layer, projection);
+            }
+        }
+
+        Ok(Self {
+            teacher,
+            student,
+            config,
+            feature_projections,
+            current_stage: 0,
+            current_step: 0,
+        })
+    }
+
+    /// Compute distillation loss
+    pub fn compute_distillation_loss(
+        &self,
+        teacher_outputs: &TeacherOutputs,
+        student_outputs: &StudentOutputs,
+        hard_targets: Option<&Tensor>,
+    ) -> Result<DistillationOutput> {
+        let mut loss_components = HashMap::new();
+        let mut total_loss = Tensor::zeros(&[1])?;
+
+        match &self.config.strategy {
+            DistillationStrategy::ResponseBased => {
+                let response_loss = self.compute_response_distillation_loss(
+                    &teacher_outputs.logits,
+                    &student_outputs.logits,
+                )?;
+                loss_components.insert("response".to_string(), response_loss.clone());
+                total_loss = total_loss.add(&response_loss)?;
+            },
+            DistillationStrategy::FeatureBased => {
+                let feature_loss = self.compute_feature_distillation_loss(
+                    &teacher_outputs.hidden_states,
+                    &student_outputs.hidden_states,
+                )?;
+                loss_components.insert("feature".to_string(), feature_loss.clone());
+                total_loss = total_loss.add(&feature_loss)?;
+            },
+            DistillationStrategy::AttentionBased => {
+                let attention_loss = self.compute_attention_distillation_loss(
+                    &teacher_outputs.attentions,
+                    &student_outputs.attentions,
+                )?;
+                loss_components.insert("attention".to_string(), attention_loss.clone());
+                total_loss = total_loss.add(&attention_loss)?;
+            },
+            DistillationStrategy::Combined {
+                response_weight,
+                feature_weight,
+                attention_weight,
+            } => {
+                if *response_weight > 0.0 {
+                    let response_loss = self.compute_response_distillation_loss(
+                        &teacher_outputs.logits,
+                        &student_outputs.logits,
+                    )?;
+                    let weighted_response_loss = response_loss.scalar_mul(*response_weight)?;
+                    loss_components.insert("response".to_string(), weighted_response_loss.clone());
+                    total_loss = total_loss.add(&weighted_response_loss)?;
+                }
+
+                if *feature_weight > 0.0 && !teacher_outputs.hidden_states.is_empty() {
+                    let feature_loss = self.compute_feature_distillation_loss(
+                        &teacher_outputs.hidden_states,
+                        &student_outputs.hidden_states,
+                    )?;
+                    let weighted_feature_loss = feature_loss.scalar_mul(*feature_weight)?;
+                    loss_components.insert("feature".to_string(), weighted_feature_loss.clone());
+                    total_loss = total_loss.add(&weighted_feature_loss)?;
+                }
+
+                if *attention_weight > 0.0 && !teacher_outputs.attentions.is_empty() {
+                    let attention_loss = self.compute_attention_distillation_loss(
+                        &teacher_outputs.attentions,
+                        &student_outputs.attentions,
+                    )?;
+                    let weighted_attention_loss = attention_loss.scalar_mul(*attention_weight)?;
+                    loss_components
+                        .insert("attention".to_string(), weighted_attention_loss.clone());
+                    total_loss = total_loss.add(&weighted_attention_loss)?;
+                }
+            },
+            DistillationStrategy::Progressive { stages } => {
+                let current_stage = &stages[self.current_stage.min(stages.len() - 1)];
+                let response_loss = self.compute_response_distillation_loss_with_temperature(
+                    &teacher_outputs.logits,
+                    &student_outputs.logits,
+                    current_stage.temperature,
+                )?;
+                loss_components.insert("progressive_response".to_string(), response_loss.clone());
+                total_loss = total_loss.add(&response_loss)?;
+            },
+        }
+
+        // Add hard target loss if provided
+        if let Some(targets) = hard_targets {
+            let hard_loss = self.compute_hard_target_loss(&student_outputs.logits, targets)?;
+            let weighted_hard_loss = hard_loss.scalar_mul(1.0 - self.config.alpha)?;
+            loss_components.insert("hard_target".to_string(), weighted_hard_loss.clone());
+            total_loss = total_loss.add(&weighted_hard_loss)?;
+        }
+
+        // Collect feature losses for tracking
+        let feature_losses = if !teacher_outputs.hidden_states.is_empty()
+            && !student_outputs.hidden_states.is_empty()
+        {
+            Some(self.compute_layer_wise_feature_losses(
+                &teacher_outputs.hidden_states,
+                &student_outputs.hidden_states,
+            )?)
+        } else {
+            None
+        };
+
+        // Collect attention losses for tracking
+        let attention_losses =
+            if !teacher_outputs.attentions.is_empty() && !student_outputs.attentions.is_empty() {
+                Some(self.compute_layer_wise_attention_losses(
+                    &teacher_outputs.attentions,
+                    &student_outputs.attentions,
+                )?)
+            } else {
+                None
+            };
+
+        Ok(DistillationOutput {
+            total_loss,
+            loss_components,
+            teacher_predictions: teacher_outputs.logits.clone(),
+            student_predictions: student_outputs.logits.clone(),
+            feature_losses,
+            attention_losses,
+        })
+    }
+
+    /// Compute response-based distillation loss (KL divergence of soft targets)
+    fn compute_response_distillation_loss(
+        &self,
+        teacher_logits: &Tensor,
+        student_logits: &Tensor,
+    ) -> Result<Tensor> {
+        self.compute_response_distillation_loss_with_temperature(
+            teacher_logits,
+            student_logits,
+            self.config.temperature,
+        )
+    }
+
+    /// Compute response-based distillation loss with custom temperature
+    fn compute_response_distillation_loss_with_temperature(
+        &self,
+        teacher_logits: &Tensor,
+        student_logits: &Tensor,
+        temperature: f32,
+    ) -> Result<Tensor> {
+        // Apply temperature scaling
+        let teacher_scaled = teacher_logits.scalar_div(temperature)?;
+        let student_scaled = student_logits.scalar_div(temperature)?;
+
+        // Compute soft targets (softmax with temperature)
+        let teacher_soft = teacher_scaled.softmax(-1)?;
+        let student_soft = student_scaled.softmax(-1)?;
+        let student_log_soft = student_soft.log()?;
+
+        // KL divergence loss
+        let teacher_log = teacher_soft.log()?;
+        let log_diff = teacher_log.sub(&student_log_soft)?;
+        let kl_div = teacher_soft.mul(&log_diff)?;
+        let loss = kl_div.sum(None, false)?.mean()?;
+
+        // Scale by temperature squared (standard in knowledge distillation)
+        let temp_squared = temperature * temperature;
+        loss.scalar_mul(temp_squared)
+    }
+
+    /// Compute feature-based distillation loss
+    fn compute_feature_distillation_loss(
+        &self,
+        teacher_features: &[Tensor],
+        student_features: &[Tensor],
+    ) -> Result<Tensor> {
+        let mut total_loss = Tensor::zeros(&[1])?;
+        let mut num_matched = 0;
+
+        for (&teacher_layer, &student_layer) in &self.config.feature_matching_layers {
+            if teacher_layer < teacher_features.len() && student_layer < student_features.len() {
+                let teacher_feat = &teacher_features[teacher_layer];
+                let student_feat = &student_features[student_layer];
+
+                // Project student features to match teacher dimensionality if needed
+                let projected_student =
+                    if let Some(projection) = self.feature_projections.get(&student_layer) {
+                        projection.forward(student_feat.clone())?
+                    } else {
+                        student_feat.clone()
+                    };
+
+                // MSE loss between features
+                let diff = teacher_feat.sub(&projected_student)?;
+                let diff_squared = diff.mul(&diff)?;
+                let mse_loss = diff_squared.mean()?;
+                total_loss = total_loss.add(&mse_loss)?;
+                num_matched += 1;
+            }
+        }
+
+        if num_matched > 0 {
+            Ok(total_loss.scalar_div(num_matched as f32)?)
+        } else {
+            Ok(total_loss)
+        }
+    }
+
+    /// Compute attention-based distillation loss
+    fn compute_attention_distillation_loss(
+        &self,
+        teacher_attentions: &[Tensor],
+        student_attentions: &[Tensor],
+    ) -> Result<Tensor> {
+        let mut total_loss = Tensor::zeros(&[1])?;
+        let num_layers = teacher_attentions.len().min(student_attentions.len());
+
+        for i in 0..num_layers {
+            let teacher_attn = &teacher_attentions[i];
+            let student_attn = &student_attentions[i];
+
+            // MSE loss between attention matrices
+            let diff = teacher_attn.sub(student_attn)?;
+            let diff_squared = diff.mul(&diff)?;
+            let mse_loss = diff_squared.mean()?;
+            total_loss = total_loss.add(&mse_loss)?;
+        }
+
+        if num_layers > 0 {
+            Ok(total_loss.scalar_div(num_layers as f32)?)
+        } else {
+            Ok(total_loss)
+        }
+    }
+
+    /// Compute the hard-target loss: mean cross-entropy of the student's logits
+    /// against the ground-truth labels.
+    ///
+    /// `logits` has shape `[batch, num_classes]` (a leading batch axis is
+    /// optional for a single example). `targets` is accepted in either of the
+    /// two shapes a training loop produces:
+    ///
+    /// * **class indices** — shape `[batch]`, each entry an integer class id;
+    /// * **one-hot / soft labels** — shape `[batch, num_classes]`, each row a
+    ///   distribution over classes (soft labels are the general case and reduce
+    ///   to one-hot when a single entry is 1).
+    ///
+    /// A previous revision took `_targets` and returned `mean(-log softmax(logits))`
+    /// — the mean negative log-probability over *every* class. That value is
+    /// completely independent of the labels, so the "hard target" term of the
+    /// distillation objective carried no supervision at all: two batches with
+    /// swapped labels produced the identical loss.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tensors are not `F32`, when the shapes disagree, or when a
+    /// target class index is out of range for the logits' class axis.
+    fn compute_hard_target_loss(&self, logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
+        hard_target_cross_entropy(logits, targets)
+    }
+
+    /// Update training step and potentially stage for progressive distillation
+    pub fn step(&mut self) {
+        self.current_step += 1;
+
+        if let DistillationStrategy::Progressive { stages } = &self.config.strategy {
+            // Check if we should advance to the next stage
+            if self.current_stage < stages.len() - 1 {
+                let current_stage_config = &stages[self.current_stage];
+                if self.current_step >= current_stage_config.duration {
+                    self.current_stage += 1;
+                    self.current_step = 0;
+                }
+            }
+        }
+    }
+
+    /// Get current temperature (useful for progressive distillation)
+    pub fn current_temperature(&self) -> f32 {
+        match &self.config.strategy {
+            DistillationStrategy::Progressive { stages } => {
+                if self.current_stage < stages.len() {
+                    stages[self.current_stage].temperature
+                } else {
+                    self.config.min_temperature
+                }
+            },
+            _ => self.config.temperature,
+        }
+    }
+
+    /// Get current alpha (useful for progressive distillation)
+    pub fn current_alpha(&self) -> f32 {
+        match &self.config.strategy {
+            DistillationStrategy::Progressive { stages } => {
+                if self.current_stage < stages.len() {
+                    stages[self.current_stage].alpha
+                } else {
+                    self.config.alpha
+                }
+            },
+            _ => self.config.alpha,
+        }
+    }
+
+    /// Compute layer-wise feature losses for detailed tracking
+    fn compute_layer_wise_feature_losses(
+        &self,
+        teacher_hidden_states: &[Tensor],
+        student_hidden_states: &[Tensor],
+    ) -> Result<HashMap<String, Tensor>> {
+        let mut feature_losses = HashMap::new();
+
+        // Ensure we have matching layers (or use the minimum)
+        let num_layers = teacher_hidden_states.len().min(student_hidden_states.len());
+
+        for layer_idx in 0..num_layers {
+            let teacher_hidden = &teacher_hidden_states[layer_idx];
+            let student_hidden = &student_hidden_states[layer_idx];
+
+            // Apply projection if dimensions don't match
+            let aligned_student = if teacher_hidden.shape() != student_hidden.shape() {
+                // Simple projection to match teacher dimensions
+                match (teacher_hidden, student_hidden) {
+                    (Tensor::F32(t_arr), Tensor::F32(s_arr)) => {
+                        let teacher_shape = t_arr.shape();
+                        let student_shape = s_arr.shape();
+
+                        if teacher_shape.len() == student_shape.len()
+                            && teacher_shape[..teacher_shape.len() - 1]
+                                == student_shape[..student_shape.len() - 1]
+                        {
+                            // Only hidden dimension differs, project student to teacher size
+                            let teacher_hidden_dim = teacher_shape[teacher_shape.len() - 1];
+                            let student_hidden_dim = student_shape[student_shape.len() - 1];
+
+                            if student_hidden_dim != teacher_hidden_dim {
+                                // Simple linear projection (in practice, this would be a learned projection)
+                                let scale = teacher_hidden_dim as f32 / student_hidden_dim as f32;
+                                let projected = s_arr.mapv(|x| x * scale);
+
+                                // Reshape to match teacher dimensions
+                                let new_shape = teacher_shape.to_vec();
+                                let projected_data = if teacher_hidden_dim > student_hidden_dim {
+                                    // Pad with zeros
+                                    let mut padded_data = vec![0.0; new_shape.iter().product()];
+                                    let chunk_size = student_hidden_dim;
+                                    let total_chunks = s_arr.len() / chunk_size;
+
+                                    for chunk_idx in 0..total_chunks {
+                                        let src_start = chunk_idx * chunk_size;
+                                        let dst_start = chunk_idx * teacher_hidden_dim;
+                                        for i in 0..chunk_size {
+                                            padded_data[dst_start + i] = projected[src_start + i];
+                                        }
+                                    }
+                                    padded_data
+                                } else {
+                                    // Truncate
+                                    let chunk_size = teacher_hidden_dim;
+                                    let total_chunks = projected.len() / student_hidden_dim;
+                                    let mut truncated_data = Vec::new();
+
+                                    for chunk_idx in 0..total_chunks {
+                                        let src_start = chunk_idx * student_hidden_dim;
+                                        for i in 0..chunk_size {
+                                            truncated_data.push(projected[src_start + i]);
+                                        }
+                                    }
+                                    truncated_data
+                                };
+
+                                let projected_array =
+                                    ArrayD::from_shape_vec(IxDyn(&new_shape), projected_data)
+                                        .map_err(|_| {
+                                            TrustformersError::shape_error(
+                                                "Failed to project student features".to_string(),
+                                            )
+                                        })?;
+
+                                Tensor::F32(projected_array)
+                            } else {
+                                student_hidden.clone()
+                            }
+                        } else {
+                            student_hidden.clone()
+                        }
+                    },
+                    _ => student_hidden.clone(),
+                }
+            } else {
+                student_hidden.clone()
+            };
+
+            // Compute MSE loss between teacher and (aligned) student features
+            let diff = teacher_hidden.sub(&aligned_student)?;
+            let squared_diff = diff.mul(&diff)?;
+            let mse_loss = squared_diff.mean()?;
+
+            feature_losses.insert(format!("layer_{}", layer_idx), mse_loss);
+        }
+
+        Ok(feature_losses)
+    }
+
+    /// Compute layer-wise attention losses for detailed tracking
+    fn compute_layer_wise_attention_losses(
+        &self,
+        teacher_attentions: &[Tensor],
+        student_attentions: &[Tensor],
+    ) -> Result<HashMap<String, Tensor>> {
+        let mut attention_losses = HashMap::new();
+
+        // Ensure we have matching layers
+        let num_layers = teacher_attentions.len().min(student_attentions.len());
+
+        for layer_idx in 0..num_layers {
+            let teacher_attn = &teacher_attentions[layer_idx];
+            let student_attn = &student_attentions[layer_idx];
+
+            // Handle different attention head counts
+            let aligned_student_attn = if teacher_attn.shape() != student_attn.shape() {
+                self.align_attention_tensors(teacher_attn, student_attn)?
+            } else {
+                student_attn.clone()
+            };
+
+            // Compute attention transfer loss (MSE between attention distributions)
+            let diff = teacher_attn.sub(&aligned_student_attn)?;
+            let squared_diff = diff.mul(&diff)?;
+            let attn_loss = squared_diff.mean()?;
+
+            attention_losses.insert(format!("layer_{}", layer_idx), attn_loss);
+
+            // Additional attention-specific metrics
+            // 1. Attention entropy similarity
+            let teacher_entropy = self.compute_attention_entropy(teacher_attn)?;
+            let student_entropy = self.compute_attention_entropy(&aligned_student_attn)?;
+            let entropy_diff = teacher_entropy.sub(&student_entropy)?;
+            let entropy_loss = entropy_diff.mul(&entropy_diff)?;
+            attention_losses.insert(format!("layer_{}_entropy", layer_idx), entropy_loss);
+
+            // 2. Attention pattern correlation
+            let pattern_correlation =
+                self.compute_attention_correlation(teacher_attn, &aligned_student_attn)?;
+            attention_losses.insert(
+                format!("layer_{}_correlation", layer_idx),
+                pattern_correlation,
+            );
+        }
+
+        Ok(attention_losses)
+    }
+
+    /// Align attention tensors when they have different shapes (e.g., different head counts)
+    fn align_attention_tensors(&self, teacher: &Tensor, student: &Tensor) -> Result<Tensor> {
+        match (teacher, student) {
+            (Tensor::F32(t_arr), Tensor::F32(s_arr)) => {
+                let teacher_shape = t_arr.shape();
+                let student_shape = s_arr.shape();
+
+                // Assume attention shape is [batch, heads, seq_len, seq_len]
+                if teacher_shape.len() == 4 && student_shape.len() == 4 {
+                    let teacher_heads = teacher_shape[1];
+                    let student_heads = student_shape[1];
+
+                    if teacher_heads != student_heads {
+                        // Simple head alignment: average/repeat heads to match teacher count
+                        if student_heads < teacher_heads {
+                            // Repeat student heads
+                            let _repeat_factor = teacher_heads / student_heads;
+                            let mut aligned_data = Vec::new();
+
+                            let batch_size = student_shape[0];
+                            let seq_len = student_shape[2];
+                            let seq_len_2 = student_shape[3];
+
+                            for b in 0..batch_size {
+                                for h in 0..teacher_heads {
+                                    let source_head = h % student_heads;
+                                    for i in 0..seq_len {
+                                        for j in 0..seq_len_2 {
+                                            aligned_data.push(s_arr[[b, source_head, i, j]]);
+                                        }
+                                    }
+                                }
+                            }
+
+                            let aligned_array = ArrayD::from_shape_vec(
+                                IxDyn(&[batch_size, teacher_heads, seq_len, seq_len_2]),
+                                aligned_data,
+                            )
+                            .map_err(|_| {
+                                TrustformersError::shape_error(
+                                    "Failed to align attention heads".to_string(),
+                                )
+                            })?;
+
+                            Ok(Tensor::F32(aligned_array))
+                        } else {
+                            // Average student heads to match teacher count
+                            let group_size = student_heads / teacher_heads;
+                            let mut aligned_data = Vec::new();
+
+                            let batch_size = student_shape[0];
+                            let seq_len = student_shape[2];
+                            let seq_len_2 = student_shape[3];
+
+                            for b in 0..batch_size {
+                                for h in 0..teacher_heads {
+                                    for i in 0..seq_len {
+                                        for j in 0..seq_len_2 {
+                                            let mut sum = 0.0;
+                                            for g in 0..group_size {
+                                                let student_head = h * group_size + g;
+                                                if student_head < student_heads {
+                                                    sum += s_arr[[b, student_head, i, j]];
+                                                }
+                                            }
+                                            aligned_data.push(sum / group_size as f32);
+                                        }
+                                    }
+                                }
+                            }
+
+                            let aligned_array = ArrayD::from_shape_vec(
+                                IxDyn(&[batch_size, teacher_heads, seq_len, seq_len_2]),
+                                aligned_data,
+                            )
+                            .map_err(|_| {
+                                TrustformersError::shape_error(
+                                    "Failed to align attention heads".to_string(),
+                                )
+                            })?;
+
+                            Ok(Tensor::F32(aligned_array))
+                        }
+                    } else {
+                        Ok(student.clone())
+                    }
+                } else {
+                    Ok(student.clone())
+                }
+            },
+            _ => Ok(student.clone()),
+        }
+    }
+
+    /// Compute attention entropy for measuring attention distribution sharpness
+    fn compute_attention_entropy(&self, attention: &Tensor) -> Result<Tensor> {
+        match attention {
+            Tensor::F32(arr) => {
+                // Compute entropy: -sum(p * log(p)) for each attention head
+                let epsilon = 1e-8_f32; // Small constant to avoid log(0)
+                let log_probs = arr.mapv(|x| (x + epsilon).ln());
+                let entropy_contributions = arr * &log_probs;
+                let entropy = entropy_contributions.sum_axis(Axis(3)); // Sum over last dimension
+                let mean_entropy = entropy.mean().ok_or_else(|| {
+                    tensor_op_error(
+                        "tensor_operation",
+                        "Cannot compute mean of empty entropy tensor".to_string(),
+                    )
+                })?;
+
+                Ok(Tensor::F32(ArrayD::from_elem(IxDyn(&[1]), -mean_entropy)))
+            },
+            _ => Err(tensor_op_error(
+                "tensor_operation",
+                "Attention entropy computation only supports F32 tensors".to_string(),
+            )),
+        }
+    }
+
+    /// Compute correlation between teacher and student attention patterns
+    fn compute_attention_correlation(&self, teacher: &Tensor, student: &Tensor) -> Result<Tensor> {
+        match (teacher, student) {
+            (Tensor::F32(t_arr), Tensor::F32(s_arr)) => {
+                // Flatten attention matrices and compute Pearson correlation
+                let teacher_flat: Vec<f32> = t_arr.iter().cloned().collect();
+                let student_flat: Vec<f32> = s_arr.iter().cloned().collect();
+
+                if teacher_flat.len() != student_flat.len() {
+                    return Ok(Tensor::F32(ArrayD::from_elem(IxDyn(&[1]), 0.0)));
+                }
+
+                let n = teacher_flat.len() as f32;
+                let teacher_mean: f32 = teacher_flat.iter().sum::<f32>() / n;
+                let student_mean: f32 = student_flat.iter().sum::<f32>() / n;
+
+                let mut numerator = 0.0;
+                let mut teacher_var = 0.0;
+                let mut student_var = 0.0;
+
+                for i in 0..teacher_flat.len() {
+                    let teacher_centered = teacher_flat[i] - teacher_mean;
+                    let student_centered = student_flat[i] - student_mean;
+
+                    numerator += teacher_centered * student_centered;
+                    teacher_var += teacher_centered * teacher_centered;
+                    student_var += student_centered * student_centered;
+                }
+
+                let correlation = if teacher_var > 0.0 && student_var > 0.0 {
+                    numerator / (teacher_var.sqrt() * student_var.sqrt())
+                } else {
+                    0.0
+                };
+
+                Ok(Tensor::F32(ArrayD::from_elem(IxDyn(&[1]), correlation)))
+            },
+            _ => Err(tensor_op_error(
+                "tensor_operation",
+                "Attention correlation computation only supports F32 tensors".to_string(),
+            )),
+        }
+    }
+}
+
+/// Mean cross-entropy of `logits` against ground-truth `targets`.
+///
+/// `logits` has shape `[batch, num_classes]` (the batch axis may be omitted for
+/// a single example). `targets` is accepted in either of the two shapes a
+/// training loop produces:
+///
+/// * **class indices** — shape `[batch]`, each entry an integer class id;
+/// * **one-hot / soft labels** — shape `[batch, num_classes]`, each row a
+///   distribution over classes (soft labels are the general case and reduce to
+///   one-hot when a single entry is 1).
+///
+/// A previous revision of the distillation trainer's hard-target term took
+/// `_targets` and returned `mean(-log softmax(logits))` — the mean negative
+/// log-probability over *every* class. That value is completely independent of
+/// the labels, so the "hard target" term of the objective carried no
+/// supervision at all: two batches with swapped labels produced an identical
+/// loss.
+///
+/// # Errors
+///
+/// Fails when the tensors are not `F32`, when the shapes disagree, or when a
+/// target class index is out of range for the logits' class axis.
+pub fn hard_target_cross_entropy(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
+    let log_probs = logits.softmax(-1)?.log()?;
+    let (Tensor::F32(log_prob_arr), Tensor::F32(target_arr)) = (&log_probs, targets) else {
+        return Err(tensor_op_error(
+            "hard_target_cross_entropy",
+            "hard-target cross-entropy requires F32 logits and F32 targets".to_string(),
+        ));
+    };
+
+    // Normalise the logits to [batch, num_classes].
+    let logit_shape = log_prob_arr.shape().to_vec();
+    let (batch_size, num_classes) = match logit_shape.as_slice() {
+        [classes] => (1usize, *classes),
+        [.., classes] => (
+            logit_shape[..logit_shape.len() - 1].iter().product(),
+            *classes,
+        ),
+        [] => {
+            return Err(tensor_op_error(
+                "hard_target_cross_entropy",
+                "logits tensor is a scalar; cross-entropy needs a class axis".to_string(),
+            ))
+        },
+    };
+    if batch_size == 0 || num_classes == 0 {
+        return Err(tensor_op_error(
+            "hard_target_cross_entropy",
+            format!("logits with shape {logit_shape:?} carry no class scores"),
+        ));
+    }
+
+    let flat_log_probs: Vec<f32> = log_prob_arr.iter().copied().collect();
+    let flat_targets: Vec<f32> = target_arr.iter().copied().collect();
+    let target_shape = target_arr.shape().to_vec();
+
+    let mut total_loss = 0.0f32;
+    if flat_targets.len() == batch_size {
+        // Class-index targets: -log p[b, target[b]].
+        for b in 0..batch_size {
+            let raw = flat_targets[b];
+            if raw < 0.0 || raw.fract() != 0.0 {
+                return Err(tensor_op_error(
+                    "hard_target_cross_entropy",
+                    format!(
+                        "target {raw} at batch position {b} is not a non-negative integer \
+                         class index"
+                    ),
+                ));
+            }
+            let class = raw as usize;
+            if class >= num_classes {
+                return Err(tensor_op_error(
+                    "hard_target_cross_entropy",
+                    format!(
+                        "target class {class} at batch position {b} is out of range for \
+                         {num_classes} classes"
+                    ),
+                ));
+            }
+            total_loss -= flat_log_probs[b * num_classes + class];
+        }
+    } else if flat_targets.len() == batch_size * num_classes {
+        // One-hot / soft-label targets: -sum_c q[b, c] * log p[b, c].
+        for b in 0..batch_size {
+            for c in 0..num_classes {
+                let weight = flat_targets[b * num_classes + c];
+                if weight != 0.0 {
+                    total_loss -= weight * flat_log_probs[b * num_classes + c];
+                }
+            }
+        }
+    } else {
+        return Err(tensor_op_error(
+            "hard_target_cross_entropy",
+            format!(
+                "targets with shape {target_shape:?} match neither class indices \
+                 ([{batch_size}]) nor one-hot labels ([{batch_size}, {num_classes}]) for \
+                 logits with shape {logit_shape:?}"
+            ),
+        ));
+    }
+
+    Tensor::scalar(total_loss / batch_size as f32)
+}
+
+/// Outputs from teacher model for distillation
+#[derive(Debug, Clone)]
+pub struct TeacherOutputs {
+    /// Final layer logits
+    pub logits: Tensor,
+    /// Hidden states from all layers
+    pub hidden_states: Vec<Tensor>,
+    /// Attention weights from all layers
+    pub attentions: Vec<Tensor>,
+}
+
+/// Outputs from student model for distillation
+#[derive(Debug, Clone)]
+pub struct StudentOutputs {
+    /// Final layer logits
+    pub logits: Tensor,
+    /// Hidden states from all layers
+    pub hidden_states: Vec<Tensor>,
+    /// Attention weights from all layers
+    pub attentions: Vec<Tensor>,
+}
+
+/// Utilities for knowledge distillation
+pub mod utils {
+    use super::*;
+
+    /// Create a basic response-based distillation config
+    pub fn response_distillation_config(temperature: f32, alpha: f32) -> DistillationConfig {
+        DistillationConfig {
+            temperature,
+            alpha,
+            strategy: DistillationStrategy::ResponseBased,
+            ..Default::default()
+        }
+    }
+
+    /// Create a feature-based distillation config
+    pub fn feature_distillation_config(
+        layer_mapping: HashMap<usize, usize>,
+        alpha: f32,
+    ) -> DistillationConfig {
+        DistillationConfig {
+            alpha,
+            strategy: DistillationStrategy::FeatureBased,
+            use_feature_matching: true,
+            feature_matching_layers: layer_mapping,
+            ..Default::default()
+        }
+    }
+
+    /// Create a combined distillation config
+    pub fn combined_distillation_config(
+        temperature: f32,
+        alpha: f32,
+        response_weight: f32,
+        feature_weight: f32,
+        attention_weight: f32,
+    ) -> DistillationConfig {
+        DistillationConfig {
+            temperature,
+            alpha,
+            strategy: DistillationStrategy::Combined {
+                response_weight,
+                feature_weight,
+                attention_weight,
+            },
+            use_feature_matching: feature_weight > 0.0,
+            use_attention_transfer: attention_weight > 0.0,
+            ..Default::default()
+        }
+    }
+
+    /// Create a progressive distillation config
+    pub fn progressive_distillation_config(stages: Vec<ProgressiveStage>) -> DistillationConfig {
+        DistillationConfig {
+            strategy: DistillationStrategy::Progressive { stages },
+            progressive: true,
+            ..Default::default()
+        }
+    }
+
+    /// Helper to create a linear decay schedule for progressive distillation
+    pub fn linear_decay_stages(
+        initial_temp: f32,
+        final_temp: f32,
+        initial_alpha: f32,
+        final_alpha: f32,
+        num_stages: usize,
+        steps_per_stage: usize,
+    ) -> Vec<ProgressiveStage> {
+        let mut stages = Vec::new();
+
+        for i in 0..num_stages {
+            let progress = i as f32 / (num_stages - 1) as f32;
+            let temp = initial_temp + progress * (final_temp - initial_temp);
+            let alpha = initial_alpha + progress * (final_alpha - initial_alpha);
+
+            stages.push(ProgressiveStage {
+                duration: steps_per_stage,
+                temperature: temp,
+                alpha,
+                freeze_teacher: false,
+            });
+        }
+
+        stages
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the hard-target term must actually depend on the targets.
+    ///
+    /// The previous body ignored `_targets` and returned
+    /// `mean(-log softmax(logits))`, so both calls below produced the same
+    /// number and this assertion failed.
+    #[test]
+    fn hard_target_loss_depends_on_the_labels() {
+        // Row 0 strongly prefers class 0, row 1 strongly prefers class 2.
+        let logits = Tensor::from_vec(vec![5.0, 0.0, 0.0, 0.0, 0.0, 5.0], &[2, 3])
+            .expect("logits must build");
+
+        let correct = Tensor::from_vec(vec![0.0, 2.0], &[2]).expect("targets must build");
+        let wrong = Tensor::from_vec(vec![2.0, 0.0], &[2]).expect("targets must build");
+
+        let correct_loss = hard_target_cross_entropy(&logits, &correct)
+            .expect("cross-entropy must succeed")
+            .to_scalar()
+            .expect("loss must be a scalar");
+        let wrong_loss = hard_target_cross_entropy(&logits, &wrong)
+            .expect("cross-entropy must succeed")
+            .to_scalar()
+            .expect("loss must be a scalar");
+
+        assert!(
+            wrong_loss > correct_loss,
+            "predicting the wrong class must cost more: correct={correct_loss}, \
+             wrong={wrong_loss}"
+        );
+        // -log softmax(5,0,0)[0] = log(1 + 2*e^-5) ~= 0.01342
+        assert!(
+            (correct_loss - 0.013_42).abs() < 1e-3,
+            "unexpected cross-entropy for a confident correct prediction: {correct_loss}"
+        );
+    }
+
+    #[test]
+    fn hard_target_loss_accepts_one_hot_labels() {
+        let logits = Tensor::from_vec(vec![5.0, 0.0, 0.0], &[1, 3]).expect("logits must build");
+        let indices = Tensor::from_vec(vec![0.0], &[1]).expect("targets must build");
+        let one_hot = Tensor::from_vec(vec![1.0, 0.0, 0.0], &[1, 3]).expect("targets must build");
+
+        let from_indices = hard_target_cross_entropy(&logits, &indices)
+            .expect("index targets must work")
+            .to_scalar()
+            .expect("scalar");
+        let from_one_hot = hard_target_cross_entropy(&logits, &one_hot)
+            .expect("one-hot targets must work")
+            .to_scalar()
+            .expect("scalar");
+        assert!(
+            (from_indices - from_one_hot).abs() < 1e-6,
+            "index and one-hot encodings of the same label must agree: \
+             {from_indices} vs {from_one_hot}"
+        );
+    }
+
+    #[test]
+    fn hard_target_loss_rejects_an_out_of_range_class() {
+        let logits = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[1, 3]).expect("logits must build");
+        let targets = Tensor::from_vec(vec![7.0], &[1]).expect("targets must build");
+        let err = hard_target_cross_entropy(&logits, &targets)
+            .expect_err("an out-of-range class must be rejected");
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_distillation_config_default() {
+        let config = DistillationConfig::default();
+        assert_eq!(config.temperature, 4.0);
+        assert_eq!(config.alpha, 0.7);
+        assert!(!config.use_feature_matching);
+        assert!(!config.use_attention_transfer);
+    }
+
+    #[test]
+    fn test_response_distillation_config() {
+        let config = utils::response_distillation_config(3.0, 0.8);
+        assert_eq!(config.temperature, 3.0);
+        assert_eq!(config.alpha, 0.8);
+        assert!(matches!(
+            config.strategy,
+            DistillationStrategy::ResponseBased
+        ));
+    }
+
+    #[test]
+    fn test_feature_distillation_config() {
+        let mut layer_mapping = HashMap::new();
+        layer_mapping.insert(11, 5); // Map teacher layer 11 to student layer 5
+
+        let config = utils::feature_distillation_config(layer_mapping.clone(), 0.6);
+        assert_eq!(config.alpha, 0.6);
+        assert!(config.use_feature_matching);
+        assert_eq!(config.feature_matching_layers, layer_mapping);
+    }
+
+    #[test]
+    fn test_combined_distillation_config() {
+        let config = utils::combined_distillation_config(4.0, 0.7, 0.5, 0.3, 0.2);
+        assert_eq!(config.temperature, 4.0);
+        assert_eq!(config.alpha, 0.7);
+        assert!(config.use_feature_matching);
+        assert!(config.use_attention_transfer);
+
+        if let DistillationStrategy::Combined {
+            response_weight,
+            feature_weight,
+            attention_weight,
+        } = config.strategy
+        {
+            assert_eq!(response_weight, 0.5);
+            assert_eq!(feature_weight, 0.3);
+            assert_eq!(attention_weight, 0.2);
+        } else {
+            panic!("Expected Combined strategy");
+        }
+    }
+
+    #[test]
+    fn test_progressive_stages() {
+        let stages = utils::linear_decay_stages(5.0, 1.0, 0.8, 0.5, 4, 1000);
+        assert_eq!(stages.len(), 4);
+        assert_eq!(stages[0].temperature, 5.0);
+        assert_eq!(stages[3].temperature, 1.0);
+        assert_eq!(stages[0].alpha, 0.8);
+        assert!(stages[3].alpha - 0.5 < 1e-6); // Float comparison
+    }
+
+    #[test]
+    fn test_progressive_distillation_config() {
+        let stages = vec![
+            ProgressiveStage {
+                duration: 1000,
+                temperature: 5.0,
+                alpha: 0.8,
+                freeze_teacher: false,
+            },
+            ProgressiveStage {
+                duration: 1000,
+                temperature: 3.0,
+                alpha: 0.6,
+                freeze_teacher: false,
+            },
+        ];
+
+        let config = utils::progressive_distillation_config(stages.clone());
+        assert!(config.progressive);
+
+        if let DistillationStrategy::Progressive {
+            stages: config_stages,
+        } = config.strategy
+        {
+            assert_eq!(config_stages.len(), 2);
+            assert_eq!(config_stages[0].temperature, 5.0);
+            assert_eq!(config_stages[1].temperature, 3.0);
+        } else {
+            panic!("Expected Progressive strategy");
+        }
+    }
+
+    // ---- Response distillation loss: soft targets with temperature T ----
+
+    /// Scaling logits by temperature T > 1 must produce a softer (higher-entropy) distribution.
+    #[test]
+    fn test_temperature_softens_distribution() {
+        // Soft distribution: p = softmax(logits / T)
+        // Higher T → more uniform distribution → higher entropy.
+        fn softmax_entropy(logits: &[f64], temperature: f64) -> f64 {
+            let scaled: Vec<f64> = logits.iter().map(|&x| x / temperature).collect();
+            let max_val = scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exp_vals: Vec<f64> = scaled.iter().map(|&x| (x - max_val).exp()).collect();
+            let sum: f64 = exp_vals.iter().sum();
+            let probs: Vec<f64> = exp_vals.iter().map(|&x| x / sum).collect();
+            -probs.iter().map(|&p| if p > 0.0 { p * p.ln() } else { 0.0 }).sum::<f64>()
+        }
+
+        let logits = [2.0f64, 1.0, 0.5, -0.5];
+        let entropy_t1 = softmax_entropy(&logits, 1.0);
+        let entropy_t4 = softmax_entropy(&logits, 4.0);
+        let entropy_t10 = softmax_entropy(&logits, 10.0);
+
+        assert!(
+            entropy_t4 > entropy_t1,
+            "T=4 must produce higher entropy than T=1; got {:.4} vs {:.4}",
+            entropy_t4,
+            entropy_t1
+        );
+        assert!(
+            entropy_t10 > entropy_t4,
+            "T=10 must produce higher entropy than T=4"
+        );
+    }
+
+    /// At T=1 the soft-target distribution must equal the standard softmax.
+    #[test]
+    fn test_temperature_1_equals_standard_softmax() {
+        fn softmax(logits: &[f64], temperature: f64) -> Vec<f64> {
+            let scaled: Vec<f64> = logits.iter().map(|&x| x / temperature).collect();
+            let max_val = scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exp_vals: Vec<f64> = scaled.iter().map(|&x| (x - max_val).exp()).collect();
+            let sum: f64 = exp_vals.iter().sum();
+            exp_vals.iter().map(|&x| x / sum).collect()
+        }
+
+        let logits = [1.5f64, -0.3, 0.8, 2.1];
+        let p_t1 = softmax(&logits, 1.0);
+        let p_standard = softmax(&logits, 1.0);
+        for (a, b) in p_t1.iter().zip(p_standard.iter()) {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "T=1 soft targets must equal standard softmax"
+            );
+        }
+    }
+
+    /// KL divergence D_KL(P||Q) ≥ 0 always, with equality when P = Q.
+    #[test]
+    fn test_kl_divergence_non_negative() {
+        fn kl_div(p: &[f64], q: &[f64]) -> f64 {
+            p.iter()
+                .zip(q.iter())
+                .map(
+                    |(&pi, &qi)| {
+                        if pi > 0.0 {
+                            pi * (pi / qi).ln()
+                        } else {
+                            0.0
+                        }
+                    },
+                )
+                .sum()
+        }
+
+        // Same distributions: KL = 0
+        let p = [0.5f64, 0.3, 0.2];
+        let kl_same = kl_div(&p, &p);
+        assert!(kl_same.abs() < 1e-12, "KL(P||P) must be 0; got {}", kl_same);
+
+        // Different distributions: KL ≥ 0
+        let q = [0.2f64, 0.5, 0.3];
+        let kl_diff = kl_div(&p, &q);
+        assert!(kl_diff >= 0.0, "KL(P||Q) must be >= 0; got {}", kl_diff);
+    }
+
+    // ---- Feature matching MSE ----
+
+    /// MSE between identical tensors must be zero.
+    #[test]
+    fn test_feature_mse_zero_for_identical() {
+        use trustformers_core::tensor::Tensor;
+        let t = Tensor::zeros(&[4, 8]).expect("tensor creation must succeed");
+        let s = Tensor::zeros(&[4, 8]).expect("tensor creation must succeed");
+        let diff = t.sub(&s).expect("subtraction must succeed");
+        let sq = diff.mul(&diff).expect("element-wise mul must succeed");
+        let mse = sq.mean().expect("mean must succeed");
+        let val = mse.data_f32().expect("data extraction must succeed");
+        assert!(
+            val.iter().all(|&x| x.abs() < 1e-6),
+            "MSE between identical zero tensors must be 0"
+        );
+    }
+
+    // ---- Attention map distillation ----
+
+    /// Attention map MSE must be ≥ 0.
+    #[test]
+    fn test_attention_mse_non_negative() {
+        use trustformers_core::tensor::Tensor;
+        let t = Tensor::ones(&[2, 4, 8, 8]).expect("teacher attention must be created");
+        let s = Tensor::zeros(&[2, 4, 8, 8]).expect("student attention must be created");
+        let diff = t.sub(&s).expect("subtraction must succeed");
+        let sq = diff.mul(&diff).expect("squaring must succeed");
+        let mse = sq.mean().expect("mean must succeed");
+        let val = mse.data_f32().expect("data extraction must succeed");
+        assert!(val.iter().all(|&x| x >= 0.0), "Attention MSE must be >= 0");
+    }
+
+    // ---- Layer mapping ----
+
+    /// A feature_matching_layers mapping of teacher → student must be correctly stored.
+    #[test]
+    fn test_layer_mapping_stored_correctly() {
+        let mut mapping = HashMap::new();
+        mapping.insert(11usize, 5usize); // teacher layer 11 → student layer 5
+        mapping.insert(6, 3);
+        let config = utils::feature_distillation_config(mapping.clone(), 0.7);
+        assert_eq!(config.feature_matching_layers.get(&11), Some(&5usize));
+        assert_eq!(config.feature_matching_layers.get(&6), Some(&3usize));
+    }
+
+    // ---- Progressive distillation scheduling ----
+
+    /// linear_decay_stages must produce monotonically decreasing temperature from initial to final.
+    #[test]
+    fn test_linear_decay_stages_monotone_temperature() {
+        let stages = utils::linear_decay_stages(8.0, 1.0, 0.9, 0.4, 5, 500);
+        assert_eq!(stages.len(), 5);
+        for w in stages.windows(2) {
+            assert!(
+                w[0].temperature >= w[1].temperature,
+                "Temperature must be monotonically decreasing; got {} > {}",
+                w[0].temperature,
+                w[1].temperature
+            );
+        }
+    }
+
+    /// The first stage temperature must equal the initial and last must equal the final.
+    #[test]
+    fn test_linear_decay_stages_endpoints() {
+        let init_t = 6.0f32;
+        let final_t = 1.5f32;
+        let stages = utils::linear_decay_stages(init_t, final_t, 0.8, 0.5, 4, 1000);
+        assert!(
+            (stages[0].temperature - init_t).abs() < 1e-5,
+            "First stage must have initial temp"
+        );
+        assert!(
+            (stages[stages.len() - 1].temperature - final_t).abs() < 1e-5,
+            "Last stage must have final temp"
+        );
+    }
+
+    /// Each stage duration must equal the steps_per_stage value.
+    #[test]
+    fn test_linear_decay_stages_duration_per_stage() {
+        let steps_per_stage = 250;
+        let stages = utils::linear_decay_stages(5.0, 1.0, 0.8, 0.5, 4, steps_per_stage);
+        for stage in &stages {
+            assert_eq!(
+                stage.duration, steps_per_stage,
+                "Each stage must have duration == steps_per_stage"
+            );
+        }
+    }
+
+    // ---- Distillation weight scheduling ----
+
+    /// alpha must remain in [0, 1] across all linear_decay_stages.
+    #[test]
+    fn test_linear_decay_alpha_in_unit_interval() {
+        let stages = utils::linear_decay_stages(5.0, 1.0, 0.9, 0.3, 8, 100);
+        for stage in &stages {
+            assert!(
+                stage.alpha >= 0.0 && stage.alpha <= 1.0,
+                "Alpha must be in [0,1]; got {}",
+                stage.alpha
+            );
+        }
+    }
+
+    // ---- DistillationConfig defaults ----
+
+    #[test]
+    fn test_distillation_config_min_temperature_default() {
+        let config = DistillationConfig::default();
+        assert!(
+            (config.min_temperature - 1.0).abs() < 1e-6,
+            "Default min_temperature must be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_distillation_config_progressive_stages_default() {
+        let config = DistillationConfig::default();
+        assert_eq!(
+            config.progressive_stages, 5,
+            "Default progressive_stages must be 5"
+        );
+    }
+
+    #[test]
+    fn test_combined_strategy_weights_sum_to_one() {
+        let rw = 0.5f32;
+        let fw = 0.3f32;
+        let aw = 0.2f32;
+        let config = utils::combined_distillation_config(4.0, 0.7, rw, fw, aw);
+        if let DistillationStrategy::Combined {
+            response_weight,
+            feature_weight,
+            attention_weight,
+        } = config.strategy
+        {
+            let total = response_weight + feature_weight + attention_weight;
+            assert!(
+                (total - 1.0).abs() < 1e-6,
+                "Combined strategy weights must sum to 1.0; got {}",
+                total
+            );
+        } else {
+            panic!("Expected Combined strategy");
+        }
+    }
+}

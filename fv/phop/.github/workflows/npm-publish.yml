@@ -1,0 +1,67 @@
+# npm publish workflow for the `@cooljapan/phop` WebAssembly package (crate `phop-wasm`).
+#
+# Builds the wasm-bindgen package with wasm-pack and publishes the generated
+# `crates/phop-wasm/pkg` directory to the npm registry with provenance.
+
+name: npm publish (phop-wasm)
+
+on:
+  # Publish on a release tag push (publish.sh / 010.sh push `vX.Y.Z`) or a manual run.
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # REQUIRED for `npm publish --provenance`
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+        # Alternative: `cargo install wasm-pack`
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # Build the wasm package. `--target web` emits an ES module for native browser
+      # `<script type="module">` / import use. Alternatives: `--target bundler` (for
+      # webpack/rollup/vite) or `--target nodejs` (CommonJS for Node).
+      # `--scope cooljapan` writes the package name `@cooljapan/phop` into pkg/package.json.
+      - name: Build wasm package
+        run: wasm-pack build crates/phop-wasm --release --target web --scope cooljapan --out-dir pkg
+
+      # Publish on a release tag push (refs/tags/v*) or a manual workflow_dispatch run.
+      # `--access public` is required for a brand-new scoped (@cooljapan/...) package.
+      # `--provenance` attaches a signed build-provenance attestation (needs id-token: write).
+      #
+      # ONE-TIME MAINTAINER SETUP (before the first run):
+      #   1. Add the `NPM_TOKEN` repository secret (an npm automation token with
+      #      publish rights). Settings -> Secrets and variables -> Actions.
+      #   2. Confirm the `@cooljapan` npm scope/org exists and that the publishing
+      #      account is a member with publish permission, so the package name
+      #      `@cooljapan/phop` resolves.
+      - name: Publish to npm
+        if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+        run: npm publish --access public --provenance
+        working-directory: crates/phop-wasm/pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

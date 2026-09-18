@@ -1,0 +1,75 @@
+[package]
+name = "oxitls"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiTLS — Pure-Rust TLS facade (rustls + RustCrypto, zero FFI by default)"
+readme = "README.md"
+categories = ["cryptography", "network-programming"]
+keywords = ["tls", "rustls", "pure-rust", "cooljapan", "oxitls"]
+
+[features]
+default = ["pure", "webpki-roots"]
+pure = [
+    "dep:oxitls-adapter-rustls-rustcrypto",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:rustls-pki-types",
+    "dep:tokio-rustls",
+    "dep:tokio",
+    "dep:aes-gcm",
+    "dep:getrandom",
+    "dep:sha2",
+]
+webpki-roots = ["dep:oxitls-webpki-roots"]
+h2 = ["dep:oxitls-h2"]
+rcgen = ["dep:oxitls-rcgen"]
+quic-preview = ["pure"]
+# Passthrough for the generic-transport GAT traits in oxitls-core.
+generic-transport = ["oxitls-core/generic-transport"]
+# Post-quantum hybrid key exchange (X25519MLKEM768, draft-ietf-tls-ecdhe-mlkem)
+# — fully wired (Wave 6 complete): real encapsulate/decapsulate via ml-kem +
+# x25519-dalek (see oxitls-adapter-rustls-rustcrypto/src/kx.rs), selected by
+# both tls13::client::ClientBuilder and tls13::server::ServerBuilder when
+# enabled.
+post-quantum = ["dep:oxitls-adapter-rustls-rustcrypto", "oxitls-adapter-rustls-rustcrypto/post-quantum"]
+# Encrypted Client Hello (RFC 8449) support: real ECH config-list or GREASE mode.
+# Implies `pure`; wires HPKE suites from the adapter behind the `ech` sub-feature.
+ech = ["pure", "dep:oxitls-adapter-rustls-rustcrypto", "oxitls-adapter-rustls-rustcrypto/ech"]
+# RFC 8879 TLS certificate compression backed by OxiARC pure-Rust zlib.
+cert-compression = ["dep:oxitls-adapter-rustls-rustcrypto", "oxitls-adapter-rustls-rustcrypto/cert-compression"]
+
+[dependencies]
+oxitls-core = { workspace = true }
+oxitls-adapter-rustls-rustcrypto = { workspace = true, optional = true }
+oxitls-webpki-roots = { workspace = true, optional = true }
+oxitls-h2 = { workspace = true, optional = true }
+oxitls-rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+# OxiTicketer: AES-256-GCM for session-ticket encryption (no ring).
+# Gated behind the `pure` feature since ticketer.rs uses rustls types.
+aes-gcm   = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+# sha2: SHA-256 fingerprinting for anti-replay ticket tracking (no ring).
+sha2 = { workspace = true, optional = true }
+# tracing: zero-cost log facade for rotation task warnings.
+tracing = { workspace = true }
+
+[dev-dependencies]
+oxitls-adapter-rustls-rustcrypto = { path = "../oxitls-adapter-rustls-rustcrypto" }
+oxitls-rcgen = { path = "../oxitls-rcgen" }
+# Existing tests use rcgen::KeyPair::generate() which requires the `crypto`
+# feature (backed by ring).  Ring on a dev-only edge is acceptable per project
+# policy; no ring in the normal (library) edge.
+rcgen = { workspace = true, features = ["crypto", "pem", "ring"] }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio = { workspace = true, features = ["full", "macros"] }
+tokio-rustls = { workspace = true }

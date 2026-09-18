@@ -1,0 +1,1249 @@
+//! CRC (Cyclic Redundancy Check) implementations.
+//!
+//! This module provides CRC implementations commonly used in archive formats:
+//!
+//! - **CRC-32 (ISO 3309)**: Used by ZIP, GZIP, PNG
+//! - **CRC-64/ECMA-182**: Used by XZ format
+//! - **CRC-16/ARC**: Used by LZH/LHA archives
+//!
+//! ## Performance Optimization
+//!
+//! Both CRC-32 and CRC-64 use the "slicing-by-8" technique for data >=16 bytes,
+//! processing 8 bytes at a time using 8 pre-computed lookup tables. This provides
+//! significant speedup (typically 3-5x) over the traditional byte-at-a-time algorithm
+//! while maintaining full compatibility.
+//!
+//! For smaller data (<16 bytes), a simpler single-table lookup is used to avoid
+//! the overhead of the more complex slicing algorithm.
+//!
+//! ## SIMD Acceleration (Automatic)
+//!
+//! Hardware-accelerated CRC-32 is selected automatically at runtime — there is
+//! **no** cargo feature to enable. The dispatch is chosen once (cached in a
+//! `OnceLock`) based on `cfg(target_arch)` plus CPU feature probing:
+//!
+//! - **aarch64**: Uses PMULL (polynomial multiplication) when
+//!   `is_aarch64_feature_detected!("aes")` reports the crypto extensions
+//!   (AES implies PMULL). The fold/Barrett constants are verified against the
+//!   scalar slicing-by-8 reference; see `crc_simd::arm`.
+//! - **x86_64**: Uses PCLMULQDQ when `pclmulqdq` and `sse4.1` are detected.
+//!   The fold/Barrett constants and reduction shape are shared with the
+//!   aarch64 path (`crc_simd::reflected_constants`) and are cross-checked
+//!   against the scalar slicing-by-8 reference by the `test_pclmulqdq_*`
+//!   tests; see `crc_simd::x86` for how that verification was performed.
+//! - **Other architectures**: always use the slicing-by-8 software path.
+//!
+//! Every implementation uses the same ISO 3309 polynomial (0xEDB88320) as the
+//! software path, ensuring full compatibility with ZIP/GZIP/PNG formats.
+//!
+//! [`Crc32::implementation_name`] reports the path that was actually selected,
+//! and [`Crc32::is_simd_available`] reflects whether that path is SIMD.
+//!
+//! Note: a `simd` cargo feature previously gated this and is now a documented
+//! no-op kept only for backward compatibility.
+//!
+//! ## Note on Hardware CRC Instructions
+//!
+//! The x86_64 SSE4.2 `CRC32` instruction and ARM `CRC32C` instruction use the
+//! Castagnoli polynomial (0x1EDC6F41), which is different from the ISO 3309
+//! polynomial (0xEDB88320) used by ZIP/GZIP. Therefore, we use PCLMULQDQ/PMULL
+//! with pre-computed fold constants for the correct polynomial.
+
+/// CRC-32 lookup table (polynomial 0xEDB88320, reflected).
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// CRC-32 slicing-by-8 lookup tables.
+/// This pre-computes 8 tables, allowing us to process 8 bytes in parallel.
+const CRC32_TABLE_SLICE: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
+
+    // First table is the standard CRC-32 table
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        tables[0][i] = crc;
+        i += 1;
+    }
+
+    // Build subsequent tables
+    let mut t = 1;
+    while t < 8 {
+        let mut i = 0usize;
+        while i < 256 {
+            let prev = tables[t - 1][i];
+            tables[t][i] = tables[0][(prev & 0xFF) as usize] ^ (prev >> 8);
+            i += 1;
+        }
+        t += 1;
+    }
+
+    tables
+};
+
+/// CRC-16/ARC lookup table (polynomial 0xA001, reflected).
+const CRC16_TABLE: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u16;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+// Re-export SIMD module when on supported target architectures
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub use crate::crc_simd::{SimdCrc32Dispatcher, software_crc32 as simd_software_crc32};
+
+/// Signature for the CRC-32 update function dispatched at runtime.
+///
+/// Arguments: (current_crc_inverted, data) -> updated_crc_inverted
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+type Crc32Fn = fn(u32, &[u8]) -> u32;
+
+/// The CRC-32 implementation actually chosen by [`init_crc32_dispatch`].
+///
+/// This records *what was selected*, so [`Crc32::is_simd_available`] and
+/// [`Crc32::implementation_name`] can report the real dispatch path instead of
+/// independently re-probing CPU features (which historically caused x86_64 to
+/// advertise PCLMULQDQ while `update` was silently using the software path).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+struct Crc32Dispatch {
+    /// The function `Crc32::update` calls.
+    func: Crc32Fn,
+    /// Human-readable name of the selected path.
+    name: &'static str,
+    /// Whether the selected path is a hardware SIMD implementation.
+    simd: bool,
+}
+
+/// Runtime-selected CRC-32 dispatch (initialized once via OnceLock).
+///
+/// On x86_64/aarch64, this may be a SIMD-accelerated implementation if the
+/// CPU supports it and the path is verified. Otherwise, falls back to the
+/// slicing-by-8 scalar path.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+static CRC32_DISPATCH: std::sync::OnceLock<Crc32Dispatch> = std::sync::OnceLock::new();
+
+/// Select the best available CRC-32 implementation at runtime.
+///
+/// Called once and cached in `CRC32_DISPATCH`. Checks for CPU features and
+/// returns the selected implementation together with a label describing it:
+/// - On aarch64 with AES/PMULL support: verified `arm::crc32_pmull` wrapper.
+/// - On x86_64 with PCLMULQDQ + SSE4.1: verified `x86::crc32_pclmulqdq` wrapper.
+/// - Other architectures: slicing-by-8.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn init_crc32_dispatch() -> Crc32Dispatch {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if crate::crc_simd::arm::is_supported() {
+            fn pmull_dispatch(crc: u32, data: &[u8]) -> u32 {
+                // SAFETY: this function is only selected when is_supported() is true,
+                // meaning the AES (and therefore PMULL) CPU feature is present.
+                unsafe { crate::crc_simd::arm::crc32_pmull(crc, data) }
+            }
+            return Crc32Dispatch {
+                func: pmull_dispatch,
+                name: "PMULL (aarch64 SIMD)",
+                simd: true,
+            };
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::crc_simd::x86::is_supported() {
+            fn pclmulqdq_dispatch(crc: u32, data: &[u8]) -> u32 {
+                // SAFETY: this function is only selected when is_supported() is true,
+                // meaning both the PCLMULQDQ and SSE4.1 CPU features are present.
+                unsafe { crate::crc_simd::x86::crc32_pclmulqdq(crc, data) }
+            }
+            return Crc32Dispatch {
+                func: pclmulqdq_dispatch,
+                name: "PCLMULQDQ (x86_64 SIMD)",
+                simd: true,
+            };
+        }
+    }
+    // Fallback: slicing-by-8 software implementation.
+    fn software_dispatch(crc: u32, data: &[u8]) -> u32 {
+        crate::crc_simd::software_crc32(crc, data)
+    }
+    // The label explains *why* software was chosen on each architecture.
+    #[cfg(target_arch = "aarch64")]
+    let name = "slicing-by-8 (software, PMULL not available)";
+    #[cfg(target_arch = "x86_64")]
+    let name = "slicing-by-8 (software, PCLMULQDQ not available)";
+    Crc32Dispatch {
+        func: software_dispatch,
+        name,
+        simd: false,
+    }
+}
+
+/// Get the cached runtime dispatch record.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
+fn get_crc32_dispatch() -> Crc32Dispatch {
+    *CRC32_DISPATCH.get_or_init(init_crc32_dispatch)
+}
+
+/// Get the cached runtime-dispatched CRC-32 function.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
+fn get_crc32_fn() -> Crc32Fn {
+    get_crc32_dispatch().func
+}
+
+/// CRC-32 calculator (ISO 3309).
+///
+/// This is the standard CRC-32 used by ZIP, GZIP, PNG, and many other formats.
+///
+/// - Polynomial: 0x04C11DB7 (reflected: 0xEDB88320)
+/// - Initial value: 0xFFFFFFFF
+/// - Final XOR: 0xFFFFFFFF
+/// - Reflected input: Yes
+/// - Reflected output: Yes
+///
+/// # Performance
+///
+/// The implementation is selected automatically at runtime (no cargo feature
+/// required). On aarch64 with AES/PMULL support, `update` uses the verified
+/// hardware PMULL path for large data blocks (5-20x speedup). On x86_64 and
+/// other architectures it currently uses the slicing-by-8 software path.
+/// [`Crc32::implementation_name`] reports the path in effect.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_core::crc::Crc32;
+///
+/// let mut crc = Crc32::new();
+/// crc.update(b"Hello, World!");
+/// assert_eq!(crc.finalize(), 0xEC4AC3D0);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Crc32 {
+    crc: u32,
+}
+
+impl Crc32 {
+    /// Create a new CRC-32 calculator.
+    pub fn new() -> Self {
+        Self { crc: 0xFFFFFFFF }
+    }
+
+    /// Reset the CRC to its initial state.
+    pub fn reset(&mut self) {
+        self.crc = 0xFFFFFFFF;
+    }
+
+    /// Update the CRC with more data.
+    ///
+    /// On aarch64 with AES/PMULL support, this uses the hardware PMULL path via
+    /// a `OnceLock`-cached runtime dispatch. On x86_64 (PCLMULQDQ dispatch not
+    /// yet enabled) and other architectures, the slicing-by-8 scalar path is
+    /// used. Call [`Crc32::implementation_name`] to see the selected path.
+    #[inline]
+    pub fn update(&mut self, data: &[u8]) {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            self.crc = get_crc32_fn()(self.crc, data);
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            // Use slicing-by-8 for better performance on large data
+            if data.len() >= 16 {
+                crc32_slice8(&mut self.crc, data);
+            } else {
+                crc32_sw(&mut self.crc, data);
+            }
+        }
+    }
+
+    /// Get the current CRC value (without finalizing).
+    #[inline(always)]
+    pub fn value(&self) -> u32 {
+        self.crc ^ 0xFFFFFFFF
+    }
+
+    /// Finalize and return the CRC value.
+    #[inline(always)]
+    pub fn finalize(self) -> u32 {
+        self.crc ^ 0xFFFFFFFF
+    }
+
+    /// Resume a running CRC from a previously observed [`Crc32::value`].
+    ///
+    /// Feeding more data to the result gives the same CRC as feeding it to
+    /// the calculator `value` was read from.
+    ///
+    /// ```
+    /// use oxiarc_core::crc::Crc32;
+    ///
+    /// let mut a = Crc32::new();
+    /// a.update(b"Hello, ");
+    /// let mut resumed = Crc32::from_value(a.value());
+    /// resumed.update(b"World!");
+    /// assert_eq!(resumed.value(), Crc32::compute(b"Hello, World!"));
+    /// ```
+    #[inline]
+    pub fn from_value(value: u32) -> Self {
+        Self {
+            crc: value ^ 0xFFFFFFFF,
+        }
+    }
+
+    /// zlib's `crc32_combine`: the CRC-32 of `A || B` from `crc(A)`,
+    /// `crc(B)` and `len(B)`, in `O(log len(B))`.
+    ///
+    /// ```
+    /// use oxiarc_core::crc::Crc32;
+    ///
+    /// let a = Crc32::compute(b"The quick brown fox ");
+    /// let b = Crc32::compute(b"jumps over the lazy dog");
+    /// assert_eq!(
+    ///     Crc32::combine(a, b, 23),
+    ///     Crc32::compute(b"The quick brown fox jumps over the lazy dog"),
+    /// );
+    /// ```
+    pub fn combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
+        fn times(mat: &[u32; 32], mut vec: u32) -> u32 {
+            let mut sum = 0u32;
+            let mut i = 0usize;
+            while vec != 0 {
+                if vec & 1 != 0 {
+                    sum ^= mat[i];
+                }
+                vec >>= 1;
+                i += 1;
+            }
+            sum
+        }
+        fn square(out: &mut [u32; 32], mat: &[u32; 32]) {
+            for (n, slot) in out.iter_mut().enumerate() {
+                *slot = times(mat, mat[n]);
+            }
+        }
+        if len_b == 0 {
+            return crc_a;
+        }
+        let mut even = [0u32; 32];
+        let mut odd = [0u32; 32];
+        odd[0] = 0xEDB8_8320;
+        let mut row = 1u32;
+        for slot in odd.iter_mut().skip(1) {
+            *slot = row;
+            row <<= 1;
+        }
+        square(&mut even, &odd);
+        square(&mut odd, &even);
+        let mut crc = crc_a;
+        let mut len = len_b;
+        loop {
+            square(&mut even, &odd);
+            if len & 1 != 0 {
+                crc = times(&even, crc);
+            }
+            len >>= 1;
+            if len == 0 {
+                break;
+            }
+            square(&mut odd, &even);
+            if len & 1 != 0 {
+                crc = times(&odd, crc);
+            }
+            len >>= 1;
+            if len == 0 {
+                break;
+            }
+        }
+        crc ^ crc_b
+    }
+
+    /// Compute CRC-32 for a slice in one call.
+    #[inline]
+    pub fn compute(data: &[u8]) -> u32 {
+        let mut crc = Self::new();
+        crc.update(data);
+        crc.finalize()
+    }
+
+    /// Check whether the CRC-32 path actually dispatched by [`Crc32::update`] is
+    /// a hardware SIMD implementation.
+    ///
+    /// This reflects the *real* dispatch decision made by `init_crc32_dispatch`
+    /// (cached in a `OnceLock`), not an independent CPU-feature probe. It returns
+    /// `true` only on aarch64 when the verified PMULL path was selected. On
+    /// x86_64 the PCLMULQDQ path is not yet wired into dispatch, so this returns
+    /// `false` even though the CPU may support PCLMULQDQ; other architectures
+    /// always return `false`.
+    ///
+    /// Note: the `simd` cargo feature is now a no-op alias kept for backward
+    /// compatibility; SIMD is auto-detected via `cfg(target_arch)` and CPU
+    /// feature detection.
+    #[inline]
+    pub fn is_simd_available() -> bool {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            get_crc32_dispatch().simd
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
+    /// Get a description of the implementation actually being used.
+    ///
+    /// This reports the path selected by the runtime dispatcher (the same one
+    /// [`Crc32::update`] calls), so it never misreports the implementation. It
+    /// is useful for debugging and benchmarking to verify which path is taken.
+    #[inline]
+    pub fn implementation_name() -> &'static str {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            get_crc32_dispatch().name
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            "slicing-by-8 (software)"
+        }
+    }
+
+    /// Compute CRC-32 using software implementation only.
+    ///
+    /// This is useful for benchmarking to compare against SIMD implementation.
+    #[inline]
+    pub fn compute_software(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFFFFFF_u32;
+        if data.len() >= 16 {
+            crc32_slice8(&mut crc, data);
+        } else {
+            crc32_sw(&mut crc, data);
+        }
+        crc ^ 0xFFFFFFFF
+    }
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Software CRC-32 implementation using single lookup table.
+/// Best for small data (< 16 bytes).
+#[inline]
+fn crc32_sw(crc: &mut u32, data: &[u8]) {
+    for &byte in data {
+        let index = ((*crc ^ byte as u32) & 0xFF) as usize;
+        *crc = CRC32_TABLE[index] ^ (*crc >> 8);
+    }
+}
+
+/// Optimized CRC-32 using slicing-by-8 technique.
+/// Processes 8 bytes at a time for better throughput on large data.
+#[inline]
+fn crc32_slice8(crc: &mut u32, data: &[u8]) {
+    let mut c = *crc;
+    let mut ptr = data.as_ptr();
+    // SAFETY: `ptr` is `data.as_ptr()`, and offsetting it by `data.len()` gives
+    // the one-past-the-end address of the same slice, which `pointer::add`
+    // permits (a slice never spans more than `isize::MAX` bytes).
+    let end = unsafe { ptr.add(data.len()) };
+
+    // Process 8 bytes at a time
+    // SAFETY-FIX: compare addresses instead of calling `ptr.add(8)` speculatively.
+    // `ptr.add(n)` is UB when the result would land more than one byte past the end
+    // of the allocation, even if the pointer is only compared and never dereferenced.
+    while (end as usize) - (ptr as usize) >= 8 {
+        // Read 8 bytes
+        // SAFETY: `ptr` starts at `data.as_ptr()` and only ever advances by the 8
+        // or 1 bytes a loop condition has just found before `end`, so it stays in
+        // `data.as_ptr()..=end`; this loop's condition leaves at least 8 bytes from
+        // `ptr` to `end`, so all 8 bytes read lie inside `data`. `read_unaligned`
+        // needs no alignment, and every `[u8; 8]` is a valid value.
+        let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
+
+        // XOR the first 4 bytes with current CRC, then extract individual bytes
+        let crc_xor = c ^ u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let b0 = (crc_xor & 0xFF) as usize;
+        let b1 = ((crc_xor >> 8) & 0xFF) as usize;
+        let b2 = ((crc_xor >> 16) & 0xFF) as usize;
+        let b3 = ((crc_xor >> 24) & 0xFF) as usize;
+
+        // Look up all 8 bytes using different tables
+        c = CRC32_TABLE_SLICE[7][b0]
+            ^ CRC32_TABLE_SLICE[6][b1]
+            ^ CRC32_TABLE_SLICE[5][b2]
+            ^ CRC32_TABLE_SLICE[4][b3]
+            ^ CRC32_TABLE_SLICE[3][bytes[4] as usize]
+            ^ CRC32_TABLE_SLICE[2][bytes[5] as usize]
+            ^ CRC32_TABLE_SLICE[1][bytes[6] as usize]
+            ^ CRC32_TABLE_SLICE[0][bytes[7] as usize];
+
+        // SAFETY: the loop condition found at least 8 bytes between `ptr` and `end`
+        // at the top of this iteration, so `ptr + 8` is at most `end`, the
+        // one-past-the-end address of `data`.
+        ptr = unsafe { ptr.add(8) };
+    }
+
+    // Process remaining bytes one at a time
+    while ptr < end {
+        // SAFETY: `ptr < end` (the loop condition) and `ptr` never moves below
+        // `data.as_ptr()`, so it points at a byte of `data`.
+        let byte = unsafe { *ptr };
+        c = CRC32_TABLE[((c ^ byte as u32) & 0xFF) as usize] ^ (c >> 8);
+        // SAFETY: `ptr < end` held at the top of this iteration, so `ptr + 1` is at
+        // most `end`.
+        ptr = unsafe { ptr.add(1) };
+    }
+
+    *crc = c;
+}
+
+/// CRC-64/ECMA-182 lookup table (polynomial 0xC96C5795D7870F42, reflected).
+const CRC64_TABLE: [u64; 256] = {
+    // ECMA-182 polynomial: 0x42F0E1EBA9EA3693 (normal)
+    // Reflected: 0xC96C5795D7870F42
+    let poly: u64 = 0xC96C5795D7870F42;
+    let mut table = [0u64; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u64;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ poly;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// CRC-64 slicing-by-8 lookup tables.
+/// This pre-computes 8 tables for processing 8 bytes in parallel.
+const CRC64_TABLE_SLICE: [[u64; 256]; 8] = {
+    let poly: u64 = 0xC96C5795D7870F42;
+    let mut tables = [[0u64; 256]; 8];
+
+    // First table is the standard CRC-64 table
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u64;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ poly;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        tables[0][i] = crc;
+        i += 1;
+    }
+
+    // Build subsequent tables
+    let mut t = 1;
+    while t < 8 {
+        let mut i = 0usize;
+        while i < 256 {
+            let prev = tables[t - 1][i];
+            tables[t][i] = tables[0][(prev & 0xFF) as usize] ^ (prev >> 8);
+            i += 1;
+        }
+        t += 1;
+    }
+
+    tables
+};
+
+/// CRC-64/ECMA-182 calculator.
+///
+/// This is the CRC-64 variant used by XZ format.
+///
+/// - Polynomial: 0x42F0E1EBA9EA3693 (reflected: 0xC96C5795D7870F42)
+/// - Initial value: 0xFFFFFFFFFFFFFFFF
+/// - Final XOR: 0xFFFFFFFFFFFFFFFF
+/// - Reflected input: Yes
+/// - Reflected output: Yes
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_core::crc::Crc64;
+///
+/// let mut crc = Crc64::new();
+/// crc.update(b"123456789");
+/// assert_eq!(crc.finalize(), 0x995DC9BBDF1939FA);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Crc64 {
+    crc: u64,
+}
+
+impl Crc64 {
+    /// Create a new CRC-64 calculator.
+    pub fn new() -> Self {
+        Self {
+            crc: 0xFFFFFFFFFFFFFFFF,
+        }
+    }
+
+    /// Reset the CRC to its initial state.
+    pub fn reset(&mut self) {
+        self.crc = 0xFFFFFFFFFFFFFFFF;
+    }
+
+    /// Update the CRC with more data.
+    pub fn update(&mut self, data: &[u8]) {
+        // Use slicing-by-8 for better performance on large data
+        if data.len() >= 16 {
+            crc64_slice8(&mut self.crc, data);
+        } else {
+            crc64_sw(&mut self.crc, data);
+        }
+    }
+
+    /// Get the current CRC value (without finalizing).
+    pub fn value(&self) -> u64 {
+        self.crc ^ 0xFFFFFFFFFFFFFFFF
+    }
+
+    /// Finalize and return the CRC value.
+    pub fn finalize(self) -> u64 {
+        self.crc ^ 0xFFFFFFFFFFFFFFFF
+    }
+
+    /// Compute CRC-64 for a slice in one call.
+    pub fn compute(data: &[u8]) -> u64 {
+        let mut crc = Self::new();
+        crc.update(data);
+        crc.finalize()
+    }
+}
+
+impl Default for Crc64 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Software CRC-64 implementation using single lookup table.
+/// Best for small data (< 16 bytes).
+#[inline]
+fn crc64_sw(crc: &mut u64, data: &[u8]) {
+    for &byte in data {
+        let index = ((*crc ^ byte as u64) & 0xFF) as usize;
+        *crc = CRC64_TABLE[index] ^ (*crc >> 8);
+    }
+}
+
+/// Optimized CRC-64 using slicing-by-8 technique.
+/// Processes 8 bytes at a time for better throughput on large data.
+#[inline]
+fn crc64_slice8(crc: &mut u64, data: &[u8]) {
+    let mut c = *crc;
+    let mut ptr = data.as_ptr();
+    // SAFETY: `ptr` is `data.as_ptr()`, and offsetting it by `data.len()` gives
+    // the one-past-the-end address of the same slice, which `pointer::add`
+    // permits (a slice never spans more than `isize::MAX` bytes).
+    let end = unsafe { ptr.add(data.len()) };
+
+    // Process 8 bytes at a time
+    // SAFETY-FIX: compare addresses instead of calling `ptr.add(8)` speculatively.
+    // `ptr.add(n)` is UB when the result would land more than one byte past the end
+    // of the allocation, even if the pointer is only compared and never dereferenced.
+    while (end as usize) - (ptr as usize) >= 8 {
+        // Read 8 bytes
+        // SAFETY: `ptr` starts at `data.as_ptr()` and only ever advances by the 8
+        // or 1 bytes a loop condition has just found before `end`, so it stays in
+        // `data.as_ptr()..=end`; this loop's condition leaves at least 8 bytes from
+        // `ptr` to `end`, so all 8 bytes read lie inside `data`. `read_unaligned`
+        // needs no alignment, and every `[u8; 8]` is a valid value.
+        let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
+
+        // XOR the first 8 bytes with current CRC, then extract individual bytes
+        let crc_xor = c ^ u64::from_le_bytes(bytes);
+        let b0 = (crc_xor & 0xFF) as usize;
+        let b1 = ((crc_xor >> 8) & 0xFF) as usize;
+        let b2 = ((crc_xor >> 16) & 0xFF) as usize;
+        let b3 = ((crc_xor >> 24) & 0xFF) as usize;
+        let b4 = ((crc_xor >> 32) & 0xFF) as usize;
+        let b5 = ((crc_xor >> 40) & 0xFF) as usize;
+        let b6 = ((crc_xor >> 48) & 0xFF) as usize;
+        let b7 = ((crc_xor >> 56) & 0xFF) as usize;
+
+        // Look up all 8 bytes using different tables
+        c = CRC64_TABLE_SLICE[7][b0]
+            ^ CRC64_TABLE_SLICE[6][b1]
+            ^ CRC64_TABLE_SLICE[5][b2]
+            ^ CRC64_TABLE_SLICE[4][b3]
+            ^ CRC64_TABLE_SLICE[3][b4]
+            ^ CRC64_TABLE_SLICE[2][b5]
+            ^ CRC64_TABLE_SLICE[1][b6]
+            ^ CRC64_TABLE_SLICE[0][b7];
+
+        // SAFETY: the loop condition found at least 8 bytes between `ptr` and `end`
+        // at the top of this iteration, so `ptr + 8` is at most `end`, the
+        // one-past-the-end address of `data`.
+        ptr = unsafe { ptr.add(8) };
+    }
+
+    // Process remaining bytes one at a time
+    while ptr < end {
+        // SAFETY: `ptr < end` (the loop condition) and `ptr` never moves below
+        // `data.as_ptr()`, so it points at a byte of `data`.
+        let byte = unsafe { *ptr };
+        c = CRC64_TABLE[((c ^ byte as u64) & 0xFF) as usize] ^ (c >> 8);
+        // SAFETY: `ptr < end` held at the top of this iteration, so `ptr + 1` is at
+        // most `end`.
+        ptr = unsafe { ptr.add(1) };
+    }
+
+    *crc = c;
+}
+
+/// CRC-16/ARC calculator.
+///
+/// This is the CRC-16 variant used by LZH/LHA archives.
+///
+/// - Polynomial: 0x8005 (reflected: 0xA001)
+/// - Initial value: 0x0000
+/// - Final XOR: 0x0000
+/// - Reflected input: Yes
+/// - Reflected output: Yes
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_core::crc::Crc16;
+///
+/// let mut crc = Crc16::new();
+/// crc.update(b"123456789");
+/// assert_eq!(crc.finalize(), 0xBB3D);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Crc16 {
+    crc: u16,
+}
+
+impl Crc16 {
+    /// Create a new CRC-16 calculator.
+    pub fn new() -> Self {
+        Self { crc: 0x0000 }
+    }
+
+    /// Reset the CRC to its initial state.
+    pub fn reset(&mut self) {
+        self.crc = 0x0000;
+    }
+
+    /// Update the CRC with more data.
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            let index = ((self.crc ^ byte as u16) & 0xFF) as usize;
+            self.crc = CRC16_TABLE[index] ^ (self.crc >> 8);
+        }
+    }
+
+    /// Get the current CRC value.
+    pub fn value(&self) -> u16 {
+        self.crc
+    }
+
+    /// Finalize and return the CRC value.
+    pub fn finalize(self) -> u16 {
+        self.crc
+    }
+
+    /// Compute CRC-16 for a slice in one call.
+    pub fn compute(data: &[u8]) -> u16 {
+        let mut crc = Self::new();
+        crc.update(data);
+        crc.finalize()
+    }
+}
+
+impl Default for Crc16 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Combined CRC calculator for streaming operations.
+///
+/// This is useful when you need to compute both CRC-32 and CRC-16
+/// simultaneously during decompression.
+#[derive(Debug, Clone)]
+pub struct DualCrc {
+    crc32: Crc32,
+    crc16: Crc16,
+}
+
+impl DualCrc {
+    /// Create a new dual CRC calculator.
+    pub fn new() -> Self {
+        Self {
+            crc32: Crc32::new(),
+            crc16: Crc16::new(),
+        }
+    }
+
+    /// Reset both CRCs.
+    pub fn reset(&mut self) {
+        self.crc32.reset();
+        self.crc16.reset();
+    }
+
+    /// Update both CRCs with data.
+    /// This is optimized to compute both CRCs in a single pass for better cache locality.
+    pub fn update(&mut self, data: &[u8]) {
+        // For small data, use the dual path
+        if data.len() < 16 {
+            for &byte in data {
+                let idx32 = ((self.crc32.crc ^ byte as u32) & 0xFF) as usize;
+                self.crc32.crc = CRC32_TABLE[idx32] ^ (self.crc32.crc >> 8);
+
+                let idx16 = ((self.crc16.crc ^ byte as u16) & 0xFF) as usize;
+                self.crc16.crc = CRC16_TABLE[idx16] ^ (self.crc16.crc >> 8);
+            }
+        } else {
+            // For larger data, use the optimized paths separately
+            // (slicing-by-8 is more efficient despite two passes)
+            self.crc32.update(data);
+            self.crc16.update(data);
+        }
+    }
+
+    /// Get the CRC-32 value.
+    pub fn crc32(&self) -> u32 {
+        self.crc32.value()
+    }
+
+    /// Get the CRC-16 value.
+    pub fn crc16(&self) -> u16 {
+        self.crc16.value()
+    }
+}
+
+impl Default for DualCrc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_crc32_empty() {
+        assert_eq!(Crc32::compute(b""), 0x00000000);
+    }
+
+    #[test]
+    fn test_crc32_check() {
+        // Standard CRC-32 check value for "123456789"
+        assert_eq!(Crc32::compute(b"123456789"), 0xCBF43926);
+    }
+
+    #[test]
+    fn test_crc32_hello_world() {
+        assert_eq!(Crc32::compute(b"Hello, World!"), 0xEC4AC3D0);
+    }
+
+    #[test]
+    fn test_crc32_incremental() {
+        let mut crc = Crc32::new();
+        crc.update(b"Hello");
+        crc.update(b", ");
+        crc.update(b"World!");
+        assert_eq!(crc.finalize(), 0xEC4AC3D0);
+    }
+
+    #[test]
+    fn test_crc32_software_vs_default() {
+        // Verify software-only matches default implementation
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let sw_crc = Crc32::compute_software(data);
+        let default_crc = Crc32::compute(data);
+        assert_eq!(sw_crc, default_crc);
+    }
+
+    #[test]
+    fn test_crc32_implementation_name() {
+        // Just verify it doesn't panic and returns a non-empty string
+        let name = Crc32::implementation_name();
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn test_crc16_empty() {
+        assert_eq!(Crc16::compute(b""), 0x0000);
+    }
+
+    #[test]
+    fn test_crc16_check() {
+        // Standard CRC-16/ARC check value for "123456789"
+        assert_eq!(Crc16::compute(b"123456789"), 0xBB3D);
+    }
+
+    #[test]
+    fn test_crc16_incremental() {
+        let mut crc = Crc16::new();
+        crc.update(b"12345");
+        crc.update(b"6789");
+        assert_eq!(crc.finalize(), 0xBB3D);
+    }
+
+    #[test]
+    fn test_dual_crc() {
+        let mut dual = DualCrc::new();
+        dual.update(b"123456789");
+        assert_eq!(dual.crc32(), 0xCBF43926);
+        assert_eq!(dual.crc16(), 0xBB3D);
+    }
+
+    #[test]
+    fn test_dual_crc_various_sizes() {
+        // Test that DualCrc produces consistent results across different data sizes
+        // and matches individual CRC computations
+        for size in [1, 7, 8, 15, 16, 17, 31, 32, 64, 128, 256] {
+            let data = vec![size as u8; size];
+
+            // Compute with DualCrc
+            let mut dual = DualCrc::new();
+            dual.update(&data);
+            let dual_crc32 = dual.crc32();
+            let dual_crc16 = dual.crc16();
+
+            // Compute individually
+            let individual_crc32 = Crc32::compute(&data);
+            let individual_crc16 = Crc16::compute(&data);
+
+            assert_eq!(
+                dual_crc32, individual_crc32,
+                "CRC-32 mismatch for size {}",
+                size
+            );
+            assert_eq!(
+                dual_crc16, individual_crc16,
+                "CRC-16 mismatch for size {}",
+                size
+            );
+        }
+    }
+
+    #[test]
+    fn test_dual_crc_incremental() {
+        // Test incremental updates with mixed small/large chunks
+        let mut dual = DualCrc::new();
+        dual.update(b"12"); // Small chunk (< 16)
+        dual.update(b"345678"); // Small chunk (< 16)
+        dual.update(b"9"); // Small chunk (< 16)
+
+        assert_eq!(dual.crc32(), 0xCBF43926);
+        assert_eq!(dual.crc16(), 0xBB3D);
+
+        // Test with larger chunks
+        let mut dual2 = DualCrc::new();
+        dual2.update(b"1234567890123456"); // Large chunk (>= 16)
+        let data = b"1234567890123456";
+        assert_eq!(dual2.crc32(), Crc32::compute(data));
+        assert_eq!(dual2.crc16(), Crc16::compute(data));
+    }
+
+    #[test]
+    fn test_crc32_table_correctness() {
+        // Verify a few known table entries
+        assert_eq!(CRC32_TABLE[0], 0x00000000);
+        assert_eq!(CRC32_TABLE[1], 0x77073096);
+        assert_eq!(CRC32_TABLE[255], 0x2D02EF8D);
+    }
+
+    #[test]
+    fn test_crc16_table_correctness() {
+        // Verify a few known table entries
+        assert_eq!(CRC16_TABLE[0], 0x0000);
+        assert_eq!(CRC16_TABLE[1], 0xC0C1);
+        assert_eq!(CRC16_TABLE[255], 0x4040);
+    }
+
+    #[test]
+    fn test_crc64_empty() {
+        assert_eq!(Crc64::compute(b""), 0x0000000000000000);
+    }
+
+    #[test]
+    fn test_crc64_check() {
+        // Standard CRC-64/ECMA-182 check value for "123456789"
+        assert_eq!(Crc64::compute(b"123456789"), 0x995DC9BBDF1939FA);
+    }
+
+    #[test]
+    fn test_crc64_incremental() {
+        let mut crc = Crc64::new();
+        crc.update(b"12345");
+        crc.update(b"6789");
+        assert_eq!(crc.finalize(), 0x995DC9BBDF1939FA);
+    }
+
+    #[test]
+    fn test_crc64_table_correctness() {
+        // Verify first and last table entries
+        assert_eq!(CRC64_TABLE[0], 0x0000000000000000);
+        // Entry for byte 0x01
+        assert_eq!(CRC64_TABLE[1], 0xB32E4CBE03A75F6F);
+    }
+
+    #[test]
+    fn test_crc64_slice8_table_correctness() {
+        // Verify slicing tables are correctly generated
+        // Table 0 should match the standard CRC table
+        assert_eq!(CRC64_TABLE_SLICE[0][0], CRC64_TABLE[0]);
+        assert_eq!(CRC64_TABLE_SLICE[0][1], CRC64_TABLE[1]);
+        assert_eq!(CRC64_TABLE_SLICE[0][255], CRC64_TABLE[255]);
+
+        // Each subsequent table is derived from the previous one
+        for t in 1..8 {
+            for (i, &prev) in CRC64_TABLE_SLICE[t - 1].iter().enumerate() {
+                let expected = CRC64_TABLE[(prev & 0xFF) as usize] ^ (prev >> 8);
+                assert_eq!(
+                    CRC64_TABLE_SLICE[t][i], expected,
+                    "Table {} entry {} mismatch",
+                    t, i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_crc64_large_data() {
+        // Test with data large enough to trigger slicing-by-8
+        let data = vec![0x42u8; 1024];
+        let crc = Crc64::compute(&data);
+
+        // Verify against incremental computation
+        let mut crc2 = Crc64::new();
+        for chunk in data.chunks(17) {
+            // Use odd chunk size to test edge cases
+            crc2.update(chunk);
+        }
+
+        assert_eq!(crc, crc2.finalize());
+    }
+
+    #[test]
+    fn test_crc64_various_sizes() {
+        // Test boundary conditions for slicing-by-8 threshold
+        for size in [1, 7, 8, 15, 16, 17, 31, 32, 63, 64, 127, 128, 255, 256] {
+            let data = vec![size as u8; size];
+            let crc1 = Crc64::compute(&data);
+
+            // Compute in small chunks to use non-optimized path
+            let mut crc2 = Crc64::new();
+            for &byte in &data {
+                crc2.update(&[byte]);
+            }
+
+            assert_eq!(crc1, crc2.finalize(), "CRC mismatch for size {}", size);
+        }
+    }
+
+    #[test]
+    fn test_crc32_slice8_table_correctness() {
+        // Verify slicing tables are correctly generated
+        // Table 0 should match the standard CRC table
+        assert_eq!(CRC32_TABLE_SLICE[0][0], CRC32_TABLE[0]);
+        assert_eq!(CRC32_TABLE_SLICE[0][1], CRC32_TABLE[1]);
+        assert_eq!(CRC32_TABLE_SLICE[0][255], CRC32_TABLE[255]);
+
+        // Each subsequent table is derived from the previous one
+        for t in 1..8 {
+            for (i, &prev) in CRC32_TABLE_SLICE[t - 1].iter().enumerate() {
+                let expected = CRC32_TABLE[(prev & 0xFF) as usize] ^ (prev >> 8);
+                assert_eq!(
+                    CRC32_TABLE_SLICE[t][i], expected,
+                    "Table {} entry {} mismatch",
+                    t, i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_crc32_large_data() {
+        // Test with data large enough to trigger slicing-by-8
+        let data = vec![0x42u8; 1024];
+        let crc = Crc32::compute(&data);
+
+        // Verify against incremental computation
+        let mut crc2 = Crc32::new();
+        for chunk in data.chunks(17) {
+            // Use odd chunk size to test edge cases
+            crc2.update(chunk);
+        }
+
+        assert_eq!(crc, crc2.finalize());
+    }
+
+    #[test]
+    fn test_crc32_various_sizes() {
+        // Test boundary conditions for slicing-by-8 threshold
+        for size in [1, 7, 8, 15, 16, 17, 31, 32, 63, 64, 127, 128, 255, 256] {
+            let data = vec![size as u8; size];
+            let crc1 = Crc32::compute(&data);
+
+            // Compute in small chunks to use non-optimized path
+            let mut crc2 = Crc32::new();
+            for &byte in &data {
+                crc2.update(&[byte]);
+            }
+
+            assert_eq!(crc1, crc2.finalize(), "CRC mismatch for size {}", size);
+        }
+    }
+
+    /// Verify that SIMD and scalar CRC-32 paths produce identical results on a 1 MiB buffer.
+    ///
+    /// Uses a cycling pattern to stress-test all byte values across the full megabyte.
+    #[test]
+    fn test_crc32_simd_scalar_agree() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1_048_576).collect();
+
+        // Scalar path: use compute_software which always takes the slicing-by-8 path
+        let crc_scalar = Crc32::compute_software(&data);
+
+        // Default path: may be SIMD on x86_64/aarch64, scalar on other targets
+        let crc_default = Crc32::compute(&data);
+
+        assert_eq!(
+            crc_scalar, crc_default,
+            "SIMD and scalar CRC-32 disagree on 1 MiB buffer"
+        );
+
+        // On SIMD-capable architectures, also exercise the dispatcher directly.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            let dispatcher = crate::crc_simd::SimdCrc32Dispatcher::new();
+            let crc_dispatcher = dispatcher.update(0xFFFF_FFFF, &data) ^ 0xFFFF_FFFF;
+            assert_eq!(
+                crc_scalar, crc_dispatcher,
+                "SimdCrc32Dispatcher and scalar disagree on 1 MiB buffer"
+            );
+        }
+    }
+
+    /// Known-good vector: CRC-32 of "Hello, World!" must equal 0xEC4AC3D0.
+    #[test]
+    fn test_crc32_consistency() {
+        const EXPECTED: u32 = 0xEC4AC3D0;
+        assert_eq!(
+            Crc32::compute(b"Hello, World!"),
+            EXPECTED,
+            "CRC-32 of 'Hello, World!' must equal 0xEC4AC3D0"
+        );
+        // Also verify via incremental API
+        let mut crc = Crc32::new();
+        crc.update(b"Hello, World!");
+        assert_eq!(crc.finalize(), EXPECTED);
+    }
+
+    /// Regression test for the x86_64 PCLMULQDQ CRC-32 path (OXIARC-CRC-01).
+    ///
+    /// `crc_simd::x86::crc32_pclmulqdq` shipped as a public `unsafe fn` while
+    /// combining the *non-reflected* Intel whitepaper constants with
+    /// reflected-mode folding and extracting the result from the wrong dword
+    /// lane, so it returned wrong CRC-32 values — silently accepting corrupt
+    /// archives or rejecting valid ones for any downstream caller that did its
+    /// own feature detection and called it. The crate worked around this by
+    /// hardcoding dispatch off, which left the broken arithmetic exported.
+    ///
+    /// The path is now the same arithmetic as the validated aarch64 PMULL path
+    /// and IS dispatched, so the runtime-selected implementation must agree
+    /// with the scalar slicing-by-8 reference byte for byte. This test asserts
+    /// that on every architecture, including the incremental (chunked) form
+    /// which exercises non-zero seed CRCs.
+    #[test]
+    fn dispatched_crc32_matches_software_reference() {
+        let data: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+
+        for len in [
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 79, 127, 128, 129, 255, 256, 1023,
+            1024, 4095, 4096, 8192,
+        ] {
+            let slice = &data[..len];
+            assert_eq!(
+                Crc32::compute(slice),
+                Crc32::compute_software(slice),
+                "dispatched CRC-32 diverges from the software reference at len {len} \
+                 (implementation: {})",
+                Crc32::implementation_name()
+            );
+        }
+
+        // Incremental updates: every chunk after the first feeds a non-zero
+        // running CRC into the dispatched function.
+        for chunk in [1usize, 3, 16, 17, 64, 1000] {
+            let mut incremental = Crc32::new();
+            for part in data.chunks(chunk) {
+                incremental.update(part);
+            }
+            assert_eq!(
+                incremental.finalize(),
+                Crc32::compute_software(&data),
+                "incremental CRC-32 diverges from the software reference with chunk size {chunk} \
+                 (implementation: {})",
+                Crc32::implementation_name()
+            );
+        }
+    }
+}

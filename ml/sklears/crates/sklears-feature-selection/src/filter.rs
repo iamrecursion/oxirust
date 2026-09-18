@@ -1,0 +1,972 @@
+//! Filter-based feature selection methods
+//!
+//! This module provides filter-based feature selection algorithms including
+//! univariate selection, correlation filtering, Relief algorithms, and high-dimensional methods.
+//! All implementations follow the SciRS2 policy using scirs2-core for numerical computations.
+
+use scirs2_core::ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use sklears_core::error::{Result as SklResult, SklearsError};
+type Result<T> = SklResult<T>;
+use crate::base::{FeatureSelector, SelectorMixin};
+use sklears_core::traits::{Estimator, Fit, Transform};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+/// FilterError
+pub enum FilterError {
+    #[error("Invalid number of features to select: {0}")]
+    /// InvalidFeatureCount
+    InvalidFeatureCount(usize),
+    #[error("Invalid percentile: {0}, must be between 0 and 100")]
+    /// InvalidPercentile
+    InvalidPercentile(f64),
+    #[error("Insufficient variance for threshold: {0}")]
+    /// InsufficientVariance
+    InsufficientVariance(f64),
+    #[error("Empty feature matrix")]
+    /// EmptyFeatureMatrix
+    EmptyFeatureMatrix,
+    #[error("Feature selection failed: {0}")]
+    /// SelectionFailed
+    SelectionFailed(String),
+}
+
+impl From<FilterError> for SklearsError {
+    fn from(err: FilterError) -> Self {
+        SklearsError::FitError(format!("Filter selection error: {}", err))
+    }
+}
+
+/// Score function type for univariate selection
+pub type ScoreFunc = fn(ArrayView2<f64>, ArrayView1<f64>) -> Result<Array1<f64>>;
+
+/// Configuration for filter methods
+#[derive(Debug, Clone)]
+pub struct FilterConfig {
+    /// score_func
+    pub score_func: String,
+    /// k
+    pub k: Option<usize>,
+    /// percentile
+    pub percentile: Option<f64>,
+    /// threshold
+    pub threshold: Option<f64>,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            score_func: "f_classif".to_string(),
+            k: Some(10),
+            percentile: None,
+            threshold: None,
+        }
+    }
+}
+
+/// Results from filter-based selection
+#[derive(Debug, Clone)]
+pub struct FilterResults {
+    /// scores
+    pub scores: Array1<f64>,
+    /// selected_features
+    pub selected_features: Vec<usize>,
+    /// feature_names
+    pub feature_names: Option<Vec<String>>,
+}
+
+/// Select K best features based on univariate statistical tests
+#[derive(Debug, Clone)]
+pub struct SelectKBest {
+    /// k
+    pub k: usize,
+    /// score_func
+    pub score_func: String,
+}
+
+impl SelectKBest {
+    /// new
+    pub fn new(k: usize, score_func: &str) -> Self {
+        Self {
+            k,
+            score_func: score_func.to_string(),
+        }
+    }
+}
+
+impl Estimator for SelectKBest {
+    type Config = FilterConfig;
+    type Error = FilterError;
+    type Float = f64;
+
+    fn config(&self) -> &Self::Config {
+        // Create a default config - in practice this should be stored
+        // For now, we'll create a static config
+        static CONFIG: std::sync::OnceLock<FilterConfig> = std::sync::OnceLock::new();
+        CONFIG.get_or_init(FilterConfig::default)
+    }
+
+    fn check_compatibility(&self, _n_samples: usize, n_features: usize) -> Result<()> {
+        if self.k > n_features {
+            return Err(FilterError::InvalidFeatureCount(self.k).into());
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Fit<ArrayView2<'a, f64>, ArrayView1<'a, f64>> for SelectKBest {
+    type Fitted = SelectKBestTrained;
+
+    fn fit(self, X: &ArrayView2<'a, f64>, y: &ArrayView1<'a, f64>) -> Result<Self::Fitted> {
+        self.fit_impl(X, y)
+    }
+}
+
+// Also implement for owned arrays
+impl Fit<Array2<f64>, Array1<i32>> for SelectKBest {
+    type Fitted = SelectKBestTrained;
+
+    fn fit(self, X: &Array2<f64>, y: &Array1<i32>) -> Result<Self::Fitted> {
+        // Convert i32 target to f64 and use views
+        let y_f64: Array1<f64> = y.mapv(|x| x as f64);
+        self.fit_impl(&X.view(), &y_f64.view())
+    }
+}
+
+impl SelectKBest {
+    fn fit_impl(self, X: &ArrayView2<f64>, y: &ArrayView1<f64>) -> Result<SelectKBestTrained> {
+        if X.is_empty() || y.is_empty() {
+            return Err(FilterError::EmptyFeatureMatrix.into());
+        }
+
+        if self.k == 0 || self.k > X.ncols() {
+            return Err(FilterError::InvalidFeatureCount(self.k).into());
+        }
+
+        // Compute scores (simplified correlation-based scoring)
+        let mut scores = Array1::zeros(X.ncols());
+        for i in 0..X.ncols() {
+            let feature = X.column(i);
+            scores[i] = self.compute_correlation(feature, *y);
+        }
+
+        // Select top k features
+        let mut indexed_scores: Vec<(usize, f64)> = scores
+            .iter()
+            .enumerate()
+            .map(|(i, &score)| (i, score.abs()))
+            .collect();
+
+        indexed_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("operation should succeed"));
+
+        let selected_features: Vec<usize> = indexed_scores
+            .into_iter()
+            .take(self.k)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        Ok(SelectKBestTrained {
+            selected_features,
+            scores,
+            k: self.k,
+        })
+    }
+}
+
+impl SelectKBest {
+    fn compute_correlation(&self, x: ArrayView1<f64>, y: ArrayView1<f64>) -> f64 {
+        let n = x.len() as f64;
+        if n < 2.0 {
+            return 0.0;
+        }
+
+        let mean_x = x.mean().unwrap_or(0.0);
+        let mean_y = y.mean().unwrap_or(0.0);
+
+        let mut sum_xy = 0.0;
+        let mut sum_x2 = 0.0;
+        let mut sum_y2 = 0.0;
+
+        for i in 0..x.len() {
+            let dx = x[i] - mean_x;
+            let dy = y[i] - mean_y;
+            sum_xy += dx * dy;
+            sum_x2 += dx * dx;
+            sum_y2 += dy * dy;
+        }
+
+        let denom = (sum_x2 * sum_y2).sqrt();
+        if denom < 1e-10 {
+            0.0
+        } else {
+            sum_xy / denom
+        }
+    }
+}
+
+/// Trained SelectKBest selector
+#[derive(Debug, Clone)]
+pub struct SelectKBestTrained {
+    /// selected_features
+    pub selected_features: Vec<usize>,
+    /// scores
+    pub scores: Array1<f64>,
+    /// k
+    pub k: usize,
+}
+
+impl Transform<ArrayView2<'_, f64>, Array2<f64>> for SelectKBestTrained {
+    fn transform(&self, X: &ArrayView2<'_, f64>) -> Result<Array2<f64>> {
+        self.transform_impl(&X.view())
+    }
+}
+
+// Also implement for owned arrays
+impl Transform<Array2<f64>, Array2<f64>> for SelectKBestTrained {
+    fn transform(&self, X: &Array2<f64>) -> Result<Array2<f64>> {
+        self.transform_impl(&X.view())
+    }
+}
+
+impl SelectorMixin for SelectKBestTrained {
+    fn get_support(&self) -> Result<Array1<bool>> {
+        // Need to know total number of features - use maximum feature index + 1 or scores length
+        let n_features = self.scores.len();
+        let mut support = Array1::from_elem(n_features, false);
+        for &idx in &self.selected_features {
+            if idx < support.len() {
+                support[idx] = true;
+            }
+        }
+        Ok(support)
+    }
+
+    fn transform_features(&self, indices: &[usize]) -> Result<Vec<usize>> {
+        Ok(indices
+            .iter()
+            .filter_map(|&idx| self.selected_features.iter().position(|&f| f == idx))
+            .collect())
+    }
+}
+
+impl FeatureSelector for SelectKBestTrained {
+    fn selected_features(&self) -> &Vec<usize> {
+        &self.selected_features
+    }
+}
+
+impl SelectKBestTrained {
+    fn transform_impl(&self, X: &ArrayView2<f64>) -> Result<Array2<f64>> {
+        if self.selected_features.is_empty() {
+            return Err(FilterError::SelectionFailed("No features selected".to_string()).into());
+        }
+
+        let n_samples = X.nrows();
+        let mut transformed = Array2::zeros((n_samples, self.selected_features.len()));
+
+        for (new_idx, &orig_idx) in self.selected_features.iter().enumerate() {
+            if orig_idx < X.ncols() {
+                transformed.column_mut(new_idx).assign(&X.column(orig_idx));
+            }
+        }
+
+        Ok(transformed)
+    }
+}
+
+/// Select features based on percentile of highest scores
+#[derive(Debug, Clone)]
+pub struct SelectPercentile {
+    /// percentile
+    pub percentile: f64,
+    /// score_func
+    pub score_func: String,
+}
+
+impl SelectPercentile {
+    /// new
+    pub fn new(percentile: f64, score_func: &str) -> Self {
+        Self {
+            percentile,
+            score_func: score_func.to_string(),
+        }
+    }
+}
+
+impl Estimator for SelectPercentile {
+    type Config = FilterConfig;
+    type Error = FilterError;
+    type Float = f64;
+
+    fn config(&self) -> &Self::Config {
+        static CONFIG: std::sync::OnceLock<FilterConfig> = std::sync::OnceLock::new();
+        CONFIG.get_or_init(FilterConfig::default)
+    }
+
+    fn check_compatibility(&self, _n_samples: usize, _n_features: usize) -> Result<()> {
+        if self.percentile <= 0.0 || self.percentile > 100.0 {
+            return Err(FilterError::InvalidPercentile(self.percentile).into());
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Fit<ArrayView2<'a, f64>, ArrayView1<'a, f64>> for SelectPercentile {
+    type Fitted = SelectPercentileTrained;
+
+    fn fit(self, X: &ArrayView2<'a, f64>, y: &ArrayView1<'a, f64>) -> Result<Self::Fitted> {
+        if X.is_empty() || y.is_empty() {
+            return Err(FilterError::EmptyFeatureMatrix.into());
+        }
+
+        if self.percentile <= 0.0 || self.percentile > 100.0 {
+            return Err(FilterError::InvalidPercentile(self.percentile).into());
+        }
+
+        // Compute scores
+        let mut scores = Array1::zeros(X.ncols());
+        for i in 0..X.ncols() {
+            let feature = X.column(i);
+            scores[i] = self.compute_correlation(feature, *y).abs();
+        }
+
+        // Calculate threshold based on percentile
+        let mut sorted_scores: Vec<f64> = scores.to_vec();
+        sorted_scores.sort_by(|a, b| b.partial_cmp(a).expect("operation should succeed"));
+
+        let threshold_idx =
+            ((100.0 - self.percentile) / 100.0 * sorted_scores.len() as f64) as usize;
+        let threshold = sorted_scores.get(threshold_idx).copied().unwrap_or(0.0);
+
+        // Select features above threshold
+        let selected_features: Vec<usize> = scores
+            .iter()
+            .enumerate()
+            .filter(|(_, &score)| score >= threshold)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        Ok(SelectPercentileTrained {
+            selected_features,
+            scores,
+            percentile: self.percentile,
+            threshold,
+        })
+    }
+}
+
+impl SelectPercentile {
+    fn compute_correlation(&self, x: ArrayView1<f64>, y: ArrayView1<f64>) -> f64 {
+        let n = x.len() as f64;
+        if n < 2.0 {
+            return 0.0;
+        }
+
+        let mean_x = x.mean().unwrap_or(0.0);
+        let mean_y = y.mean().unwrap_or(0.0);
+
+        let mut sum_xy = 0.0;
+        let mut sum_x2 = 0.0;
+        let mut sum_y2 = 0.0;
+
+        for i in 0..x.len() {
+            let dx = x[i] - mean_x;
+            let dy = y[i] - mean_y;
+            sum_xy += dx * dy;
+            sum_x2 += dx * dx;
+            sum_y2 += dy * dy;
+        }
+
+        let denom = (sum_x2 * sum_y2).sqrt();
+        if denom < 1e-10 {
+            0.0
+        } else {
+            sum_xy / denom
+        }
+    }
+}
+
+/// Trained SelectPercentile selector
+#[derive(Debug, Clone)]
+pub struct SelectPercentileTrained {
+    /// selected_features
+    pub selected_features: Vec<usize>,
+    /// scores
+    pub scores: Array1<f64>,
+    /// percentile
+    pub percentile: f64,
+    /// threshold
+    pub threshold: f64,
+}
+
+impl Transform<ArrayView2<'_, f64>, Array2<f64>> for SelectPercentileTrained {
+    fn transform(&self, X: &ArrayView2<'_, f64>) -> Result<Array2<f64>> {
+        if self.selected_features.is_empty() {
+            return Err(FilterError::SelectionFailed("No features selected".to_string()).into());
+        }
+
+        let n_samples = X.nrows();
+        let mut transformed = Array2::zeros((n_samples, self.selected_features.len()));
+
+        for (new_idx, &orig_idx) in self.selected_features.iter().enumerate() {
+            if orig_idx < X.ncols() {
+                transformed.column_mut(new_idx).assign(&X.column(orig_idx));
+            }
+        }
+
+        Ok(transformed)
+    }
+}
+
+/// Remove features with low variance
+#[derive(Debug, Clone)]
+pub struct VarianceThreshold {
+    /// threshold
+    pub threshold: f64,
+}
+
+impl VarianceThreshold {
+    /// new
+    pub fn new(threshold: f64) -> Self {
+        Self { threshold }
+    }
+}
+
+impl Default for VarianceThreshold {
+    fn default() -> Self {
+        Self { threshold: 0.0 }
+    }
+}
+
+impl Estimator for VarianceThreshold {
+    type Config = FilterConfig;
+    type Error = FilterError;
+    type Float = f64;
+
+    fn config(&self) -> &Self::Config {
+        static CONFIG: std::sync::OnceLock<FilterConfig> = std::sync::OnceLock::new();
+        CONFIG.get_or_init(FilterConfig::default)
+    }
+
+    fn check_compatibility(&self, _n_samples: usize, _n_features: usize) -> Result<()> {
+        if self.threshold < 0.0 {
+            return Err(FilterError::InsufficientVariance(self.threshold).into());
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Fit<ArrayView2<'a, f64>, ArrayView1<'a, f64>> for VarianceThreshold {
+    type Fitted = VarianceThresholdTrained;
+
+    fn fit(self, X: &ArrayView2<'a, f64>, _y: &ArrayView1<'a, f64>) -> Result<Self::Fitted> {
+        self.fit_impl(X)
+    }
+}
+
+// Also implement for owned arrays
+impl Fit<Array2<f64>, Array1<i32>> for VarianceThreshold {
+    type Fitted = VarianceThresholdTrained;
+
+    fn fit(self, X: &Array2<f64>, _y: &Array1<i32>) -> Result<Self::Fitted> {
+        self.fit_impl(&X.view())
+    }
+}
+
+impl VarianceThreshold {
+    fn fit_impl(self, X: &ArrayView2<f64>) -> Result<VarianceThresholdTrained> {
+        if X.is_empty() {
+            return Err(FilterError::EmptyFeatureMatrix.into());
+        }
+
+        // Compute variance for each feature
+        let mut variances = Array1::zeros(X.ncols());
+        let mut selected_features = Vec::new();
+
+        for i in 0..X.ncols() {
+            let feature = X.column(i);
+            let variance = feature.var(1.0);
+            variances[i] = variance;
+
+            if variance > self.threshold {
+                selected_features.push(i);
+            }
+        }
+
+        Ok(VarianceThresholdTrained {
+            selected_features,
+            variances,
+            threshold: self.threshold,
+        })
+    }
+}
+
+/// Trained VarianceThreshold selector
+#[derive(Debug, Clone)]
+pub struct VarianceThresholdTrained {
+    /// selected_features
+    pub selected_features: Vec<usize>,
+    /// variances
+    pub variances: Array1<f64>,
+    /// threshold
+    pub threshold: f64,
+}
+
+impl Transform<ArrayView2<'_, f64>, Array2<f64>> for VarianceThresholdTrained {
+    fn transform(&self, X: &ArrayView2<'_, f64>) -> Result<Array2<f64>> {
+        self.transform_impl(&X.view())
+    }
+}
+
+// Also implement for owned arrays
+impl Transform<Array2<f64>, Array2<f64>> for VarianceThresholdTrained {
+    fn transform(&self, X: &Array2<f64>) -> Result<Array2<f64>> {
+        self.transform_impl(&X.view())
+    }
+}
+
+impl SelectorMixin for VarianceThresholdTrained {
+    fn get_support(&self) -> Result<Array1<bool>> {
+        let n_features = self.variances.len();
+        let mut support = Array1::from_elem(n_features, false);
+        for &idx in &self.selected_features {
+            if idx < support.len() {
+                support[idx] = true;
+            }
+        }
+        Ok(support)
+    }
+
+    fn transform_features(&self, indices: &[usize]) -> Result<Vec<usize>> {
+        Ok(indices
+            .iter()
+            .filter_map(|&idx| self.selected_features.iter().position(|&f| f == idx))
+            .collect())
+    }
+}
+
+impl FeatureSelector for VarianceThresholdTrained {
+    fn selected_features(&self) -> &Vec<usize> {
+        &self.selected_features
+    }
+}
+
+impl VarianceThresholdTrained {
+    fn transform_impl(&self, X: &ArrayView2<f64>) -> Result<Array2<f64>> {
+        if self.selected_features.is_empty() {
+            return Err(FilterError::SelectionFailed(
+                "All features removed by variance threshold".to_string(),
+            )
+            .into());
+        }
+
+        let n_samples = X.nrows();
+        let mut transformed = Array2::zeros((n_samples, self.selected_features.len()));
+
+        for (new_idx, &orig_idx) in self.selected_features.iter().enumerate() {
+            if orig_idx < X.ncols() {
+                transformed.column_mut(new_idx).assign(&X.column(orig_idx));
+            }
+        }
+
+        Ok(transformed)
+    }
+}
+
+// Stub implementations for other filter methods to satisfy imports
+
+/// Generic univariate selection (stub implementation)
+#[derive(Debug, Clone)]
+pub struct GenericUnivariateSelect {
+    /// score_func
+    pub score_func: String,
+    /// mode
+    pub mode: String,
+    /// param
+    pub param: f64,
+}
+
+impl GenericUnivariateSelect {
+    /// new
+    pub fn new(score_func: &str, mode: &str, param: f64) -> Self {
+        Self {
+            score_func: score_func.to_string(),
+            mode: mode.to_string(),
+            param,
+        }
+    }
+}
+
+impl Estimator for GenericUnivariateSelect {
+    type Config = FilterConfig;
+    type Error = FilterError;
+    type Float = f64;
+
+    fn config(&self) -> &Self::Config {
+        static CONFIG: std::sync::OnceLock<FilterConfig> = std::sync::OnceLock::new();
+        CONFIG.get_or_init(FilterConfig::default)
+    }
+
+    fn check_compatibility(&self, _n_samples: usize, n_features: usize) -> Result<()> {
+        if self.mode == "k_best" && (self.param as usize) > n_features {
+            return Err(FilterError::InvalidFeatureCount(self.param as usize).into());
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Fit<ArrayView2<'a, f64>, ArrayView1<'a, f64>> for GenericUnivariateSelect {
+    type Fitted = GenericUnivariateSelectTrained;
+
+    fn fit(self, X: &ArrayView2<'a, f64>, y: &ArrayView1<'a, f64>) -> Result<Self::Fitted> {
+        // Delegate to SelectKBest for now
+        let k_best = SelectKBest::new(self.param as usize, &self.score_func);
+        let trained = k_best.fit(X, y)?;
+
+        Ok(GenericUnivariateSelectTrained {
+            selected_features: trained.selected_features,
+            scores: trained.scores,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+/// GenericUnivariateSelectTrained
+pub struct GenericUnivariateSelectTrained {
+    /// selected_features
+    pub selected_features: Vec<usize>,
+    /// scores
+    pub scores: Array1<f64>,
+}
+
+impl Transform<ArrayView2<'_, f64>, Array2<f64>> for GenericUnivariateSelectTrained {
+    fn transform(&self, X: &ArrayView2<'_, f64>) -> Result<Array2<f64>> {
+        let n_samples = X.nrows();
+        let mut transformed = Array2::zeros((n_samples, self.selected_features.len()));
+
+        for (new_idx, &orig_idx) in self.selected_features.iter().enumerate() {
+            if orig_idx < X.ncols() {
+                transformed.column_mut(new_idx).assign(&X.column(orig_idx));
+            }
+        }
+
+        Ok(transformed)
+    }
+}
+
+// Additional stub implementations for other filter types mentioned in lib.rs
+
+/// Correlation threshold filtering (stub implementation)
+#[derive(Debug, Clone)]
+pub struct CorrelationThreshold {
+    /// threshold
+    pub threshold: f64,
+}
+
+impl CorrelationThreshold {
+    /// new
+    pub fn new(threshold: f64) -> Self {
+        Self { threshold }
+    }
+}
+
+impl Estimator for CorrelationThreshold {
+    type Config = FilterConfig;
+    type Error = FilterError;
+    type Float = f64;
+
+    fn config(&self) -> &Self::Config {
+        static CONFIG: std::sync::OnceLock<FilterConfig> = std::sync::OnceLock::new();
+        CONFIG.get_or_init(FilterConfig::default)
+    }
+
+    fn check_compatibility(&self, _n_samples: usize, _n_features: usize) -> Result<()> {
+        if self.threshold < 0.0 || self.threshold > 1.0 {
+            return Err(FilterError::InvalidPercentile(self.threshold).into());
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Fit<ArrayView2<'a, f64>, ArrayView1<'a, f64>> for CorrelationThreshold {
+    type Fitted = CorrelationThresholdTrained;
+
+    /// Select features whose absolute Pearson correlation with the target exceeds
+    /// `self.threshold`.
+    ///
+    /// A feature `j` is **kept** when |corr(X[:, j], y)| >= threshold.
+    /// If no features exceed the threshold, all features are kept to avoid an empty
+    /// output.
+    fn fit(self, x: &ArrayView2<'a, f64>, y: &ArrayView1<'a, f64>) -> Result<Self::Fitted> {
+        let n_samples = x.nrows();
+        let n_features = x.ncols();
+
+        if n_samples == 0 {
+            return Err(FilterError::EmptyFeatureMatrix.into());
+        }
+        if self.threshold < 0.0 || self.threshold > 1.0 {
+            return Err(FilterError::InvalidPercentile(self.threshold).into());
+        }
+
+        // Mean and std of y
+        let y_mean: f64 = y.iter().sum::<f64>() / n_samples as f64;
+        let y_var: f64 = y.iter().map(|&v| (v - y_mean).powi(2)).sum::<f64>() / n_samples as f64;
+        let y_std = y_var.sqrt();
+
+        let mut selected_features = Vec::new();
+
+        for j in 0..n_features {
+            let col = x.column(j);
+            let x_mean: f64 = col.iter().sum::<f64>() / n_samples as f64;
+            let x_var: f64 =
+                col.iter().map(|&v| (v - x_mean).powi(2)).sum::<f64>() / n_samples as f64;
+            let x_std = x_var.sqrt();
+
+            // If either std is zero (constant feature/target), correlation is undefined;
+            // treat it as 0.0 (no correlation).
+            let corr = if x_std < f64::EPSILON || y_std < f64::EPSILON {
+                0.0
+            } else {
+                let cov: f64 = col
+                    .iter()
+                    .zip(y.iter())
+                    .map(|(&xi, &yi)| (xi - x_mean) * (yi - y_mean))
+                    .sum::<f64>()
+                    / n_samples as f64;
+                cov / (x_std * y_std)
+            };
+
+            if corr.abs() >= self.threshold {
+                selected_features.push(j);
+            }
+        }
+
+        // Fall back to all features if none passed the threshold.
+        if selected_features.is_empty() {
+            selected_features = (0..n_features).collect();
+        }
+
+        Ok(CorrelationThresholdTrained { selected_features })
+    }
+}
+
+#[derive(Debug, Clone)]
+/// CorrelationThresholdTrained
+pub struct CorrelationThresholdTrained {
+    /// selected_features
+    pub selected_features: Vec<usize>,
+}
+
+impl Transform<ArrayView2<'_, f64>, Array2<f64>> for CorrelationThresholdTrained {
+    fn transform(&self, X: &ArrayView2<'_, f64>) -> Result<Array2<f64>> {
+        let n_samples = X.nrows();
+        let mut transformed = Array2::zeros((n_samples, self.selected_features.len()));
+        for (new_idx, &orig_idx) in self.selected_features.iter().enumerate() {
+            if orig_idx < X.ncols() {
+                transformed.column_mut(new_idx).assign(&X.column(orig_idx));
+            }
+        }
+        Ok(transformed)
+    }
+}
+
+// Additional stubs for other filter methods referenced in lib.rs
+
+macro_rules! impl_stub_selector {
+    ($name:ident, $trained:ident) => {
+        #[derive(Debug, Clone)]
+        /// pub
+        pub struct $name;
+
+        impl Estimator for $name {
+            type Config = FilterConfig;
+            type Error = FilterError;
+            type Float = f64;
+
+            fn config(&self) -> &Self::Config {
+                static CONFIG: std::sync::OnceLock<FilterConfig> = std::sync::OnceLock::new();
+                CONFIG.get_or_init(|| FilterConfig::default())
+            }
+        }
+
+        impl<'a> Fit<ArrayView2<'a, f64>, ArrayView1<'a, f64>> for $name {
+            type Fitted = $trained;
+            fn fit(
+                self,
+                _X: &ArrayView2<'a, f64>,
+                _y: &ArrayView1<'a, f64>,
+            ) -> Result<Self::Fitted> {
+                Err(SklearsError::NotImplemented(
+                    concat!(stringify!($name), " selector not yet implemented").to_string(),
+                )
+                .into())
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        /// pub
+        pub struct $trained {
+            /// selected_features
+            pub selected_features: Vec<usize>,
+        }
+
+        impl Transform<ArrayView2<'_, f64>, Array2<f64>> for $trained {
+            fn transform(&self, X: &ArrayView2<'_, f64>) -> Result<Array2<f64>> {
+                let n_samples = X.nrows();
+                let mut transformed = Array2::zeros((n_samples, self.selected_features.len()));
+                for (new_idx, &orig_idx) in self.selected_features.iter().enumerate() {
+                    if orig_idx < X.ncols() {
+                        transformed.column_mut(new_idx).assign(&X.column(orig_idx));
+                    }
+                }
+                Ok(transformed)
+            }
+        }
+    };
+}
+
+// Generate stub implementations for all the selectors referenced in lib.rs
+impl_stub_selector!(SelectFpr, SelectFprTrained);
+impl_stub_selector!(SelectFdr, SelectFdrTrained);
+impl_stub_selector!(SelectFwe, SelectFweTrained);
+impl_stub_selector!(Relief, ReliefTrained);
+impl_stub_selector!(ReliefF, ReliefFTrained);
+impl_stub_selector!(RReliefF, RReliefFTrained);
+impl_stub_selector!(SureIndependenceScreening, SureIndependenceScreeningTrained);
+impl_stub_selector!(KnockoffSelector, KnockoffSelectorTrained);
+impl_stub_selector!(HighDimensionalInference, HighDimensionalInferenceTrained);
+impl_stub_selector!(CompressedSensingSelector, CompressedSensingSelectorTrained);
+impl_stub_selector!(ImbalancedDataSelector, ImbalancedDataSelectorTrained);
+impl_stub_selector!(SelectKBestParallel, SelectKBestParallelTrained);
+
+// Enum for compressed sensing algorithms
+#[derive(Debug, Clone)]
+/// CompressedSensingAlgorithm
+pub enum CompressedSensingAlgorithm {
+    /// OMP
+    OMP,
+    /// CoSaMP
+    CoSaMP,
+    /// IHT
+    IHT,
+    /// SP
+    SP,
+}
+
+// Enum for inference methods
+#[derive(Debug, Clone)]
+/// InferenceMethod
+pub enum InferenceMethod {
+    /// Lasso
+    Lasso,
+    /// Ridge
+    Ridge,
+    /// ElasticNet
+    ElasticNet,
+    /// PostSelection
+    PostSelection,
+}
+
+// Enum for knockoff types
+#[derive(Debug, Clone)]
+/// KnockoffType
+pub enum KnockoffType {
+    /// Equicorrelated
+    Equicorrelated,
+    /// SDP
+    SDP,
+    /// FixedDesign
+    FixedDesign,
+}
+
+// Enum for imbalanced strategies
+#[derive(Debug, Clone)]
+/// ImbalancedStrategy
+pub enum ImbalancedStrategy {
+    /// MinorityFocused
+    MinorityFocused,
+    /// CostSensitive
+    CostSensitive,
+    /// EnsembleImbalanced
+    EnsembleImbalanced,
+    /// SMOTEEnhanced
+    SMOTEEnhanced,
+    /// WeightedSelection
+    WeightedSelection,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scirs2_core::ndarray::array;
+
+    #[test]
+    fn test_correlation_threshold_selects_correlated_features() {
+        // Feature 0: highly correlated with y (r ≈ 1.0)
+        // Feature 1: uncorrelated noise (constant 0.5)
+        // Feature 2: negatively correlated (r ≈ -1.0)
+        let x = array![
+            [1.0, 0.5, 5.0],
+            [2.0, 0.5, 4.0],
+            [3.0, 0.5, 3.0],
+            [4.0, 0.5, 2.0],
+            [5.0, 0.5, 1.0],
+        ];
+        let y = array![1.0, 2.0, 3.0, 4.0, 5.0];
+
+        let selector = CorrelationThreshold::new(0.9);
+        let fitted = selector
+            .fit(&x.view(), &y.view())
+            .expect("CorrelationThreshold fit should succeed");
+
+        // Features 0 and 2 should be selected (|r| ≈ 1.0 >= 0.9)
+        // Feature 1 (constant) should NOT be selected
+        assert!(
+            fitted.selected_features.contains(&0),
+            "Feature 0 (r≈1) should be selected"
+        );
+        assert!(
+            fitted.selected_features.contains(&2),
+            "Feature 2 (r≈-1) should be selected"
+        );
+        assert!(
+            !fitted.selected_features.contains(&1),
+            "Feature 1 (constant) should NOT be selected"
+        );
+    }
+
+    #[test]
+    fn test_correlation_threshold_transform_shape() {
+        let x = array![[1.0, 0.5, 5.0], [2.0, 0.5, 4.0], [3.0, 0.5, 3.0],];
+        let y = array![1.0, 2.0, 3.0];
+
+        let selector = CorrelationThreshold::new(0.9);
+        let fitted = selector
+            .fit(&x.view(), &y.view())
+            .expect("fit should succeed");
+        let transformed = fitted
+            .transform(&x.view())
+            .expect("transform should succeed");
+
+        // Transformed should have fewer (or equal) columns than original
+        assert!(transformed.ncols() <= 3);
+        assert_eq!(transformed.nrows(), 3);
+    }
+
+    #[test]
+    fn test_correlation_threshold_fallback_all_features() {
+        // Very high threshold → no feature passes → should fall back to all features.
+        let x = array![[1.0, 2.0], [2.0, 1.0], [3.0, 0.0]];
+        let y = array![0.1, 0.5, 0.9];
+
+        // With threshold 0.999 only a perfect correlation would pass.
+        // The correlations here won't be that perfect, so all features are kept.
+        let selector = CorrelationThreshold::new(0.999);
+        let fitted = selector
+            .fit(&x.view(), &y.view())
+            .expect("fit should succeed");
+
+        // Must not be empty
+        assert!(!fitted.selected_features.is_empty());
+    }
+}

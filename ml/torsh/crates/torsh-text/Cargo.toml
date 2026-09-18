@@ -1,0 +1,69 @@
+[package]
+name = "torsh-text"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Natural language processing utilities for ToRSh deep learning framework"
+readme = "README.md"
+documentation = "https://docs.rs/torsh-text"
+rust-version.workspace = true
+keywords = ["deep-learning", "machine-learning", "nlp", "text", "pytorch"]
+categories = ["science", "text-processing"]
+
+[lints]
+workspace = true
+
+[dependencies]
+torsh-core = { workspace = true }
+torsh-tensor = { workspace = true }
+torsh-data = { workspace = true }
+torsh-linalg = { workspace = true }
+
+# Text processing
+# Pure Rust profile: default features would pull `onig` (Oniguruma, C) and
+# `esaxx_fast` (esaxx-rs/cpp, C++). `unstable_wasm` selects the pure-Rust
+# `fancy-regex` backend instead, and dropping `esaxx_fast` keeps esaxx-rs on its
+# pure-Rust `suffix_rs` path (Unigram training only).
+tokenizers = { version = "0.23", default-features = false, features = [
+    "unstable_wasm",
+    "progressbar",
+] }
+unicode-segmentation = { workspace = true }
+regex = { workspace = true }
+
+# Scientific computing - comprehensive NLP integration
+scirs2-core = { workspace = true }
+scirs2-autograd = { workspace = true }
+scirs2-text = { workspace = true }
+scirs2-cluster = { workspace = true }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+reqwest = { workspace = true, features = ["blocking"], optional = true }
+oxiarc-archive = { workspace = true, optional = true }
+dirs = { workspace = true }
+lazy_static = { workspace = true }
+# rand = { workspace = true }  # REMOVED: Use scirs2_core::random instead (SciRS2 POLICY)
+# rayon = "1.11"  # REMOVED: Use scirs2_core::parallel_ops instead (SciRS2 POLICY) - Migration completed!
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[dev-dependencies]
+approx = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+# Pure-Rust by default: `pretrained` (network downloads via reqwest, which pulls
+# a rustls TLS provider) is opt-in so a default build stays C/asm-free.
+default = []
+pretrained = ["reqwest", "oxiarc-archive"]

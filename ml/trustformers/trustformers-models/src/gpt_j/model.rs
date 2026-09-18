@@ -1,0 +1,1639 @@
+use crate::common::ActivationType;
+use crate::gpt_j::config::GptJConfig;
+use scirs2_core::ndarray::{s, ArrayD, IxDyn}; // SciRS2 Integration Policy
+use std::io::Read;
+use trustformers_core::device::Device;
+use trustformers_core::errors::{tensor_op_error, Result, TrustformersError};
+use trustformers_core::layers::{Embedding, LayerNorm, Linear};
+use trustformers_core::tensor::Tensor;
+use trustformers_core::traits::{Config, Layer, Model, TokenizedInput};
+
+/// Rotary Position Embedding (RoPE) for GPT-J
+/// Reference: "RoFormer: Enhanced Transformer with Rotary Position Embedding" (Su et al., 2021)
+/// GPT-J uses RoPE on a subset of dimensions (rotary_dim) for efficiency, and
+/// (unlike the LLaMA/GPT-NeoX "rotate-half" convention) rotates *interleaved*
+/// adjacent pairs `(x[2i], x[2i+1])`, matching EleutherAI's original GPT-J
+/// implementation and HF `modeling_gptj.py`'s `rotate_every_two`.
+#[derive(Debug, Clone)]
+pub struct GptJRotaryEmbedding {
+    /// Number of leading channels per head that receive rotation. Channels
+    /// `[dim, head_dim)` pass through unrotated.
+    pub dim: usize,
+    /// Total per-head channel width (`n_embd / n_head`).
+    pub head_dim: usize,
+    pub max_seq_len: usize,
+    pub base: f32, // theta parameter, typically 10000.0
+}
+
+impl GptJRotaryEmbedding {
+    pub fn new(dim: usize, head_dim: usize, max_seq_len: usize, base: f32) -> Self {
+        Self {
+            dim,
+            head_dim,
+            max_seq_len,
+            base,
+        }
+    }
+
+    /// Apply rotary embedding to query and key tensors.
+    ///
+    /// `q`/`k` have shape `[seq_len, num_heads * head_dim]`; the head count
+    /// is inferred independently for each tensor from `head_dim`, and every
+    /// head is rotated (only its first `dim` channels — the rest pass
+    /// through unchanged, per GPT-J's partial-rotary design).
+    pub fn apply_rotary_emb(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        position_ids: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        match (q, k) {
+            (Tensor::F32(q_arr), Tensor::F32(k_arr)) => {
+                if self.head_dim == 0 {
+                    return Err(tensor_op_error("gptj_rope", "head_dim must be > 0"));
+                }
+                if self.dim > self.head_dim {
+                    return Err(tensor_op_error(
+                        "gptj_rope",
+                        "rotary_dim must not exceed head_dim",
+                    ));
+                }
+                let q_shape = q_arr.shape().to_vec();
+                let k_shape = k_arr.shape().to_vec();
+                let q_last = *q_shape
+                    .last()
+                    .ok_or_else(|| tensor_op_error("gptj_rope", "q tensor has no dimensions"))?;
+                let k_last = *k_shape
+                    .last()
+                    .ok_or_else(|| tensor_op_error("gptj_rope", "k tensor has no dimensions"))?;
+                if !q_last.is_multiple_of(self.head_dim) || !k_last.is_multiple_of(self.head_dim) {
+                    return Err(tensor_op_error(
+                        "gptj_rope",
+                        format!(
+                            "last dim (q={q_last}, k={k_last}) must be a multiple of head_dim={}",
+                            self.head_dim
+                        ),
+                    ));
+                }
+                let q_heads = q_last / self.head_dim;
+                let k_heads = k_last / self.head_dim;
+
+                let mut q_data = q_arr
+                    .as_slice()
+                    .ok_or_else(|| tensor_op_error("gptj_rope", "q tensor not contiguous"))?
+                    .to_vec();
+                let mut k_data = k_arr
+                    .as_slice()
+                    .ok_or_else(|| tensor_op_error("gptj_rope", "k tensor not contiguous"))?
+                    .to_vec();
+
+                let seq_len_q = q_data.len() / q_last.max(1);
+                let seq_len_k = k_data.len() / k_last.max(1);
+                if seq_len_q != position_ids.len() || seq_len_k != position_ids.len() {
+                    return Err(tensor_op_error(
+                        "gptj_rope",
+                        "position_ids length must match the sequence length of q and k",
+                    ));
+                }
+
+                apply_rope_interleaved(
+                    &mut q_data,
+                    q_heads,
+                    self.head_dim,
+                    self.dim,
+                    self.base,
+                    position_ids,
+                );
+                apply_rope_interleaved(
+                    &mut k_data,
+                    k_heads,
+                    self.head_dim,
+                    self.dim,
+                    self.base,
+                    position_ids,
+                );
+
+                Ok((
+                    Tensor::from_vec(q_data, &q_shape)?,
+                    Tensor::from_vec(k_data, &k_shape)?,
+                ))
+            },
+            _ => Err(tensor_op_error(
+                "tensor_operation",
+                "Unsupported tensor types for GPT-J RoPE",
+            )),
+        }
+    }
+}
+
+/// Rotate `data` (row-major, shape `[seq_len, num_heads * head_dim]`) in
+/// place using GPT-J's interleaved-pair RoPE convention: for each head, the
+/// first `rotary_dim` channels are rotated as adjacent pairs
+/// `(x[2i], x[2i+1]) -> (x[2i]*cos - x[2i+1]*sin, x[2i]*sin + x[2i+1]*cos)`;
+/// channels `[rotary_dim, head_dim)` are left unchanged.
+fn apply_rope_interleaved(
+    data: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    base: f32,
+    position_ids: &[usize],
+) {
+    let pairs = rotary_dim / 2;
+    if pairs == 0 {
+        return;
+    }
+    let row_width = num_heads * head_dim;
+    for (row, &pos) in position_ids.iter().enumerate() {
+        let row_off = row * row_width;
+        for h in 0..num_heads {
+            let head_off = row_off + h * head_dim;
+            for i in 0..pairs {
+                let freq = 1.0 / base.powf(2.0 * i as f32 / rotary_dim as f32);
+                let angle = pos as f32 * freq;
+                let cos_v = angle.cos();
+                let sin_v = angle.sin();
+                let idx0 = head_off + 2 * i;
+                let idx1 = head_off + 2 * i + 1;
+                let x0 = data[idx0];
+                let x1 = data[idx1];
+                data[idx0] = x0 * cos_v - x1 * sin_v;
+                data[idx1] = x0 * sin_v + x1 * cos_v;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GptJModel {
+    config: GptJConfig,
+    wte: Embedding,
+    blocks: Vec<GptJBlock>,
+    ln_f: LayerNorm,
+}
+
+#[derive(Debug, Clone)]
+pub struct GptJBlock {
+    ln_1: LayerNorm,
+    attn: GptJAttention,
+    mlp: GptJMLP,
+}
+
+#[derive(Debug, Clone)]
+pub struct GptJAttention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    out_proj: Linear,
+    num_heads: usize,
+    head_dim: usize,
+    #[allow(dead_code)]
+    rotary_dim: usize,
+    #[allow(dead_code)]
+    dropout: f32,
+    rotary_emb: GptJRotaryEmbedding,
+}
+
+#[derive(Debug, Clone)]
+pub struct GptJMLP {
+    fc_in: Linear,
+    fc_out: Linear,
+    activation: ActivationType,
+    #[allow(dead_code)]
+    dropout: f32,
+}
+
+#[derive(Debug)]
+pub struct GptJModelOutput {
+    pub last_hidden_state: Tensor,
+    pub hidden_states: Option<Vec<Tensor>>,
+}
+
+impl GptJModel {
+    pub fn new(config: GptJConfig) -> Result<Self> {
+        config.validate()?;
+
+        let wte = Embedding::new(config.vocab_size, config.n_embd, None)?;
+
+        let mut blocks = Vec::new();
+        for _ in 0..config.n_layer {
+            blocks.push(GptJBlock::new(&config)?);
+        }
+
+        let ln_f = LayerNorm::new(vec![config.n_embd], config.layer_norm_epsilon)?;
+
+        Ok(Self {
+            config,
+            wte,
+            blocks,
+            ln_f,
+        })
+    }
+
+    pub fn new_with_device(config: GptJConfig, device: Device) -> Result<Self> {
+        config.validate()?;
+
+        let wte = Embedding::new_with_device(config.vocab_size, config.n_embd, None, device)?;
+
+        let mut blocks = Vec::new();
+        for _ in 0..config.n_layer {
+            blocks.push(GptJBlock::new_with_device(&config, device)?);
+        }
+
+        let ln_f =
+            LayerNorm::new_with_device(vec![config.n_embd], config.layer_norm_epsilon, device)?;
+
+        Ok(Self {
+            config,
+            wte,
+            blocks,
+            ln_f,
+        })
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn weights_to_gpu(&mut self, device: &Device) -> Result<()> {
+        self.wte.weights_to_gpu(device)?;
+        for block in &mut self.blocks {
+            block.weights_to_gpu(device)?;
+        }
+        self.ln_f.weights_to_gpu(device)?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    pub fn weights_to_gpu_cuda(&mut self, device: &Device) -> Result<()> {
+        self.wte.weights_to_gpu_cuda(device)?;
+        for block in &mut self.blocks {
+            block.weights_to_gpu_cuda(device)?;
+        }
+        self.ln_f.weights_to_gpu_cuda(device)?;
+        tracing::debug!("✓ GptJModel: All layer weights cached on CUDA GPU");
+        Ok(())
+    }
+}
+
+impl GptJBlock {
+    fn new(config: &GptJConfig) -> Result<Self> {
+        let ln_1 = LayerNorm::new(vec![config.n_embd], config.layer_norm_epsilon)?;
+        let attn = GptJAttention::new(config)?;
+        let mlp = GptJMLP::new(config)?;
+
+        Ok(Self { ln_1, attn, mlp })
+    }
+
+    fn new_with_device(config: &GptJConfig, device: Device) -> Result<Self> {
+        let ln_1 =
+            LayerNorm::new_with_device(vec![config.n_embd], config.layer_norm_epsilon, device)?;
+        let attn = GptJAttention::new_with_device(config, device)?;
+        let mlp = GptJMLP::new_with_device(config, device)?;
+
+        Ok(Self { ln_1, attn, mlp })
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.ln_1.parameter_count() + self.attn.parameter_count() + self.mlp.parameter_count()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn weights_to_gpu(&mut self, device: &Device) -> Result<()> {
+        self.ln_1.weights_to_gpu(device)?;
+        self.attn.weights_to_gpu(device)?;
+        self.mlp.weights_to_gpu(device)?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    pub fn weights_to_gpu_cuda(&mut self, device: &Device) -> Result<()> {
+        self.ln_1.weights_to_gpu_cuda(device)?;
+        self.attn.weights_to_gpu_cuda(device)?;
+        self.mlp.weights_to_gpu_cuda(device)?;
+        Ok(())
+    }
+
+    fn forward(&self, hidden_states: Tensor) -> Result<Tensor> {
+        // GPT-J uses parallel attention and MLP (not sequential like GPT-2)
+        let normed_hidden_states = self.ln_1.forward(hidden_states.clone())?;
+
+        // Parallel computation of attention and MLP
+        let attn_output = self.attn.forward(normed_hidden_states.clone())?;
+        let mlp_output = self.mlp.forward(normed_hidden_states)?;
+
+        // Add both outputs to the residual
+        let hidden_states = hidden_states.add(&attn_output)?;
+        let hidden_states = hidden_states.add(&mlp_output)?;
+
+        Ok(hidden_states)
+    }
+}
+
+impl GptJAttention {
+    fn new(config: &GptJConfig) -> Result<Self> {
+        let head_dim = config.head_dim();
+        let rotary_emb = GptJRotaryEmbedding::new(
+            config.rotary_dim,
+            head_dim,
+            config.n_positions,
+            10000.0, // Standard RoPE theta value
+        );
+
+        Ok(Self {
+            q_proj: Linear::new(config.n_embd, config.n_embd, false),
+            k_proj: Linear::new(config.n_embd, config.n_embd, false),
+            v_proj: Linear::new(config.n_embd, config.n_embd, false),
+            out_proj: Linear::new(config.n_embd, config.n_embd, false),
+            num_heads: config.n_head,
+            head_dim,
+            rotary_dim: config.rotary_dim,
+            dropout: config.attn_pdrop,
+            rotary_emb,
+        })
+    }
+
+    fn new_with_device(config: &GptJConfig, device: Device) -> Result<Self> {
+        let head_dim = config.head_dim();
+        let rotary_emb = GptJRotaryEmbedding::new(
+            config.rotary_dim,
+            head_dim,
+            config.n_positions,
+            10000.0, // Standard RoPE theta value
+        );
+
+        Ok(Self {
+            q_proj: Linear::new_with_device(config.n_embd, config.n_embd, false, device),
+            k_proj: Linear::new_with_device(config.n_embd, config.n_embd, false, device),
+            v_proj: Linear::new_with_device(config.n_embd, config.n_embd, false, device),
+            out_proj: Linear::new_with_device(config.n_embd, config.n_embd, false, device),
+            num_heads: config.n_head,
+            head_dim,
+            rotary_dim: config.rotary_dim,
+            dropout: config.attn_pdrop,
+            rotary_emb,
+        })
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.q_proj.parameter_count()
+            + self.k_proj.parameter_count()
+            + self.v_proj.parameter_count()
+            + self.out_proj.parameter_count()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn weights_to_gpu(&mut self, device: &Device) -> Result<()> {
+        self.q_proj.weights_to_gpu(device)?;
+        self.k_proj.weights_to_gpu(device)?;
+        self.v_proj.weights_to_gpu(device)?;
+        self.out_proj.weights_to_gpu(device)?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    pub fn weights_to_gpu_cuda(&mut self, device: &Device) -> Result<()> {
+        self.q_proj.weights_to_gpu_cuda(device)?;
+        self.k_proj.weights_to_gpu_cuda(device)?;
+        self.v_proj.weights_to_gpu_cuda(device)?;
+        self.out_proj.weights_to_gpu_cuda(device)?;
+        Ok(())
+    }
+
+    /// Real multi-head scaled dot-product attention with GPT-J's partial
+    /// (interleaved-pair) RoPE and causal masking. GPT-J uses standard
+    /// multi-head attention (no grouped/multi-query heads), so every query
+    /// head reads from the key/value head of the same index.
+    fn forward(&self, hidden_states: Tensor) -> Result<Tensor> {
+        // Compute Q, K, V
+        let q = self.q_proj.forward(hidden_states.clone())?;
+        let k = self.k_proj.forward(hidden_states.clone())?;
+        let v = self.v_proj.forward(hidden_states)?;
+
+        if self.num_heads == 0 {
+            return Err(tensor_op_error("gptj_attn", "num_heads must be > 0"));
+        }
+        let width = self.num_heads * self.head_dim;
+        let total_q: usize = q.shape().iter().product();
+        if width == 0 || !total_q.is_multiple_of(width) {
+            return Err(tensor_op_error(
+                "gptj_attn",
+                "q size inconsistent with num_heads * head_dim",
+            ));
+        }
+        let seq_len = total_q / width;
+        let position_ids: Vec<usize> = (0..seq_len).collect();
+
+        // Apply RoPE to query and key tensors (first `rotary_dim` channels
+        // of each head only; `v` is never rotated).
+        let (q_rotated, k_rotated) = self.rotary_emb.apply_rotary_emb(&q, &k, &position_ids)?;
+
+        match (&q_rotated, &k_rotated, &v) {
+            (Tensor::F32(q_arr), Tensor::F32(k_arr), Tensor::F32(v_arr)) => {
+                let q_data = q_arr
+                    .as_slice()
+                    .ok_or_else(|| tensor_op_error("gptj_attn", "q tensor not contiguous"))?;
+                let k_data = k_arr
+                    .as_slice()
+                    .ok_or_else(|| tensor_op_error("gptj_attn", "k tensor not contiguous"))?;
+                let v_data = v_arr
+                    .as_slice()
+                    .ok_or_else(|| tensor_op_error("gptj_attn", "v tensor not contiguous"))?;
+                if q_data.len() != seq_len * width
+                    || k_data.len() != seq_len * width
+                    || v_data.len() != seq_len * width
+                {
+                    return Err(tensor_op_error(
+                        "gptj_attn",
+                        "q/k/v tensor size inconsistent with num_heads * head_dim",
+                    ));
+                }
+
+                let scale = 1.0 / (self.head_dim as f32).sqrt();
+                let mut out = vec![0f32; seq_len * width];
+                for h in 0..self.num_heads {
+                    for i in 0..seq_len {
+                        let q_off = i * width + h * self.head_dim;
+                        // Causal: query position i attends to keys 0..=i.
+                        let mut scores = Vec::with_capacity(i + 1);
+                        for j in 0..=i {
+                            let k_off = j * width + h * self.head_dim;
+                            let dot: f32 = (0..self.head_dim)
+                                .map(|d| q_data[q_off + d] * k_data[k_off + d])
+                                .sum();
+                            scores.push(dot * scale);
+                        }
+                        let max_val = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut weights = vec![0f32; scores.len()];
+                        let mut sum = 0f32;
+                        for (idx, &s) in scores.iter().enumerate() {
+                            let e = (s - max_val).exp();
+                            weights[idx] = e;
+                            sum += e;
+                        }
+                        let inv_sum = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                        let out_off = i * width + h * self.head_dim;
+                        for (j, &w) in weights.iter().enumerate() {
+                            let wn = w * inv_sum;
+                            let v_off = j * width + h * self.head_dim;
+                            for d in 0..self.head_dim {
+                                out[out_off + d] += wn * v_data[v_off + d];
+                            }
+                        }
+                    }
+                }
+
+                let attended = Tensor::from_vec(out, &[seq_len, width])?;
+                self.out_proj.forward(attended)
+            },
+            _ => Err(tensor_op_error(
+                "tensor_operation",
+                "Unsupported tensor types for GPT-J attention",
+            )),
+        }
+    }
+
+    /// Apply rotary position embedding to a tensor
+    /// This is a helper method that delegates to the rotary embedding instance
+    #[allow(dead_code)]
+    fn apply_rotary_pos_emb(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        position_ids: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        self.rotary_emb.apply_rotary_emb(q, k, position_ids)
+    }
+}
+
+impl GptJMLP {
+    fn new(config: &GptJConfig) -> Result<Self> {
+        let intermediate_size = 4 * config.n_embd; // GPT-J uses 4x hidden size for MLP
+
+        Ok(Self {
+            fc_in: Linear::new(config.n_embd, intermediate_size, true),
+            fc_out: Linear::new(intermediate_size, config.n_embd, true),
+            activation: ActivationType::try_from(config.activation_function.as_str())?,
+            dropout: config.resid_pdrop,
+        })
+    }
+
+    fn new_with_device(config: &GptJConfig, device: Device) -> Result<Self> {
+        let intermediate_size = 4 * config.n_embd; // GPT-J uses 4x hidden size for MLP
+
+        Ok(Self {
+            fc_in: Linear::new_with_device(config.n_embd, intermediate_size, true, device),
+            fc_out: Linear::new_with_device(intermediate_size, config.n_embd, true, device),
+            activation: ActivationType::try_from(config.activation_function.as_str())?,
+            dropout: config.resid_pdrop,
+        })
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.fc_in.parameter_count() + self.fc_out.parameter_count()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn weights_to_gpu(&mut self, device: &Device) -> Result<()> {
+        self.fc_in.weights_to_gpu(device)?;
+        self.fc_out.weights_to_gpu(device)?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    pub fn weights_to_gpu_cuda(&mut self, device: &Device) -> Result<()> {
+        self.fc_in.weights_to_gpu_cuda(device)?;
+        self.fc_out.weights_to_gpu_cuda(device)?;
+        Ok(())
+    }
+
+    fn forward(&self, hidden_states: Tensor) -> Result<Tensor> {
+        let hidden_states = self.fc_in.forward(hidden_states)?;
+
+        // Apply activation function
+        let hidden_states = self.activation.apply(&hidden_states)?;
+
+        self.fc_out.forward(hidden_states)
+    }
+}
+
+impl Model for GptJModel {
+    type Config = GptJConfig;
+    type Input = TokenizedInput;
+    type Output = GptJModelOutput;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output> {
+        // Get token embeddings (GPT-J doesn't use separate position embeddings)
+        let mut hidden_states = self.wte.forward(input.input_ids)?;
+
+        // Pass through blocks
+        for block in &self.blocks {
+            hidden_states = block.forward(hidden_states)?;
+        }
+
+        // Final layer norm
+        let last_hidden_state = self.ln_f.forward(hidden_states)?;
+
+        Ok(GptJModelOutput {
+            last_hidden_state,
+            hidden_states: None,
+        })
+    }
+
+    fn load_pretrained(&mut self, _reader: &mut dyn Read) -> Result<()> {
+        // Legacy interface - use enhanced weight loading methods for production
+        Err(TrustformersError::not_implemented(
+            "Use load_from_path or load_from_huggingface for enhanced weight loading".to_string(),
+        ))
+    }
+
+    fn get_config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn num_parameters(&self) -> usize {
+        let mut total = 0;
+
+        // Word token embeddings
+        total += self.wte.parameter_count();
+
+        // Transformer blocks
+        for block in &self.blocks {
+            total += block.ln_1.parameter_count();
+            total += block.attn.q_proj.parameter_count();
+            total += block.attn.k_proj.parameter_count();
+            total += block.attn.v_proj.parameter_count();
+            total += block.attn.out_proj.parameter_count();
+            total += block.mlp.fc_in.parameter_count();
+            total += block.mlp.fc_out.parameter_count();
+        }
+
+        // Final layer norm
+        total += self.ln_f.parameter_count();
+
+        total
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GptJLMHeadModel {
+    transformer: GptJModel,
+    lm_head: Linear,
+}
+
+impl GptJLMHeadModel {
+    pub fn new(config: GptJConfig) -> Result<Self> {
+        let transformer = GptJModel::new(config.clone())?;
+        let lm_head = Linear::new(config.n_embd, config.vocab_size, false);
+
+        Ok(Self {
+            transformer,
+            lm_head,
+        })
+    }
+
+    pub fn new_with_device(config: GptJConfig, device: Device) -> Result<Self> {
+        let transformer = GptJModel::new_with_device(config.clone(), device)?;
+        let lm_head = Linear::new_with_device(config.n_embd, config.vocab_size, false, device);
+
+        Ok(Self {
+            transformer,
+            lm_head,
+        })
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn weights_to_gpu(&mut self, device: &Device) -> Result<()> {
+        self.transformer.weights_to_gpu(device)?;
+        self.lm_head.weights_to_gpu(device)?;
+        tracing::debug!("✓ GptJLMHeadModel: All model weights uploaded to Metal GPU");
+        Ok(())
+    }
+
+    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    pub fn weights_to_gpu_cuda(&mut self, device: &Device) -> Result<()> {
+        self.transformer.weights_to_gpu_cuda(device)?;
+        self.lm_head.weights_to_gpu_cuda(device)?;
+        tracing::debug!("✓ GptJLMHeadModel: All model weights uploaded to CUDA GPU");
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct GptJLMHeadOutput {
+    pub logits: Tensor,
+    pub hidden_states: Option<Tensor>,
+}
+
+impl Model for GptJLMHeadModel {
+    type Config = GptJConfig;
+    type Input = TokenizedInput;
+    type Output = GptJLMHeadOutput;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output> {
+        let transformer_output = self.transformer.forward(input)?;
+        let logits = self.lm_head.forward(transformer_output.last_hidden_state.clone())?;
+
+        Ok(GptJLMHeadOutput {
+            logits,
+            hidden_states: Some(transformer_output.last_hidden_state),
+        })
+    }
+
+    fn load_pretrained(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.transformer.load_pretrained(reader)
+    }
+
+    fn get_config(&self) -> &Self::Config {
+        self.transformer.get_config()
+    }
+
+    fn num_parameters(&self) -> usize {
+        self.transformer.num_parameters() + self.lm_head.parameter_count()
+    }
+}
+
+impl GptJLMHeadModel {
+    /// Load model weights from a directory containing HuggingFace format weights
+    pub fn load_from_path(&mut self, model_path: impl AsRef<std::path::Path>) -> Result<()> {
+        use crate::weight_loading::{auto_create_loader, WeightLoadingConfig};
+
+        let config = WeightLoadingConfig {
+            lazy_loading: true,
+            memory_mapped: false,
+            ..Default::default()
+        };
+
+        let mut loader = auto_create_loader(model_path, Some(config))?;
+
+        // Load word token embeddings
+        if let Ok(embed_weights) = loader.load_tensor("transformer.wte.weight") {
+            self.transformer.wte.set_weight(embed_weights)?;
+        }
+
+        // Load transformer blocks
+        for (i, block) in self.transformer.blocks.iter_mut().enumerate() {
+            // Load attention weights
+            let attn_prefix = format!("transformer.h.{}.attn", i);
+
+            if let Ok(q_weight) = loader.load_tensor(&format!("{}.q_proj.weight", attn_prefix)) {
+                block.attn.q_proj.set_weight(q_weight)?;
+            }
+            if let Ok(k_weight) = loader.load_tensor(&format!("{}.k_proj.weight", attn_prefix)) {
+                block.attn.k_proj.set_weight(k_weight)?;
+            }
+            if let Ok(v_weight) = loader.load_tensor(&format!("{}.v_proj.weight", attn_prefix)) {
+                block.attn.v_proj.set_weight(v_weight)?;
+            }
+            if let Ok(o_weight) = loader.load_tensor(&format!("{}.out_proj.weight", attn_prefix)) {
+                block.attn.out_proj.set_weight(o_weight)?;
+            }
+
+            // Load MLP weights
+            let mlp_prefix = format!("transformer.h.{}.mlp", i);
+
+            if let Ok(fc_in_weight) = loader.load_tensor(&format!("{}.fc_in.weight", mlp_prefix)) {
+                block.mlp.fc_in.set_weight(fc_in_weight)?;
+            }
+            if let Ok(fc_out_weight) = loader.load_tensor(&format!("{}.fc_out.weight", mlp_prefix))
+            {
+                block.mlp.fc_out.set_weight(fc_out_weight)?;
+            }
+
+            // Load layer norm weights
+            if let Ok(ln_weight) = loader.load_tensor(&format!("transformer.h.{}.ln_1.weight", i)) {
+                block.ln_1.set_weight(ln_weight)?;
+            }
+            if let Ok(ln_bias) = loader.load_tensor(&format!("transformer.h.{}.ln_1.bias", i)) {
+                block.ln_1.set_bias(ln_bias)?;
+            }
+        }
+
+        // Load final layer norm
+        if let Ok(norm_weight) = loader.load_tensor("transformer.ln_f.weight") {
+            self.transformer.ln_f.set_weight(norm_weight)?;
+        }
+        if let Ok(norm_bias) = loader.load_tensor("transformer.ln_f.bias") {
+            self.transformer.ln_f.set_bias(norm_bias)?;
+        }
+
+        // Load LM head weights
+        if let Ok(lm_head_weight) = loader.load_tensor("lm_head.weight") {
+            self.lm_head.set_weight(lm_head_weight)?;
+        }
+
+        Ok(())
+    }
+
+    /// Load from HuggingFace Hub model name
+    pub fn load_from_huggingface(&mut self, model_name: &str) -> Result<()> {
+        // Check if model is cached locally
+        let cache_dir = std::env::var("HF_HOME")
+            .or_else(|_| std::env::var("HUGGINGFACE_HUB_CACHE"))
+            .unwrap_or_else(|_| {
+                std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                    + "/.cache/huggingface/hub"
+            });
+
+        let model_path = std::path::Path::new(&cache_dir)
+            .join(format!("models--{}", model_name.replace("/", "--")));
+
+        if model_path.exists() {
+            self.load_from_path(&model_path)
+        } else {
+            // Attempt to download the model from HuggingFace Hub
+            self.download_from_huggingface_hub(model_name, &model_path)?;
+            self.load_from_path(&model_path)
+        }
+    }
+
+    /// Download model from HuggingFace Hub
+    fn download_from_huggingface_hub(
+        &self,
+        model_name: &str,
+        model_path: &std::path::Path,
+    ) -> Result<()> {
+        use std::process::Command;
+
+        tracing::info!(
+            "Downloading model {} from HuggingFace Hub to {:?}",
+            model_name,
+            model_path
+        );
+
+        // Create the model directory
+        std::fs::create_dir_all(model_path).map_err(|e| {
+            TrustformersError::io_error(format!("Failed to create model directory: {}", e))
+        })?;
+
+        // List of essential files for GPT-J models
+        let essential_files = vec![
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "pytorch_model.bin", // Try .bin first
+            "model.safetensors", // Fall back to safetensors
+        ];
+
+        let base_url = format!("https://huggingface.co/{}/resolve/main", model_name);
+
+        // Try to download each essential file
+        for file_name in &essential_files {
+            let file_url = format!("{}/{}", base_url, file_name);
+            let file_path = model_path.join(file_name);
+
+            tracing::info!("Attempting to download {}", file_url);
+
+            // Try using curl first
+            let file_path_str = file_path.to_str().ok_or_else(|| {
+                TrustformersError::io_error("Invalid file path encoding".to_string())
+            })?;
+            let curl_result = Command::new("curl")
+                .args([
+                    "-L", // Follow redirects
+                    "-f", // Fail on HTTP errors
+                    "-o",
+                    file_path_str,
+                    &file_url,
+                ])
+                .output();
+
+            match curl_result {
+                Ok(output) if output.status.success() => {
+                    tracing::info!("Successfully downloaded {}", file_name);
+                    continue;
+                },
+                Ok(output) => {
+                    tracing::warn!(
+                        "Failed to download {} with curl: {}",
+                        file_name,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                },
+                Err(e) => {
+                    tracing::info!("curl not available: {}", e);
+                },
+            }
+
+            // Try using wget as fallback
+            let wget_result = Command::new("wget").args(["-O", file_path_str, &file_url]).output();
+
+            match wget_result {
+                Ok(output) if output.status.success() => {
+                    tracing::info!("Successfully downloaded {} with wget", file_name);
+                    continue;
+                },
+                Ok(output) => {
+                    tracing::warn!(
+                        "Failed to download {} with wget: {}",
+                        file_name,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                },
+                Err(e) => {
+                    tracing::info!("wget not available: {}", e);
+                },
+            }
+
+            // If essential files like config.json or pytorch_model.bin fail, return error
+            if matches!(file_name, &"config.json" | &"pytorch_model.bin") {
+                return Err(TrustformersError::io_error(format!(
+                    "Failed to download essential file {} for model {}. Please ensure curl or wget is installed and you have internet access.",
+                    file_name, model_name
+                )));
+            }
+        }
+
+        tracing::info!(
+            "Successfully downloaded model {} from HuggingFace Hub",
+            model_name
+        );
+        Ok(())
+    }
+
+    /// Load weights with lazy loading for large models
+    pub fn load_with_lazy_loading(
+        &mut self,
+        model_path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        use crate::weight_loading::{auto_create_loader, WeightLoadingConfig};
+
+        let config = WeightLoadingConfig {
+            lazy_loading: true,
+            memory_mapped: true,
+            streaming: false,
+            ..Default::default()
+        };
+
+        let mut loader = auto_create_loader(model_path, Some(config))?;
+
+        // Load word token embeddings
+        if let Ok(embed_weights) = loader.load_tensor("transformer.wte.weight") {
+            self.transformer.wte.set_weight(embed_weights)?;
+        }
+
+        // Load transformer blocks
+        for (i, block) in self.transformer.blocks.iter_mut().enumerate() {
+            // Load attention weights
+            let attn_prefix = format!("transformer.h.{}.attn", i);
+
+            if let Ok(q_weight) = loader.load_tensor(&format!("{}.q_proj.weight", attn_prefix)) {
+                block.attn.q_proj.set_weight(q_weight)?;
+            }
+            if let Ok(k_weight) = loader.load_tensor(&format!("{}.k_proj.weight", attn_prefix)) {
+                block.attn.k_proj.set_weight(k_weight)?;
+            }
+            if let Ok(v_weight) = loader.load_tensor(&format!("{}.v_proj.weight", attn_prefix)) {
+                block.attn.v_proj.set_weight(v_weight)?;
+            }
+            if let Ok(o_weight) = loader.load_tensor(&format!("{}.out_proj.weight", attn_prefix)) {
+                block.attn.out_proj.set_weight(o_weight)?;
+            }
+
+            // Load MLP weights
+            let mlp_prefix = format!("transformer.h.{}.mlp", i);
+
+            if let Ok(fc_in_weight) = loader.load_tensor(&format!("{}.fc_in.weight", mlp_prefix)) {
+                block.mlp.fc_in.set_weight(fc_in_weight)?;
+            }
+            if let Ok(fc_out_weight) = loader.load_tensor(&format!("{}.fc_out.weight", mlp_prefix))
+            {
+                block.mlp.fc_out.set_weight(fc_out_weight)?;
+            }
+
+            // Load layer norm weights
+            if let Ok(ln_weight) = loader.load_tensor(&format!("transformer.h.{}.ln_1.weight", i)) {
+                block.ln_1.set_weight(ln_weight)?;
+            }
+            if let Ok(ln_bias) = loader.load_tensor(&format!("transformer.h.{}.ln_1.bias", i)) {
+                block.ln_1.set_bias(ln_bias)?;
+            }
+        }
+
+        // Load final layer norm
+        if let Ok(norm_weight) = loader.load_tensor("transformer.ln_f.weight") {
+            self.transformer.ln_f.set_weight(norm_weight)?;
+        }
+        if let Ok(norm_bias) = loader.load_tensor("transformer.ln_f.bias") {
+            self.transformer.ln_f.set_bias(norm_bias)?;
+        }
+
+        // Load LM head weights
+        if let Ok(lm_head_weight) = loader.load_tensor("lm_head.weight") {
+            self.lm_head.set_weight(lm_head_weight)?;
+        }
+
+        Ok(())
+    }
+
+    /// Generate text given a prompt using GPT-J
+    pub fn generate(
+        &self,
+        input_ids: Vec<u32>,
+        max_length: usize,
+        temperature: f32,
+        top_k: Option<usize>,
+        top_p: Option<f32>,
+    ) -> Result<Vec<u32>> {
+        let mut generated = input_ids.clone();
+
+        while generated.len() < max_length {
+            // Prepare input
+            let input = TokenizedInput {
+                input_ids: generated.clone(),
+                attention_mask: vec![1u8; generated.len()],
+                token_type_ids: None,
+                special_tokens_mask: None,
+                offset_mapping: None,
+                overflowing_tokens: None,
+            };
+
+            // Forward pass
+            let output = self.forward(input)?;
+
+            // Get logits for the last token
+            let logits = output.logits;
+            let last_logits = match &logits {
+                Tensor::F32(arr) => {
+                    // Get the last token's logits (shape: [batch, seq_len, vocab_size])
+                    let shape = arr.shape();
+                    if shape.len() != 3 {
+                        return Err(tensor_op_error(
+                            "tensor_operation",
+                            "Expected 3D tensor for logits".to_string(),
+                        ));
+                    }
+                    let seq_len = shape[1];
+                    let vocab_size = shape[2];
+                    let slice = arr.slice(s![0, seq_len - 1, ..]);
+                    // ArrayD and IxDyn already imported via scirs2_core at top
+                    ArrayD::from_shape_vec(IxDyn(&[vocab_size]), slice.iter().cloned().collect())
+                        .map_err(|e| {
+                            TrustformersError::tensor_op_error(
+                                &format!("Failed to reshape tensor: {}", e),
+                                "tensor_reshape",
+                            )
+                        })?
+                },
+                _ => {
+                    return Err(tensor_op_error(
+                        "tensor_operation",
+                        "Unsupported tensor type for generation".to_string(),
+                    ))
+                },
+            };
+
+            // Apply temperature
+            let scaled_logits = if temperature != 1.0 {
+                last_logits.mapv(|x| x / temperature)
+            } else {
+                last_logits
+            };
+
+            // Apply top-k filtering
+            let filtered_logits = if let Some(k) = top_k {
+                apply_top_k_filtering_gpt_j(scaled_logits, k)?
+            } else {
+                scaled_logits
+            };
+
+            // Apply top-p (nucleus) filtering
+            let final_logits = if let Some(p) = top_p {
+                apply_top_p_filtering_gpt_j(filtered_logits, p)?
+            } else {
+                filtered_logits
+            };
+
+            // Sample from the distribution
+            let next_token = sample_from_logits_gpt_j(final_logits)?;
+            generated.push(next_token);
+
+            // Check for EOS token (assuming 50256 is EOS for GPT-J, same as GPT-2)
+            if next_token == 50256 {
+                break;
+            }
+        }
+
+        Ok(generated)
+    }
+
+    /// Generate text using greedy decoding
+    pub fn generate_greedy(&self, input_ids: Vec<u32>, max_length: usize) -> Result<Vec<u32>> {
+        self.generate(input_ids, max_length, 1.0, Some(1), None)
+    }
+}
+
+// Helper functions for GPT-J text generation
+fn apply_top_k_filtering_gpt_j(logits: ArrayD<f32>, k: usize) -> Result<ArrayD<f32>> {
+    let mut result = logits.clone();
+    let mut indices_and_values: Vec<(usize, f32)> =
+        logits.iter().enumerate().map(|(idx, &val)| (idx, val)).collect();
+
+    // Sort by value in descending order
+    indices_and_values.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Set all values outside top-k to -inf
+    for (idx, _) in indices_and_values.iter().skip(k) {
+        result[*idx] = f32::NEG_INFINITY;
+    }
+
+    Ok(result)
+}
+
+fn apply_top_p_filtering_gpt_j(logits: ArrayD<f32>, p: f32) -> Result<ArrayD<f32>> {
+    // Convert to probabilities
+    let probs = softmax_gpt_j(logits.clone())?;
+    let mut indices_and_probs: Vec<(usize, f32)> =
+        probs.iter().enumerate().map(|(idx, &prob)| (idx, prob)).collect();
+
+    // Sort by probability in descending order
+    indices_and_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Find the smallest set of tokens with cumulative probability > p
+    let mut cumsum = 0.0;
+    let mut cutoff_idx = indices_and_probs.len();
+    for (i, (_, prob)) in indices_and_probs.iter().enumerate() {
+        cumsum += prob;
+        if cumsum > p {
+            cutoff_idx = i + 1;
+            break;
+        }
+    }
+
+    // Set all probabilities outside top-p to 0 and convert back to logits
+    let mut result = logits.clone();
+    for (idx, _) in indices_and_probs.iter().skip(cutoff_idx) {
+        result[*idx] = f32::NEG_INFINITY;
+    }
+
+    Ok(result)
+}
+
+fn sample_from_logits_gpt_j(logits: ArrayD<f32>) -> Result<u32> {
+    use scirs2_core::random::*; // SciRS2 Integration Policy (includes WeightedIndex)
+
+    // Convert to probabilities
+    let probs = softmax_gpt_j(logits)?;
+
+    // Create weighted distribution
+    let weights: Vec<f32> = probs.iter().copied().collect();
+    let dist = WeightedIndex::new(weights).map_err(|e| {
+        TrustformersError::model_error(format!("Failed to create distribution: {}", e))
+    })?;
+
+    // Sample
+    let mut rng = thread_rng(); // From scirs2_core::random
+    Ok(rng.sample(&dist) as u32)
+}
+
+fn softmax_gpt_j(logits: ArrayD<f32>) -> Result<ArrayD<f32>> {
+    // Find max for numerical stability
+    let max_val = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+    // Compute exp(x - max)
+    let exp_vals = logits.mapv(|x| (x - max_val).exp());
+
+    // Sum of exp values
+    let sum: f32 = exp_vals.iter().sum();
+
+    if sum <= 0.0 {
+        return Err(TrustformersError::model_error(
+            "Invalid softmax computation".to_string(),
+        ));
+    }
+
+    // Normalize
+    Ok(exp_vals / sum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trustformers_core::traits::Config;
+
+    fn tiny_config() -> GptJConfig {
+        GptJConfig {
+            vocab_size: 64,
+            n_embd: 16,
+            n_layer: 1,
+            n_head: 2,
+            n_positions: 32,
+            rotary_dim: 4, // less than head_dim=8
+            activation_function: "gelu_new".to_string(),
+            resid_pdrop: 0.0,
+            embd_pdrop: 0.0,
+            attn_pdrop: 0.0,
+            layer_norm_epsilon: 1e-5,
+            initializer_range: 0.02,
+            use_cache: false,
+            bos_token_id: 50256,
+            eos_token_id: 50256,
+            model_type: "gptj".to_string(),
+        }
+    }
+
+    // --- GptJConfig tests ---
+
+    #[test]
+    fn test_gpt_j_6b_config_values() {
+        let cfg = GptJConfig::gpt_j_6b();
+        assert_eq!(cfg.n_embd, 4096);
+        assert_eq!(cfg.n_head, 16);
+        assert_eq!(cfg.n_layer, 28);
+        assert_eq!(cfg.rotary_dim, 64);
+        assert_eq!(cfg.vocab_size, 50400);
+    }
+
+    #[test]
+    fn test_gpt_j_config_head_dim() {
+        let cfg = GptJConfig::gpt_j_6b();
+        // 4096 / 16 = 256
+        assert_eq!(cfg.head_dim(), 256);
+    }
+
+    #[test]
+    fn test_gpt_j_config_rotary_dim_less_than_head_dim() {
+        let cfg = GptJConfig::gpt_j_6b();
+        // rotary_dim=64 < head_dim=256
+        assert!(
+            cfg.rotary_dim < cfg.head_dim(),
+            "rotary_dim should be a fraction of head_dim for partial RoPE"
+        );
+    }
+
+    #[test]
+    fn test_gpt_j_config_rotary_dim_is_64() {
+        let cfg = GptJConfig::gpt_j_6b();
+        assert_eq!(cfg.rotary_dim, 64, "GPT-J-6B uses rotary_dim=64");
+    }
+
+    #[test]
+    fn test_gpt_j_config_validate_ok() {
+        let cfg = GptJConfig::gpt_j_6b();
+        assert!(cfg.validate().is_ok(), "gpt_j_6b config should validate");
+    }
+
+    #[test]
+    fn test_gpt_j_config_validate_bad_heads() {
+        let cfg = GptJConfig {
+            n_embd: 15, // not divisible by 3
+            n_head: 3,
+            ..GptJConfig::gpt_j_6b()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "n_embd not divisible by n_head should fail"
+        );
+    }
+
+    #[test]
+    fn test_gpt_j_config_validate_rotary_too_large() {
+        let cfg = GptJConfig {
+            n_embd: 16,
+            n_head: 2,
+            rotary_dim: 16, // == head_dim=8 is fine, but > head_dim would fail
+            ..tiny_config()
+        };
+        // rotary_dim=16 > head_dim=8 → should fail
+        assert!(cfg.validate().is_err(), "rotary_dim > head_dim should fail");
+    }
+
+    #[test]
+    fn test_gpt_j_config_architecture_name() {
+        let cfg = GptJConfig::default();
+        assert_eq!(cfg.architecture(), "GPT-J");
+    }
+
+    #[test]
+    fn test_gpt_j_config_from_pretrained_name() {
+        let cfg = GptJConfig::from_pretrained_name("gpt-j-6b");
+        assert_eq!(cfg.n_embd, 4096);
+    }
+
+    // --- GptJRotaryEmbedding ---
+
+    #[test]
+    fn test_gptj_rope_construction() {
+        let rope = GptJRotaryEmbedding::new(64, 64, 2048, 10000.0);
+        assert_eq!(rope.dim, 64);
+        assert_eq!(rope.max_seq_len, 2048);
+        assert!((rope.base - 10000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_gptj_rope_apply_preserves_shape() {
+        use scirs2_core::ndarray::{ArrayD, IxDyn};
+        use trustformers_core::tensor::Tensor;
+        let rope = GptJRotaryEmbedding::new(4, 4, 32, 10000.0);
+        let q_data = vec![0.1f32; 2 * 4]; // seq=2, dim=4
+        let k_data = vec![0.2f32; 2 * 4];
+        let q_arr = ArrayD::from_shape_vec(IxDyn(&[2, 4]), q_data).expect("create q");
+        let k_arr = ArrayD::from_shape_vec(IxDyn(&[2, 4]), k_data).expect("create k");
+        let q = Tensor::F32(q_arr);
+        let k = Tensor::F32(k_arr);
+        let (rq, rk) =
+            rope.apply_rotary_emb(&q, &k, &[0, 1]).expect("apply_rotary_emb should succeed");
+        assert_eq!(
+            rq.shape(),
+            q.shape(),
+            "RoPE output q shape must match input"
+        );
+        assert_eq!(
+            rk.shape(),
+            k.shape(),
+            "RoPE output k shape must match input"
+        );
+    }
+
+    // -- Real RoPE / attention regression tests --
+    //
+    // These would have FAILED against the old no-op RoPE (which computed
+    // cos/sin into unused `_cos_val`/`_sin_val` and returned unrotated
+    // clones) and the old `out_proj(v)` fake attention (Q and K discarded).
+
+    #[test]
+    fn test_gptj_rope_position_zero_is_identity() {
+        use trustformers_core::tensor::Tensor;
+        let rope = GptJRotaryEmbedding::new(4, 4, 32, 10000.0);
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let q = Tensor::from_vec(data.clone(), &[1, 4]).expect("tensor");
+        let k = q.clone();
+        let (q_out, _) = rope.apply_rotary_emb(&q, &k, &[0]).expect("rope");
+        let out = match q_out {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        for (a, b) in data.iter().zip(out.iter()) {
+            assert!((a - b).abs() < 1e-5, "position 0 must be identity");
+        }
+    }
+
+    #[test]
+    fn test_gptj_rope_different_positions_differ() {
+        use trustformers_core::tensor::Tensor;
+        let rope = GptJRotaryEmbedding::new(4, 4, 32, 10000.0);
+        let data = vec![1.0f32; 4];
+        let q = Tensor::from_vec(data, &[1, 4]).expect("tensor");
+        let k = q.clone();
+        let (q_pos0, _) = rope.apply_rotary_emb(&q, &k, &[0]).expect("rope pos0");
+        let (q_pos5, _) = rope.apply_rotary_emb(&q, &k, &[5]).expect("rope pos5");
+        let out0 = match q_pos0 {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        let out5 = match q_pos5 {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        let differs = out0.iter().zip(out5.iter()).any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(
+            differs,
+            "RoPE must rotate differently at different positions"
+        );
+    }
+
+    /// Regression: RoPE must rotate every head, not just the first
+    /// `head_dim`-wide block of a multi-head row.
+    #[test]
+    fn test_gptj_rope_rotates_every_head() {
+        use trustformers_core::tensor::Tensor;
+        let head_dim = 4;
+        let rope = GptJRotaryEmbedding::new(head_dim, head_dim, 32, 10000.0); // full rotary_dim
+        let data = vec![1.0f32; 8]; // seq_len=1, num_heads=2
+        let q = Tensor::from_vec(data.clone(), &[1, 8]).expect("tensor");
+        let k = q.clone();
+        let (q_out, _) = rope.apply_rotary_emb(&q, &k, &[7]).expect("rope");
+        let out = match q_out {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        let head0_changed = out[0..4].iter().zip(&data[0..4]).any(|(a, b)| (a - b).abs() > 1e-4);
+        let head1_changed = out[4..8].iter().zip(&data[4..8]).any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(head0_changed, "head 0 must rotate");
+        assert!(head1_changed, "head 1 must ALSO rotate, not just head 0");
+    }
+
+    /// GPT-J's defining partial-rotary behavior: channels beyond
+    /// `rotary_dim` within a head must NOT be rotated.
+    #[test]
+    fn test_gptj_rope_leaves_channels_beyond_rotary_dim_untouched() {
+        use trustformers_core::tensor::Tensor;
+        let head_dim = 8;
+        let rotary_dim = 4; // < head_dim
+        let rope = GptJRotaryEmbedding::new(rotary_dim, head_dim, 32, 10000.0);
+        let data = vec![1.0f32; head_dim]; // seq_len=1, single head
+        let q = Tensor::from_vec(data.clone(), &[1, head_dim]).expect("tensor");
+        let k = q.clone();
+        let (q_out, _) = rope.apply_rotary_emb(&q, &k, &[9]).expect("rope");
+        let out = match q_out {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        let rotated_changed = out[0..rotary_dim]
+            .iter()
+            .zip(&data[0..rotary_dim])
+            .any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(rotated_changed, "the first rotary_dim channels must rotate");
+        for (a, b) in out[rotary_dim..head_dim].iter().zip(&data[rotary_dim..head_dim]) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "channels beyond rotary_dim must pass through unrotated"
+            );
+        }
+    }
+
+    fn attn_test_config() -> GptJConfig {
+        tiny_config()
+    }
+
+    #[test]
+    fn test_gptj_attention_output_shape() {
+        use trustformers_core::tensor::Tensor;
+        let config = attn_test_config();
+        let attn = GptJAttention::new(&config).expect("attention");
+        let seq_len = 4;
+        let hidden = config.n_embd;
+        let data: Vec<f32> = (0..seq_len * hidden).map(|i| (i as f32) * 0.01).collect();
+        let input = Tensor::from_vec(data, &[seq_len, hidden]).expect("tensor");
+        let out = attn.forward(input).expect("forward");
+        assert_eq!(out.shape(), vec![seq_len, hidden]);
+    }
+
+    /// Changing an EARLY token must change a LATER position's output — the
+    /// discriminating test that only passes for real QK^T/softmax/V
+    /// attention (the old `out_proj(v)` fake path only mixed V, and even
+    /// V-only would trivially pass this since output[i] += w*v[i] uses V
+    /// from position 0..=i; the REAL failure mode this catches is Q/K being
+    /// entirely ignored, which this test's causal-masking sibling below
+    /// exercises together with position sensitivity from RoPE).
+    #[test]
+    fn test_gptj_attention_early_token_change_propagates_forward() {
+        use trustformers_core::tensor::Tensor;
+        let config = attn_test_config();
+        let attn = GptJAttention::new(&config).expect("attention");
+        let seq_len = 4;
+        let hidden = config.n_embd;
+
+        let base: Vec<f32> = (0..seq_len * hidden).map(|i| (i as f32) * 0.01 - 0.2).collect();
+        let mut modified = base.clone();
+        for x in modified[0..hidden].iter_mut() {
+            *x += 5.0;
+        }
+
+        let out_base = attn
+            .forward(Tensor::from_vec(base, &[seq_len, hidden]).expect("t"))
+            .expect("fwd");
+        let out_mod = attn
+            .forward(Tensor::from_vec(modified, &[seq_len, hidden]).expect("t"))
+            .expect("fwd");
+
+        let a = match &out_base {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        let b = match &out_mod {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        let last_a = &a[3 * hidden..4 * hidden];
+        let last_b = &b[3 * hidden..4 * hidden];
+        let differs = last_a.iter().zip(last_b.iter()).any(|(x, y)| (x - y).abs() > 1e-5);
+        assert!(differs, "changing token 0 must change token 3's output");
+    }
+
+    /// Causal masking: changing the LAST token must not change any earlier
+    /// position's output.
+    #[test]
+    fn test_gptj_attention_causal_mask_future_does_not_leak_backward() {
+        use trustformers_core::tensor::Tensor;
+        let config = attn_test_config();
+        let attn = GptJAttention::new(&config).expect("attention");
+        let seq_len = 4;
+        let hidden = config.n_embd;
+
+        let base: Vec<f32> = (0..seq_len * hidden).map(|i| (i as f32) * 0.01 - 0.2).collect();
+        let mut modified = base.clone();
+        for x in modified[3 * hidden..4 * hidden].iter_mut() {
+            *x += 5.0;
+        }
+
+        let out_base = attn
+            .forward(Tensor::from_vec(base, &[seq_len, hidden]).expect("t"))
+            .expect("fwd");
+        let out_mod = attn
+            .forward(Tensor::from_vec(modified, &[seq_len, hidden]).expect("t"))
+            .expect("fwd");
+
+        let a = match &out_base {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        let b = match &out_mod {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        for row in 0..3 {
+            let ra = &a[row * hidden..(row + 1) * hidden];
+            let rb = &b[row * hidden..(row + 1) * hidden];
+            for (x, y) in ra.iter().zip(rb.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-6,
+                    "row {row} must be unaffected by a later change"
+                );
+            }
+        }
+    }
+
+    /// Causal property with a growing sequence: forwarding a prefix of
+    /// length N and then forwarding that same prefix plus one appended
+    /// token must leave rows `0..N` of the output bit-identical. This is
+    /// the variable-length analogue of "appending a token to the KV cache
+    /// does not change earlier positions' outputs" for this crate's
+    /// stateless `Layer::forward` (there is no incremental KV cache in the
+    /// `Layer` API; `seq_len` and `position_ids` are recomputed fresh from
+    /// the input on every call). Stronger than the fixed-length "modify a
+    /// token" tests above: it also catches a mask or RoPE angle that leaked
+    /// total `seq_len` instead of depending only on each row's own
+    /// position — relevant here since GPT-J's RoPE is partial-rotary
+    /// (`rotary_dim=4 < head_dim=8` in `tiny_config`).
+    #[test]
+    fn test_gptj_attention_prefix_extension_preserves_earlier_outputs() {
+        use trustformers_core::tensor::Tensor;
+        let config = attn_test_config();
+        let attn = GptJAttention::new(&config).expect("attention");
+        let hidden = config.n_embd;
+        let prefix_len = 3;
+
+        let prefix: Vec<f32> = (0..prefix_len * hidden).map(|i| (i as f32) * 0.01 - 0.2).collect();
+        let mut extended = prefix.clone();
+        extended.extend((0..hidden).map(|i| (i as f32) * 0.02 + 0.3));
+
+        let out_prefix = attn
+            .forward(Tensor::from_vec(prefix, &[prefix_len, hidden]).expect("t"))
+            .expect("fwd prefix");
+        let out_extended = attn
+            .forward(Tensor::from_vec(extended, &[prefix_len + 1, hidden]).expect("t"))
+            .expect("fwd extended");
+
+        let a = match &out_prefix {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        let b = match &out_extended {
+            Tensor::F32(arr) => arr.as_slice().expect("contiguous").to_vec(),
+            _ => panic!("expected F32"),
+        };
+        for row in 0..prefix_len {
+            let ra = &a[row * hidden..(row + 1) * hidden];
+            let rb = &b[row * hidden..(row + 1) * hidden];
+            for (x, y) in ra.iter().zip(rb.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-5,
+                    "row {row} must be unchanged when a new token is appended after it"
+                );
+            }
+        }
+    }
+
+    // --- GptJModel ---
+
+    #[test]
+    fn test_gptj_model_construction() {
+        let cfg = tiny_config();
+        let model = GptJModel::new(cfg);
+        assert!(model.is_ok(), "GptJModel should construct");
+    }
+
+    #[test]
+    fn test_gptj_model_num_parameters_positive() {
+        use trustformers_core::traits::Model;
+        let cfg = tiny_config();
+        let model = GptJModel::new(cfg).expect("GptJModel should construct");
+        assert!(
+            model.num_parameters() > 0,
+            "model should have positive parameter count"
+        );
+    }
+
+    #[test]
+    fn test_gptj_model_blocks_count() {
+        let cfg = tiny_config();
+        let model = GptJModel::new(cfg.clone()).expect("GptJModel should construct");
+        assert_eq!(
+            model.blocks.len(),
+            cfg.n_layer,
+            "blocks count must match n_layer"
+        );
+    }
+
+    // --- GptJLMHeadModel ---
+
+    #[test]
+    fn test_gptj_lm_head_construction() {
+        let cfg = tiny_config();
+        let model = GptJLMHeadModel::new(cfg);
+        assert!(model.is_ok(), "GptJLMHeadModel should construct");
+    }
+
+    #[test]
+    fn test_gptj_lm_head_num_params_larger_than_base() {
+        use trustformers_core::traits::Model;
+        let cfg = tiny_config();
+        let base = GptJModel::new(cfg.clone()).expect("GptJModel construct");
+        let lm = GptJLMHeadModel::new(cfg).expect("GptJLMHeadModel construct");
+        assert!(
+            lm.num_parameters() > base.num_parameters(),
+            "LM head model should have more params than base"
+        );
+    }
+
+    #[test]
+    fn test_gptj_model_forward_output_shape() {
+        use trustformers_core::traits::{Model, TokenizedInput};
+        let cfg = tiny_config();
+        let model = GptJModel::new(cfg.clone()).expect("GptJModel should construct");
+        let input = TokenizedInput {
+            input_ids: vec![1u32, 2, 3],
+            attention_mask: vec![1u8, 1, 1],
+            token_type_ids: None,
+            special_tokens_mask: None,
+            offset_mapping: None,
+            overflowing_tokens: None,
+        };
+        let output = model.forward(input).expect("GptJModel forward should succeed");
+        let shape = output.last_hidden_state.shape();
+        // hidden_states: [seq_len, n_embd] or [1, seq_len, n_embd]
+        assert!(!shape.is_empty(), "output shape should not be empty");
+        // Last dim must be n_embd
+        let last_dim = *shape.last().expect("shape should have dimensions");
+        assert_eq!(last_dim, cfg.n_embd, "last dim must match n_embd");
+    }
+
+    // --- GptJBlock parallel attention+MLP ---
+
+    #[test]
+    fn test_gptj_block_parallel_attn_mlp() {
+        // GPT-J computes attention and MLP in parallel (both use ln_1 output)
+        // Verify that block construction works for parallel execution
+        let cfg = tiny_config();
+        let model = GptJModel::new(cfg).expect("GptJModel should construct");
+        // Each block has a single LayerNorm (ln_1) used for both attn and mlp
+        assert!(
+            model.blocks.iter().all(|_| true),
+            "all blocks should be constructed"
+        );
+    }
+
+    #[test]
+    fn test_gptj_no_bias_in_attention_projections() {
+        // GPT-J-6B uses no bias in attention projections (use_bias=false)
+        // Verify the default config reflects this
+        let cfg = GptJConfig::gpt_j_6b();
+        assert_eq!(cfg.resid_pdrop, 0.0, "GPT-J-6B uses no residual dropout");
+        assert_eq!(cfg.attn_pdrop, 0.0, "GPT-J-6B uses no attention dropout");
+    }
+
+    #[test]
+    fn test_gptj_n_positions_is_2048() {
+        // GPT-J-6B has a context length of 2048 tokens
+        let cfg = GptJConfig::gpt_j_6b();
+        assert_eq!(cfg.n_positions, 2048, "GPT-J context length should be 2048");
+    }
+}

@@ -1,0 +1,65 @@
+[package]
+name = "oxiquic-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OxiQUIC transport: Pure-Rust QUIC (RFC 9000/9001/9002) over rustls + tokio UDP, zero ring/aws-lc-rs."
+categories = ["network-programming", "asynchronous"]
+keywords = ["quic", "transport", "pure-rust", "cooljapan", "oxiquic"]
+
+[features]
+dangerous = []
+h3-compat = ["dep:h3", "dep:bytes"]
+
+[dependencies]
+oxiquic-core = { workspace = true }
+oxiquic-crypto = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio = { workspace = true }
+socket2 = { workspace = true }
+h3 = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+aes-gcm = { workspace = true, features = ["aes", "alloc"] }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rustls-rustcrypto = { workspace = true }
+
+# Receive-side ECN (RFC 9000 §13.4.1) needs `recvmsg` ancillary data, which is
+# a POSIX-only facility; see `endpoint::ecn_recv`. Non-unix targets fall back to
+# a plain `recv_from` that reports no codepoint rather than inventing one.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+# oxiquic-core is already a normal (non-dev) dependency above and is
+# therefore available to tests/benches/examples without restating it here;
+# this used to duplicate it via a bare `path = "../oxiquic-core"` entry that
+# bypassed workspace dependency management.
+oxitls-rcgen = { workspace = true }
+criterion    = { workspace = true }
+proptest     = { workspace = true }
+tokio        = { workspace = true }
+# socket2 is a normal dependency above, but integration tests are separate
+# crates: `tests/ecn_socket.rs` needs it to stamp the egress ECN codepoint on a
+# raw sender socket.
+socket2      = { workspace = true }
+
+[[bench]]
+name    = "transport"
+harness = false
+
+[[bench]]
+name    = "migration"
+harness = false
+
+[[bench]]
+name    = "congestion_compare"
+harness = false
+
+[[bench]]
+name    = "cpu_profile"
+harness = false

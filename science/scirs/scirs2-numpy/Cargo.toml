@@ -1,0 +1,49 @@
+[package]
+name = "scirs2-numpy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "PyO3-based Rust bindings of the NumPy C-API (SciRS2 fork with ndarray 0.17 support)"
+readme = "README.md"
+documentation = "https://docs.rs/scirs2-numpy"
+repository.workspace = true
+license.workspace = true
+keywords = ["python", "numpy", "ffi", "pyo3", "scientific"]
+categories = ["api-bindings", "development-tools::ffi", "science"]
+
+[dependencies]
+# Core dependencies with ndarray 0.17 support
+half = { workspace = true, optional = true }
+libc = { workspace = true }
+nalgebra = { workspace = true, default-features = false, optional = true }
+num-complex = { workspace = true, default-features = false }
+num-integer = { workspace = true, default-features = false }
+num-traits = { workspace = true, default-features = false }
+ndarray = { workspace = true, default-features = false }  # ndarray 0.17.1 from workspace
+pyo3 = { workspace = true, default-features = false, features = ["macros"] }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = { workspace = true, features = ["resolve-config"] }
+
+[dev-dependencies]
+# Enable auto-initialize for tests only (not for production builds)
+pyo3 = { workspace = true, features = ["macros", "auto-initialize"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "conversion_bench"
+harness = false
+
+[[bench]]
+name = "allocation_bench"
+harness = false
+
+[features]
+default = []
+half-support = ["half"]
+nalgebra-support = ["nalgebra"]
+
+[package.metadata.docs.rs]
+all-features = true

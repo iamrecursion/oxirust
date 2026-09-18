@@ -1,0 +1,23 @@
+[package]
+name = "oxixml-fo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XSL-FO 1.1 formatting-object tree, property refinement and area-model primitives."
+keywords = ["xsl-fo", "xsl", "formatting", "typesetting", "xml"]
+categories = ["parsing", "text-processing", "template-engine", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-xml = { workspace = true }
+
+[lints]
+workspace = true

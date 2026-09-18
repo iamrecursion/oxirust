@@ -1,0 +1,42 @@
+[package]
+name = "oximedia-edit"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Video timeline editor for OxiMedia"
+keywords = ["video", "timeline", "editing", "multimedia", "editor"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-codec = { workspace = true, default-features = true }
+oximedia-audio = { workspace = true }
+oximedia-graph = { workspace = true }
+oximedia-lut.workspace = true
+oximedia-graphics = { workspace = true }
+oximedia-mixer = { workspace = true }
+oximedia-image = { workspace = true }
+thiserror.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+rayon = { workspace = true }
+serde_json.workspace = true
+quick-xml = { workspace = true, features = ["serialize"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+futures.workspace = true
+
+[dev-dependencies]
+oximedia-codec = { path = "../oximedia-codec", default-features = true }
+oximedia-audio = { path = "../oximedia-audio" }
+oximedia-core = { path = "../oximedia-core" }

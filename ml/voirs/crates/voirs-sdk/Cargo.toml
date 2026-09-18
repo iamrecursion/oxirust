@@ -1,0 +1,301 @@
+[package]
+name = "voirs-sdk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/voirs-sdk"
+keywords = ["voirs", "sdk", "tts", "speech-synthesis", "api"]
+categories = ["api-bindings", "multimedia::audio", "science"]
+rust-version.workspace = true
+description = "Unified SDK and public API for VoiRS speech synthesis"
+readme = "README.md"
+
+[lib]
+name = "voirs_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core.workspace = true
+scirs2-fft.workspace = true
+
+# Re-export all core crates
+voirs-g2p.workspace = true
+voirs-acoustic.workspace = true
+voirs-vocoder.workspace = true
+voirs-dataset.workspace = true
+
+# New advanced features
+voirs-emotion = { workspace = true, optional = true }
+voirs-cloning = { workspace = true, optional = true }
+voirs-conversion = { workspace = true, optional = true }
+voirs-spatial = { workspace = true, optional = true }
+
+# Common dependencies for the unified API
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+async-stream = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hound.workspace = true
+toml.workspace = true
+fastrand.workspace = true
+reqwest.workspace = true
+# Pure-Rust TLS provider (rustls + RustCrypto) — re-exported install helper
+oxitls-adapter-rustls-rustcrypto.workspace = true
+rustls.workspace = true
+regex.workspace = true
+glob.workspace = true
+memmap2.workspace = true
+semver.workspace = true
+thread_local.workspace = true
+pin-project.workspace = true
+cpal.workspace = true
+notify.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+
+# Audio codec dependencies
+claxon.workspace = true
+symphonia.workspace = true
+lewton.workspace = true
+ogg.workspace = true
+# Optional codecs (libopus/minimp3/LAME are C-FFI; FLAC is Pure-Rust via OxiAudio) — gated behind default-OFF `ffi-codecs` feature
+opus = { workspace = true, optional = true }
+# Pure-Rust FLAC encoding (OxiAudio, FLAC via flacenc) — replaces C-FFI flac-bound.
+oxiaudio-core = { workspace = true, optional = true }
+oxiaudio-encode = { workspace = true, optional = true }
+minimp3 = { workspace = true, optional = true }
+mp3lame-encoder = { workspace = true, optional = true }
+
+# Web Integration dependencies
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+wasm-logger = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+# Response compression layer (src/http_compression): tower Layer over OxiARC
+# content-coding, replacing tower-http's brotli/flate2-based compression.
+oxiarc-http = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+uuid.workspace = true
+chrono.workspace = true
+num_cpus.workspace = true
+
+# Cloud Integration dependencies
+oxiarc-deflate = { workspace = true, optional = true }
+oxiarc-zstd = { workspace = true, optional = true }
+# SHA-256 model-integrity verification (pipeline/init.rs) - always available
+sha2.workspace = true
+hex.workspace = true
+# Pure-Rust HMAC (RustCrypto), used for real AWS SigV4 / Azure Shared-Key
+# request signing in cloud/storage.rs (no OpenSSL, no vendored C signing lib).
+hmac = { workspace = true, optional = true }
+
+# Real model-weight loading: binds safetensors/pth tensors into the vocoder
+# inference graph (pipeline/init.rs::load_vocoder)
+candle-core.workspace = true
+candle-nn.workspace = true
+aes-gcm = { workspace = true, optional = true }
+oxicode = { workspace = true, optional = true }
+
+# ONNX runtime
+oxionnx = { workspace = true, optional = true }
+
+# Plugin loading dependencies
+libloading = { workspace = true, optional = true }
+wasmtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+wasm-bindgen-test = "0.3"
+tokio-tungstenite = "0.29"
+criterion.workspace = true
+http-body-util.workspace = true  # collecting bodies in http_compression tests
+tower = { workspace = true, features = ["util"] }  # ServiceExt / service_fn in http_compression tests
+
+[features]
+default = []
+# Optional audio codecs: Opus (libopus), minimp3, LAME (all C-FFI) plus Pure-Rust
+# FLAC (OxiAudio). Default-OFF to keep the default build Pure Rust. Propagates to
+# voirs-vocoder and voirs-dataset, which gate their codec code behind their own
+# `ffi-codecs` feature.
+ffi-codecs = [
+    "dep:opus",
+    "dep:oxiaudio-core",
+    "dep:oxiaudio-encode",
+    "dep:minimp3",
+    "dep:mp3lame-encoder",
+    "voirs-vocoder/ffi-codecs",
+    "voirs-dataset/ffi-codecs",
+]
+gpu = ["oxionnx?/gpu", "voirs-acoustic/gpu", "voirs-vocoder/gpu", "voirs-g2p/gpu", "voirs-cloning?/gpu", "voirs-conversion?/gpu", "voirs-emotion?/gpu", "voirs-spatial?/gpu"]
+onnx = ["dep:oxionnx", "voirs-acoustic/onnx", "voirs-vocoder/onnx", "voirs-g2p/onnx", "voirs-cloning?/onnx", "voirs-conversion?/onnx", "voirs-emotion?/onnx", "voirs-spatial?/onnx"]
+wasm = ["wasm-bindgen", "wasm-bindgen-futures", "web-sys", "js-sys", "console_error_panic_hook", "wasm-logger"]
+http = ["axum", "tower", "tower-http", "http-compression"]
+# `voirs_sdk::http_compression::CompressionLayer` (gzip / deflate / br via
+# OxiARC). Also used by voirs-recognizer's `rest-api` server.
+http-compression = ["tower", "dep:oxiarc-http", "dep:http", "dep:http-body", "dep:bytes"]
+cloud = ["oxiarc-deflate", "oxiarc-zstd", "aes-gcm", "oxicode", "dep:hmac"]
+plugins = ["libloading", "wasmtime"]
+
+# Advanced voice features
+emotion = ["voirs-emotion"]
+cloning = ["voirs-cloning"]
+conversion = ["voirs-conversion"]
+singing = []
+spatial = ["voirs-spatial"]
+realtime-conversion = ["conversion", "voirs-conversion/real-time"]
+streaming-conversion = ["conversion", "voirs-conversion/streaming"]
+
+# Complete feature sets
+voice-cloning = ["cloning", "voirs-cloning/acoustic-integration"]
+advanced-emotions = ["emotion", "voirs-emotion/acoustic-integration"]
+all-features = ["emotion", "cloning", "conversion", "gpu", "onnx", "http", "cloud", "plugins"]
+
+[[example]]
+name = "quick_start"
+path = "examples/basic/quick_start.rs"
+
+[[example]]
+name = "audio_workflows"
+path = "examples/basic/audio_workflows.rs"
+
+[[example]]
+name = "advanced_features_demo"
+path = "examples/advanced/advanced_features_demo.rs"
+required-features = ["emotion", "cloning", "conversion"]
+
+[[example]]
+name = "comprehensive_benchmarking"
+path = "examples/advanced/comprehensive_benchmarking.rs"
+required-features = ["emotion", "cloning", "conversion"]
+
+[[example]]
+name = "multi_modal_integration"
+path = "examples/advanced/multi_modal_integration.rs"
+required-features = ["singing", "spatial", "emotion"]
+
+[[example]]
+name = "real_time_audio_device"
+path = "examples/advanced/real_time_audio_device.rs"
+required-features = ["emotion", "cloning", "conversion"]
+
+[[example]]
+name = "audio_analysis"
+path = "examples/advanced/audio_analysis.rs"
+
+[[example]]
+name = "production_features"
+path = "examples/advanced/production_features.rs"
+
+[[example]]
+name = "cache_warming_demo"
+path = "examples/advanced/cache_warming_demo.rs"
+
+[[example]]
+name = "advanced_spectral_analysis"
+path = "examples/advanced/advanced_spectral_analysis.rs"
+
+[[example]]
+name = "music_information_retrieval"
+path = "examples/advanced/music_information_retrieval.rs"
+
+[[example]]
+name = "simd_performance_demo"
+path = "examples/advanced/simd_performance_demo.rs"
+
+[[example]]
+name = "adaptive_enhancement_demo"
+path = "examples/advanced/adaptive_enhancement_demo.rs"
+
+[[example]]
+name = "audio_effects_demo"
+path = "examples/advanced/audio_effects_demo.rs"
+
+[[example]]
+name = "ml_quality_optimization"
+path = "examples/advanced/ml_quality_optimization.rs"
+
+[[example]]
+name = "quality_monitoring_demo"
+path = "examples/advanced/quality_monitoring_demo.rs"
+
+[[example]]
+name = "regression_detection_demo"
+path = "examples/advanced/regression_detection_demo.rs"
+
+[[example]]
+name = "sdk_batch_processing"
+path = "examples/advanced/batch_processing.rs"
+required-features = ["emotion", "cloning", "conversion"]
+
+[[example]]
+name = "sdk_performance_profiling"
+path = "examples/advanced/performance_profiling.rs"
+required-features = ["emotion", "cloning", "conversion"]
+
+[[example]]
+name = "sdk_streaming_synthesis"
+path = "examples/advanced/streaming_synthesis.rs"
+required-features = ["emotion", "cloning", "conversion"]
+
+[[example]]
+name = "sdk_batch_with_profiling"
+path = "examples/advanced/batch_with_profiling.rs"
+required-features = ["emotion", "cloning", "conversion"]
+
+[[example]]
+name = "sdk_performance_monitoring"
+path = "examples/advanced/performance_monitoring.rs"
+
+[[bench]]
+name = "synthesis_benchmarks"
+harness = false
+
+[[bench]]
+name = "streaming_benchmarks"
+harness = false
+
+[[bench]]
+name = "pipeline_benchmarks"
+harness = false
+
+[[bench]]
+name = "concurrent_benchmarks"
+harness = false
+
+[[bench]]
+name = "memory_benchmarks"
+harness = false
+
+[[bench]]
+name = "simd_audio_benchmarks"
+harness = false
+
+[[bench]]
+name = "batch_benchmarks"
+harness = false
+
+[[bench]]
+name = "profiling_benchmarks"
+harness = false
+
+[lints]
+workspace = true

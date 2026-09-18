@@ -1,0 +1,58 @@
+{
+  "name": "@cool-japan/ipfrs-node",
+  "version": "0.3.0",
+  "description": "IPFRS Node.js native addon — content-addressed storage with semantic search and TensorLogic reasoning",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "napi": {
+    "name": "ipfrs-node",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+        "aarch64-apple-darwin",
+        "aarch64-linux-android"
+      ]
+    }
+  },
+  "license": "Apache-2.0",
+  "author": "COOLJAPAN OU (Team Kitasan)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cool-japan/ipfrs"
+  },
+  "keywords": [
+    "ipfs",
+    "ipld",
+    "content-addressed",
+    "p2p",
+    "semantic-search",
+    "logic-programming",
+    "napi-rs",
+    "rust"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release --features napi",
+    "build:debug": "napi build --platform --features napi",
+    "prepublishOnly": "napi prepublish -t npm",
+    "version": "napi version"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  }
+}

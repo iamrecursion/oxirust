@@ -1,0 +1,9 @@
+{
+  "name": "direct_vp9",
+  "args": ["-i", "in.mkv", "-c:v", "libvpx-vp9", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_codec": "vp9"
+  }
+}

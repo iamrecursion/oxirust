@@ -1,0 +1,35 @@
+[package]
+name = "legalis-dsl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Domain Specific Language for legal document parsing"
+categories = ["parser-implementations", "development-tools", "text-processing"]
+keywords = ["legalis", "dsl", "parser", "lsp", "legal-tech"]
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/legalis-dsl"
+
+[dependencies]
+legalis-core.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+rustyline.workspace = true
+tower-lsp.workspace = true
+tokio.workspace = true
+env_logger.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+proptest.workspace = true
+insta = { workspace = true, features = ["json", "yaml"] }
+tempfile.workspace = true
+
+[[bench]]
+name = "parser_benchmarks"
+harness = false

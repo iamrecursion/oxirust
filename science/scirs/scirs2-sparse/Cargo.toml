@@ -1,0 +1,49 @@
+[package]
+name = "scirs2-sparse"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Sparse matrix module for SciRS2 (scirs2-sparse)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["sparse-matrix", "csr", "scientific", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[features]
+default = ["parallel", "random"]
+parallel = ["scirs2-core/parallel"]
+simd = ["scirs2-core/simd"] 
+gpu = ["scirs2-core/gpu"]
+random = ["scirs2-core/random"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies
+scirs2-core = { workspace = true, features = ["array", "random", "gpu"] }
+# Removed scirs2-linalg to avoid circular dependency
+thiserror = { workspace = true }
+
+# Sparse matrix specific dependencies
+num_cpus = { workspace = true }
+
+# For logging
+log = { workspace = true }
+
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+# NOTE: ndarray-linalg is already included via scirs2-core dependency
+# Adding it in dev-dependencies causes duplicate resolution and linker conflicts in doctests
+
+[[bench]]
+name = "sparse_benchmarks"
+harness = false

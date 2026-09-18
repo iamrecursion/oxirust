@@ -1,0 +1,9 @@
+{
+  "name": "quality_bitrate_audio",
+  "args": ["-i", "in.mkv", "-b:a", "192k", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "audio_bitrate": "192k"
+  }
+}

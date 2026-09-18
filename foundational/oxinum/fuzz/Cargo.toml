@@ -1,0 +1,32 @@
+[package]
+name = "oxinum-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxinum-core = { path = "../crates/oxinum-core" }
+oxinum-int = { path = "../crates/oxinum-int" }
+oxinum-float = { path = "../crates/oxinum-float" }
+
+[[bin]]
+name = "radix_roundtrip"
+path = "fuzz_targets/radix_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hex_float_parse"
+path = "fuzz_targets/hex_float_parse.rs"
+test = false
+doc = false
+
+# Deliberately isolated from the parent workspace (same convention as the
+# other oxi* fuzz crates, e.g. oxirpc/fuzz, oxicrypto-hash/fuzz): cargo-fuzz
+# targets pull in libfuzzer-sys and are typically built with nightly, neither
+# of which the main workspace should depend on for `cargo build`/`cargo fmt`.
+[workspace]

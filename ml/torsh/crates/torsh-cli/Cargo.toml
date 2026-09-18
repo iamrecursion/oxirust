@@ -1,0 +1,112 @@
+[package]
+name = "torsh-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Command-line tools for the ToRSh deep learning framework"
+readme = "README.md"
+documentation = "https://docs.rs/torsh-cli"
+rust-version.workspace = true
+keywords = ["machine-learning", "deep-learning", "neural-networks", "cli", "tools"]
+categories = ["command-line-utilities", "science"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "torsh"
+path = "src/main.rs"
+
+[dependencies]
+# Core ToRSh dependency - meta-crate with all features
+torsh = { workspace = true, features = ["nn", "optim", "data", "vision", "text", "quantization", "jit", "profiler", "hub"] }
+
+# SciRS2 ecosystem dependencies (following SCIRS2 POLICY)
+# Must use SciRS2 as foundation instead of rand/ndarray
+# ✅ UNIFIED ACCESS: Use scirs2-core 0.1.0-RC.1+ for complete ndarray/random functionality
+scirs2-core = { workspace = true, features = ["simd", "parallel"] }
+scirs2-linalg = { workspace = true, optional = true }
+scirs2-metrics = { workspace = true, optional = true }
+
+# CLI framework
+clap = { workspace = true, features = ["derive", "env", "color"] }
+clap_complete = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# Maintained pure-Rust YAML (serde_yaml fork); replaces the unmaintained
+# serde_yaml 0.9.34+deprecated (RUSTSEC-2024-0370).
+serde_norway = { workspace = true }
+toml = { workspace = true }
+
+# File handling
+walkdir = { workspace = true }
+glob = { workspace = true }
+
+# Progress and UI
+indicatif = { workspace = true }
+console = { workspace = true }
+dialoguer = { workspace = true }
+colored = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+humantime = { workspace = true }
+byte-unit = { workspace = true }
+uuid = { workspace = true }
+fastrand = { workspace = true }
+
+# Networking for model downloads
+reqwest = { workspace = true, features = ["json", "stream"] }
+# Pure-Rust TLS provider (replaces reqwest's aws-lc-rs/BoringSSL default backend)
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+oxitls-rustcrypto-provider = { workspace = true }
+futures-util = { workspace = true }
+
+# System info - Pure Rust (libc removed for SciRS2 Pure Rust ecosystem)
+sysinfo = { workspace = true }
+
+# Directory utilities
+dirs = { workspace = true }
+
+[features]
+default = ["nn", "optim", "data", "vision", "text", "quantization", "jit", "hub", "profiler", "linalg", "metrics"]
+
+# Core features (from torsh dependency)
+nn = []
+optim = []
+data = []
+vision = []
+text = []
+
+# Advanced features
+quantization = []
+jit = []
+hub = []
+profiler = []
+linalg = ["dep:scirs2-linalg"]
+metrics = ["dep:scirs2-metrics"]
+
+# Development features
+dev = []
+
+[dev-dependencies]
+tempfile = { workspace = true }
+assert_cmd = "2.2"
+predicates = "3.1"

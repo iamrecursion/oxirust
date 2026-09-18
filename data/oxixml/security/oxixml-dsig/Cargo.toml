@@ -1,0 +1,26 @@
+[package]
+name = "oxixml-dsig"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XML Signature (XMLDSig Core 1.1): verification and generation, pure Rust."
+keywords = ["xml", "xmldsig", "signature", "xmlsec", "security"]
+categories = ["cryptography", "encoding", "parsing", "text-processing"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-dom = { workspace = true }
+oxixml-c14n = { workspace = true }
+oxixml-text = { workspace = true }
+
+[lints]
+workspace = true

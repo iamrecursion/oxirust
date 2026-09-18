@@ -1,0 +1,98 @@
+{
+  "version": "0.2.2",
+  "timestamp": "unix:1746460800",
+  "benchmarks": {
+    "theory_bool_arith": {
+      "avg_time_us": 9.975124999999998,
+      "category": "Theory"
+    },
+    "sat_3sat_small": {
+      "avg_time_us": 6.374209999999997,
+      "category": "Sat"
+    },
+    "parser_medium": {
+      "avg_time_us": 101.20044,
+      "category": "Parser"
+    },
+    "sat_unsat_pigeonhole": {
+      "avg_time_us": 6.61875,
+      "category": "Sat"
+    },
+    "sat_unit_propagation": {
+      "avg_time_us": 91.12634000000001,
+      "category": "Sat"
+    },
+    "parser_nested": {
+      "avg_time_us": 181.97043500000007,
+      "category": "Parser"
+    },
+    "theory_lia_unsat": {
+      "avg_time_us": 5.6958666666666655,
+      "category": "Theory"
+    },
+    "parser_dimacs": {
+      "avg_time_us": 13.538999999999998,
+      "category": "Parser"
+    },
+    "theory_lia_medium": {
+      "avg_time_us": 25.420733333333327,
+      "category": "Theory"
+    },
+    "sat_3sat_medium": {
+      "avg_time_us": 28.28004,
+      "category": "Sat"
+    },
+    "theory_lia_simple": {
+      "avg_time_us": 10.512540000000001,
+      "category": "Theory"
+    },
+    "maxsat_simple": {
+      "avg_time_us": 12.98748,
+      "category": "MaxSat"
+    },
+    "maxsat_weighted": {
+      "avg_time_us": 181.67093333333335,
+      "category": "MaxSat"
+    },
+    "maxsat_partial": {
+      "avg_time_us": 23.879133333333336,
+      "category": "MaxSat"
+    },
+    "parser_simple": {
+      "avg_time_us": 4.100399999999999,
+      "category": "Parser"
+    },
+    "euf_intern_leaf_chain": {
+      "avg_time_us": 528.91,
+      "category": "Theory"
+    },
+    "euf_intern_app_tree": {
+      "avg_time_us": 1267.1,
+      "category": "Theory"
+    },
+    "euf_merge_congruence_chain": {
+      "avg_time_us": 71.436,
+      "category": "Theory"
+    },
+    "euf_merge_injective": {
+      "avg_time_us": 81.267,
+      "category": "Theory"
+    },
+    "euf_push_pop_cycle": {
+      "avg_time_us": 77.0,
+      "category": "Theory"
+    },
+    "bv_simple": {
+      "avg_time_us": 3916.4,
+      "category": "Theory"
+    },
+    "lra_simple": {
+      "avg_time_us": 380.33,
+      "category": "Theory"
+    },
+    "arrays_simple": {
+      "avg_time_us": 439.76,
+      "category": "Theory"
+    }
+  }
+}

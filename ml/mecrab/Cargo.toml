@@ -1,0 +1,84 @@
+# MeCrab Workspace
+# Copyright 2026 COOLJAPAN OU (Team KitaSan)
+
+[workspace]
+members = ["mecrab", "mecrab-builder", "mecrab-bench", "kizame", "mecrab-word2vec"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/mecrab"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Core dependencies
+memmap2 = "0.9"
+byteorder = "1.5"
+encoding_rs = "0.8"
+thiserror = "2.0"
+yada = "0.7"
+
+# CLI dependencies
+clap = { version = "4.6", features = ["derive", "cargo"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Parallel processing
+rayon = "1.12"
+
+# Atomic Arc swapping for lock-free hot-reload
+arc-swap = "1.9"
+
+# Data pipeline dependencies (mecrab-builder)
+# Pure Rust gzip streaming via OxiARC (COOLJAPAN policy: no flate2)
+oxiarc-deflate = "0.4.2"
+indicatif = "0.18"
+# Note: the "gzip" feature is intentionally omitted — it pulls flate2
+# transitively (tower-http/async-compression), which violates the COOLJAPAN
+# Pure-Rust OxiARC compression policy. Dump files are decompressed by
+# oxiarc-deflate (GzipStreamDecoder); the Wikidata JSON API works without
+# transport-level gzip. reqwest's default features (rustls TLS, http2,
+# charset, system-proxy) are retained.
+reqwest = { version = "0.13", features = ["json", "stream"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+futures = "0.3"
+csv = "1.4"
+
+# WASM bindings
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+console_error_panic_hook = "0.1"
+
+# Python bindings
+pyo3 = { version = "0.29", features = ["extension-module", "multiple-pymethods"] }
+
+# URL encoding
+urlencoding = "2"
+
+# Unicode normalization (real NFKC via unicode-normalization crate)
+unicode-normalization = "0.1"
+
+# GPU compute (wgpu-based; optional, behind `gpu` feature in mecrab-word2vec)
+wgpu = "29.0"
+pollster = "0.4"
+bytemuck = { version = "1.25", features = ["derive"] }
+
+# Dev dependencies
+criterion = { version = "0.8", features = ["html_reports"] }
+# Note: criterion 0.5 is pinned for compatibility; 0.8 requires migration
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+lto = true
+codegen-units = 1

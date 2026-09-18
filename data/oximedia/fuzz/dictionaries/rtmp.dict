@@ -1,0 +1,103 @@
+# RTMP protocol dictionary for fuzzing
+# Contains AMF markers, chunk headers, and common patterns
+
+# AMF0 type markers
+"\x00"
+"\x01"
+"\x02"
+"\x03"
+"\x04"
+"\x05"
+"\x06"
+"\x08"
+"\x0A"
+"\x0B"
+"\x0C"
+
+# Chunk basic header formats
+"\x00"
+"\x01"
+"\x02"
+"\x03"
+"\x40"
+"\x80"
+"\xC0"
+
+# Message type IDs
+"\x01"
+"\x02"
+"\x03"
+"\x04"
+"\x05"
+"\x06"
+"\x08"
+"\x09"
+"\x12"
+"\x13"
+"\x14"
+"\x15"
+"\x16"
+"\x17"
+"\x18"
+
+# Common RTMP commands
+"connect"
+"releaseStream"
+"FCPublish"
+"createStream"
+"publish"
+"FCUnpublish"
+"deleteStream"
+"play"
+"pause"
+"seek"
+
+# Common property names
+"app"
+"type"
+"flashVer"
+"tcUrl"
+"fpad"
+"capabilities"
+"audioCodecs"
+"videoCodecs"
+"videoFunction"
+"objectEncoding"
+"level"
+"code"
+"description"
+
+# Common property values
+"nonprivate"
+"live"
+"NetConnection.Connect.Success"
+"NetStream.Publish.Start"
+"NetStream.Play.Start"
+
+# Extended timestamp marker
+"\xFF\xFF\xFF"
+
+# Common chunk sizes
+"\x00\x00\x10\x00"
+"\x00\x00\x20\x00"
+"\x00\x00\x40\x00"
+
+# Stream IDs
+"\x00\x00\x00\x00"
+"\x00\x00\x00\x01"
+"\x00\x00\x00\x02"
+
+# Handshake version
+"\x03"
+
+# Object end marker
+"\x00\x00\x09"
+
+# Boolean values
+"\x00"
+"\x01"
+
+# Common numbers (IEEE 754 double)
+"\x00\x00\x00\x00\x00\x00\x00\x00"
+"\x3F\xF0\x00\x00\x00\x00\x00\x00"
+"\x40\x00\x00\x00\x00\x00\x00\x00"

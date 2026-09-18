@@ -1,0 +1,31 @@
+[package]
+name = "oximedia-vfx"
+description = "Visual effects processing pipeline for media production"
+keywords = ["vfx", "effects", "video", "pipeline", "multimedia"]
+categories = ["multimedia::video"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-graph = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+# Pure-Rust glyph rasterization for `text::render` (same engine as
+# oximedia-graph's timecode burn-in and oximedia-subtitle). Depending on
+# oximedia-subtitle's font module instead would re-enable oximedia-codec's
+# default features, which oximedia-graph deliberately turns off.
+fontdue.workspace = true
+rand = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

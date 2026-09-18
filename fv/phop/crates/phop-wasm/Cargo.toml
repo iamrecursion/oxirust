@@ -1,0 +1,44 @@
+[package]
+name = "phop-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/phop-wasm"
+description = "WebAssembly bindings for phop: in-browser differentiable symbolic discovery"
+readme = "README.md"
+keywords = ["symbolic-regression", "machine-learning", "webassembly", "wasm", "eml"]
+categories = ["wasm", "science", "mathematics"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+phop-core.workspace = true
+scirs2-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+
+[features]
+default = []
+# Forward phop-core's stronger-canonicalization (e-graph) and SMT-proof (OxiZ) tiers into the wasm
+# build — the "discover → canonicalize → prove" path, entirely client-side. Both must wasm-compile.
+egraph = ["phop-core/egraph"]
+smt = ["phop-core/smt"]
+
+# Browser wasm entropy backends. phop's discovery uses its own deterministic SplitMix64, but the
+# transitive scirs2 / oxieml stack pulls three major versions of `getrandom`; each needs a JS-backed
+# source on wasm32-unknown-unknown (0.2 via its `js` feature; 0.3/0.4 via `wasm_js` + the
+# `getrandom_backend` cfg set in `.cargo/config.toml`). Renamed so features unify per version.
+[target.wasm32-unknown-unknown.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.76"

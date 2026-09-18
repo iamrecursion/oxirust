@@ -1,0 +1,23 @@
+[package]
+name = "oxixml-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Text codecs for XML/XSD/IRI processing: base64, hex, percent-encoding, and ECMAScript/XSD number formatting (pure-Rust replacement for the base64, hex, and percent-encoding crates)."
+keywords = ["base64", "percent-encoding", "hex", "xsd", "codec"]
+categories = ["encoding", "text-processing"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+
+[lints]
+workspace = true

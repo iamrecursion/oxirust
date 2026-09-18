@@ -1,0 +1,36 @@
+[package]
+name = "oximedia-auto"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Automated video editing for OxiMedia"
+keywords = ["auto-edit", "video", "editing", "automation", "multimedia"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-codec = { workspace = true, default-features = true }
+oximedia-audio = { workspace = true }
+oximedia-cv = { workspace = true }
+oximedia-edit = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "scoring_bench"
+harness = false

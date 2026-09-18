@@ -1,0 +1,41 @@
+[package]
+name = "oxicuda-solver"
+description = "OxiCUDA Solver - GPU-accelerated matrix decompositions (cuSOLVER equivalent)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "solver", "gpu", "linear-algebra", "decomposition"]
+categories = ["mathematics", "science", "hardware-support"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+oxicuda-memory.workspace = true
+oxicuda-launch.workspace = true
+oxicuda-ptx.workspace = true
+oxicuda-blas.workspace = true
+oxicuda-rand.workspace = true
+oxicuda-sparse = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[features]
+default = []
+f16 = ["dep:half", "oxicuda-blas/f16"]
+sparse-solvers = ["dep:oxicuda-sparse"]
+full = ["f16", "sparse-solvers"]
+# On-device PTX validation tests (require a real CUDA GPU). The infra crates
+# (`oxicuda-driver`, `oxicuda-memory`, `oxicuda-launch`) are already regular
+# dependencies, so the harness needs no extra dev-dependencies — this is an
+# empty feature flag that simply gates the `gpu_tests` module.
+gpu-tests = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

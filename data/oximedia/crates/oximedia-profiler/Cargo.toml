@@ -1,0 +1,31 @@
+[package]
+name = "oximedia-profiler"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Performance profiling and optimization tools for OxiMedia"
+readme = "README.md"
+homepage.workspace = true
+repository.workspace = true
+keywords = ["profiling", "performance", "optimization", "benchmarking"]
+categories = ["development-tools::profiling"]
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sysinfo = { workspace = true }
+crossbeam-deque = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lib]
+name = "oximedia_profiler"
+path = "src/lib.rs"

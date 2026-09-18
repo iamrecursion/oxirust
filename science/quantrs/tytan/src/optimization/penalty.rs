@@ -1,0 +1,762 @@
+//! Penalty function optimization for QUBO problems
+//!
+//! This module provides advanced penalty weight optimization using SciRS2
+//! for automatic tuning and constraint satisfaction analysis.
+
+use crate::optimization::constraints::{ConstraintType, Expression};
+use scirs2_core::ndarray::{Array1, Array2};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[cfg(feature = "scirs")]
+use crate::scirs_stub::{
+    scirs2_linalg::norm::Norm,
+    scirs2_optimization::{OptimizationProblem, Optimizer},
+};
+
+/// Penalty function configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyConfig {
+    /// Initial penalty weight
+    pub initial_weight: f64,
+    /// Minimum penalty weight
+    pub min_weight: f64,
+    /// Maximum penalty weight
+    pub max_weight: f64,
+    /// Weight adjustment factor
+    pub adjustment_factor: f64,
+    /// Target constraint violation tolerance
+    pub violation_tolerance: f64,
+    /// Maximum optimization iterations
+    pub max_iterations: usize,
+    /// Use adaptive penalty scaling
+    pub adaptive_scaling: bool,
+    /// Penalty function type
+    pub penalty_type: PenaltyType,
+}
+
+/// Types of penalty functions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PenaltyType {
+    /// Quadratic penalty: weight * violation^2
+    Quadratic,
+    /// Linear penalty: weight * |violation|
+    Linear,
+    /// Logarithmic barrier: -weight * log(slack)
+    LogBarrier,
+    /// Exponential penalty: weight * exp(violation) - 1
+    Exponential,
+    /// Augmented Lagrangian method
+    AugmentedLagrangian,
+}
+
+impl Default for PenaltyConfig {
+    fn default() -> Self {
+        Self {
+            initial_weight: 1.0,
+            min_weight: 0.001,
+            max_weight: 1000.0,
+            adjustment_factor: 2.0,
+            violation_tolerance: 1e-6,
+            max_iterations: 100,
+            adaptive_scaling: true,
+            penalty_type: PenaltyType::Quadratic,
+        }
+    }
+}
+
+/// Penalty function optimizer
+pub struct PenaltyOptimizer {
+    config: PenaltyConfig,
+    constraint_weights: HashMap<String, f64>,
+    violation_history: Vec<ConstraintViolation>,
+    #[cfg(feature = "scirs")]
+    optimizer: Option<Box<dyn Optimizer>>,
+}
+
+/// Constraint violation information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstraintViolation {
+    pub constraint_name: String,
+    pub violation_amount: f64,
+    pub penalty_weight: f64,
+    pub iteration: usize,
+}
+
+/// Penalty optimization result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyOptimizationResult {
+    pub optimal_weights: HashMap<String, f64>,
+    pub final_violations: HashMap<String, f64>,
+    pub converged: bool,
+    pub iterations: usize,
+    pub objective_value: f64,
+    pub constraint_satisfaction: f64,
+}
+
+impl PenaltyOptimizer {
+    /// Create new penalty optimizer
+    pub fn new(config: PenaltyConfig) -> Self {
+        Self {
+            config,
+            constraint_weights: HashMap::new(),
+            violation_history: Vec::new(),
+            #[cfg(feature = "scirs")]
+            optimizer: None,
+        }
+    }
+
+    /// Initialize constraint weights
+    pub fn initialize_weights(&mut self, constraints: &[String]) {
+        for constraint in constraints {
+            self.constraint_weights
+                .insert(constraint.clone(), self.config.initial_weight);
+        }
+
+        #[cfg(feature = "scirs")]
+        {
+            // Initialize SciRS2 optimizer
+            use crate::scirs_stub::scirs2_optimization::gradient::LBFGS;
+            self.optimizer = Some(Box::new(LBFGS::new(constraints.len())));
+        }
+    }
+
+    /// Optimize penalty weights for a compiled model
+    pub fn optimize_penalties(
+        &mut self,
+        model: &CompiledModel,
+        sample_results: &[(Vec<bool>, f64)],
+    ) -> Result<PenaltyOptimizationResult, Box<dyn std::error::Error>> {
+        let mut iteration = 0;
+        let mut converged = false;
+
+        while iteration < self.config.max_iterations && !converged {
+            // Evaluate constraint violations
+            let violations = self.evaluate_violations(model, sample_results)?;
+
+            // Check convergence
+            let max_violation = violations.values().map(|v| v.abs()).fold(0.0, f64::max);
+
+            if max_violation < self.config.violation_tolerance {
+                converged = true;
+                break;
+            }
+
+            // Update penalty weights
+            self.update_weights(&violations, iteration)?;
+
+            // Record history
+            for (name, &violation) in &violations {
+                self.violation_history.push(ConstraintViolation {
+                    constraint_name: name.clone(),
+                    violation_amount: violation,
+                    penalty_weight: self.constraint_weights[name],
+                    iteration,
+                });
+            }
+
+            iteration += 1;
+        }
+
+        // Calculate final metrics
+        let final_violations = self.evaluate_violations(model, sample_results)?;
+        let objective_value = self.calculate_objective(model, sample_results)?;
+        let constraint_satisfaction = self.calculate_satisfaction_rate(&final_violations);
+
+        Ok(PenaltyOptimizationResult {
+            optimal_weights: self.constraint_weights.clone(),
+            final_violations,
+            converged,
+            iterations: iteration,
+            objective_value,
+            constraint_satisfaction,
+        })
+    }
+
+    /// Evaluate constraint violations
+    fn evaluate_violations(
+        &self,
+        model: &CompiledModel,
+        sample_results: &[(Vec<bool>, f64)],
+    ) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
+        let mut violations = HashMap::new();
+
+        // For each constraint in the model
+        for (constraint_name, constraint_expr) in model.get_constraints() {
+            let mut total_violation = 0.0;
+            let mut count = 0;
+
+            // Evaluate constraint for each sample
+            for (assignment, _energy) in sample_results {
+                let violation = self.evaluate_constraint_violation(
+                    constraint_expr,
+                    assignment,
+                    model.get_variable_map(),
+                )?;
+
+                total_violation += violation;
+                count += 1;
+            }
+
+            // Average violation
+            violations.insert(
+                constraint_name.clone(),
+                if count > 0 {
+                    total_violation / count as f64
+                } else {
+                    0.0
+                },
+            );
+        }
+
+        Ok(violations)
+    }
+
+    /// Evaluate single constraint violation
+    ///
+    /// Actually evaluates `constraint.expression` against `assignment`
+    /// (mapped through `var_map`) and computes the real violation for
+    /// `constraint.constraint_type`, rather than a hardcoded `0.0`.
+    fn evaluate_constraint_violation(
+        &self,
+        constraint: &ConstraintExpr,
+        assignment: &[bool],
+        var_map: &HashMap<String, usize>,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let named_assignment: HashMap<String, bool> = var_map
+            .iter()
+            .filter_map(|(name, &index)| assignment.get(index).map(|&value| (name.clone(), value)))
+            .collect();
+
+        let value = constraint.violation(&named_assignment);
+
+        // Calculate violation based on constraint type
+        Ok(match self.config.penalty_type {
+            PenaltyType::Quadratic => value.powi(2),
+            PenaltyType::Linear => value.abs(),
+            PenaltyType::LogBarrier => {
+                if value > 0.0 {
+                    -value.ln()
+                } else {
+                    f64::INFINITY
+                }
+            }
+            PenaltyType::Exponential => value.exp_m1(),
+            PenaltyType::AugmentedLagrangian => {
+                // Simplified augmented Lagrangian
+                value.mul_add(value, value.abs())
+            }
+        })
+    }
+
+    /// Update penalty weights based on violations
+    fn update_weights(
+        &mut self,
+        violations: &HashMap<String, f64>,
+        iteration: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(feature = "scirs")]
+        {
+            if self.config.adaptive_scaling && self.optimizer.is_some() {
+                // Use SciRS2 optimizer for weight updates
+                self.update_weights_optimized(violations, iteration)?;
+                return Ok(());
+            }
+        }
+
+        // Standard weight update
+        for (constraint_name, &violation) in violations {
+            if let Some(weight) = self.constraint_weights.get_mut(constraint_name) {
+                if violation.abs() > self.config.violation_tolerance {
+                    // Increase penalty weight
+                    *weight = (*weight * self.config.adjustment_factor).min(self.config.max_weight);
+                } else if violation.abs() < self.config.violation_tolerance * 0.1 {
+                    // Decrease penalty weight if over-penalized
+                    *weight = (*weight / self.config.adjustment_factor.sqrt())
+                        .max(self.config.min_weight);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "scirs")]
+    /// Update weights using SciRS2 optimization
+    fn update_weights_optimized(
+        &mut self,
+        violations: &HashMap<String, f64>,
+        iteration: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::scirs_stub::scirs2_optimization::{Bounds, ObjectiveFunction};
+
+        // Define optimization problem
+        let constraint_names: Vec<_> = violations.keys().cloned().collect();
+        let current_weights: Array1<f64> = constraint_names
+            .iter()
+            .map(|name| self.constraint_weights[name])
+            .collect();
+
+        // Objective: minimize total weighted violations
+        let violations_vec: Array1<f64> = constraint_names
+            .iter()
+            .map(|name| violations[name].abs())
+            .collect();
+
+        let mut objective = WeightOptimizationObjective {
+            violations: violations_vec,
+            penalty_type: self.config.penalty_type,
+            regularization: 0.01, // L2 regularization on weights
+        };
+
+        // Set bounds
+        let lower_bounds = Array1::from_elem(constraint_names.len(), self.config.min_weight);
+        let upper_bounds = Array1::from_elem(constraint_names.len(), self.config.max_weight);
+        let bounds = Bounds::new(lower_bounds, upper_bounds);
+
+        // Optimize. The outer loop counter is not an iteration budget for the inner solve:
+        // passing it meant the very first weight update ran the optimizer for zero
+        // iterations and returned the starting weights unchanged.
+        let inner_max_iterations = self.config.max_iterations.max(1);
+        let _ = iteration;
+        if let Some(ref mut optimizer) = self.optimizer {
+            let mut result =
+                optimizer.minimize(&objective, &current_weights, &bounds, inner_max_iterations)?;
+
+            // Update weights
+            for (i, name) in constraint_names.iter().enumerate() {
+                self.constraint_weights.insert(name.clone(), result.x[i]);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Calculate objective value
+    fn calculate_objective(
+        &self,
+        model: &CompiledModel,
+        sample_results: &[(Vec<bool>, f64)],
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let mut total_objective = 0.0;
+
+        for (assignment, energy) in sample_results {
+            // Original objective
+            let mut penalized_objective = *energy;
+
+            // Add penalty terms
+            for (constraint_name, constraint_expr) in model.get_constraints() {
+                let violation = self.evaluate_constraint_violation(
+                    constraint_expr,
+                    assignment,
+                    model.get_variable_map(),
+                )?;
+
+                let weight = self
+                    .constraint_weights
+                    .get(constraint_name)
+                    .copied()
+                    .unwrap_or(1.0);
+
+                penalized_objective += weight * violation;
+            }
+
+            total_objective += penalized_objective;
+        }
+
+        Ok(total_objective / sample_results.len() as f64)
+    }
+
+    /// Calculate constraint satisfaction rate
+    fn calculate_satisfaction_rate(&self, violations: &HashMap<String, f64>) -> f64 {
+        let satisfied = violations
+            .values()
+            .filter(|&&v| v.abs() < self.config.violation_tolerance)
+            .count();
+
+        if violations.is_empty() {
+            1.0
+        } else {
+            satisfied as f64 / violations.len() as f64
+        }
+    }
+
+    /// Get penalty weight for a constraint
+    pub fn get_weight(&self, constraint_name: &str) -> Option<f64> {
+        self.constraint_weights.get(constraint_name).copied()
+    }
+
+    /// Get violation history
+    pub fn get_violation_history(&self) -> &[ConstraintViolation] {
+        &self.violation_history
+    }
+
+    /// Export penalty configuration
+    pub fn export_config(&self) -> PenaltyExport {
+        PenaltyExport {
+            config: self.config.clone(),
+            weights: self.constraint_weights.clone(),
+            final_violations: self
+                .violation_history
+                .iter()
+                .filter(|v| {
+                    v.iteration
+                        == self
+                            .violation_history
+                            .iter()
+                            .map(|h| h.iteration)
+                            .max()
+                            .unwrap_or(0)
+                })
+                .map(|v| (v.constraint_name.clone(), v.violation_amount))
+                .collect(),
+        }
+    }
+}
+
+/// Exported penalty configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyExport {
+    pub config: PenaltyConfig,
+    pub weights: HashMap<String, f64>,
+    pub final_violations: HashMap<String, f64>,
+}
+
+#[cfg(feature = "scirs")]
+/// Objective function for weight optimization
+struct WeightOptimizationObjective {
+    violations: Array1<f64>,
+    penalty_type: PenaltyType,
+    regularization: f64,
+}
+
+#[cfg(feature = "scirs")]
+impl WeightOptimizationObjective {
+    /// Floor applied to a weight before dividing by it, so a probe at or below zero cannot
+    /// produce a non-finite residual. The optimizer's own bounds keep weights at or above
+    /// `PenaltyConfig::min_weight` in practice.
+    const MIN_SAFE_WEIGHT: f64 = 1e-12;
+}
+
+#[cfg(feature = "scirs")]
+impl crate::scirs_stub::scirs2_optimization::ObjectiveFunction for WeightOptimizationObjective {
+    fn evaluate(&self, weights: &Array1<f64>) -> f64 {
+        // Residual violation left by each penalty weight, plus L2 regularisation.
+        //
+        // The residual has to *decrease* as a weight grows. The previous form summed
+        // `weight * violation`, which increases with the weight, so minimising it drove
+        // every weight down to `min_weight` precisely when a constraint was still
+        // violated — the opposite of what an adaptive penalty method must do, and why a
+        // persistently violated constraint never had its weight raised. Balancing
+        // `v / w` against `lambda * w^2` puts the optimum at `w = (v / (2*lambda))^(1/3)`,
+        // which grows with the violation and stays finite.
+        let residual: f64 = self
+            .violations
+            .iter()
+            .zip(weights.iter())
+            .map(|(&violation, &weight)| violation / weight.max(Self::MIN_SAFE_WEIGHT))
+            .sum();
+
+        residual + self.regularization * weights.dot(weights)
+    }
+
+    fn gradient(&self, weights: &Array1<f64>) -> Array1<f64> {
+        let mut gradient = Array1::zeros(weights.len());
+        for (index, (&violation, &weight)) in self.violations.iter().zip(weights.iter()).enumerate()
+        {
+            let safe_weight = weight.max(Self::MIN_SAFE_WEIGHT);
+            gradient[index] =
+                2.0 * self.regularization * weight - violation / (safe_weight * safe_weight);
+        }
+        gradient
+    }
+}
+
+/// A penalty-optimization view of a compiled QUBO/HOBO model: the set of
+/// named constraints (as real, evaluable [`ConstraintExpr`]s) plus the
+/// variable name -> QUBO index mapping used to interpret sample bit vectors.
+#[derive(Debug, Clone)]
+pub struct CompiledModel {
+    constraints: HashMap<String, ConstraintExpr>,
+    variable_map: HashMap<String, usize>,
+}
+
+impl Default for CompiledModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompiledModel {
+    pub fn new() -> Self {
+        Self {
+            constraints: HashMap::new(),
+            variable_map: HashMap::new(),
+        }
+    }
+
+    /// Build a model with an explicit variable ordering (name -> QUBO index).
+    #[must_use]
+    pub fn with_variables(variables: &[String]) -> Self {
+        let variable_map = variables
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index))
+            .collect();
+        Self {
+            constraints: HashMap::new(),
+            variable_map,
+        }
+    }
+
+    /// Register a real constraint to be tracked/optimized.
+    pub fn add_constraint(&mut self, name: impl Into<String>, constraint: ConstraintExpr) {
+        self.constraints.insert(name.into(), constraint);
+    }
+
+    /// Register (or overwrite) a variable's QUBO index.
+    pub fn set_variable_index(&mut self, name: impl Into<String>, index: usize) {
+        self.variable_map.insert(name.into(), index);
+    }
+
+    pub const fn get_constraints(&self) -> &HashMap<String, ConstraintExpr> {
+        &self.constraints
+    }
+
+    pub const fn get_variable_map(&self) -> &HashMap<String, usize> {
+        &self.variable_map
+    }
+
+    pub fn to_qubo(&self) -> (Array2<f64>, HashMap<String, usize>) {
+        let size = self.variable_map.len();
+        (Array2::zeros((size, size)), self.variable_map.clone())
+    }
+}
+
+/// A real, evaluable constraint expression: an [`Expression`] tree (reusing
+/// the evaluator from [`crate::optimization::constraints`]) together with
+/// the [`ConstraintType`] that determines how far a given expression value
+/// is from feasibility.
+#[derive(Debug, Clone)]
+pub struct ConstraintExpr {
+    pub expression: Expression,
+    pub constraint_type: ConstraintType,
+}
+
+impl ConstraintExpr {
+    #[must_use]
+    pub const fn new(expression: Expression, constraint_type: ConstraintType) -> Self {
+        Self {
+            expression,
+            constraint_type,
+        }
+    }
+
+    /// Evaluate the real constraint violation (`0.0` when satisfied) for a
+    /// given named variable assignment.
+    #[must_use]
+    pub fn violation(&self, assignment: &HashMap<String, bool>) -> f64 {
+        let value = self.expression.evaluate(assignment);
+        self.constraint_type.violation(value)
+    }
+}
+
+/// Analyze penalty function behavior
+pub fn analyze_penalty_landscape(config: &PenaltyConfig, violations: &[f64]) -> PenaltyAnalysis {
+    let weights = Array1::linspace(config.min_weight, config.max_weight, 100);
+    let mut penalties = Vec::new();
+
+    for &weight in &weights {
+        let penalty_values: Vec<f64> = violations
+            .iter()
+            .map(|&v| calculate_penalty(v, weight, config.penalty_type))
+            .collect();
+
+        penalties.push(PenaltyPoint {
+            weight,
+            avg_penalty: penalty_values.iter().sum::<f64>() / penalty_values.len() as f64,
+            max_penalty: penalty_values.iter().fold(0.0, |a, &b| a.max(b)),
+            min_penalty: penalty_values.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
+        });
+    }
+
+    PenaltyAnalysis {
+        penalty_points: penalties,
+        optimal_weight: find_optimal_weight(&weights, violations, config),
+        sensitivity: calculate_sensitivity(violations, config),
+    }
+}
+
+/// Calculate penalty value
+fn calculate_penalty(violation: f64, weight: f64, penalty_type: PenaltyType) -> f64 {
+    weight
+        * match penalty_type {
+            PenaltyType::Quadratic => violation.powi(2),
+            PenaltyType::Linear => violation.abs(),
+            PenaltyType::LogBarrier => {
+                if violation > 0.0 {
+                    -violation.ln()
+                } else {
+                    1e10 // Large penalty for infeasible region
+                }
+            }
+            PenaltyType::Exponential => violation.exp_m1(),
+            PenaltyType::AugmentedLagrangian => violation.mul_add(violation, violation.abs()),
+        }
+}
+
+/// Find optimal penalty weight
+fn find_optimal_weight(weights: &Array1<f64>, violations: &[f64], config: &PenaltyConfig) -> f64 {
+    // Simple heuristic: find weight that balances constraint satisfaction
+    // with objective minimization
+    let target_penalty = violations.len() as f64 * config.violation_tolerance;
+
+    let mut best_weight = config.initial_weight;
+    let mut best_diff = f64::INFINITY;
+
+    for &weight in weights {
+        let total_penalty: f64 = violations
+            .iter()
+            .map(|&v| calculate_penalty(v, weight, config.penalty_type))
+            .sum();
+
+        let diff = (total_penalty - target_penalty).abs();
+        if diff < best_diff {
+            best_diff = diff;
+            best_weight = weight;
+        }
+    }
+
+    best_weight
+}
+
+/// Calculate penalty sensitivity
+fn calculate_sensitivity(violations: &[f64], config: &PenaltyConfig) -> f64 {
+    if violations.is_empty() {
+        return 0.0;
+    }
+
+    // Calculate derivative of penalty w.r.t. weight at current weight
+    let weight = config.initial_weight;
+    let penalties: Vec<f64> = violations
+        .iter()
+        .map(|&v| calculate_penalty(v, weight, config.penalty_type))
+        .collect();
+
+    let delta = 0.01 * weight;
+    let penalties_delta: Vec<f64> = violations
+        .iter()
+        .map(|&v| calculate_penalty(v, weight + delta, config.penalty_type))
+        .collect();
+
+    let derivatives: Vec<f64> = penalties
+        .iter()
+        .zip(penalties_delta.iter())
+        .map(|(&p1, &p2)| (p2 - p1) / delta)
+        .collect();
+
+    // Return average sensitivity
+    derivatives.iter().sum::<f64>() / derivatives.len() as f64
+}
+
+/// Penalty analysis results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyAnalysis {
+    pub penalty_points: Vec<PenaltyPoint>,
+    pub optimal_weight: f64,
+    pub sensitivity: f64,
+}
+
+/// Penalty evaluation point
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyPoint {
+    pub weight: f64,
+    pub avg_penalty: f64,
+    pub max_penalty: f64,
+    pub min_penalty: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::optimization::constraints::Variable;
+
+    /// Builds a model with a single equality constraint `x0 == 1` over two
+    /// QUBO variables `x0`, `x1`.
+    fn equality_model() -> CompiledModel {
+        let mut model = CompiledModel::with_variables(&["x0".to_string(), "x1".to_string()]);
+        let expr: Expression = Variable::new("x0".to_string()).into();
+        model.add_constraint(
+            "x0_must_be_true",
+            ConstraintExpr::new(expr, ConstraintType::Equality { target: 1.0 }),
+        );
+        model
+    }
+
+    #[test]
+    fn test_evaluate_constraint_violation_is_real() {
+        let optimizer = PenaltyOptimizer::new(PenaltyConfig::default());
+        let model = equality_model();
+        let constraint = &model.get_constraints()["x0_must_be_true"];
+
+        // x0 = false violates x0 == 1 by -1.0; quadratic penalty type squares it.
+        let violated = optimizer
+            .evaluate_constraint_violation(constraint, &[false, true], model.get_variable_map())
+            .expect("evaluation should succeed");
+        assert_eq!(violated, 1.0);
+
+        // x0 = true satisfies the constraint exactly.
+        let satisfied = optimizer
+            .evaluate_constraint_violation(constraint, &[true, false], model.get_variable_map())
+            .expect("evaluation should succeed");
+        assert_eq!(satisfied, 0.0);
+    }
+
+    #[test]
+    fn test_optimize_penalties_detects_real_violations() {
+        let mut optimizer = PenaltyOptimizer::new(PenaltyConfig {
+            max_iterations: 5,
+            ..PenaltyConfig::default()
+        });
+        let model = equality_model();
+        optimizer.initialize_weights(&["x0_must_be_true".to_string()]);
+
+        // All sampled assignments violate x0 == 1 (x0 is always false).
+        let sample_results = vec![
+            (vec![false, false], 0.0),
+            (vec![false, true], 0.0),
+            (vec![false, true], 0.0),
+        ];
+
+        let result = optimizer
+            .optimize_penalties(&model, &sample_results)
+            .expect("optimization should succeed");
+
+        // With a genuine (nonzero) violation, satisfaction cannot be
+        // trivially reported as perfect, and the penalty weight must have
+        // been increased from its initial value to push toward feasibility.
+        assert!(result.final_violations["x0_must_be_true"].abs() > 0.0);
+        assert!(result.constraint_satisfaction < 1.0);
+        assert!(
+            result.optimal_weights["x0_must_be_true"] > PenaltyConfig::default().initial_weight
+        );
+    }
+
+    #[test]
+    fn test_optimize_penalties_recognizes_feasible_samples() {
+        let mut optimizer = PenaltyOptimizer::new(PenaltyConfig::default());
+        let model = equality_model();
+        optimizer.initialize_weights(&["x0_must_be_true".to_string()]);
+
+        // All sampled assignments satisfy x0 == 1.
+        let sample_results = vec![(vec![true, false], -1.0), (vec![true, true], -0.5)];
+
+        let result = optimizer
+            .optimize_penalties(&model, &sample_results)
+            .expect("optimization should succeed");
+
+        assert!(result.converged);
+        assert_eq!(result.constraint_satisfaction, 1.0);
+        assert_eq!(result.final_violations["x0_must_be_true"], 0.0);
+    }
+}

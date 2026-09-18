@@ -1,0 +1,30 @@
+[package]
+name = "oxify-examples"
+version = "0.2.0"
+edition = "2021"
+# Example workflows for OxiFY, not a crates.io crate (the workspace already excludes it).
+publish = false
+
+[[bin]]
+name = "simple_workflow"
+path = "simple_workflow.rs"
+
+[[bin]]
+name = "rag_workflow"
+path = "rag_workflow.rs"
+
+[[bin]]
+name = "conditional_workflow"
+path = "conditional_workflow.rs"
+
+[dependencies]
+oxify-model = { path = "../crates/oxify-model" }
+oxify-engine = { path = "../crates/oxify-engine" }
+oxify-connect-llm = { path = "../crates/oxify-connect-llm" }
+oxify-connect-vector = { path = "../crates/oxify-connect-vector" }
+
+tokio = { version = "1.48.0", features = ["full"] }
+anyhow = "1.0.100"
+serde_json = "1.0.145"
+tracing = "0.1.43"
+tracing-subscriber = "0.3.22"

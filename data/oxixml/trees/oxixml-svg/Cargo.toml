@@ -1,0 +1,23 @@
+[package]
+name = "oxixml-svg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "A typed SVG 1.1/2.0 document model, microsyntax parser, geometry toolkit, builder, and linter over an oxixml-dom tree."
+keywords = ["svg", "vector-graphics", "parser", "xml", "graphics"]
+categories = ["parser-implementations", "graphics", "text-processing", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-dom = { workspace = true }
+
+[lints]
+workspace = true

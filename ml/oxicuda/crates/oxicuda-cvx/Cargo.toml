@@ -1,0 +1,35 @@
+[package]
+name = "oxicuda-cvx"
+description = "OxiCUDA: Convex Optimization (LP, QP, SOCP, SDP, ADMM, FISTA, prox operators, projections)"
+categories = ["mathematics", "science", "algorithms"]
+keywords = ["convex-optimization", "linear-programming", "admm", "fista", "gpu"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[features]
+# Enables on-device GPU tests that JIT-compile the hand-written PTX kernels,
+# launch them on a real CUDA device, and assert numerical equivalence to the
+# crate's CPU references. The tests skip gracefully when no GPU is present, so
+# this feature is safe to enable on CPU-only machines.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "cvx_ops"
+harness = false

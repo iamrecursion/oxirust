@@ -1,0 +1,45 @@
+[package]
+name = "fop-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Rendering backends for Apache FOP (PDF, SVG, etc.)"
+documentation = "https://docs.rs/fop-render"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories = ["rendering", "graphics"]
+keywords = ["pdf", "rendering", "xsl-fo", "svg", "postscript"]
+readme = "README.md"
+
+[features]
+default = ["raster"]
+raster = ["resvg", "usvg", "tiny-skia", "jpeg-encoder"]
+
+[dependencies]
+fop-types = { workspace = true }
+fop-layout = { workspace = true }
+fop-core = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+png = { workspace = true }
+jpeg-decoder = { workspace = true }
+oxiarc-deflate = { workspace = true }
+ttf-parser = { workspace = true }
+subsetter = { workspace = true }
+resvg = { workspace = true, optional = true }
+usvg = { workspace = true, optional = true }
+tiny-skia = { workspace = true, optional = true }
+jpeg-encoder = { workspace = true, optional = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+getrandom = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }
+# Used by the end-to-end font-subset round-trip test: it loads a generated PDF
+# back through the workspace's own pure-Rust PDF renderer to prove the embedded
+# subset's CIDToGIDMap / cmap / widths stay consistent (text + glyph rendering).
+fop-pdf-renderer = { workspace = true }

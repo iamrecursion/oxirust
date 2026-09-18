@@ -1,0 +1,34 @@
+[package]
+name         = "oxicuda-dist-infer"
+description  = "Distributed GPU inference for OxiCUDA: tensor parallelism, sequence parallelism, expert parallelism, distributed KV cache, and affinity-aware request routing."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme                 = "README.md"
+keywords = ["gpu", "distributed", "inference", "cuda", "parallel"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[features]
+# On-device GPU PTX validation harness (`src/gpu_tests.rs`). Off by default so
+# the crate builds and unit-tests on machines without a CUDA device; enable with
+# `--features gpu-tests` on a box with a real GPU to JIT-load and run every PTX
+# kernel against a CPU oracle.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }

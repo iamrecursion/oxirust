@@ -1,0 +1,31 @@
+[package]
+name = "oxicuda-geom2d"
+description = "OxiCUDA: 2D Computational Geometry (predicates, intersection, hull, triangulation, Voronoi, clipping, spatial indices)"
+categories = ["mathematics", "algorithms", "science"]
+keywords = ["geometry", "triangulation", "voronoi", "convex-hull", "gpu"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[features]
+gpu-tests = []
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "geom2d_ops"
+harness = false

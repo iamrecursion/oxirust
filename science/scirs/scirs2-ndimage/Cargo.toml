@@ -1,0 +1,87 @@
+[package]
+name = "scirs2-ndimage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "N-dimensional image processing module for SciRS2 (scirs2-ndimage)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["image", "processing", "scientific", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["validation", "memory_efficient", "parallel", "array", "random"] }
+# scirs2-interpolate = { workspace = true }
+scirs2-fft = { workspace = true, features = ["oxifft"] }
+thiserror = { workspace = true }
+approx = { workspace = true }
+tempfile = { workspace = true }
+lazy_static = { workspace = true }
+num_cpus = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Pure Rust compression (COOLJAPAN Policy)
+oxiarc-deflate = { workspace = true, optional = true }
+oxiarc-zstd = { workspace = true, optional = true }
+oxiarc-lz4 = { workspace = true, optional = true }
+statrs.workspace = true
+
+# OxiCUDA pure-Rust CUDA backend (optional, `cuda` feature only). oxicuda-driver
+# loads libcuda at runtime (zero build-time CUDA SDK dependency), and libnvrtc is
+# resolved at runtime by oxicuda-nvrtc for CUDA-C -> PTX kernel JIT compilation.
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }
+oxicuda-nvrtc = { workspace = true, optional = true }
+
+[features]
+default = []
+simd = ["scirs2-core/simd"]
+parallel = ["scirs2-core/parallel"]
+# ndimage has its own backend (backend/cuda.rs) built on the pure-Rust oxicuda
+# ecosystem (runtime libcuda via oxicuda-driver, runtime libnvrtc via
+# oxicuda-nvrtc); no build-time CUDA SDK needed.
+cuda = ["dep:oxicuda-driver", "dep:oxicuda-memory", "dep:oxicuda-nvrtc"]
+opencl = []
+metal = []
+gpu = []  # GPU abstraction layer - does NOT auto-enable specific backends
+compression = ["dep:oxiarc-deflate", "dep:oxiarc-zstd", "dep:oxiarc-lz4"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "filters_bench"
+harness = false
+
+[[bench]]
+name = "morphology_bench"
+harness = false
+
+[[bench]]
+name = "interpolation_bench"
+harness = false
+
+[[bench]]
+name = "distance_transform_bench"
+harness = false
+
+[[example]]
+name = "streaming_processing"
+
+[[example]]
+name = "gpu_backend"
+required-features = ["gpu"]
+
+# [[example]]
+# name = "ndimage_comprehensive_analysis"

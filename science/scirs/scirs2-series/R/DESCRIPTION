@@ -1,0 +1,34 @@
+Package: scirs2.series
+Type: Package
+Title: Time Series Analysis with SciRS2
+Version: 0.1.0
+Date: 2025-12-29
+Authors@R: c(
+    person("SciRS2", "Team", email = "info@scirs2.org", role = c("aut", "cre")),
+    person("Claude", "AI", email = "claude@anthropic.com", role = "ctb")
+)
+Description: Comprehensive time series analysis package powered by Rust.
+    Provides high-performance implementations of ARIMA modeling, anomaly detection,
+    time series decomposition, forecasting, and advanced analytics. Seamlessly
+    integrates with R's time series ecosystem while leveraging Rust's performance
+    and safety guarantees.
+License: Apache License 2.0
+URL: https://github.com/cool-japan/scirs
+BugReports: https://github.com/cool-japan/scirs/issues
+Depends: R (>= 3.6.0)
+Imports: methods
+Suggests: 
+    testthat (>= 3.0.0),
+    forecast,
+    tseries,
+    xts,
+    zoo,
+    ggplot2,
+    dplyr
+SystemRequirements: Rust (>= 1.70.0), Cargo
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.2.0
+NeedsCompilation: yes
+Classification/ACM: G.1.2, G.1.3, G.3, G.4
+Keywords: time-series, forecasting, arima, anomaly-detection, decomposition, rust

@@ -1,0 +1,37 @@
+[package]
+name = "spintronics-demo"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.70.0"
+authors.workspace = true
+description = "Interactive web demonstrations for spintronics physics simulations"
+license.workspace = true
+publish = false
+
+[dependencies]
+# Core spintronics library
+spintronics = { path = "..", default-features = false, features = ["serde"] }
+
+# Web framework
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["fs", "trace", "cors"] }
+
+# Templating
+# NOTE: askama 0.13 removed the built-in web-framework integration crates
+# (askama_axum is now a deprecated tombstone). Templates are bridged to axum
+# responses manually via `Html(template.render()?)` in `main.rs`.
+askama = "0.16"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+reqwest = "0.13"
+hyper = "1.10"

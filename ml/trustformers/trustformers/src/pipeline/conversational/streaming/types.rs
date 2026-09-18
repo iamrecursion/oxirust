@@ -1,0 +1,1464 @@
+//! Comprehensive types and data structures for streaming conversational AI responses.
+//!
+//! This module contains all types used in the streaming response system, including
+//! configuration structs, response types, state management, metrics, error handling,
+//! and quality analysis types.
+
+use crate::pipeline::conversational::types::*;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+
+// ================================================================================================
+// CONFIGURATION TYPES
+// ================================================================================================
+
+/// Advanced streaming configuration with enhanced features
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedStreamingConfig {
+    /// Basic streaming configuration
+    pub base_config: StreamingConfig,
+    /// Enable adaptive chunking based on content
+    pub adaptive_chunking: bool,
+    /// Maximum chunk size in characters
+    pub max_chunk_size: usize,
+    /// Minimum chunk size in characters
+    pub min_chunk_size: usize,
+    /// Enable natural pausing at sentence boundaries
+    pub natural_pausing: bool,
+    /// Pause duration at punctuation marks (ms)
+    pub punctuation_pause_ms: u64,
+    /// Enable typing speed variation
+    pub variable_typing_speed: bool,
+    /// Base typing speed (characters per second)
+    pub base_typing_speed: f32,
+    /// Speed variation factor (0.0 to 1.0)
+    pub speed_variation: f32,
+    /// Enable backpressure handling
+    pub enable_backpressure: bool,
+    /// Maximum buffer size for backpressure
+    pub max_buffer_size: usize,
+    /// Timeout for chunk delivery (ms)
+    pub chunk_timeout_ms: u64,
+    /// Enable quality-based streaming
+    pub quality_based_streaming: bool,
+    /// Enable error recovery
+    pub enable_error_recovery: bool,
+    /// Maximum retry attempts
+    pub max_retry_attempts: usize,
+}
+
+impl Default for AdvancedStreamingConfig {
+    fn default() -> Self {
+        Self {
+            base_config: StreamingConfig::default(),
+            adaptive_chunking: true,
+            max_chunk_size: 50,
+            min_chunk_size: 5,
+            natural_pausing: true,
+            punctuation_pause_ms: 150,
+            variable_typing_speed: true,
+            base_typing_speed: 25.0, // characters per second
+            speed_variation: 0.3,
+            enable_backpressure: true,
+            max_buffer_size: 1000,
+            chunk_timeout_ms: 5000,
+            quality_based_streaming: true,
+            enable_error_recovery: true,
+            max_retry_attempts: 3,
+        }
+    }
+}
+
+// ================================================================================================
+// RESPONSE AND STREAMING TYPES
+// ================================================================================================
+
+/// Extended streaming response with additional metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtendedStreamingResponse {
+    /// Base streaming response
+    pub base_response: StreamingResponse,
+    /// Streaming state
+    pub state: StreamingState,
+    /// Timestamp when chunk was generated
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Estimated completion time
+    pub estimated_completion: Option<chrono::DateTime<chrono::Utc>>,
+    /// Current streaming metrics
+    pub metrics: StreamingMetrics,
+    /// Quality indicators
+    pub quality: StreamingQuality,
+}
+
+/// Individual stream chunk with metadata
+#[derive(Debug, Clone)]
+pub struct StreamChunk {
+    /// Chunk content
+    pub content: String,
+    /// Chunk index in sequence
+    pub index: usize,
+    /// Type of chunk
+    pub chunk_type: ChunkType,
+    /// Timing information
+    pub timing: ChunkTiming,
+    /// Chunk metadata
+    pub metadata: ChunkMetadata,
+}
+
+/// Type of chunk for different processing
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChunkType {
+    Content,
+    Sentence,
+    Adaptive,
+    Semantic,
+    Punctuation,
+    Special,
+}
+
+/// Timing information for chunks
+#[derive(Debug, Clone)]
+pub struct ChunkTiming {
+    /// Delay before sending this chunk (ms)
+    pub delay_ms: u64,
+    /// Pause after sending this chunk (ms)
+    pub pause_ms: u64,
+    /// Variable timing factor
+    pub timing_factor: f32,
+}
+
+impl Default for ChunkTiming {
+    fn default() -> Self {
+        Self {
+            delay_ms: 50,
+            pause_ms: 0,
+            timing_factor: 1.0,
+        }
+    }
+}
+
+impl ChunkTiming {
+    /// Create timing with pause
+    pub fn with_pause(pause_ms: u64) -> Self {
+        Self {
+            delay_ms: 50,
+            pause_ms,
+            timing_factor: 1.0,
+        }
+    }
+
+    /// Create adaptive timing based on complexity
+    pub fn adaptive(complexity: f32) -> Self {
+        let base_delay = 50;
+        let delay_ms = (base_delay as f32 * (0.5 + complexity * 0.5)) as u64;
+
+        Self {
+            delay_ms,
+            pause_ms: if complexity > 0.7 { 100 } else { 0 },
+            timing_factor: 0.5 + complexity * 0.5,
+        }
+    }
+}
+
+/// Metadata for chunks
+#[derive(Debug, Clone)]
+pub struct ChunkMetadata {
+    /// Complexity score
+    pub complexity: f32,
+    /// Importance score
+    pub importance: f32,
+    /// Quality indicators
+    pub quality_indicators: Vec<String>,
+    /// Processing hints
+    pub processing_hints: Vec<String>,
+}
+
+impl Default for ChunkMetadata {
+    fn default() -> Self {
+        Self {
+            complexity: 0.5,
+            importance: 0.5,
+            quality_indicators: Vec::new(),
+            processing_hints: Vec::new(),
+        }
+    }
+}
+
+impl ChunkMetadata {
+    /// Create metadata with complexity
+    pub fn with_complexity(complexity: f32) -> Self {
+        Self {
+            complexity,
+            importance: complexity,
+            quality_indicators: vec!["adaptive".to_string()],
+            processing_hints: Vec::new(),
+        }
+    }
+
+    /// Create semantic metadata
+    pub fn semantic() -> Self {
+        Self {
+            complexity: 0.6,
+            importance: 0.7,
+            quality_indicators: vec!["semantic".to_string()],
+            processing_hints: vec!["maintain_context".to_string()],
+        }
+    }
+}
+
+// ================================================================================================
+// STATE MANAGEMENT TYPES
+// ================================================================================================
+
+/// Current stream state
+#[derive(Debug, Clone)]
+pub struct StreamState {
+    /// Current connection status
+    pub connection: StreamConnection,
+    /// Buffer state
+    pub buffer: BufferState,
+    /// Performance metrics
+    pub performance: StreamPerformance,
+    /// Quality metrics
+    pub quality: StreamingQuality,
+    /// Error information
+    pub error_info: Option<StreamError>,
+    /// Last state update
+    pub last_update: Instant,
+}
+
+impl Default for StreamState {
+    fn default() -> Self {
+        Self {
+            connection: StreamConnection::Connecting,
+            buffer: BufferState {
+                current_size: 0,
+                max_size: 1000,
+                utilization: 0.0,
+                pending_chunks: 0,
+            },
+            performance: StreamPerformance::default(),
+            quality: StreamingQuality::default(),
+            error_info: None,
+            last_update: Instant::now(),
+        }
+    }
+}
+
+/// Buffer state for backpressure management
+#[derive(Debug, Clone)]
+pub struct BufferState {
+    /// Current buffer size
+    pub current_size: usize,
+    /// Maximum buffer size
+    pub max_size: usize,
+    /// Buffer utilization percentage
+    pub utilization: f32,
+    /// Pending chunks
+    pub pending_chunks: usize,
+}
+
+/// Stream connection status
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamConnection {
+    Connecting,
+    Connected,
+    Streaming,
+    Paused,
+    Buffering,
+    Reconnecting,
+    Disconnected,
+    Error(String),
+}
+
+/// Chunk processing strategy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChunkingStrategy {
+    /// Fixed size chunks
+    FixedSize(usize),
+    /// Word boundary chunking
+    WordBoundary,
+    /// Sentence boundary chunking
+    SentenceBoundary,
+    /// Adaptive chunking based on content
+    Adaptive,
+    /// Semantic chunking
+    Semantic,
+}
+
+/// Flow control state
+#[derive(Debug, Clone)]
+pub struct FlowState {
+    /// Current flow rate (chunks per second)
+    pub flow_rate: f32,
+    /// Target flow rate
+    pub target_rate: f32,
+    /// Buffer fill level (0.0 to 1.0)
+    pub buffer_fill: f32,
+    /// Flow control actions taken
+    pub actions_taken: Vec<FlowAction>,
+    /// Last adjustment time
+    pub last_adjustment: Instant,
+}
+
+impl Default for FlowState {
+    fn default() -> Self {
+        Self {
+            flow_rate: 10.0, // Default 10 chunks per second
+            target_rate: 10.0,
+            buffer_fill: 0.0,
+            actions_taken: Vec::new(),
+            last_adjustment: Instant::now(),
+        }
+    }
+}
+
+/// State transition for tracking changes
+#[derive(Debug, Clone)]
+pub struct StateTransition {
+    /// Timestamp of transition
+    pub timestamp: Instant,
+    /// Previous state
+    pub from_state: StreamConnection,
+    /// New state
+    pub to_state: StreamConnection,
+    /// Reason for transition
+    pub reason: String,
+    /// Additional context
+    pub context: Option<String>,
+}
+
+// ================================================================================================
+// METRICS AND PERFORMANCE TYPES
+// ================================================================================================
+
+/// Real-time streaming metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingMetrics {
+    /// Current streaming speed (chunks per second)
+    pub chunks_per_second: f32,
+    /// Average chunk size
+    pub avg_chunk_size: f32,
+    /// Total chunks sent
+    pub total_chunks: usize,
+    /// Bytes streamed
+    pub bytes_streamed: usize,
+    /// Stream duration (ms)
+    pub duration_ms: u64,
+    /// Current buffer utilization (0.0 to 1.0)
+    pub buffer_utilization: f32,
+    /// Error count
+    pub error_count: usize,
+    /// Retry count
+    pub retry_count: usize,
+}
+
+impl Default for StreamingMetrics {
+    fn default() -> Self {
+        Self {
+            chunks_per_second: 0.0,
+            avg_chunk_size: 0.0,
+            total_chunks: 0,
+            bytes_streamed: 0,
+            duration_ms: 0,
+            buffer_utilization: 0.0,
+            error_count: 0,
+            retry_count: 0,
+        }
+    }
+}
+
+/// Global streaming metrics across all sessions
+#[derive(Debug, Clone)]
+pub struct GlobalStreamingMetrics {
+    /// Total active streams
+    pub active_streams: usize,
+    /// Total streams created
+    pub total_streams_created: usize,
+    /// Average stream duration
+    pub avg_stream_duration_ms: f64,
+    /// Total chunks streamed
+    pub total_chunks_streamed: usize,
+    /// Total bytes streamed
+    pub total_bytes_streamed: usize,
+    /// Global error rate
+    pub global_error_rate: f32,
+    /// System performance metrics
+    pub system_performance: SystemPerformanceMetrics,
+}
+
+impl Default for GlobalStreamingMetrics {
+    fn default() -> Self {
+        Self {
+            active_streams: 0,
+            total_streams_created: 0,
+            avg_stream_duration_ms: 0.0,
+            total_chunks_streamed: 0,
+            total_bytes_streamed: 0,
+            global_error_rate: 0.0,
+            system_performance: SystemPerformanceMetrics::default(),
+        }
+    }
+}
+
+/// System performance metrics for streaming
+#[derive(Debug, Clone)]
+pub struct SystemPerformanceMetrics {
+    /// CPU usage during streaming
+    pub cpu_usage: f32,
+    /// Memory usage
+    pub memory_usage_mb: f64,
+    /// Network utilization
+    pub network_utilization: f32,
+    /// Average latency
+    pub avg_latency_ms: f64,
+    /// Throughput (chunks per second)
+    pub throughput: f32,
+}
+
+impl Default for SystemPerformanceMetrics {
+    fn default() -> Self {
+        Self {
+            cpu_usage: 0.0,
+            memory_usage_mb: 0.0,
+            network_utilization: 0.0,
+            avg_latency_ms: 0.0,
+            throughput: 0.0,
+        }
+    }
+}
+
+/// Stream performance metrics
+#[derive(Debug, Clone)]
+pub struct StreamPerformance {
+    /// Current throughput (chunks/sec)
+    pub throughput: f32,
+    /// Latency metrics
+    pub latency: LatencyMetrics,
+    /// Resource utilization
+    pub resource_usage: ResourceUsage,
+    /// Network metrics
+    pub network: NetworkMetrics,
+}
+
+impl Default for StreamPerformance {
+    fn default() -> Self {
+        Self {
+            throughput: 0.0,
+            latency: LatencyMetrics::default(),
+            resource_usage: ResourceUsage::default(),
+            network: NetworkMetrics::default(),
+        }
+    }
+}
+
+/// Latency measurement metrics
+#[derive(Debug, Clone)]
+pub struct LatencyMetrics {
+    /// Current latency (ms)
+    pub current_ms: f64,
+    /// Average latency (ms)
+    pub average_ms: f64,
+    /// 95th percentile latency (ms)
+    pub p95_ms: f64,
+    /// 99th percentile latency (ms)
+    pub p99_ms: f64,
+    /// Maximum latency seen (ms)
+    pub max_ms: f64,
+}
+
+impl Default for LatencyMetrics {
+    fn default() -> Self {
+        Self {
+            current_ms: 0.0,
+            average_ms: 0.0,
+            p95_ms: 0.0,
+            p99_ms: 0.0,
+            max_ms: 0.0,
+        }
+    }
+}
+
+/// Resource usage metrics
+#[derive(Debug, Clone)]
+pub struct ResourceUsage {
+    /// CPU usage percentage
+    pub cpu_percent: f32,
+    /// Memory usage in MB
+    pub memory_mb: f64,
+    /// Network bandwidth usage (Mbps)
+    pub bandwidth_mbps: f32,
+    /// File descriptor usage
+    pub fd_count: usize,
+}
+
+impl Default for ResourceUsage {
+    fn default() -> Self {
+        Self {
+            cpu_percent: 0.0,
+            memory_mb: 0.0,
+            bandwidth_mbps: 0.0,
+            fd_count: 0,
+        }
+    }
+}
+
+/// Network performance metrics
+#[derive(Debug, Clone)]
+pub struct NetworkMetrics {
+    /// Packets sent
+    pub packets_sent: usize,
+    /// Packets lost
+    pub packets_lost: usize,
+    /// Bandwidth utilization
+    pub bandwidth_utilization: f32,
+    /// Connection quality score
+    pub connection_quality: f32,
+}
+
+impl Default for NetworkMetrics {
+    fn default() -> Self {
+        Self {
+            packets_sent: 0,
+            packets_lost: 0,
+            bandwidth_utilization: 0.0,
+            connection_quality: 1.0,
+        }
+    }
+}
+
+/// Backpressure metrics
+#[derive(Debug, Clone, Default)]
+pub struct BackpressureMetrics {
+    /// Total pressure events
+    pub pressure_events: usize,
+    /// Time under pressure (ms)
+    pub time_under_pressure_ms: u64,
+    /// Flow adjustments made
+    pub flow_adjustments: usize,
+    /// Buffer overflows prevented
+    pub overflows_prevented: usize,
+    /// Quality adjustments made
+    pub quality_adjustments: usize,
+}
+
+/// Statistics about streaming performance
+#[derive(Debug, Clone, Default)]
+pub struct StreamingStats {
+    pub total_chunks: usize,
+    pub total_characters: usize,
+    pub total_words: usize,
+    pub avg_chunk_size: f32,
+    pub estimated_duration_seconds: f32,
+}
+
+// ================================================================================================
+// QUALITY ANALYSIS TYPES
+// ================================================================================================
+
+/// Quality indicators for streaming
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingQuality {
+    /// Smoothness score (0.0 to 1.0)
+    pub smoothness: f32,
+    /// Naturalness score (0.0 to 1.0)
+    pub naturalness: f32,
+    /// Responsiveness score (0.0 to 1.0)
+    pub responsiveness: f32,
+    /// Coherence score (0.0 to 1.0)
+    pub coherence: f32,
+    /// Overall quality score (0.0 to 1.0)
+    pub overall_quality: f32,
+}
+
+impl Default for StreamingQuality {
+    fn default() -> Self {
+        Self {
+            smoothness: 1.0,
+            naturalness: 1.0,
+            responsiveness: 1.0,
+            coherence: 1.0,
+            overall_quality: 1.0,
+        }
+    }
+}
+
+/// Individual quality measurement
+#[derive(Debug, Clone)]
+pub struct QualityMeasurement {
+    /// Timestamp of measurement
+    pub timestamp: Instant,
+    /// Smoothness score (0.0 to 1.0)
+    pub smoothness: f32,
+    /// Naturalness score (0.0 to 1.0)
+    pub naturalness: f32,
+    /// Responsiveness score (0.0 to 1.0)
+    pub responsiveness: f32,
+    /// Coherence score (0.0 to 1.0)
+    pub coherence: f32,
+    /// Latency (ms)
+    pub latency_ms: f64,
+    /// Chunk size consistency
+    pub chunk_consistency: f32,
+}
+
+/// Quality thresholds for different aspects
+#[derive(Debug, Clone)]
+pub struct QualityThresholds {
+    /// Minimum smoothness threshold
+    pub min_smoothness: f32,
+    /// Minimum naturalness threshold
+    pub min_naturalness: f32,
+    /// Minimum responsiveness threshold
+    pub min_responsiveness: f32,
+    /// Minimum coherence threshold
+    pub min_coherence: f32,
+    /// Maximum acceptable latency (ms)
+    pub max_latency_ms: f64,
+    /// Minimum overall quality threshold
+    pub min_overall_quality: f32,
+}
+
+impl Default for QualityThresholds {
+    fn default() -> Self {
+        Self {
+            min_smoothness: 0.7,
+            min_naturalness: 0.6,
+            min_responsiveness: 0.8,
+            min_coherence: 0.7,
+            max_latency_ms: 200.0,
+            min_overall_quality: 0.7,
+        }
+    }
+}
+
+/// Quality trends analysis
+#[derive(Debug, Clone)]
+pub struct QualityTrends {
+    /// Overall quality trend
+    pub overall_trend: TrendDirection,
+    /// Smoothness trend
+    pub smoothness_trend: TrendDirection,
+    /// Naturalness trend
+    pub naturalness_trend: TrendDirection,
+    /// Responsiveness trend
+    pub responsiveness_trend: TrendDirection,
+    /// Coherence trend
+    pub coherence_trend: TrendDirection,
+}
+
+impl Default for QualityTrends {
+    fn default() -> Self {
+        Self {
+            overall_trend: TrendDirection::Stable,
+            smoothness_trend: TrendDirection::Stable,
+            naturalness_trend: TrendDirection::Stable,
+            responsiveness_trend: TrendDirection::Stable,
+            coherence_trend: TrendDirection::Stable,
+        }
+    }
+}
+
+// ================================================================================================
+// SESSION MANAGEMENT TYPES
+// ================================================================================================
+
+/// Individual stream session
+#[derive(Debug, Clone)]
+pub struct StreamSession {
+    /// Session ID
+    pub session_id: String,
+    /// Conversation ID
+    pub conversation_id: String,
+    /// Current state
+    pub state: StreamConnection,
+    /// Session metrics
+    pub metrics: StreamingMetrics,
+    /// Start time
+    pub start_time: Instant,
+    /// Last activity
+    pub last_activity: Instant,
+    /// Buffer state
+    pub buffer_state: BufferState,
+}
+
+/// Streaming session information
+#[derive(Debug, Clone)]
+pub struct StreamingSession {
+    pub session_id: String,
+    pub start_time: chrono::DateTime<chrono::Utc>,
+    pub end_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub config: StreamingConfig,
+    pub state: StreamingState,
+    pub stats: Option<StreamingStats>,
+}
+
+impl StreamingSession {
+    pub fn new(config: StreamingConfig) -> Self {
+        Self {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            start_time: chrono::Utc::now(),
+            end_time: None,
+            config,
+            state: StreamingState::NotStarted,
+            stats: None,
+        }
+    }
+
+    pub fn complete(&mut self, stats: StreamingStats) {
+        self.end_time = Some(chrono::Utc::now());
+        self.state = StreamingState::Completed;
+        self.stats = Some(stats);
+    }
+
+    pub fn duration_ms(&self) -> Option<i64> {
+        self.end_time.map(|end| (end - self.start_time).num_milliseconds())
+    }
+}
+
+// ================================================================================================
+// TYPING SIMULATION TYPES
+// ================================================================================================
+
+/// Typing event for natural simulation
+#[derive(Debug, Clone)]
+pub struct TypingEvent {
+    /// Type of typing event
+    pub event_type: TypingEventType,
+    /// Character index in the full content
+    pub char_index: usize,
+    /// Content for this event
+    pub content: String,
+    /// Delay before this event
+    pub delay: Duration,
+}
+
+/// Types of typing events
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypingEventType {
+    StartTyping,
+    Pause,
+    Correction,
+    Hesitation,
+}
+
+/// Typing patterns analyzer for natural simulation
+#[derive(Debug)]
+pub struct TypingPatterns {
+    /// Common typing patterns
+    patterns: Vec<TypingPattern>,
+}
+
+impl Default for TypingPatterns {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TypingPatterns {
+    /// Create new typing patterns analyzer
+    pub fn new() -> Self {
+        Self {
+            patterns: vec![
+                TypingPattern::new(
+                    "technical",
+                    vec!["algorithm", "implementation", "function"],
+                    0.8,
+                ),
+                TypingPattern::new("emotional", vec!["feel", "think", "believe"], 0.6),
+                TypingPattern::new("question", vec!["what", "how", "why", "when", "where"], 0.7),
+                TypingPattern::new("explanation", vec!["because", "therefore", "however"], 0.75),
+            ],
+        }
+    }
+
+    /// Analyze content for typing patterns
+    pub fn analyze_content(&self, content: &str) -> TypingAnalysis {
+        let content_lower = content.to_lowercase();
+        let mut pattern_scores = std::collections::HashMap::new();
+
+        for pattern in &self.patterns {
+            let score = pattern.calculate_score(&content_lower);
+            pattern_scores.insert(pattern.name.clone(), score);
+        }
+
+        TypingAnalysis {
+            dominant_pattern: pattern_scores
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(k, _)| k.clone()),
+            pattern_scores,
+            complexity_score: self.calculate_complexity(&content_lower),
+            naturalness_indicators: self.extract_naturalness_indicators(&content_lower),
+        }
+    }
+
+    /// Calculate content complexity
+    fn calculate_complexity(&self, content: &str) -> f32 {
+        let word_count = content.split_whitespace().count();
+        let avg_word_length = content.split_whitespace().map(|w| w.len()).sum::<usize>() as f32
+            / word_count.max(1) as f32;
+
+        let sentence_count = content.matches('.').count()
+            + content.matches('!').count()
+            + content.matches('?').count();
+
+        let avg_sentence_length = word_count as f32 / sentence_count.max(1) as f32;
+
+        // Normalize complexity factors
+        let word_complexity = (avg_word_length / 8.0).min(1.0);
+        let sentence_complexity = (avg_sentence_length / 20.0).min(1.0);
+
+        (word_complexity + sentence_complexity) / 2.0
+    }
+
+    /// Extract naturalness indicators
+    fn extract_naturalness_indicators(&self, content: &str) -> Vec<String> {
+        let mut indicators = Vec::new();
+
+        if content.contains("um") || content.contains("uh") || content.contains("er") {
+            indicators.push("hesitation_markers".to_string());
+        }
+
+        if content.matches("...").count() > 0 {
+            indicators.push("ellipsis_pauses".to_string());
+        }
+
+        if content.matches("!").count() > content.matches(".").count() {
+            indicators.push("exclamatory".to_string());
+        }
+
+        if content.contains("?") {
+            indicators.push("questioning".to_string());
+        }
+
+        indicators
+    }
+}
+
+/// Individual typing pattern
+#[derive(Debug, Clone)]
+pub struct TypingPattern {
+    /// Pattern name
+    pub name: String,
+    /// Keywords associated with this pattern
+    pub keywords: Vec<String>,
+    /// Base complexity score
+    pub complexity: f32,
+}
+
+impl TypingPattern {
+    /// Create a new typing pattern
+    pub fn new(name: &str, keywords: Vec<&str>, complexity: f32) -> Self {
+        Self {
+            name: name.to_string(),
+            keywords: keywords.iter().map(|s| s.to_string()).collect(),
+            complexity,
+        }
+    }
+
+    /// Calculate pattern match score for content
+    pub fn calculate_score(&self, content: &str) -> f32 {
+        let word_count = content.split_whitespace().count();
+        if word_count == 0 {
+            return 0.0;
+        }
+
+        let matches = self
+            .keywords
+            .iter()
+            .map(|keyword| content.matches(keyword).count())
+            .sum::<usize>();
+
+        (matches as f32 / word_count as f32) * self.complexity
+    }
+}
+
+/// Analysis results for typing patterns
+#[derive(Debug, Clone)]
+pub struct TypingAnalysis {
+    /// Dominant typing pattern detected
+    pub dominant_pattern: Option<String>,
+    /// Scores for all patterns
+    pub pattern_scores: std::collections::HashMap<String, f32>,
+    /// Overall complexity score
+    pub complexity_score: f32,
+    /// Naturalness indicators
+    pub naturalness_indicators: Vec<String>,
+}
+
+// ================================================================================================
+// ERROR HANDLING TYPES
+// ================================================================================================
+
+/// Stream error information
+#[derive(Debug, Clone)]
+pub struct StreamError {
+    /// Error type
+    pub error_type: StreamErrorType,
+    /// Error message
+    pub message: String,
+    /// Error severity
+    pub severity: ErrorSeverity,
+    /// Timestamp when error occurred
+    pub timestamp: Instant,
+    /// Recovery strategy
+    pub recovery_strategy: Option<RecoveryStrategy>,
+    /// Error context
+    pub context: std::collections::HashMap<String, String>,
+}
+
+/// Types of streaming errors
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamErrorType {
+    ConnectionLost,
+    BufferOverflow,
+    BufferUnderflow,
+    TimeoutError,
+    NetworkError,
+    ProcessingError,
+    ConfigurationError,
+    ResourceExhaustion,
+    QualityDegradation,
+    SecurityViolation,
+}
+
+/// Error severity levels
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub enum ErrorSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Recovery strategies for different error types
+#[derive(Debug, Clone)]
+pub enum RecoveryStrategy {
+    Retry,
+    Reconnect,
+    BufferAdjustment,
+    QualityReduction,
+    Fallback,
+    Restart,
+    GracefulShutdown,
+}
+
+// ================================================================================================
+// FLOW CONTROL TYPES
+// ================================================================================================
+
+/// Pressure levels for backpressure management
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub enum PressureLevel {
+    None = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
+    Critical = 4,
+}
+
+/// Flow control actions
+#[derive(Debug, Clone)]
+pub enum FlowAction {
+    IncreaseRate(f32),
+    DecreaseRate(f32),
+    PauseFlow,
+    ResumeFlow,
+    BufferDrain,
+    QualityAdjustment(f32),
+}
+
+// ================================================================================================
+// INTERNAL MANAGER TYPES
+//
+// `ErrorRecoveryManager` and `QualityAnalyzer` here are the versions actually
+// used internally by `coordinator.rs`/`chunking.rs`/`state_management.rs`
+// (each pulls this module in via `use super::types::*;`, with no local
+// struct of the same name to shadow it). This is distinct from the
+// same-named `QualityAnalyzer` re-exported from `quality_analyzer.rs` at
+// `streaming::QualityAnalyzer` in `mod.rs`'s public surface — an existing
+// naming collision predating this cleanup pass, out of scope to unify here.
+// The other manager structs that used to live in this section
+// (StreamingCoordinator, ResponseChunker, TypingSimulator, StreamStateManager,
+// BackpressureController, ConversationalStreamingPipeline, StreamingManager)
+// were unused duplicates of the real types owned by their dedicated files
+// and have been removed.
+// ================================================================================================
+
+/// Error recovery manager for handling streaming failures
+#[derive(Debug)]
+pub struct ErrorRecoveryManager {
+    /// Recovery strategies mapping
+    strategies: std::collections::HashMap<StreamErrorType, Vec<RecoveryStrategy>>,
+    /// Recovery attempt tracking
+    recovery_attempts: Arc<RwLock<std::collections::HashMap<StreamErrorType, usize>>>,
+    /// Maximum recovery attempts
+    max_attempts: usize,
+}
+
+impl Default for ErrorRecoveryManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ErrorRecoveryManager {
+    pub fn new() -> Self {
+        Self {
+            strategies: std::collections::HashMap::new(),
+            recovery_attempts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            max_attempts: 3,
+        }
+    }
+
+    /// Recovery strategies configured for each error type.
+    pub fn strategies(&self) -> &std::collections::HashMap<StreamErrorType, Vec<RecoveryStrategy>> {
+        &self.strategies
+    }
+
+    /// Shared, async-lockable recovery-attempt counters per error type.
+    pub fn recovery_attempts(
+        &self,
+    ) -> &Arc<RwLock<std::collections::HashMap<StreamErrorType, usize>>> {
+        &self.recovery_attempts
+    }
+
+    /// Maximum recovery attempts allowed before giving up on an error.
+    pub fn max_attempts(&self) -> usize {
+        self.max_attempts
+    }
+}
+
+/// Quality analyzer for streaming performance
+#[derive(Debug)]
+pub struct QualityAnalyzer {
+    /// Quality metrics window
+    metrics_window: Arc<RwLock<VecDeque<QualityMeasurement>>>,
+    /// Window size
+    window_size: usize,
+    /// Quality thresholds
+    pub thresholds: QualityThresholds,
+}
+
+impl Default for QualityAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QualityAnalyzer {
+    /// Create a new quality analyzer
+    pub fn new() -> Self {
+        Self {
+            metrics_window: Arc::new(RwLock::new(VecDeque::with_capacity(100))),
+            window_size: 100,
+            thresholds: QualityThresholds::default(),
+        }
+    }
+
+    /// Get metrics window for external access
+    pub fn metrics_window(&self) -> &Arc<RwLock<VecDeque<QualityMeasurement>>> {
+        &self.metrics_window
+    }
+
+    /// Get window size
+    pub fn window_size(&self) -> usize {
+        self.window_size
+    }
+
+    /// Get quality thresholds
+    pub fn thresholds(&self) -> &QualityThresholds {
+        &self.thresholds
+    }
+}
+
+// ================================================================================================
+// TESTS
+// ================================================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- AdvancedStreamingConfig tests ---
+
+    #[test]
+    fn test_advanced_streaming_config_default_values() {
+        let config = AdvancedStreamingConfig::default();
+        assert!(
+            config.max_chunk_size > config.min_chunk_size,
+            "max_chunk_size ({}) should exceed min_chunk_size ({})",
+            config.max_chunk_size,
+            config.min_chunk_size
+        );
+        assert!(
+            config.base_typing_speed > 0.0,
+            "base_typing_speed should be positive"
+        );
+        assert!(
+            config.speed_variation >= 0.0 && config.speed_variation <= 1.0,
+            "speed_variation must be in [0.0, 1.0]"
+        );
+        assert!(
+            config.max_buffer_size > 0,
+            "max_buffer_size should be positive"
+        );
+        assert!(
+            config.max_retry_attempts > 0,
+            "max_retry_attempts should be positive"
+        );
+    }
+
+    #[test]
+    fn test_advanced_streaming_config_chunk_size_validation() {
+        let mut config = AdvancedStreamingConfig::default();
+        config.max_chunk_size = 100;
+        config.min_chunk_size = 10;
+        assert!(
+            config.min_chunk_size < config.max_chunk_size,
+            "ChunkSize invariant: min < max must hold"
+        );
+    }
+
+    // --- StreamChunk tests ---
+
+    #[test]
+    fn test_stream_chunk_construction() {
+        let chunk = StreamChunk {
+            content: "hello world".to_string(),
+            index: 3,
+            chunk_type: ChunkType::Content,
+            timing: ChunkTiming::default(),
+            metadata: ChunkMetadata::default(),
+        };
+        assert_eq!(chunk.content, "hello world");
+        assert_eq!(chunk.index, 3);
+        assert_eq!(chunk.chunk_type, ChunkType::Content);
+    }
+
+    #[test]
+    fn test_stream_chunk_content_field() {
+        let text = "This is the token text content";
+        let chunk = StreamChunk {
+            content: text.to_string(),
+            index: 0,
+            chunk_type: ChunkType::Sentence,
+            timing: ChunkTiming::default(),
+            metadata: ChunkMetadata::default(),
+        };
+        assert_eq!(chunk.content, text);
+    }
+
+    #[test]
+    fn test_stream_chunk_index_field() {
+        for i in 0..5usize {
+            let chunk = StreamChunk {
+                content: "test".to_string(),
+                index: i,
+                chunk_type: ChunkType::Content,
+                timing: ChunkTiming::default(),
+                metadata: ChunkMetadata::default(),
+            };
+            assert_eq!(
+                chunk.index, i,
+                "chunk index should match construction value"
+            );
+        }
+    }
+
+    // --- ChunkType tests ---
+
+    #[test]
+    fn test_chunk_type_equality() {
+        assert_eq!(ChunkType::Content, ChunkType::Content);
+        assert_eq!(ChunkType::Sentence, ChunkType::Sentence);
+        assert_ne!(ChunkType::Content, ChunkType::Sentence);
+        assert_ne!(ChunkType::Adaptive, ChunkType::Semantic);
+    }
+
+    // --- ChunkTiming tests ---
+
+    #[test]
+    fn test_chunk_timing_default() {
+        let timing = ChunkTiming::default();
+        assert_eq!(timing.delay_ms, 50, "default delay_ms should be 50");
+        assert_eq!(timing.pause_ms, 0, "default pause_ms should be 0");
+        assert!(
+            (timing.timing_factor - 1.0).abs() < 1e-6,
+            "default timing_factor should be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_chunk_timing_with_pause() {
+        let timing = ChunkTiming::with_pause(200);
+        assert_eq!(
+            timing.pause_ms, 200,
+            "with_pause should set pause_ms to 200"
+        );
+        assert_eq!(timing.delay_ms, 50);
+    }
+
+    #[test]
+    fn test_chunk_timing_adaptive_low_complexity() {
+        let timing = ChunkTiming::adaptive(0.1);
+        assert!(timing.delay_ms > 0, "adaptive delay_ms should be positive");
+        assert_eq!(timing.pause_ms, 0, "low complexity should not add pause");
+    }
+
+    #[test]
+    fn test_chunk_timing_adaptive_high_complexity() {
+        let timing = ChunkTiming::adaptive(0.9);
+        assert!(
+            timing.delay_ms > 0,
+            "adaptive delay_ms should be positive for high complexity"
+        );
+        assert!(
+            timing.pause_ms > 0,
+            "high complexity should add pause_ms > 0"
+        );
+    }
+
+    #[test]
+    fn test_chunk_timing_adaptive_factor_increases_with_complexity() {
+        let low_timing = ChunkTiming::adaptive(0.0);
+        let high_timing = ChunkTiming::adaptive(1.0);
+        assert!(
+            high_timing.timing_factor >= low_timing.timing_factor,
+            "timing_factor should increase with complexity"
+        );
+    }
+
+    // --- ChunkMetadata tests ---
+
+    #[test]
+    fn test_chunk_metadata_default() {
+        let meta = ChunkMetadata::default();
+        assert!(
+            meta.complexity >= 0.0 && meta.complexity <= 1.0,
+            "default complexity must be in [0.0, 1.0]"
+        );
+        assert!(
+            meta.importance >= 0.0 && meta.importance <= 1.0,
+            "default importance must be in [0.0, 1.0]"
+        );
+    }
+
+    #[test]
+    fn test_chunk_metadata_with_complexity() {
+        let meta = ChunkMetadata::with_complexity(0.75);
+        assert!(
+            (meta.complexity - 0.75).abs() < 1e-6,
+            "with_complexity should set complexity to 0.75"
+        );
+        assert!(
+            !meta.quality_indicators.is_empty(),
+            "with_complexity should populate quality_indicators"
+        );
+    }
+
+    #[test]
+    fn test_chunk_metadata_semantic() {
+        let meta = ChunkMetadata::semantic();
+        assert!(
+            !meta.quality_indicators.is_empty(),
+            "semantic metadata should have quality indicators"
+        );
+        assert!(
+            !meta.processing_hints.is_empty(),
+            "semantic metadata should have processing hints"
+        );
+    }
+
+    // --- BufferState tests ---
+
+    #[test]
+    fn test_buffer_state_capacity_invariant() {
+        let state = BufferState {
+            current_size: 300,
+            max_size: 1000,
+            utilization: 0.3,
+            pending_chunks: 5,
+        };
+        assert!(
+            state.current_size <= state.max_size,
+            "current_size ({}) should not exceed max_size ({})",
+            state.current_size,
+            state.max_size
+        );
+    }
+
+    #[test]
+    fn test_buffer_state_utilization_in_range() {
+        let state = BufferState {
+            current_size: 500,
+            max_size: 1000,
+            utilization: 0.5,
+            pending_chunks: 10,
+        };
+        assert!(
+            state.utilization >= 0.0 && state.utilization <= 1.0,
+            "buffer utilization must be in [0.0, 1.0]"
+        );
+    }
+
+    // --- StreamState tests ---
+
+    #[test]
+    fn test_stream_state_default() {
+        let state = StreamState::default();
+        assert_eq!(
+            state.connection,
+            StreamConnection::Connecting,
+            "default connection state should be Connecting"
+        );
+        assert_eq!(
+            state.buffer.current_size, 0,
+            "default buffer should be empty"
+        );
+        assert!(
+            state.error_info.is_none(),
+            "default state should have no error_info"
+        );
+    }
+
+    #[test]
+    fn test_stream_connection_idle_to_streaming_transition() {
+        // Test enum transitions via equality
+        assert_ne!(StreamConnection::Connecting, StreamConnection::Connected);
+        assert_ne!(StreamConnection::Connected, StreamConnection::Streaming);
+        assert_ne!(StreamConnection::Streaming, StreamConnection::Disconnected);
+    }
+
+    #[test]
+    fn test_stream_connection_error_holds_message() {
+        let conn = StreamConnection::Error("test error message".to_string());
+        if let StreamConnection::Error(msg) = &conn {
+            assert_eq!(msg, "test error message");
+        } else {
+            panic!("Expected Error variant");
+        }
+    }
+
+    // --- StreamingMetrics tests ---
+
+    #[test]
+    fn test_streaming_metrics_default() {
+        let metrics = StreamingMetrics::default();
+        assert_eq!(metrics.total_chunks, 0);
+        assert_eq!(metrics.bytes_streamed, 0);
+        assert_eq!(metrics.error_count, 0);
+        assert_eq!(metrics.retry_count, 0);
+        assert_eq!(metrics.buffer_utilization, 0.0);
+    }
+
+    // --- StreamingQuality tests (types.rs version) ---
+
+    #[test]
+    fn test_streaming_quality_types_default_all_ones() {
+        let quality = StreamingQuality::default();
+        assert!((quality.smoothness - 1.0).abs() < 1e-6);
+        assert!((quality.naturalness - 1.0).abs() < 1e-6);
+        assert!((quality.responsiveness - 1.0).abs() < 1e-6);
+        assert!((quality.coherence - 1.0).abs() < 1e-6);
+        assert!((quality.overall_quality - 1.0).abs() < 1e-6);
+    }
+
+    // --- QualityThresholds (types.rs version) ---
+
+    #[test]
+    fn test_quality_thresholds_types_min_responsiveness_higher() {
+        let thresholds = QualityThresholds::default();
+        assert!(
+            thresholds.min_responsiveness >= thresholds.min_naturalness,
+            "responsiveness threshold ({}) should be >= naturalness threshold ({})",
+            thresholds.min_responsiveness,
+            thresholds.min_naturalness
+        );
+    }
+
+    // --- PressureLevel tests ---
+
+    #[test]
+    fn test_pressure_level_ordering() {
+        assert!(PressureLevel::None < PressureLevel::Low);
+        assert!(PressureLevel::Low < PressureLevel::Medium);
+        assert!(PressureLevel::Medium < PressureLevel::High);
+        assert!(PressureLevel::High < PressureLevel::Critical);
+    }
+
+    #[test]
+    fn test_pressure_level_equality() {
+        assert_eq!(PressureLevel::None, PressureLevel::None);
+        assert_ne!(PressureLevel::None, PressureLevel::Critical);
+    }
+
+    // --- FlowState tests ---
+
+    #[test]
+    fn test_flow_state_default() {
+        let state = FlowState::default();
+        assert!(
+            state.flow_rate > 0.0,
+            "default flow_rate should be positive"
+        );
+        assert!(
+            state.target_rate > 0.0,
+            "default target_rate should be positive"
+        );
+        assert_eq!(state.buffer_fill, 0.0, "default buffer_fill should be 0.0");
+        assert!(
+            state.actions_taken.is_empty(),
+            "default actions_taken should be empty"
+        );
+    }
+
+    // --- StreamingSession tests ---
+
+    #[test]
+    fn test_streaming_session_new() {
+        let config = StreamingConfig::default();
+        let session = StreamingSession::new(config);
+        assert!(
+            !session.session_id.is_empty(),
+            "session_id should not be empty"
+        );
+        assert!(
+            matches!(session.state, StreamingState::NotStarted),
+            "new session should be in NotStarted state"
+        );
+        assert!(
+            session.end_time.is_none(),
+            "new session should have no end_time"
+        );
+        assert!(session.stats.is_none(), "new session should have no stats");
+    }
+
+    #[test]
+    fn test_streaming_session_complete() {
+        let config = StreamingConfig::default();
+        let mut session = StreamingSession::new(config);
+        let stats = StreamingStats {
+            total_chunks: 10,
+            total_characters: 500,
+            total_words: 80,
+            avg_chunk_size: 50.0,
+            estimated_duration_seconds: 2.5,
+        };
+        session.complete(stats.clone());
+        assert!(
+            matches!(session.state, StreamingState::Completed),
+            "completed session should be in Completed state"
+        );
+        assert!(
+            session.end_time.is_some(),
+            "completed session should have end_time"
+        );
+        let session_stats = session.stats.as_ref().expect("completed session should have stats");
+        assert_eq!(session_stats.total_chunks, 10);
+    }
+}

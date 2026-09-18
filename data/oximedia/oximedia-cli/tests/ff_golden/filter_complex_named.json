@@ -1,0 +1,9 @@
+{
+  "name": "filter_complex_named",
+  "args": ["-i", "in.mp4", "-i", "logo.png", "-filter_complex", "[0:v]scale=1920:1080[bg];[bg][1:v]overlay=10:10[out]", "-map", "[out]", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "map": 1
+  }
+}

@@ -1,0 +1,73 @@
+[package]
+name = "celers-backend-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Database (PostgreSQL/MySQL) result backend for CeleRS"
+readme = "README.md"
+keywords = ["celery", "database", "backend", "postgresql", "mysql"]
+categories = ["asynchronous", "database"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+# SQL clients (OxiSQL, Pure Rust) supporting both PostgreSQL and MySQL.
+#
+# `oxisql-postgres`/`oxisql-mysql` are `optional = true`, each tied to this
+# crate's own `postgres`/`mysql` feature (see [features] below) via
+# `dep:oxisql-postgres`/`dep:oxisql-mysql`. Every Postgres-only item
+# (`PostgresResultBackend`, `PostgresAnalytics`, the `event_persistence` and
+# `lock` modules, ...) is behind `#[cfg(feature = "postgres")]`, and every
+# MySQL-only item (`MysqlResultBackend`, `MysqlAnalytics`) is behind
+# `#[cfg(feature = "mysql")]` — selecting only one of the two features
+# excludes the other backend's entire dependency tree (compile time, binary
+# size, dependency surface) rather than compiling and linking it
+# unconditionally regardless of selection, as this crate did before. `default
+# = ["postgres", "mysql"]` keeps both enabled unless a consumer explicitly
+# opts out with `default-features = false`, so this is purely additive: no
+# existing caller (all of which rely on the default) sees any change.
+oxisql-core = { workspace = true }
+oxisql-postgres = { workspace = true, optional = true }
+oxisql-mysql = { workspace = true, optional = true }
+oxitls = { workspace = true }
+rustls = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
+# Encodes the compressed-result envelope's bytes as base64 text so
+# `result_data` -- a native JSON/JSONB column -- never holds anything but
+# valid JSON. See `result_compression.rs`.
+base64 = { workspace = true }
+
+# Core protocol
+celers-core = { workspace = true }
+celers-protocol = { workspace = true }
+
+# Re-export types from backend-redis for trait compatibility
+celers-backend-redis = { workspace = true }
+
+[features]
+default = ["postgres", "mysql"]
+postgres = ["dep:oxisql-postgres"]
+mysql = ["dep:oxisql-mysql"]
+# Distributed-lock backend (`DbLockBackend`); also requires `postgres`
+# (the `lock` module hardcodes `oxisql_postgres::PgConnection`) — see its
+# `#[cfg(all(feature = "distributed-locks", feature = "postgres"))]` gate.
+distributed-locks = []
+
+[dev-dependencies]
+# `tokio::time::pause`/`advance` (used by the deterministic, no-sleep
+# background-flush-ticker test in `event_persistence.rs`) live behind
+# tokio's `test-util` feature, which the workspace's `full`-feature `tokio`
+# dependency does not enable — added here (dev-only) rather than on the
+# main `[dependencies]` entry so it never reaches a non-test build.
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,187 @@
+# OxiPhysics PyPI Publishing Workflow
+# Author: COOLJAPAN OU (Team Kitasan)
+# License: Apache-2.0
+#
+# Builds the oxiphysics Python wheels and sdist and publishes them to PyPI
+#
+# Triggers:
+#   - push of a v* tag: build everything, then publish to PyPI.
+#   - workflow_dispatch: always builds everything; uploads to PyPI only when
+#     publish_target = pypi (publish_target = none is a build-only dry run).
+#     version_tag, when given, selects the tag that is built; otherwise the
+#     ref the run was dispatched on is built.
+#
+# Uses OIDC trusted publishing (id-token: write)
+
+name: PyPI Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_target:
+        description: 'Publish target (none = build wheels only, nothing is uploaded)'
+        required: true
+        default: 'pypi'
+        type: choice
+        options:
+          - pypi
+          - none
+      version_tag:
+        description: 'Tag to build and publish (e.g., v0.1.0); empty = the ref this run was dispatched on'
+        required: false
+        type: string
+
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Exact maturin release tag passed to every PyO3/maturin-action step. It must be
+  # a full release (vMAJOR.MINOR.PATCH): the action downloads exactly that GitHub
+  # release, and a partial version such as "1.8" is not a release tag. Keep it
+  # inside the maturin range required by crates/oxiphysics-python/pyproject.toml.
+  MATURIN_VERSION: "v1.15.0"
+  PYTHON_PACKAGE: "oxiphysics"
+
+jobs:
+  linux:
+    name: Build Linux wheels (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version_tag || github.ref }}
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: auto
+          working-directory: crates/oxiphysics-python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: crates/oxiphysics-python/dist
+
+  macos:
+    name: Build macOS wheels (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version_tag || github.ref }}
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          working-directory: crates/oxiphysics-python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: crates/oxiphysics-python/dist
+
+  windows:
+    name: Build Windows wheels
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version_tag || github.ref }}
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          working-directory: crates/oxiphysics-python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: crates/oxiphysics-python/dist
+
+  sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version_tag || github.ref }}
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          command: sdist
+          args: --out dist
+          working-directory: crates/oxiphysics-python
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: crates/oxiphysics-python/dist
+
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [linux, macos, windows, sdist]
+    # Upload only for a v* tag push or when a manual run explicitly asks for it
+    # (publish_target = pypi). publish_target = none stays a dry run: every wheel
+    # and the sdist are still built, nothing is uploaded.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.publish_target == 'pypi')
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/project/oxiphysics/
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: List distributions
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+      - name: Verify PyPI upload
+        run: |
+          sleep 30
+          pip index versions ${{ env.PYTHON_PACKAGE }} || echo "Package may still be indexing..."

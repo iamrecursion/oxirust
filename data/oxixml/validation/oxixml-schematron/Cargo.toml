@@ -1,0 +1,27 @@
+[package]
+name = "oxixml-schematron"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "ISO Schematron rule-based validation (replaces Xerces/Saxon Schematron)."
+keywords = ["schematron", "xml", "validation", "svrl", "xpath"]
+categories = ["parser-implementations", "text-processing", "data-structures"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-xml = { workspace = true }
+oxixml-qname = { workspace = true }
+oxixml-infoset = { workspace = true }
+oxixml-xpath = { workspace = true }
+
+[lints]
+workspace = true

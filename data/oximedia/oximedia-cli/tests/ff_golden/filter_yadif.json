@@ -1,0 +1,9 @@
+{
+  "name": "filter_yadif",
+  "args": ["-i", "in.mkv", "-vf", "yadif", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_filters": 1
+  }
+}

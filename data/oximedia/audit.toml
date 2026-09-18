@@ -1,0 +1,53 @@
+# cargo-deny advisory ignore list (used by `cargo deny check advisories`)
+# Note: cargo-audit reads .cargo/audit.toml (not this file) — see .cargo/audit.toml.
+#
+# All ignored advisories are transitive dependencies; none are directly invoked
+# by OxiMedia code. Each entry documents the rationale and fix path.
+
+[[advisories.ignore]]
+id = "RUSTSEC-2023-0071"
+reason = "Transitive via sqlx-mysql (rsa 0.9.10, Marvin Attack timing side-channel). OxiMedia uses PostgreSQL/SQLite only; the MySQL RSA handshake code path is never executed. No fixed version of rsa is available upstream. Will resolve when sqlx provides a fix or when rsa publishes a patched release."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2024-0384"
+reason = "Transitive via parking_lot/reed-solomon-erasure (instant 0.1.x unmaintained). No upstream fix available yet. Will resolve when reed-solomon-erasure updates its dependency tree."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2024-0436"
+reason = "Transitive dependency uses paste 1.0.x (unmaintained). No security impact — paste is a proc-macro utility with no runtime attack surface. Will update when upstream crates migrate."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2025-0124"
+reason = "Transitive via google-cloud-auth (rand_os 0.1.x unmaintained). rand_os is a legacy rand backend not directly used. Will resolve when google-cloud-auth updates its rand dependency chain."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2025-0134"
+reason = "Transitive dependency via oximedia-farm (rustls-pemfile 2.x unmaintained). No direct usage by OxiMedia code. Upstream fix pending; will be resolved when the cert-parsing crate is updated."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0097"
+reason = "Transitive via multiple crates using rand 0.7/0.8/0.9/0.10 (unsound on certain platforms). OxiMedia's direct code paths use getrandom/rand_core; the affected rand APIs are in transitive deps only. Will resolve as upstream crates migrate to rand 0.11+."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0098"
+reason = "Transitive via aws-sdk-* → aws-smithy-http-client → hyper-rustls → tokio-rustls → rustls 0.21.12 → rustls-webpki 0.101.7 (URI SAN name constraints not validated correctly). No Cargo.toml-only upgrade path exists: aws-smithy-runtime 1.1.12's only newer-rustls feature (default-https-client) requires aws-lc-sys C dependency (explicitly avoided per COOLJAPAN Pure Rust policy). OxiMedia S3/cloud calls use standard DNS names only; URI SAN handling is never exercised. Will resolve when AWS SDK migrates to rustls 0.23+."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0099"
+reason = "Transitive via the same aws-sdk-* → rustls-webpki 0.101.7 chain as RUSTSEC-2026-0098. Wildcard-name certificate constraints are not relied upon by OxiMedia code. Will resolve when AWS SDK upgrades its rustls stack."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0104"
+reason = "Transitive via aws-sdk-* → aws-smithy-runtime/tls-rustls → legacy-rustls-ring → rustls 0.21.12 → rustls-webpki 0.101.7 (reachable panic in CRL parsing). OxiMedia S3/cloud calls never perform certificate revocation list checks; the affected code path is unreachable. No Cargo.toml-only fix exists: the newer-rustls path requires aws-lc-sys (C dependency, excluded per COOLJAPAN Pure Rust policy). The workspace already uses rustls-webpki 0.103.13 via reqwest/hyper-rustls. Will resolve when AWS SDK migrates aws-smithy-runtime to rustls 0.23+."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0049"
+reason = "Transitive via rustls-rustcrypto 0.0.2-alpha (pinned '^0.102.0') → rustls-webpki 0.102.8, reachable only through oximedia-drm's non-default widevine/playready/fairplay feature flags (default feature is 'clearkey' only; rustls-rustcrypto is the Pure-Rust TLS crypto provider for DRM license-server RPC). The advisory is a faulty CRL-Distribution-Point authoritative-matching bug in webpki's certificate revocation list (CRL) verification path; oximedia-drm never constructs a `webpki::CertRevocationList` / rustls `with_crls(..)` and performs no TLS CRL checking anywhere in widevine_rpc.rs, playready_rpc.rs, or fairplay_rpc.rs (verified via grep — zero matches), so the vulnerable code path is unreachable. No Cargo.toml-only fix exists: 0.102.8 is the newest release in the 0.102.x branch (fix requires webpki >=0.103.10) and rustls-rustcrypto 0.0.2-alpha (the latest published release) hard-pins '^0.102.0', so bumping requires a new upstream rustls-rustcrypto release or a root Cargo.toml migration away from it. Will resolve when rustls-rustcrypto publishes a release depending on rustls-webpki >=0.103.10."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0174"
+reason = "Notice (not a scored vulnerability) via azure_core 0.21.0 → http-types 2.12.0 (Authorization::value / WwwAuthenticate::value can violate ASCII invariants). OxiMedia code never calls http-types' Authorization/WwwAuthenticate constructors directly — Azure Blob Storage auth headers are built internally by azure_core from operator-configured storage-account keys/SAS tokens, not from arbitrary user-controlled strings. No fixed version exists upstream: 2.12.0 is http-types' latest published release on crates.io, so no cargo update (patch or otherwise) can clear this. Will resolve when azure_core migrates off http-types or http-types publishes a fix."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0192"
+reason = "Unmaintained-crate notice (not a scored vulnerability) for ttf-parser, reachable via two independent chains: fontdue 0.9.3 → ttf-parser 0.21.1 (oximedia-subtitle/graphics/graph font rasterization) and usvg/rustybuzz/owned_ttf_parser/fontdb → ttf-parser 0.25.1 (oximedia-graphics SVG/glyph rendering via resvg/ab_glyph). Both are the newest releases in their respective semver-compatible branches (fontdue tops out at 0.9.3, ab_glyph at 0.2.32, usvg at 0.47.0 — verified via crates.io index; no compatible patch exists), so no lockfile-only fix is possible; a fix requires the font-rendering member crates to adopt fontdue/ab_glyph/usvg majors that depend on a maintained ttf-parser fork, which is a Cargo.toml dependency-graph change outside audit.toml/Cargo.lock scope. OxiMedia's font-parsing inputs are application-supplied font assets (subtitle rendering, SVG overlays), not attacker-controlled network input, so exposure is limited to local/trusted asset pipelines. Will resolve when fontdue/resvg's dependency chain moves to a maintained ttf-parser release."

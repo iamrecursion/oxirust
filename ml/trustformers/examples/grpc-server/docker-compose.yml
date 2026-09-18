@@ -1,0 +1,47 @@
+# Runs the gRPC server built from `examples/grpc-server/Dockerfile`.
+#
+# There is no Prometheus/Grafana stack here: the server has no HTTP metrics
+# endpoint to scrape, so the `monitoring` profile that used to sit in this file
+# pointed a scraper at a URL that does not exist and mounted a `prometheus.yml`
+# and a `grafana/` directory that were never part of the repository.
+# Per-response latency and throughput are returned inline on the
+# `PredictMetrics` / `BatchMetrics` messages instead.
+
+services:
+  grpc-server:
+    build:
+      context: ../..
+      dockerfile: examples/grpc-server/Dockerfile
+    ports:
+      - "50051:50051"
+    environment:
+      - RUST_LOG=info,trustformers_grpc_server=debug
+      # Read by src/main.rs; see the table at the top of that file.
+      - GRPC_PORT=50051
+      - MAX_MODELS=10
+      - DEFAULT_DEVICE=cpu
+    volumes:
+      # Mount local model cache. Paths passed as `LoadModelRequest.model_path`
+      # are resolved inside the container, so point them at /models.
+      - ./models:/models
+    healthcheck:
+      # A TCP liveness probe, not a gRPC health check: it proves the listener is
+      # up, not that a model is loaded. The server does implement
+      # `grpc.health.v1.Health`, which `grpc_health_probe` or grpcurl can query.
+      test: ["CMD", "nc", "-z", "localhost", "50051"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # Interactive gRPC browser, off unless `--profile debug` is passed.
+  grpcui:
+    image: fullstorydev/grpcui:latest
+    ports:
+      - "8080:8080"
+    command: ["-plaintext", "-port", "8080", "grpc-server:50051"]
+    depends_on:
+      - grpc-server
+    profiles:
+      - debug

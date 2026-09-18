@@ -1,0 +1,1045 @@
+//! ZIP archive reader implementation.
+
+use super::super::crypto::{ENCRYPTION_HEADER_SIZE, ZipCrypto};
+use super::super::encryption::{
+    AesExtraField, PASSWORD_VERIFICATION_LEN, WINZIP_AUTH_CODE_LEN, ZipAesDecryptor,
+};
+use super::super::name_codec;
+use super::types::{
+    CENTRAL_DIR_HEADER_SIG, CompressionMethod, DataDescriptor, END_OF_CENTRAL_DIR_SIG,
+    FLAG_DATA_DESCRIPTOR, FLAG_EFS, LOCAL_FILE_HEADER_SIG, LocalFileHeader,
+    ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG, ZIP64_EXTRA_FIELD_ID, ZIP64_MARKER_32, append_entry_meta,
+    dos_date_time_to_system_time, entry_dos_mtime, entry_gp_flags, get_entry_aes_encryption_info,
+    is_entry_encrypted, is_entry_traditional_encrypted,
+};
+use crate::lenient::{LenientWarning, LenientWarningKind};
+use oxiarc_core::entry::CompressionMethod as CoreMethod;
+use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
+use oxiarc_core::{Crc32, Entry, EntryType, FileAttributes};
+use oxiarc_deflate::inflate;
+use oxiarc_lzma::{LzmaProperties, decompress_raw as lzma_decompress_raw};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+
+/// ZIP archive reader.
+pub struct ZipReader<R: Read + Seek> {
+    reader: R,
+    entries: Vec<Entry>,
+    /// Raw (undecoded) name bytes of each entry, index-aligned with
+    /// [`ZipReader::entries`]. Exposed via [`ZipReader::entry_name_bytes`].
+    raw_names: Vec<Vec<u8>>,
+    progress: Option<ProgressHandle>,
+    /// Monotonic counter for entries extracted (used with progress callbacks).
+    extract_index: u64,
+    /// When `true`, CRC-32 mismatches during extraction are recorded in
+    /// [`ZipReader::warnings`] instead of returning an error. Disabled
+    /// by default; toggle via [`ZipReader::lenient`].
+    lenient: bool,
+    /// Accumulated non-fatal warnings emitted while operating in
+    /// lenient mode.
+    warnings: Vec<LenientWarning>,
+}
+
+impl<R: Read + Seek> ZipReader<R> {
+    /// Create a new ZIP reader.
+    pub fn new(mut reader: R) -> Result<Self> {
+        let (entries, raw_names) = Self::read_entries(&mut reader)?;
+        Ok(Self {
+            reader,
+            entries,
+            raw_names,
+            progress: None,
+            extract_index: 0,
+            lenient: false,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Borrow the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Mutably borrow the underlying reader, e.g. to stream an entry's data
+    /// directly: seek to [`Entry::offset`] and read
+    /// [`Entry::compressed_size`] bytes. Its position is unspecified
+    /// afterwards; every `extract*` call seeks before reading.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Consume the archive, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
+    /// Attach a progress handle to this reader.
+    #[must_use]
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Enable or disable lenient-mode extraction.
+    ///
+    /// When enabled, CRC-32 mismatches during extraction are recorded
+    /// in [`ZipReader::warnings`] and the (possibly corrupted) payload
+    /// is returned to the caller anyway. When disabled (default), a
+    /// CRC-32 mismatch aborts the extraction with
+    /// [`OxiArcError::CrcMismatch`].
+    #[must_use]
+    pub fn lenient(mut self, enabled: bool) -> Self {
+        self.lenient = enabled;
+        self
+    }
+
+    /// Return the accumulated non-fatal warnings from lenient-mode
+    /// operations.
+    pub fn warnings(&self) -> &[LenientWarning] {
+        &self.warnings
+    }
+
+    /// Read exactly `len` bytes from `reader` at its current position, after
+    /// validating `len` against the number of bytes physically remaining in
+    /// the stream.
+    ///
+    /// ZIP header fields such as `compressed_size` are attacker-controlled.
+    /// Allocating `vec![0u8; header_field]` eagerly lets a tiny malicious
+    /// archive request a multi-GiB buffer. This helper rejects any request
+    /// larger than the bytes actually left in the stream (so the buffer can
+    /// never exceed the real file size) and uses `try_reserve_exact` so an
+    /// allocation failure surfaces as a recoverable error rather than an
+    /// abort.
+    fn read_bounded(reader: &mut R, len: usize) -> Result<Vec<u8>> {
+        let cur = reader.stream_position()?;
+        let end = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(cur))?;
+        let remaining = end.saturating_sub(cur);
+
+        if len as u64 > remaining {
+            return Err(OxiArcError::corrupted(
+                cur,
+                format!("declared size {len} exceeds {remaining} bytes remaining in archive"),
+            ));
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve_exact(len)
+            .map_err(|_| OxiArcError::corrupted(cur, format!("failed to allocate {len} bytes")))?;
+        buf.resize(len, 0);
+        reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Constant-time equality for two byte slices.
+    ///
+    /// Used for password-verification comparisons so that a timing side
+    /// channel cannot reveal how many leading bytes of an attacker-supplied
+    /// verifier matched the expected value. Runs in time proportional to the
+    /// input length regardless of where (or whether) the slices differ.
+    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        // Prevent the optimizer from short-circuiting the accumulation.
+        core::hint::black_box(diff) == 0
+    }
+
+    /// Read all entries from the archive, together with the raw
+    /// (undecoded) name bytes of each entry.
+    /// Uses the central directory for accurate metadata (handles data descriptors).
+    fn read_entries(reader: &mut R) -> Result<(Vec<Entry>, Vec<Vec<u8>>)> {
+        // Try to find and read from central directory first
+        if let Ok(result) = Self::read_from_central_directory(reader) {
+            return Ok(result);
+        }
+
+        // Fall back to scanning local headers
+        Self::read_from_local_headers(reader)
+    }
+
+    /// Read entries from the central directory (preferred method).
+    fn read_from_central_directory(reader: &mut R) -> Result<(Vec<Entry>, Vec<Vec<u8>>)> {
+        // Find end of central directory record
+        let file_size = reader.seek(SeekFrom::End(0))?;
+
+        // Search for EOCD signature (max comment is 65535 bytes)
+        let search_start = file_size.saturating_sub(65535 + 22);
+        reader.seek(SeekFrom::Start(search_start))?;
+
+        let mut buf = vec![0u8; (file_size - search_start) as usize];
+        reader.read_exact(&mut buf)?;
+
+        // Find EOCD signature (backwards)
+        let eocd_sig = END_OF_CENTRAL_DIR_SIG.to_le_bytes();
+        let eocd_offset = buf
+            .windows(4)
+            .rposition(|w| w == eocd_sig)
+            .ok_or_else(|| OxiArcError::invalid_header("End of central directory not found"))?;
+
+        let eocd_pos = search_start + eocd_offset as u64;
+
+        // Check for Zip64 EOCD locator
+        let (cd_offset, cd_size, total_entries) = if eocd_pos >= 20 {
+            reader.seek(SeekFrom::Start(eocd_pos - 20))?;
+            let mut locator_buf = [0u8; 20];
+            reader.read_exact(&mut locator_buf)?;
+
+            let locator_sig = u32::from_le_bytes([
+                locator_buf[0],
+                locator_buf[1],
+                locator_buf[2],
+                locator_buf[3],
+            ]);
+
+            if locator_sig == ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG {
+                // The Zip64 EOCD locator records the total number of disks
+                // (bytes 16-19). A single-file archive has exactly one disk;
+                // anything else is a spanned/multi-volume set this reader
+                // cannot reassemble.
+                let total_disks = u32::from_le_bytes([
+                    locator_buf[16],
+                    locator_buf[17],
+                    locator_buf[18],
+                    locator_buf[19],
+                ]);
+                if total_disks > 1 {
+                    return Err(OxiArcError::unsupported_method(
+                        "multi-volume/spanned ZIP archives",
+                    ));
+                }
+
+                // Zip64 EOCD locator found
+                let zip64_eocd_offset = u64::from_le_bytes([
+                    locator_buf[8],
+                    locator_buf[9],
+                    locator_buf[10],
+                    locator_buf[11],
+                    locator_buf[12],
+                    locator_buf[13],
+                    locator_buf[14],
+                    locator_buf[15],
+                ]);
+
+                // Read Zip64 EOCD
+                reader.seek(SeekFrom::Start(zip64_eocd_offset))?;
+                let mut zip64_eocd = [0u8; 56];
+                reader.read_exact(&mut zip64_eocd)?;
+
+                // Reject spanned archives: "number of this disk" (bytes 16-19)
+                // and "disk with the start of the central directory"
+                // (bytes 20-23) must both be zero for a single-file archive.
+                let zip64_this_disk = u32::from_le_bytes([
+                    zip64_eocd[16],
+                    zip64_eocd[17],
+                    zip64_eocd[18],
+                    zip64_eocd[19],
+                ]);
+                let zip64_disk_with_cd = u32::from_le_bytes([
+                    zip64_eocd[20],
+                    zip64_eocd[21],
+                    zip64_eocd[22],
+                    zip64_eocd[23],
+                ]);
+                if zip64_this_disk != 0 || zip64_disk_with_cd != 0 {
+                    return Err(OxiArcError::unsupported_method(
+                        "multi-volume/spanned ZIP archives",
+                    ));
+                }
+
+                let entries_count = u64::from_le_bytes([
+                    zip64_eocd[32],
+                    zip64_eocd[33],
+                    zip64_eocd[34],
+                    zip64_eocd[35],
+                    zip64_eocd[36],
+                    zip64_eocd[37],
+                    zip64_eocd[38],
+                    zip64_eocd[39],
+                ]);
+
+                let cd_size_64 = u64::from_le_bytes([
+                    zip64_eocd[40],
+                    zip64_eocd[41],
+                    zip64_eocd[42],
+                    zip64_eocd[43],
+                    zip64_eocd[44],
+                    zip64_eocd[45],
+                    zip64_eocd[46],
+                    zip64_eocd[47],
+                ]);
+
+                let cd_offset_64 = u64::from_le_bytes([
+                    zip64_eocd[48],
+                    zip64_eocd[49],
+                    zip64_eocd[50],
+                    zip64_eocd[51],
+                    zip64_eocd[52],
+                    zip64_eocd[53],
+                    zip64_eocd[54],
+                    zip64_eocd[55],
+                ]);
+
+                (cd_offset_64, cd_size_64, entries_count)
+            } else {
+                // Standard EOCD
+                Self::parse_standard_eocd(&buf[eocd_offset..])?
+            }
+        } else {
+            Self::parse_standard_eocd(&buf[eocd_offset..])?
+        };
+
+        // Bound the declared entry count against the physical archive size
+        // before allocating. Each central-directory record is at least 46
+        // bytes, so a `file_size`-byte archive can hold at most
+        // `file_size / 46` entries. A malicious or corrupt (Zip64) EOCD can
+        // otherwise claim up to `u64::MAX` entries and drive a multi-GiB
+        // capacity allocation at open time.
+        let max_plausible_entries = file_size / 46 + 1;
+        if total_entries > max_plausible_entries {
+            return Err(OxiArcError::corrupted(
+                cd_offset,
+                format!(
+                    "central directory declares {total_entries} entries but a \
+                     {file_size}-byte archive can hold at most {max_plausible_entries}"
+                ),
+            ));
+        }
+
+        // Read central directory entries
+        reader.seek(SeekFrom::Start(cd_offset))?;
+        let capacity = total_entries as usize;
+        let mut entries: Vec<Entry> = Vec::new();
+        entries.try_reserve(capacity).map_err(|_| {
+            OxiArcError::corrupted(
+                cd_offset,
+                format!("failed to reserve capacity for {capacity} central-directory entries"),
+            )
+        })?;
+        let mut raw_names: Vec<Vec<u8>> = Vec::new();
+        raw_names.try_reserve(capacity).map_err(|_| {
+            OxiArcError::corrupted(
+                cd_offset,
+                format!("failed to reserve capacity for {capacity} central-directory names"),
+            )
+        })?;
+
+        for _ in 0..total_entries {
+            let (entry, raw_name) = Self::read_central_dir_entry(reader)?;
+            entries.push(entry);
+            raw_names.push(raw_name);
+        }
+
+        // Validate we consumed the expected amount
+        let _expected_end = cd_offset + cd_size;
+
+        Ok((entries, raw_names))
+    }
+
+    /// Parse standard EOCD record.
+    fn parse_standard_eocd(buf: &[u8]) -> Result<(u64, u64, u64)> {
+        if buf.len() < 22 {
+            return Err(OxiArcError::invalid_header("EOCD too short"));
+        }
+
+        // Reject multi-volume / spanned archives. In a single-file archive the
+        // "number of this disk" (bytes 4-5) and "disk where the central
+        // directory starts" (bytes 6-7) are both zero. Any nonzero value means
+        // the archive is split across several volumes (e.g. `.z01` + `.zip`),
+        // which this reader cannot reassemble.
+        let number_of_this_disk = u16::from_le_bytes([buf[4], buf[5]]);
+        let disk_with_cd_start = u16::from_le_bytes([buf[6], buf[7]]);
+        if number_of_this_disk != 0 || disk_with_cd_start != 0 {
+            return Err(OxiArcError::unsupported_method(
+                "multi-volume/spanned ZIP archives",
+            ));
+        }
+
+        let total_entries = u16::from_le_bytes([buf[10], buf[11]]) as u64;
+        let cd_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as u64;
+        let cd_offset = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]) as u64;
+
+        Ok((cd_offset, cd_size, total_entries))
+    }
+
+    /// Read a single central directory entry, returning the entry and its
+    /// raw (undecoded) name bytes.
+    fn read_central_dir_entry(reader: &mut R) -> Result<(Entry, Vec<u8>)> {
+        let mut buf = [0u8; 46];
+        reader.read_exact(&mut buf)?;
+
+        let signature = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if signature != CENTRAL_DIR_HEADER_SIG {
+            return Err(OxiArcError::invalid_magic(
+                CENTRAL_DIR_HEADER_SIG.to_le_bytes().to_vec(),
+                signature.to_le_bytes().to_vec(),
+            ));
+        }
+
+        let flags = u16::from_le_bytes([buf[8], buf[9]]);
+        let method = CompressionMethod::from_u16(u16::from_le_bytes([buf[10], buf[11]]));
+        let mtime = u16::from_le_bytes([buf[12], buf[13]]);
+        let mdate = u16::from_le_bytes([buf[14], buf[15]]);
+        let crc32 = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let compressed_size = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+        let uncompressed_size = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+        let filename_len = u16::from_le_bytes([buf[28], buf[29]]) as usize;
+        let extra_len = u16::from_le_bytes([buf[30], buf[31]]) as usize;
+        let comment_len = u16::from_le_bytes([buf[32], buf[33]]) as usize;
+        let local_header_offset = u32::from_le_bytes([buf[42], buf[43], buf[44], buf[45]]);
+        // "Version made by" high byte = host system; external attributes
+        // carry Unix mode bits in their high half when that host is Unix (3)
+        // or macOS/Darwin (19), and the DOS attribute byte in the low byte.
+        let host_system = buf[5];
+        let external_attr = u32::from_le_bytes([buf[38], buf[39], buf[40], buf[41]]);
+        let attributes = FileAttributes {
+            unix_mode: if matches!(host_system, 3 | 19) && external_attr >> 16 != 0 {
+                Some(external_attr >> 16)
+            } else {
+                None
+            },
+            dos_attributes: Some((external_attr & 0xff) as u8),
+            ..FileAttributes::default()
+        };
+
+        // Read variable-length fields. Names (and comments) are decoded
+        // with the EFS-aware chain (strict UTF-8 -> Shift_JIS -> injective
+        // CP437) so that distinct raw names never collapse into the same
+        // decoded name (see `crate::zip::name_codec`).
+        let utf8_flag = flags & FLAG_EFS != 0;
+        let mut filename_bytes = vec![0u8; filename_len];
+        reader.read_exact(&mut filename_bytes)?;
+        let filename = name_codec::decode_zip_text(&filename_bytes, utf8_flag);
+
+        let mut extra = vec![0u8; extra_len];
+        reader.read_exact(&mut extra)?;
+
+        let mut comment_bytes = vec![0u8; comment_len];
+        reader.read_exact(&mut comment_bytes)?;
+        let comment = name_codec::decode_zip_text(&comment_bytes, utf8_flag);
+
+        // Parse Zip64 extra field if needed
+        let mut uncompressed_size_64 = None;
+        let mut compressed_size_64 = None;
+        let mut local_header_offset_64 = None;
+
+        if uncompressed_size == ZIP64_MARKER_32
+            || compressed_size == ZIP64_MARKER_32
+            || local_header_offset == ZIP64_MARKER_32
+        {
+            let mut offset = 0;
+            while offset + 4 <= extra.len() {
+                let header_id = u16::from_le_bytes([extra[offset], extra[offset + 1]]);
+                let data_size = u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]) as usize;
+                offset += 4;
+
+                if header_id == ZIP64_EXTRA_FIELD_ID && offset + data_size <= extra.len() {
+                    let mut field_offset = offset;
+
+                    if uncompressed_size == ZIP64_MARKER_32
+                        && field_offset + 8 <= offset + data_size
+                    {
+                        uncompressed_size_64 = Some(u64::from_le_bytes([
+                            extra[field_offset],
+                            extra[field_offset + 1],
+                            extra[field_offset + 2],
+                            extra[field_offset + 3],
+                            extra[field_offset + 4],
+                            extra[field_offset + 5],
+                            extra[field_offset + 6],
+                            extra[field_offset + 7],
+                        ]));
+                        field_offset += 8;
+                    }
+
+                    if compressed_size == ZIP64_MARKER_32 && field_offset + 8 <= offset + data_size
+                    {
+                        compressed_size_64 = Some(u64::from_le_bytes([
+                            extra[field_offset],
+                            extra[field_offset + 1],
+                            extra[field_offset + 2],
+                            extra[field_offset + 3],
+                            extra[field_offset + 4],
+                            extra[field_offset + 5],
+                            extra[field_offset + 6],
+                            extra[field_offset + 7],
+                        ]));
+                        field_offset += 8;
+                    }
+
+                    if local_header_offset == ZIP64_MARKER_32
+                        && field_offset + 8 <= offset + data_size
+                    {
+                        local_header_offset_64 = Some(u64::from_le_bytes([
+                            extra[field_offset],
+                            extra[field_offset + 1],
+                            extra[field_offset + 2],
+                            extra[field_offset + 3],
+                            extra[field_offset + 4],
+                            extra[field_offset + 5],
+                            extra[field_offset + 6],
+                            extra[field_offset + 7],
+                        ]));
+                    }
+
+                    break;
+                }
+
+                offset += data_size;
+            }
+        }
+
+        // Calculate actual sizes and offset
+        let actual_uncompressed = uncompressed_size_64.unwrap_or(uncompressed_size as u64);
+        let actual_compressed = compressed_size_64.unwrap_or(compressed_size as u64);
+        let actual_header_offset = local_header_offset_64.unwrap_or(local_header_offset as u64);
+
+        // Calculate data offset by reading local header length
+        // Local header: 30 bytes fixed + filename_len + extra_len
+        // We need to peek at the local header's extra field length (may differ from central)
+        let current_pos = reader.stream_position()?;
+        reader.seek(SeekFrom::Start(actual_header_offset + 26))?;
+        let mut local_lens = [0u8; 4];
+        reader.read_exact(&mut local_lens)?;
+        let local_filename_len = u16::from_le_bytes([local_lens[0], local_lens[1]]) as u64;
+        let local_extra_len = u16::from_le_bytes([local_lens[2], local_lens[3]]) as u64;
+        let data_offset = actual_header_offset + 30 + local_filename_len + local_extra_len;
+        reader.seek(SeekFrom::Start(current_pos))?;
+
+        let entry_type = if filename.ends_with('/') {
+            EntryType::Directory
+        } else {
+            EntryType::File
+        };
+
+        // Convert DOS time to SystemTime via the shared, clamped helper
+        // (a crafted month-0 date previously underflowed and panicked here).
+        let modified = dos_date_time_to_system_time(mdate, mtime);
+
+        // Persist the general-purpose bit flags and raw DOS mtime on the
+        // entry (as a well-formed private extra record) so encryption
+        // detection and the ZipCrypto check-byte rule can consult them.
+        let mut entry_extra = extra.clone();
+        append_entry_meta(&mut entry_extra, flags, mtime);
+
+        let entry = Entry {
+            name: filename,
+            entry_type,
+            size: actual_uncompressed,
+            compressed_size: actual_compressed,
+            method: method.to_core(),
+            modified: Some(modified),
+            created: None,
+            accessed: None,
+            attributes,
+            crc32: Some(crc32),
+            comment: if comment.is_empty() {
+                None
+            } else {
+                Some(comment)
+            },
+            link_target: None,
+            offset: data_offset,
+            extra: entry_extra,
+        };
+
+        Ok((entry, filename_bytes))
+    }
+
+    /// Read entries from local headers (fallback, doesn't handle data descriptors well).
+    fn read_from_local_headers(reader: &mut R) -> Result<(Vec<Entry>, Vec<Vec<u8>>)> {
+        let mut entries = Vec::new();
+        let mut raw_names = Vec::new();
+
+        // Start from beginning
+        reader.seek(SeekFrom::Start(0))?;
+
+        loop {
+            let pos = reader.stream_position()?;
+
+            // Try to read signature
+            let mut sig_buf = [0u8; 4];
+            if reader.read_exact(&mut sig_buf).is_err() {
+                break;
+            }
+
+            let signature = u32::from_le_bytes(sig_buf);
+
+            if signature == LOCAL_FILE_HEADER_SIG {
+                // Seek back and read full header
+                reader.seek(SeekFrom::Start(pos))?;
+                let mut header = LocalFileHeader::read(reader)?;
+
+                // Record data offset
+                header.data_offset = reader.stream_position()?;
+
+                // Handle data descriptor case
+                if header.has_data_descriptor() && header.compressed_size == 0 {
+                    // Can't skip properly without scanning for next header or reading central dir
+                    // This is why we prefer central directory parsing
+                    break;
+                }
+
+                // Skip compressed data (use actual size for Zip64 support)
+                let compressed_size = header.actual_compressed_size();
+                reader.seek(SeekFrom::Current(compressed_size as i64))?;
+
+                // Skip data descriptor if present
+                if header.has_data_descriptor() {
+                    let is_zip64 = header.compressed_size == ZIP64_MARKER_32
+                        || header.uncompressed_size == ZIP64_MARKER_32;
+                    let (descriptor, _) = DataDescriptor::read(reader, is_zip64)?;
+                    // Update header with data descriptor values if header had zeros
+                    if header.crc32 == 0 {
+                        // Note: Can't mutate header here, but we've already created entry
+                        // This is fine since central directory path is preferred
+                        let _ = descriptor;
+                    }
+                }
+
+                entries.push(header.to_entry());
+                raw_names.push(header.filename_raw);
+            } else if signature == CENTRAL_DIR_HEADER_SIG || signature == END_OF_CENTRAL_DIR_SIG {
+                // Reached central directory, stop
+                break;
+            } else {
+                // Unknown signature, stop
+                break;
+            }
+        }
+
+        Ok((entries, raw_names))
+    }
+
+    /// Get the list of entries.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Get the raw (undecoded) name bytes of the entry at `index`, exactly
+    /// as stored in the archive headers.
+    ///
+    /// Entry names in [`ZipReader::entries`] are decoded to UTF-8 `String`s
+    /// (strict UTF-8, then Shift_JIS when the EFS flag is absent, then an
+    /// injective CP437 fallback). Callers that need the original on-disk
+    /// byte string — for example to re-encode it or to interoperate with
+    /// legacy tools — can retrieve it here. The index matches the position
+    /// of the entry in [`ZipReader::entries`].
+    ///
+    /// Returns `None` when `index` is out of bounds.
+    pub fn entry_name_bytes(&self, index: usize) -> Option<&[u8]> {
+        self.raw_names.get(index).map(|raw| raw.as_slice())
+    }
+
+    /// Extract an entry.
+    ///
+    /// If a progress handle is attached, `on_entry` is called with the current
+    /// extraction index and `on_progress` is called after decompression completes.
+    pub fn extract(&mut self, entry: &Entry) -> Result<Vec<u8>> {
+        let entry_index = self.extract_index;
+        self.extract_index += 1;
+        self.extract_impl(entry, entry_index)
+    }
+
+    /// Internal extract implementation that carries the entry index for progress reporting.
+    fn extract_impl(&mut self, entry: &Entry, entry_index: u64) -> Result<Vec<u8>> {
+        // Progress: notify about entry start
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(&entry.name, entry_index);
+        }
+
+        // Seek to data
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+
+        // Read compressed data (bounded against the real stream length so a
+        // spoofed `compressed_size` cannot force a huge allocation).
+        let compressed = Self::read_bounded(&mut self.reader, entry.compressed_size as usize)?;
+
+        // Decompress based on method
+        let decompressed = match entry.method {
+            CoreMethod::Stored => compressed,
+            CoreMethod::Deflate => inflate(&compressed)?,
+            CoreMethod::Lzma => Self::decompress_lzma(&compressed, entry.size)?,
+            _ => return Err(OxiArcError::unsupported_method(format!("{}", entry.method))),
+        };
+
+        // Verify CRC
+        if let Some(expected_crc) = entry.crc32 {
+            let actual_crc = Crc32::compute(&decompressed);
+            if actual_crc != expected_crc {
+                if self.lenient {
+                    self.warnings.push(LenientWarning {
+                        format: "ZIP",
+                        entry_name: Some(entry.name.clone()),
+                        kind: LenientWarningKind::CrcMismatch {
+                            expected: expected_crc,
+                            computed: actual_crc,
+                        },
+                        message: format!(
+                            "CRC-32 mismatch for entry {:?}: expected {:#010x}, computed {:#010x}",
+                            entry.name, expected_crc, actual_crc
+                        ),
+                    });
+                } else {
+                    return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+                }
+            }
+        }
+
+        // Progress: notify about completion
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(decompressed.len() as u64, Some(entry.size));
+        }
+
+        Ok(decompressed)
+    }
+
+    /// Decompress LZMA (method 14) data.
+    ///
+    /// Method-14 format per APPNOTE §5.8.8:
+    /// `[major_ver: u8][minor_ver: u8][props_size: u16_le][lzma_props: props_size bytes][lzma_stream: ...]`
+    ///
+    /// The 5-byte props are: `[lc_lp_pb_byte: u8][dict_size: u32_le]`.
+    fn decompress_lzma(compressed_data: &[u8], uncompressed_size: u64) -> Result<Vec<u8>> {
+        // Need at least 4 bytes for the method-14 header
+        if compressed_data.len() < 4 {
+            return Err(OxiArcError::invalid_header(
+                "LZMA method-14 header too short",
+            ));
+        }
+
+        let _major_ver = compressed_data[0];
+        let _minor_ver = compressed_data[1];
+        let props_size = u16::from_le_bytes([compressed_data[2], compressed_data[3]]) as usize;
+
+        if compressed_data.len() < 4 + props_size {
+            return Err(OxiArcError::invalid_header("LZMA props truncated"));
+        }
+
+        // props_size must be at least 5 bytes (1 byte props + 4 bytes dict_size)
+        if props_size < 5 {
+            return Err(OxiArcError::invalid_header(
+                "LZMA method-14 props_size too small (expected >= 5)",
+            ));
+        }
+
+        let props_bytes = &compressed_data[4..4 + props_size];
+        let stream = &compressed_data[4 + props_size..];
+
+        // Parse LzmaProperties from the single props byte
+        let props = LzmaProperties::from_byte(props_bytes[0])
+            .ok_or_else(|| OxiArcError::invalid_header("Invalid LZMA properties byte"))?;
+
+        // dict_size is the next 4 bytes in LE
+        let dict_size = u32::from_le_bytes([
+            props_bytes[1],
+            props_bytes[2],
+            props_bytes[3],
+            props_bytes[4],
+        ]);
+
+        // Decode using the known uncompressed size so we terminate cleanly
+        // whether or not an EOS marker is present in the stream
+        let size_hint = if uncompressed_size > 0 {
+            Some(uncompressed_size)
+        } else {
+            None
+        };
+
+        let cursor = Cursor::new(stream);
+        lzma_decompress_raw(cursor, props, dict_size, size_hint)
+    }
+
+    /// Extract raw compressed bytes for an entry without decompressing.
+    ///
+    /// This is useful for async decompression workflows where the decompression
+    /// step is performed separately (e.g., via `async_zip`).
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry whose compressed bytes to read
+    ///
+    /// # Returns
+    ///
+    /// The raw compressed bytes (exactly `entry.compressed_size` bytes).
+    pub fn extract_raw(&mut self, entry: &Entry) -> Result<Vec<u8>> {
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+        let compressed = Self::read_bounded(&mut self.reader, entry.compressed_size as usize)?;
+        Ok(compressed)
+    }
+
+    /// Get entry by name.
+    pub fn entry_by_name(&self, name: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.name == name)
+    }
+
+    /// Check if an entry is encrypted (any encryption type).
+    ///
+    /// This checks for the encryption flag in the general purpose bit flags
+    /// or for the AES encryption method.
+    ///
+    /// Note: This is an alias for the standalone `is_entry_encrypted` function.
+    pub fn is_encrypted(entry: &Entry) -> bool {
+        is_entry_encrypted(entry)
+    }
+
+    /// Check if an entry is encrypted with AES (WinZip AE-2).
+    ///
+    /// Returns `Some(AesExtraField)` if AES-encrypted, `None` otherwise.
+    ///
+    /// Note: This is an alias for the standalone `get_entry_aes_encryption_info` function.
+    pub fn get_aes_encryption_info(entry: &Entry) -> Option<AesExtraField> {
+        get_entry_aes_encryption_info(entry)
+    }
+
+    /// Check if an entry uses traditional PKWARE encryption.
+    ///
+    /// Note: This is an alias for the standalone `is_entry_traditional_encrypted` function.
+    pub fn is_traditional_encrypted(entry: &Entry) -> bool {
+        is_entry_traditional_encrypted(entry)
+    }
+
+    /// Extract an encrypted entry using a password (Traditional ZIP encryption).
+    ///
+    /// This method handles the traditional ZIP encryption (PKWARE/ZipCrypto).
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry to extract.
+    /// * `password` - The password for decryption.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted and decompressed data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The password is incorrect
+    /// - CRC verification fails
+    /// - Decompression fails
+    pub fn extract_with_password(&mut self, entry: &Entry, password: &[u8]) -> Result<Vec<u8>> {
+        // Check if the entry is encrypted
+        if !Self::is_encrypted(entry) {
+            // Entry is not encrypted, use normal extraction
+            return self.extract(entry);
+        }
+
+        // For encrypted entries, the data offset points to the start of the encrypted data
+        // which includes the 12-byte encryption header
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+
+        // The actual encrypted data size includes the encryption header
+        // compressed_size in the central directory is the encrypted size (including header)
+        let encrypted_size = entry.compressed_size as usize;
+        if encrypted_size < ENCRYPTION_HEADER_SIZE {
+            return Err(OxiArcError::invalid_header(
+                "Encrypted entry too small for encryption header",
+            ));
+        }
+
+        // Read all encrypted data (including header), bounded against the
+        // real stream length so a spoofed `compressed_size` cannot force a
+        // huge allocation.
+        let encrypted = Self::read_bounded(&mut self.reader, encrypted_size)?;
+
+        // Initialize the cipher with the password
+        let mut cipher = ZipCrypto::new(password);
+
+        // Decrypt the encryption header (first 12 bytes)
+        let mut header = [0u8; ENCRYPTION_HEADER_SIZE];
+        header.copy_from_slice(&encrypted[..ENCRYPTION_HEADER_SIZE]);
+        for byte in header.iter_mut() {
+            *byte = cipher.decrypt_byte(*byte);
+        }
+
+        // Verify the password using the check byte (last byte of header).
+        // Per APPNOTE §6.1.6 the check byte is the high byte of the CRC-32;
+        // however, when general-purpose bit 3 (data descriptor / streamed)
+        // is set the CRC was unknown at encryption time, so Info-ZIP
+        // (`zip -e` writes flags 0x0009) uses the high byte of the DOS
+        // modification time instead. Accept either where applicable.
+        let crc_check = entry.crc32.map(|crc| (crc >> 24) as u8).unwrap_or(0);
+        let actual_check = header[11];
+        let streamed = entry_gp_flags(entry).is_some_and(|f| f & FLAG_DATA_DESCRIPTOR != 0);
+        let mtime_check = entry_dos_mtime(entry).map(|mtime| (mtime >> 8) as u8);
+        let check_ok = actual_check == crc_check
+            || (streamed && mtime_check.is_some_and(|expected| expected == actual_check));
+
+        if !check_ok {
+            return Err(OxiArcError::invalid_header(
+                "Password verification failed - incorrect password or corrupted data",
+            ));
+        }
+
+        // Decrypt the remaining data
+        let mut decrypted_compressed = encrypted[ENCRYPTION_HEADER_SIZE..].to_vec();
+        for byte in decrypted_compressed.iter_mut() {
+            *byte = cipher.decrypt_byte(*byte);
+        }
+
+        // Decompress based on method
+        let decompressed = match entry.method {
+            CoreMethod::Stored => decrypted_compressed,
+            CoreMethod::Deflate => inflate(&decrypted_compressed)?,
+            _ => return Err(OxiArcError::unsupported_method(format!("{}", entry.method))),
+        };
+
+        // Verify CRC
+        if let Some(expected_crc) = entry.crc32 {
+            let actual_crc = Crc32::compute(&decompressed);
+            if actual_crc != expected_crc {
+                return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+            }
+        }
+
+        Ok(decompressed)
+    }
+
+    /// Extract an AES-encrypted entry using a password.
+    ///
+    /// This method handles the WinZip AE-2 AES encryption.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry to extract.
+    /// * `password` - The password for decryption.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted and decompressed data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The password is incorrect
+    /// - HMAC authentication fails
+    /// - Decompression fails
+    pub fn extract_with_password_aes(&mut self, entry: &Entry, password: &[u8]) -> Result<Vec<u8>> {
+        // Get AES encryption info from extra field
+        let aes_info = Self::get_aes_encryption_info(entry).ok_or_else(|| {
+            OxiArcError::invalid_header("Entry does not contain AES encryption information")
+        })?;
+
+        // Seek to data
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+
+        // Read salt
+        let salt_len = aes_info.strength.salt_len();
+        let mut salt = vec![0u8; salt_len];
+        self.reader.read_exact(&mut salt)?;
+
+        // Read password verification bytes
+        let mut pw_verification = [0u8; PASSWORD_VERIFICATION_LEN];
+        self.reader.read_exact(&mut pw_verification)?;
+
+        // Create decryptor and verify password
+        let (mut decryptor, expected_pw_verification): (ZipAesDecryptor, [u8; 2]) =
+            ZipAesDecryptor::new(password, &salt, aes_info.strength)?;
+
+        // Constant-time comparison: never leak, via early-exit timing, how
+        // many leading bytes of the verifier matched.
+        if !Self::ct_eq(&pw_verification, &expected_pw_verification) {
+            return Err(OxiArcError::invalid_header(
+                "Password verification failed - incorrect password",
+            ));
+        }
+
+        // Calculate encrypted data size.
+        // Total = salt + pw_verification + encrypted_data + auth_code.
+        // `compressed_size` is attacker-controlled; a value smaller than the
+        // fixed AES overhead would underflow (panic in debug, ~usize::MAX
+        // allocation in release), so reject it with `checked_sub`.
+        let overhead = salt_len + PASSWORD_VERIFICATION_LEN + WINZIP_AUTH_CODE_LEN;
+        let encrypted_data_len = (entry.compressed_size as usize)
+            .checked_sub(overhead)
+            .ok_or_else(|| {
+                OxiArcError::corrupted(
+                    entry.offset,
+                    format!(
+                        "AES entry compressed_size {} is smaller than the {overhead}-byte \
+                         encryption overhead",
+                        entry.compressed_size
+                    ),
+                )
+            })?;
+
+        // Read encrypted data (bounded against the real stream length).
+        let encrypted_data = Self::read_bounded(&mut self.reader, encrypted_data_len)?;
+
+        // Read authentication code
+        let mut auth_code = [0u8; WINZIP_AUTH_CODE_LEN];
+        self.reader.read_exact(&mut auth_code)?;
+
+        // Update HMAC with encrypted data and verify
+        decryptor.update_hmac(&encrypted_data);
+        if !decryptor.verify(&auth_code) {
+            return Err(OxiArcError::invalid_header(
+                "HMAC authentication failed - data may be corrupted",
+            ));
+        }
+
+        // Decrypt
+        let mut decrypted = encrypted_data;
+        decryptor.decrypt(&mut decrypted);
+
+        // Decompress based on actual compression method (stored in AES extra field)
+        let decompressed = match aes_info.compression_method {
+            0 => decrypted,            // Stored
+            8 => inflate(&decrypted)?, // Deflate
+            _ => {
+                return Err(OxiArcError::unsupported_method(format!(
+                    "Compression method {} in AES-encrypted entry",
+                    aes_info.compression_method
+                )));
+            }
+        };
+
+        // Verify CRC. Per the WinZip AES spec, AE-2 (vendor version 2)
+        // stores 0 in the CRC-32 field — integrity comes from the HMAC
+        // verified above — so the CRC check only applies to AE-1 entries
+        // (which store the real plaintext CRC). Legacy oxiarc archives
+        // tagged AE-2 with a real CRC are still accepted: the HMAC has
+        // already authenticated the payload.
+        if aes_info.version != 2 {
+            if let Some(expected_crc) = entry.crc32 {
+                if expected_crc != 0 {
+                    let actual_crc = Crc32::compute(&decompressed);
+                    if actual_crc != expected_crc {
+                        return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+                    }
+                }
+            }
+        }
+
+        Ok(decompressed)
+    }
+
+    /// Extract an encrypted entry, auto-detecting the encryption type.
+    ///
+    /// This method automatically detects whether the entry uses traditional
+    /// PKWARE encryption or AES encryption and uses the appropriate method.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry to extract.
+    /// * `password` - The password for decryption.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted and decompressed data.
+    pub fn extract_encrypted(&mut self, entry: &Entry, password: &[u8]) -> Result<Vec<u8>> {
+        if Self::get_aes_encryption_info(entry).is_some() {
+            self.extract_with_password_aes(entry, password)
+        } else if Self::is_encrypted(entry) {
+            self.extract_with_password(entry, password)
+        } else {
+            // Not encrypted, use normal extraction
+            self.extract(entry)
+        }
+    }
+}

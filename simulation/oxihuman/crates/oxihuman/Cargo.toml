@@ -1,0 +1,44 @@
+[package]
+name          = "oxihuman"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage      = "https://github.com/cool-japan/oxihuman"
+documentation = "https://docs.rs/oxihuman"
+description   = "Privacy-first, client-side human body generator in pure Rust — MakeHuman-compatible independent implementation (facade crate)"
+readme        = "README.md"
+keywords      = ["human", "makehuman", "3d", "mesh", "pure-rust"]
+categories    = ["graphics", "games", "science", "rendering"]
+
+[dependencies]
+anyhow.workspace           = true
+oxihuman-core.workspace    = true
+oxihuman-morph.workspace   = true
+oxihuman-mesh.workspace    = true
+oxihuman-export.workspace  = true
+oxihuman-physics.workspace = true
+oxihuman-viewer = { workspace = true, optional = true }
+oxihuman-wasm   = { workspace = true, optional = true }
+
+[features]
+default = ["viewer"]
+viewer  = ["dep:oxihuman-viewer"]
+wasm    = ["dep:oxihuman-wasm"]
+full    = ["viewer", "wasm"]
+
+[[example]]
+name = "basic_generation"
+path = "examples/basic_generation.rs"
+
+[[example]]
+name = "batch_export"
+path = "examples/batch_export.rs"
+
+[[example]]
+name = "physics_step"
+path = "examples/physics_step.rs"
+
+[lints]
+workspace = true

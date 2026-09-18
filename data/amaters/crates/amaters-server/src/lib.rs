@@ -1,0 +1,34 @@
+//! AmateRS Server Library
+//!
+//! This library exposes server modules for integration testing.
+
+pub mod audit;
+pub mod auth;
+pub mod authz;
+pub mod config;
+pub mod health;
+pub mod log_rotation;
+pub mod metrics;
+pub mod middleware;
+pub mod query_cache;
+pub mod server;
+pub mod service;
+pub mod shutdown;
+pub mod tls_config;
+
+pub mod hot_reload;
+pub mod retry;
+
+pub mod admin;
+pub mod cluster_integration;
+pub mod migration;
+pub mod snapshot;
+pub mod version;
+
+// Re-export error types for convenience
+pub use log_rotation::{
+    LogGuard, LogRotation, LogRotationConfig, LogRotationError, cleanup_old_logs,
+    setup_rotating_logger,
+};
+pub use migration::{Migration, MigrationContext, MigrationPlan, MigrationRegistry};
+pub use server::{ServerError, ServerResult};

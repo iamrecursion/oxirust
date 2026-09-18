@@ -1,0 +1,32 @@
+[package]
+name = "oxixml-iri"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "RFC 3987 IRI/URI parsing, resolution, and validation (replaces oxiri)."
+keywords = ["iri", "uri", "rfc3987", "rfc3986", "url"]
+categories = ["parser-implementations", "web-programming"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+# `serde` `Serialize`/`Deserialize` implementations for `Iri<T>`/`IriRef<T>`: serializes as the
+# plain string form and deserializes via `parse` (a parse failure becomes a `serde::de::Error`).
+# Mirrors `oxiri`'s own opt-in `serde` feature shape exactly.
+serde = ["dep:serde"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-text = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[lints]
+workspace = true

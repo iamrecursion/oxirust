@@ -1,0 +1,23 @@
+[package]
+name = "oximedia-scopes"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional video scopes (waveform, vectorscope, histogram, parade) for OxiMedia"
+keywords = ["color", "lut", "grading", "video", "multimedia"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]

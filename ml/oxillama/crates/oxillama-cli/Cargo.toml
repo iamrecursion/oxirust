@@ -1,0 +1,75 @@
+[package]
+name = "oxillama-cli"
+description = "Pure Rust LLM inference engine CLI — the sovereign alternative to llama.cpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords = ["llm", "inference", "gguf", "llama", "cli"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "oxillama"
+path = "src/main.rs"
+
+[features]
+default = ["server", "tui", "simd-neon", "simd-avx2"]
+server = ["dep:oxillama-server", "dep:axum"]
+bench = []
+simd-avx2 = ["oxillama-quant/simd-avx2", "oxillama-runtime/simd-avx2"]
+simd-avx512 = ["oxillama-quant/simd-avx512", "oxillama-runtime/simd-avx512"]
+simd-neon = ["oxillama-quant/simd-neon", "oxillama-runtime/simd-neon"]
+hub = ["dep:hf-hub"]
+tui = ["dep:ratatui", "dep:crossterm"]
+# Device-resident weights via wgpu, exposed as `--gpu` on run/serve/chat.
+# Off by default: it pulls the whole wgpu stack into the build, and only the
+# Q4_0 resident GEMV currently beats the CPU kernel.
+gpu = ["oxillama-runtime/gpu"]
+
+[dependencies]
+oxillama-gguf = { workspace = true, features = ["mmap"] }
+oxillama-quant = { workspace = true, features = ["parallel"] }
+# The shipping binary must be able to load any GGUF the user hands it, so it
+# names the full architecture set explicitly rather than inheriting it from
+# `oxillama-runtime` (the workspace table pins `default-features = false`).
+# A missing architecture here is invisible until run time: it disappears from
+# `ArchitectureRegistry::with_builtins()` and the model is rejected with
+# "unsupported architecture".
+oxillama-arch = { workspace = true, features = ["all-architectures"] }
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi", "parallel", "native-async", "mmap"] }
+oxillama-server = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+clap.workspace = true
+colored.workspace = true
+indicatif.workspace = true
+rustyline.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+dirs.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+oxicode.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+directories.workspace = true
+thiserror.workspace = true
+hf-hub = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+oxillama-gguf = { path = "../oxillama-gguf", default-features = false, features = ["mmap", "test-utils"] }
+
+[[bench]]
+name = "inference"
+harness = false

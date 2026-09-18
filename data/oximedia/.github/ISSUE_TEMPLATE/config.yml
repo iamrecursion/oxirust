@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or Discussion
+    url: https://github.com/cool-japan/oximedia/discussions
+    about: Ask questions or start discussions about OxiMedia
+  - name: Security Vulnerability
+    url: https://github.com/cool-japan/oximedia/security/advisories/new
+    about: Report a security vulnerability privately
+  - name: Documentation
+    url: https://docs.rs/oximedia
+    about: Browse the documentation

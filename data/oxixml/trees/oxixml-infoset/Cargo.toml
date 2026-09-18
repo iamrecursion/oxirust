@@ -1,0 +1,27 @@
+[package]
+name = "oxixml-infoset"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XDM/Infoset data model shared by XPath, XSLT, XQuery, and Schema."
+keywords = ["xml", "xdm", "xpath", "xquery", "infoset"]
+categories = ["parser-implementations", "data-structures", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-xml = { workspace = true }
+oxixml-qname = { workspace = true }
+oxixml-xsd = { workspace = true }
+oxixml-iri = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+{
+  "name": "seek_itsoffset",
+  "args": ["-itsoffset", "5", "-i", "in.mkv", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1
+  }
+}

@@ -1,0 +1,47 @@
+extern crate scirs2_autograd as ag;
+use ag::tensor_ops as T;
+use scirs2_core::ndarray::array;
+
+#[allow(dead_code)]
+fn main() {
+    println!("Running basic shape tests");
+
+    ag::run(|ctx| {
+        // Test scalar
+        let scalar = T::scalar(5.0, ctx);
+        println!(
+            "Scalar shape: {:?}",
+            scalar.eval(ctx).expect("Operation failed").shape()
+        );
+
+        // Test vector
+        let vector = T::ones(&[3], ctx);
+        println!(
+            "Vector shape: {:?}",
+            vector.eval(ctx).expect("Operation failed").shape()
+        );
+
+        // Test matrix
+        let matrix = T::ones(&[2, 2], ctx);
+        println!(
+            "Matrix shape: {:?}",
+            matrix.eval(ctx).expect("Operation failed").shape()
+        );
+
+        // Test matrix operations
+        let matrix_a = T::convert_to_tensor(array![[1.0, 2.0], [3.0, 4.0]], ctx);
+        let det = T::determinant(matrix_a);
+        println!(
+            "Determinant: {}",
+            det.eval(ctx).expect("Operation failed")[[]]
+        );
+
+        let inv = T::matrix_inverse(matrix_a);
+        println!(
+            "Inverse shape: {:?}",
+            inv.eval(ctx).expect("Operation failed").shape()
+        );
+
+        println!("All tests passed!");
+    });
+}

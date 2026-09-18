@@ -1,0 +1,221 @@
+[workspace]
+resolver = "2"
+members = [
+    "mielin",
+    "mielin-kernel",
+    "mielin-hal",
+    "mielin-rt",
+    "mielin-mesh/core",
+    "mielin-mesh/wire",
+    "mielin-cells",
+    "mielin-wasm",
+    "mielin-tensor",
+    "mielin-cli",
+    "mielin-tests",
+    "examples/*",
+    "benches",
+]
+exclude = [
+    "mielin-kernel/fuzz",
+    "examples/e2e-*",
+]
+
+# Default members excludes kernel (requires bootloader) and counter-agent (WASM-only)
+default-members = [
+    "mielin",
+    "mielin-hal",
+    "mielin-rt",
+    "mielin-mesh/core",
+    "mielin-mesh/wire",
+    "mielin-cells",
+    "mielin-wasm",
+    "mielin-tensor",
+    "mielin-cli",
+    "benches",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["MielinOS Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/mielin"
+
+[workspace.dependencies]
+# Internal crates
+mielin = { version = "0.1.0", path = "mielin" }
+mielin-hal = { version = "0.1.0", path = "mielin-hal" }
+mielin-kernel = { version = "0.1.0", path = "mielin-kernel", default-features = false }
+mielin-rt = { version = "0.1.0", path = "mielin-rt" }
+mielin-mesh-core = { version = "0.1.0", path = "mielin-mesh/core" }
+mielin-mesh-wire = { version = "0.1.0", path = "mielin-mesh/wire" }
+mielin-cells = { version = "0.1.0", path = "mielin-cells" }
+mielin-wasm = { version = "0.1.0", path = "mielin-wasm" }
+mielin-tensor = { version = "0.1.0", path = "mielin-tensor" }
+mielin-cli = { version = "0.1.0", path = "mielin-cli" }
+
+# Core async runtime
+tokio = { version = "1.52", features = ["full"] }
+async-trait = "0.1.89"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+oxicode = { version = "0.2.6", features = ["serde"] }
+
+# Networking
+oxiquic-transport = "0.2.1"
+oxiquic-crypto = "0.2.1"
+tokio-util = "0.7.18"
+
+# WebAssembly
+wasmtime = "46.0.1"
+wasmtime-wasi = "46.0.1"
+wit-bindgen = "0.58.0"
+
+# Cryptography & Security
+# ring removed — replaced by oxiquic-crypto (pure-Rust QUIC provider) in mesh-wire
+# Pure-Rust OxiCrypto sub-crates (replacing direct `ring` usage; ring remains a
+# transitive dep via rustls/quinn/rcgen — that migration is tracked separately).
+oxicrypto-hash = "0.3.0"
+oxicrypto-rand = "0.3.0"
+oxicrypto-aead = "0.3.0"
+oxicrypto-sig = "0.3.0"
+oxicrypto-kex = "0.3.0"
+oxicrypto-kdf = "0.3.0"
+oxicrypto-core = "0.3.0"
+ml-kem = "0.3"
+uuid = { version = "1.23.4", features = ["v4", "v5", "serde"] }
+postcard = { version = "1", features = ["alloc"] }
+rustls = { version = "0.23.41", default-features = false, features = ["std"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["pem"] }
+oxitls-rcgen = "0.3.0"
+
+# Error handling
+anyhow = "1.0.103"
+thiserror = "2.0.18"
+
+# Logging
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+# Testing
+rstest = "0.26.1"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.11.0"
+serial_test = "3.5.0"
+assert_cmd = "2.2"
+predicates = "3.1.4"
+
+# Utilities
+bitflags = "2.13.0"
+clap = "4.6.1"
+wat = "1.252.0"
+oxiarc-lz4 = "0.4.2"
+oxiarc-zstd = "0.4.2"
+libm = "0.2"
+hex = "0.4"
+futures = "0.3"
+
+# DHT and discovery
+lru = "0.18.0"
+mdns-sd = "0.20.1"
+
+# Low-level / embedded
+spin = "0.12.1"
+lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
+bootloader = "0.11.15"
+bootloader_api = "0.11.15"
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.5"
+embedded-hal = "1.0.0"
+heapless = "0.9.3"
+panic-halt = "1.0.0"
+
+# Parallelism (optional)
+rayon = "1.12"
+num_cpus = "1.17"
+
+# WebSocket
+tokio-tungstenite = "0.29"
+
+# Certificate / ACME helpers
+base64 = "0.22"
+x509-parser = "0.18.1"
+rustls-pemfile = "2.2"
+p256 = { version = "0.14.0-rc.15", default-features = false, features = ["ecdsa", "alloc"] }
+
+# WebAssembly parsing
+wasmparser = { version = "0.252", default-features = false, features = ["std"] }
+
+# Test utilities
+tempfile = "3.27"
+
+# CLI-specific utilities
+clap_complete = "4.6.7"
+dirs = "6.0.0"
+rustyline = "18.0.1"
+regex = "1.12.4"
+chrono = { version = "0.4.45", features = ["serde"] }
+comfy-table = "7.2.2"
+tabled = "0.21.0"
+
+# Serialization formats
+serde_yaml = "0.9.34"
+toml = "1.1.2"
+
+# Random number generation
+rand = "0.10"
+rand_core = "0.10"
+
+# Scripting
+rhai = "1.25.1"
+
+# HTTP client for remote operations (reqwest removed — replaced by oxihttp-client)
+oxihttp-client = { version = "0.2.1", features = ["tls"] }
+
+# HTTP server for control plane
+axum = "0.8.9"
+tower = "0.5.3"
+tower-http = { version = "0.7.0", features = ["trace", "cors"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+panic = "abort"
+
+# Release profile optimized for speed over size
+[profile.release-speed]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Release profile for embedded/size-constrained targets
+[profile.release-embedded]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Profile for debugging release builds
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false
+
+# Profile for benchmarking (optimized but with debug info)
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false
+lto = "thin"

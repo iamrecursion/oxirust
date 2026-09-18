@@ -1,0 +1,1280 @@
+//! REST API v2
+//!
+//! Modern RESTful API with OpenAPI 3.0 specification.
+//! Provides comprehensive CRUD operations for datasets, queries, and administration.
+
+use crate::server::AppState;
+use crate::store_ext::StoreExt;
+use anyhow::{Context, Result};
+use axum::{
+    extract::{Path, Query as AxumQuery, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tracing::{debug, error, info};
+use utoipa::{OpenApi, ToSchema};
+
+/// OpenAPI documentation
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        get_api_info,
+        list_datasets,
+        get_dataset,
+        create_dataset,
+        delete_dataset,
+        execute_query,
+        get_triples,
+        insert_triple,
+        delete_triple,
+        get_statistics,
+        get_health
+    ),
+    components(schemas(
+        ApiInfo,
+        DatasetList,
+        Dataset,
+        CreateDatasetRequest,
+        QueryRequest,
+        QueryResponse,
+        TripleList,
+        Triple,
+        InsertTripleRequest,
+        DeleteTripleRequest,
+        Statistics,
+        HealthStatus,
+        ErrorResponse
+    )),
+    tags(
+        (name = "info", description = "API information endpoints"),
+        (name = "datasets", description = "Dataset management endpoints"),
+        (name = "queries", description = "Query execution endpoints"),
+        (name = "triples", description = "Triple manipulation endpoints"),
+        (name = "statistics", description = "Statistics and monitoring endpoints"),
+        (name = "health", description = "Health check endpoints")
+    ),
+    info(
+        title = "OxiRS Fuseki REST API v2",
+        version = "2.0.0",
+        description = "Modern RESTful API for SPARQL and RDF data management",
+        contact(
+            name = "OxiRS Team",
+            url = "https://github.com/cool-japan/oxirs",
+            email = "team@oxirs.dev"
+        ),
+        license(
+            name = "Apache 2.0",
+            url = "https://www.apache.org/licenses/LICENSE-2.0"
+        )
+    ),
+    servers(
+        (url = "http://localhost:3030/api/v2", description = "Local development"),
+        (url = "https://api.oxirs.dev/v2", description = "Production")
+    )
+)]
+pub struct ApiDoc;
+
+/// API information
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApiInfo {
+    /// API version
+    pub version: String,
+    /// API name
+    pub name: String,
+    /// API description
+    pub description: String,
+    /// Available endpoints
+    pub endpoints: Vec<String>,
+    /// Supported features
+    pub features: Vec<String>,
+}
+
+/// Dataset list response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DatasetList {
+    /// List of datasets
+    pub datasets: Vec<Dataset>,
+    /// Total count
+    pub total: usize,
+}
+
+/// Dataset information
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Dataset {
+    /// Dataset name
+    pub name: String,
+    /// Number of triples
+    pub triple_count: usize,
+    /// Dataset description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Creation timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Last modified timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Create dataset request
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateDatasetRequest {
+    /// Dataset name
+    pub name: String,
+    /// Dataset description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Storage type (tdb, memory)
+    #[serde(default = "default_storage_type")]
+    pub storage_type: String,
+}
+
+fn default_storage_type() -> String {
+    "tdb".to_string()
+}
+
+/// Query request
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryRequest {
+    /// SPARQL query string
+    pub query: String,
+    /// Default graph URIs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_graph_uri: Option<Vec<String>>,
+    /// Named graph URIs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub named_graph_uri: Option<Vec<String>>,
+    /// Query timeout in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+/// Query response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryResponse {
+    /// Variable names (for SELECT queries)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<QueryHead>,
+    /// Query results
+    pub results: QueryResults,
+    /// Query execution time in milliseconds
+    pub execution_time_ms: u64,
+}
+
+/// Query head with variable names
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryHead {
+    /// Variable names
+    pub vars: Vec<String>,
+}
+
+/// Query results
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryResults {
+    /// Bindings (for SELECT queries)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bindings: Option<Vec<std::collections::HashMap<String, BindingValue>>>,
+    /// Boolean result (for ASK queries)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boolean: Option<bool>,
+}
+
+/// Binding value
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BindingValue {
+    /// Value type (uri, literal, bnode)
+    #[serde(rename = "type")]
+    pub value_type: String,
+    /// Value
+    pub value: String,
+    /// Datatype (for literals)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datatype: Option<String>,
+    /// Language tag (for literals)
+    #[serde(skip_serializing_if = "Option::is_none", rename = "xml:lang")]
+    pub lang: Option<String>,
+}
+
+/// Triple list response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TripleList {
+    /// List of triples
+    pub triples: Vec<Triple>,
+    /// Total count
+    pub total: usize,
+    /// Limit
+    pub limit: usize,
+    /// Offset
+    pub offset: usize,
+}
+
+/// RDF Triple
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Triple {
+    /// Subject URI
+    pub subject: String,
+    /// Predicate URI
+    pub predicate: String,
+    /// Object (URI or literal)
+    pub object: String,
+    /// Object type (uri, literal)
+    pub object_type: String,
+}
+
+/// Insert triple request
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InsertTripleRequest {
+    /// Triples to insert
+    pub triples: Vec<Triple>,
+    /// Graph URI (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+}
+
+/// Delete triple request
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeleteTripleRequest {
+    /// Subject URI (optional, ? for wildcard)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Predicate URI (optional, ? for wildcard)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// Object (optional, ? for wildcard)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    /// Graph URI (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+}
+
+/// System statistics
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Statistics {
+    /// Number of datasets
+    pub dataset_count: usize,
+    /// Total number of triples
+    pub total_triples: usize,
+    /// Total queries executed
+    pub total_queries: u64,
+    /// Average query time in milliseconds
+    pub avg_query_time_ms: f64,
+    /// Uptime in seconds
+    pub uptime_seconds: u64,
+    /// Memory usage in bytes
+    pub memory_usage_bytes: u64,
+}
+
+/// Health status
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HealthStatus {
+    /// Overall status
+    pub status: String,
+    /// Timestamp
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Component statuses
+    pub components: std::collections::HashMap<String, ComponentHealth>,
+}
+
+/// Component health
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComponentHealth {
+    /// Status (healthy, degraded, unhealthy)
+    pub status: String,
+    /// Details
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+/// Error response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorResponse {
+    /// Error code
+    pub code: String,
+    /// Error message
+    pub message: String,
+    /// Error details
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    /// Timestamp
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Pagination query parameters
+#[derive(Debug, Clone, Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct PaginationParams {
+    /// Limit (default: 100, max: 10000)
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Offset (default: 0)
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_limit() -> usize {
+    100
+}
+
+/// API error type
+#[derive(Debug)]
+pub enum ApiError {
+    NotFound(String),
+    BadRequest(String),
+    InternalError(anyhow::Error),
+    Unauthorized,
+    Forbidden(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg),
+            ApiError::InternalError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                err.to_string(),
+            ),
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "Authentication required".to_string(),
+            ),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg),
+        };
+
+        let error = ErrorResponse {
+            code: code.to_string(),
+            message,
+            details: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        (status, Json(error)).into_response()
+    }
+}
+
+/// Bridges [`crate::error::FusekiError`] (the type
+/// `AppState::reject_if_read_only` returns) into this module's own
+/// [`ApiError`], so `?` can propagate the shared read-only guard directly
+/// out of every REST v2 handler below without hand-rolling a duplicate
+/// check-and-403 per call site. Only the read-only guard's `Forbidden`
+/// outcome is expected to cross this boundary in practice; any other
+/// `FusekiError` is mapped conservatively to `InternalError` rather than
+/// silently discarding its status code.
+impl From<crate::error::FusekiError> for ApiError {
+    fn from(err: crate::error::FusekiError) -> Self {
+        if err.status_code() == StatusCode::FORBIDDEN {
+            ApiError::Forbidden(err.to_string())
+        } else {
+            ApiError::InternalError(anyhow::anyhow!(err.to_string()))
+        }
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(err: anyhow::Error) -> Self {
+        ApiError::InternalError(err)
+    }
+}
+
+/// Get API information
+///
+/// Returns information about the API version, available endpoints, and features.
+#[utoipa::path(
+    get,
+    path = "/api/v2",
+    responses(
+        (status = 200, description = "API information", body = ApiInfo)
+    ),
+    tag = "info"
+)]
+pub async fn get_api_info() -> Result<Json<ApiInfo>, ApiError> {
+    Ok(Json(ApiInfo {
+        version: "2.0.0".to_string(),
+        name: "OxiRS Fuseki REST API v2".to_string(),
+        description: "Modern RESTful API for SPARQL and RDF data management".to_string(),
+        endpoints: vec![
+            "/api/v2".to_string(),
+            "/api/v2/datasets".to_string(),
+            "/api/v2/datasets/{name}".to_string(),
+            "/api/v2/datasets/{name}/query".to_string(),
+            "/api/v2/datasets/{name}/triples".to_string(),
+            "/api/v2/statistics".to_string(),
+            "/api/v2/health".to_string(),
+        ],
+        features: vec![
+            "SPARQL 1.1".to_string(),
+            "SPARQL 1.2".to_string(),
+            "RDF-star".to_string(),
+            "Federation".to_string(),
+            "GraphQL".to_string(),
+            "WebSocket".to_string(),
+        ],
+    }))
+}
+
+/// List all datasets
+///
+/// Returns a list of all available datasets with their metadata.
+#[utoipa::path(
+    get,
+    path = "/api/v2/datasets",
+    responses(
+        (status = 200, description = "List of datasets", body = DatasetList)
+    ),
+    tag = "datasets"
+)]
+pub async fn list_datasets(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DatasetList>, ApiError> {
+    let store = &state.store;
+    let datasets = store
+        .list_datasets()
+        .map_err(|e| ApiError::InternalError(e.into()))?;
+
+    let dataset_infos: Vec<Dataset> = datasets
+        .into_iter()
+        .map(|name| {
+            let triple_count = store.count_triples(&name);
+            Dataset {
+                name,
+                triple_count,
+                description: None,
+                created_at: None,
+                modified_at: None,
+            }
+        })
+        .collect();
+
+    let total = dataset_infos.len();
+
+    Ok(Json(DatasetList {
+        datasets: dataset_infos,
+        total,
+    }))
+}
+
+/// Get dataset information
+///
+/// Returns detailed information about a specific dataset.
+#[utoipa::path(
+    get,
+    path = "/api/v2/datasets/{name}",
+    responses(
+        (status = 200, description = "Dataset information", body = Dataset),
+        (status = 404, description = "Dataset not found", body = ErrorResponse)
+    ),
+    params(
+        ("name" = String, Path, description = "Dataset name")
+    ),
+    tag = "datasets"
+)]
+pub async fn get_dataset(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Dataset>, ApiError> {
+    let store = &state.store;
+    if !store.dataset_exists(&name) {
+        return Err(ApiError::NotFound(format!("Dataset '{}' not found", name)));
+    }
+
+    let triple_count = store.count_triples(&name);
+
+    Ok(Json(Dataset {
+        name,
+        triple_count,
+        description: None,
+        created_at: None,
+        modified_at: None,
+    }))
+}
+
+/// Create a new dataset
+///
+/// Creates a new dataset with the specified configuration.
+#[utoipa::path(
+    post,
+    path = "/api/v2/datasets",
+    request_body = CreateDatasetRequest,
+    responses(
+        (status = 201, description = "Dataset created", body = Dataset),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 409, description = "Dataset already exists", body = ErrorResponse)
+    ),
+    tag = "datasets"
+)]
+pub async fn create_dataset(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateDatasetRequest>,
+) -> Result<(StatusCode, Json<Dataset>), ApiError> {
+    // Mutates dataset existence -- guard before any further validation or
+    // the on-disk creation below.
+    state.reject_if_read_only(&request.name, "dataset creation")?;
+
+    let store = &state.store;
+    if store.dataset_exists(&request.name) {
+        return Err(ApiError::BadRequest(format!(
+            "Dataset '{}' already exists",
+            request.name
+        )));
+    }
+
+    // Select the backend by the requested storage type. An unknown type is a
+    // client error (fail loud) rather than a silent fall-back to volatile memory.
+    let store_type = crate::store::StoreFactory::store_type_from_str(&request.storage_type)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let location = format!("./data/{}", request.name);
+
+    store
+        .create_dataset_with_type(&request.name, &location, &store_type)
+        .map_err(|e| ApiError::InternalError(e.into()))?;
+
+    info!(
+        "Created dataset '{}' with backend '{}'",
+        request.name,
+        store_type.label()
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(Dataset {
+            name: request.name,
+            triple_count: 0,
+            description: request.description,
+            created_at: Some(chrono::Utc::now()),
+            modified_at: Some(chrono::Utc::now()),
+        }),
+    ))
+}
+
+/// Delete a dataset
+///
+/// Deletes the specified dataset and all its triples.
+#[utoipa::path(
+    delete,
+    path = "/api/v2/datasets/{name}",
+    responses(
+        (status = 204, description = "Dataset deleted"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse)
+    ),
+    params(
+        ("name" = String, Path, description = "Dataset name")
+    ),
+    tag = "datasets"
+)]
+pub async fn delete_dataset(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    // Mutates dataset existence -- guard before touching the store.
+    state.reject_if_read_only(&name, "dataset deletion")?;
+
+    let store = &state.store;
+    if !store.dataset_exists(&name) {
+        return Err(ApiError::NotFound(format!("Dataset '{}' not found", name)));
+    }
+
+    store
+        .remove_dataset(&name)
+        .map_err(|e| ApiError::InternalError(anyhow::anyhow!("{}", e)))?;
+
+    info!("Deleted dataset: {}", name);
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Execute a SPARQL query
+///
+/// Executes a SPARQL query against the specified dataset.
+#[utoipa::path(
+    post,
+    path = "/api/v2/datasets/{name}/query",
+    request_body = QueryRequest,
+    responses(
+        (status = 200, description = "Query results", body = QueryResponse),
+        (status = 400, description = "Invalid query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse)
+    ),
+    params(
+        ("name" = String, Path, description = "Dataset name")
+    ),
+    tag = "queries"
+)]
+pub async fn execute_query(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(request): Json<QueryRequest>,
+) -> Result<Json<QueryResponse>, ApiError> {
+    let store = &state.store;
+    if !store.dataset_exists(&name) {
+        return Err(ApiError::NotFound(format!("Dataset '{}' not found", name)));
+    }
+
+    let start = std::time::Instant::now();
+
+    let results = store
+        .query_dataset(&request.query, Some(&name))
+        .map_err(|e| ApiError::BadRequest(format!("Query execution failed: {}", e)))?;
+
+    let execution_time_ms = start.elapsed().as_millis() as u64;
+
+    // Convert results to API format, deriving the SPARQL 1.1 JSON Results
+    // `type`/`datatype`/`xml:lang` fields from the actual term variant and
+    // populating `head.vars` from the query's projected variables.
+    let (vars, bindings, boolean) = match results.inner {
+        oxirs_core::query::QueryResult::Select {
+            variables,
+            bindings,
+        } => {
+            let api_bindings: Vec<std::collections::HashMap<String, BindingValue>> = bindings
+                .into_iter()
+                .map(|binding| {
+                    binding
+                        .into_iter()
+                        .map(|(var, term)| (var, term_to_binding_value(&term)))
+                        .collect()
+                })
+                .collect();
+            (variables, Some(api_bindings), None)
+        }
+        oxirs_core::query::QueryResult::Ask(result) => (Vec::new(), None, Some(result)),
+        oxirs_core::query::QueryResult::Construct(_) => {
+            return Err(ApiError::BadRequest(
+                "CONSTRUCT/DESCRIBE queries are not supported by this JSON endpoint; \
+                 request an RDF serialization instead"
+                    .to_string(),
+            ));
+        }
+    };
+
+    Ok(Json(QueryResponse {
+        head: Some(QueryHead { vars }),
+        results: QueryResults { bindings, boolean },
+        execution_time_ms,
+    }))
+}
+
+/// Convert an oxirs-core [`Term`](oxirs_core::model::Term) into the REST v2
+/// [`BindingValue`], mapping the SPARQL 1.1 JSON Results `type` (`uri`,
+/// `literal`, `bnode`, `triple`) and carrying literal `datatype`/`xml:lang`.
+fn term_to_binding_value(term: &oxirs_core::model::Term) -> BindingValue {
+    use oxirs_core::model::Term;
+    match term {
+        Term::NamedNode(node) => BindingValue {
+            value_type: "uri".to_string(),
+            value: node.as_str().to_string(),
+            datatype: None,
+            lang: None,
+        },
+        Term::BlankNode(node) => BindingValue {
+            value_type: "bnode".to_string(),
+            value: node.as_str().to_string(),
+            datatype: None,
+            lang: None,
+        },
+        Term::Literal(literal) => {
+            let lang = literal.language().map(|l| l.to_string());
+            // Per SPARQL JSON Results, a language-tagged literal reports the
+            // language via `xml:lang`; otherwise the datatype IRI is reported
+            // (xsd:string for a plain literal).
+            let datatype = if lang.is_some() {
+                None
+            } else {
+                Some(literal.datatype().as_str().to_string())
+            };
+            BindingValue {
+                value_type: "literal".to_string(),
+                value: literal.value().to_string(),
+                datatype,
+                lang,
+            }
+        }
+        Term::Variable(var) => BindingValue {
+            value_type: "variable".to_string(),
+            value: var.as_str().to_string(),
+            datatype: None,
+            lang: None,
+        },
+        Term::QuotedTriple(triple) => BindingValue {
+            value_type: "triple".to_string(),
+            value: triple.to_string(),
+            datatype: None,
+            lang: None,
+        },
+    }
+}
+
+/// Validate `value` as a well-formed absolute IRI and return it wrapped as a
+/// SPARQL `<iri>` token. Rejects (HTTP 400) any value that is not a valid IRI —
+/// which, because RFC 3987 forbids spaces, `<`, `>`, `"`, `{`, `}` and control
+/// characters, also makes SPARQL injection through the term text impossible.
+fn build_iri_token(value: &str, field: &str) -> Result<String, ApiError> {
+    let node = oxirs_core::model::NamedNode::new(value)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid {field} IRI '{value}': {e}")))?;
+    Ok(format!("<{}>", node.as_str()))
+}
+
+/// Escape a string value for safe inclusion inside a SPARQL double-quoted
+/// literal (`"…"`), per the SPARQL string-literal grammar.
+fn escape_sparql_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build the SPARQL object token for an insert triple, honouring the
+/// documented `object_type` (`uri` or `literal`). An unknown type is a client
+/// error rather than a silent misinterpretation.
+fn build_object_token(t: &Triple) -> Result<String, ApiError> {
+    match t.object_type.to_ascii_lowercase().as_str() {
+        "uri" | "iri" => build_iri_token(&t.object, "object"),
+        "literal" => Ok(format!("\"{}\"", escape_sparql_string(&t.object))),
+        other => Err(ApiError::BadRequest(format!(
+            "Unsupported object_type '{other}' for object '{}': expected \"uri\" or \"literal\"",
+            t.object
+        ))),
+    }
+}
+
+/// Build a subject/predicate token for a `DELETE WHERE` pattern. A `None` value
+/// or one beginning with `?` is a wildcard variable (`default_var`); a concrete
+/// value must be a well-formed IRI.
+fn build_pattern_subject(
+    value: Option<&str>,
+    default_var: &str,
+    field: &str,
+) -> Result<String, ApiError> {
+    match value {
+        None => Ok(default_var.to_string()),
+        Some(v) if v == "?" || v.starts_with('?') => Ok(default_var.to_string()),
+        Some(v) => build_iri_token(v, field),
+    }
+}
+
+/// Build an object token for a `DELETE WHERE` pattern. A `None` value or one
+/// beginning with `?` is the wildcard `?o`; a concrete value is emitted as an
+/// IRI when it parses as one, otherwise as a quoted literal.
+fn build_pattern_object(value: Option<&str>) -> Result<String, ApiError> {
+    match value {
+        None => Ok("?o".to_string()),
+        Some(v) if v == "?" || v.starts_with('?') => Ok("?o".to_string()),
+        Some(v) => {
+            if oxirs_core::model::NamedNode::new(v).is_ok() {
+                Ok(format!("<{}>", v))
+            } else {
+                Ok(format!("\"{}\"", escape_sparql_string(v)))
+            }
+        }
+    }
+}
+
+/// Get triples from a dataset
+///
+/// Retrieves triples matching the specified pattern.
+#[utoipa::path(
+    get,
+    path = "/api/v2/datasets/{name}/triples",
+    responses(
+        (status = 200, description = "List of triples", body = TripleList),
+        (status = 404, description = "Dataset not found", body = ErrorResponse)
+    ),
+    params(
+        ("name" = String, Path, description = "Dataset name"),
+        PaginationParams
+    ),
+    tag = "triples"
+)]
+pub async fn get_triples(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    AxumQuery(pagination): AxumQuery<PaginationParams>,
+) -> Result<Json<TripleList>, ApiError> {
+    let store = &state.store;
+    if !store.dataset_exists(&name) {
+        return Err(ApiError::NotFound(format!("Dataset '{}' not found", name)));
+    }
+
+    // Build SPARQL query to get triples
+    let query = format!(
+        "SELECT ?s ?p ?o WHERE {{ ?s ?p ?o }} LIMIT {} OFFSET {}",
+        pagination.limit, pagination.offset
+    );
+
+    let results = store
+        .query_dataset(&query, Some(&name))
+        .map_err(|e| ApiError::InternalError(anyhow::anyhow!("{}", e)))?;
+
+    let triples: Vec<Triple> = match results.inner {
+        oxirs_core::query::QueryResult::Select { bindings, .. } => bindings
+            .into_iter()
+            .map(|binding| Triple {
+                subject: binding.get("s").map(|t| t.to_string()).unwrap_or_default(),
+                predicate: binding.get("p").map(|t| t.to_string()).unwrap_or_default(),
+                object: binding.get("o").map(|t| t.to_string()).unwrap_or_default(),
+                object_type: "uri".to_string(), // Simplified
+            })
+            .collect(),
+        _ => Vec::new(), // Handle other query types
+    };
+
+    let total = store.count_triples(&name);
+
+    Ok(Json(TripleList {
+        triples,
+        total,
+        limit: pagination.limit,
+        offset: pagination.offset,
+    }))
+}
+
+/// Insert triples into a dataset
+///
+/// Inserts one or more triples into the specified dataset.
+#[utoipa::path(
+    post,
+    path = "/api/v2/datasets/{name}/triples",
+    request_body = InsertTripleRequest,
+    responses(
+        (status = 201, description = "Triples inserted"),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse)
+    ),
+    params(
+        ("name" = String, Path, description = "Dataset name")
+    ),
+    tag = "triples"
+)]
+pub async fn insert_triple(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(request): Json<InsertTripleRequest>,
+) -> Result<StatusCode, ApiError> {
+    // Direct triple-level write -- guard before any parsing or mutation,
+    // same as the SPARQL Update / Graph Store Protocol / upload / patch
+    // write paths.
+    state.reject_if_read_only(&name, "triple insertion")?;
+
+    let store = &state.store;
+    if !store.dataset_exists(&name) {
+        return Err(ApiError::NotFound(format!("Dataset '{}' not found", name)));
+    }
+
+    // Build the SPARQL INSERT DATA body from validated, properly-escaped terms.
+    // Subject/predicate must be well-formed IRIs; the object is an IRI or a
+    // quoted literal depending on `object_type`. This both validates input and
+    // prevents any SPARQL injection through unescaped term text.
+    let mut triples_str = String::new();
+    for t in &request.triples {
+        let subject = build_iri_token(&t.subject, "subject")?;
+        let predicate = build_iri_token(&t.predicate, "predicate")?;
+        let object = build_object_token(t)?;
+        triples_str.push_str(&subject);
+        triples_str.push(' ');
+        triples_str.push_str(&predicate);
+        triples_str.push(' ');
+        triples_str.push_str(&object);
+        triples_str.push_str(" .\n");
+    }
+
+    let query = format!("INSERT DATA {{ {} }}", triples_str);
+
+    store
+        .update_dataset(&query, Some(&name))
+        .map_err(|e| ApiError::BadRequest(format!("Insert failed: {}", e)))?;
+
+    info!(
+        "Inserted {} triples into dataset: {}",
+        request.triples.len(),
+        name
+    );
+
+    Ok(StatusCode::CREATED)
+}
+
+/// Delete triples from a dataset
+///
+/// Deletes triples matching the specified pattern.
+#[utoipa::path(
+    delete,
+    path = "/api/v2/datasets/{name}/triples",
+    request_body = DeleteTripleRequest,
+    responses(
+        (status = 204, description = "Triples deleted"),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse)
+    ),
+    params(
+        ("name" = String, Path, description = "Dataset name")
+    ),
+    tag = "triples"
+)]
+pub async fn delete_triple(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(request): Json<DeleteTripleRequest>,
+) -> Result<StatusCode, ApiError> {
+    // Direct triple-level write -- guard before any parsing or mutation.
+    state.reject_if_read_only(&name, "triple deletion")?;
+
+    let store = &state.store;
+    if !store.dataset_exists(&name) {
+        return Err(ApiError::NotFound(format!("Dataset '{}' not found", name)));
+    }
+
+    // Build a DELETE WHERE pattern from validated, escaped terms. A `None` or
+    // `?`-prefixed field is a wildcard variable; a concrete subject/predicate
+    // must be a well-formed IRI, and a concrete object is emitted as an IRI when
+    // it parses as one, otherwise as a quoted literal. This yields syntactically
+    // valid SPARQL for concrete patterns (the old code emitted bare IRIs that
+    // failed to parse) and blocks injection through unescaped term text.
+    let s = build_pattern_subject(request.subject.as_deref(), "?s", "subject")?;
+    let p = build_pattern_subject(request.predicate.as_deref(), "?p", "predicate")?;
+    let o = build_pattern_object(request.object.as_deref())?;
+
+    let query = format!("DELETE WHERE {{ {} {} {} }}", s, p, o);
+
+    store
+        .update_dataset(&query, Some(&name))
+        .map_err(|e| ApiError::BadRequest(format!("Delete failed: {}", e)))?;
+
+    info!("Deleted triples from dataset: {}", name);
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get system statistics
+///
+/// Returns statistics about the system and its performance.
+#[utoipa::path(
+    get,
+    path = "/api/v2/statistics",
+    responses(
+        (status = 200, description = "System statistics", body = Statistics)
+    ),
+    tag = "statistics"
+)]
+pub async fn get_statistics(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Statistics>, ApiError> {
+    let store = &state.store;
+    let datasets = store.list_datasets().unwrap_or_default();
+    let total_triples: usize = datasets.iter().map(|ds| store.count_triples(ds)).sum();
+
+    Ok(Json(Statistics {
+        dataset_count: datasets.len(),
+        total_triples,
+        total_queries: 0, // Would need metrics integration
+        avg_query_time_ms: 0.0,
+        uptime_seconds: 0,     // Would need startup time tracking
+        memory_usage_bytes: 0, // Would need system metrics
+    }))
+}
+
+/// Health check
+///
+/// Returns the health status of the system and its components.
+#[utoipa::path(
+    get,
+    path = "/api/v2/health",
+    responses(
+        (status = 200, description = "Health status", body = HealthStatus)
+    ),
+    tag = "health"
+)]
+pub async fn get_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<HealthStatus>, ApiError> {
+    let store = &state.store;
+    let mut components = std::collections::HashMap::new();
+
+    // Check store health
+    let store_status = if store.list_datasets().is_ok() {
+        ComponentHealth {
+            status: "healthy".to_string(),
+            details: None,
+        }
+    } else {
+        ComponentHealth {
+            status: "unhealthy".to_string(),
+            details: Some("Failed to access store".to_string()),
+        }
+    };
+    components.insert("store".to_string(), store_status);
+
+    let overall_status = if components.values().all(|c| c.status == "healthy") {
+        "healthy"
+    } else {
+        "degraded"
+    };
+
+    Ok(Json(HealthStatus {
+        status: overall_status.to_string(),
+        timestamp: chrono::Utc::now(),
+        components,
+    }))
+}
+
+/// Register REST API v2 routes
+///
+/// Adds all REST API v2 endpoints to the provided router.
+pub fn register_routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    router
+        // Info
+        .route("/api/v2", get(get_api_info))
+        // Datasets
+        .route("/api/v2/datasets", get(list_datasets).post(create_dataset))
+        .route(
+            "/api/v2/datasets/{name}",
+            get(get_dataset).delete(delete_dataset),
+        )
+        // Queries
+        .route("/api/v2/datasets/{name}/query", post(execute_query))
+        // Triples
+        .route(
+            "/api/v2/datasets/{name}/triples",
+            get(get_triples).post(insert_triple).delete(delete_triple),
+        )
+        // Statistics and health
+        .route("/api/v2/statistics", get(get_statistics))
+        .route("/api/v2/health", get(get_health))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_info_serialization() {
+        let info = ApiInfo {
+            version: "2.0.0".to_string(),
+            name: "Test API".to_string(),
+            description: "Test".to_string(),
+            endpoints: vec![],
+            features: vec![],
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("2.0.0"));
+    }
+
+    /// Regression: a subject value that tries to break out of the INSERT DATA
+    /// block (SPARQL injection) must be rejected by IRI validation, not
+    /// interpolated verbatim.
+    #[test]
+    fn regression_insert_iri_validation_blocks_injection() {
+        let malicious =
+            "http://x> } ; DROP ALL ; INSERT DATA { <http://a> <http://b> <http://c> } #";
+        assert!(
+            build_iri_token(malicious, "subject").is_err(),
+            "an IRI containing '>', spaces and control syntax must be rejected"
+        );
+        // A well-formed IRI is accepted and wrapped.
+        assert_eq!(
+            build_iri_token("http://example.org/s", "subject").expect("valid iri"),
+            "<http://example.org/s>"
+        );
+    }
+
+    /// Regression: object_type "literal" must produce a quoted, escaped literal
+    /// token rather than a malformed `<...>` IRI, and injection via quotes is
+    /// escaped.
+    #[test]
+    fn regression_insert_literal_object_type_emits_literal() {
+        let triple = Triple {
+            subject: "http://example.org/s".to_string(),
+            predicate: "http://example.org/p".to_string(),
+            object: "hello \"world\"\n".to_string(),
+            object_type: "literal".to_string(),
+        };
+        let token = build_object_token(&triple).expect("literal token");
+        assert_eq!(token, "\"hello \\\"world\\\"\\n\"");
+
+        // Unknown object_type is a client error, not a silent misinterpretation.
+        let bad = Triple {
+            subject: "http://example.org/s".to_string(),
+            predicate: "http://example.org/p".to_string(),
+            object: "x".to_string(),
+            object_type: "banana".to_string(),
+        };
+        assert!(build_object_token(&bad).is_err());
+    }
+
+    /// Regression: DELETE pattern terms must wrap concrete IRIs in `<>` and
+    /// treat `?`/None as wildcards, producing syntactically valid SPARQL.
+    #[test]
+    fn regression_delete_pattern_terms_are_valid_sparql() {
+        assert_eq!(
+            build_pattern_subject(Some("http://example.org/s"), "?s", "subject").expect("iri"),
+            "<http://example.org/s>"
+        );
+        assert_eq!(
+            build_pattern_subject(None, "?s", "subject").expect("wildcard"),
+            "?s"
+        );
+        assert_eq!(
+            build_pattern_object(Some("http://example.org/o")).expect("iri object"),
+            "<http://example.org/o>"
+        );
+        assert_eq!(
+            build_pattern_object(Some("plain literal")).expect("literal object"),
+            "\"plain literal\""
+        );
+        // A concrete subject that is not a valid IRI is rejected (injection guard).
+        assert!(build_pattern_subject(Some("not a > iri"), "?s", "subject").is_err());
+    }
+
+    /// Regression: query bindings must report the real term type, not a
+    /// hardcoded "uri", and carry datatype/lang for literals.
+    #[test]
+    fn regression_binding_value_reflects_term_type() {
+        use oxirs_core::model::{BlankNode, Literal, NamedNode, Term};
+
+        let uri = term_to_binding_value(&Term::NamedNode(
+            NamedNode::new("http://example.org/x").expect("iri"),
+        ));
+        assert_eq!(uri.value_type, "uri");
+        assert_eq!(uri.value, "http://example.org/x");
+
+        let bnode = term_to_binding_value(&Term::BlankNode(BlankNode::new("b0").expect("bnode")));
+        assert_eq!(bnode.value_type, "bnode");
+
+        let plain = term_to_binding_value(&Term::Literal(Literal::new_simple_literal("hi")));
+        assert_eq!(plain.value_type, "literal");
+        assert_eq!(plain.value, "hi");
+        assert!(plain.lang.is_none());
+        assert_eq!(
+            plain.datatype.as_deref(),
+            Some("http://www.w3.org/2001/XMLSchema#string")
+        );
+
+        let lang = term_to_binding_value(&Term::Literal(
+            Literal::new_language_tagged_literal("bonjour", "fr").expect("lang literal"),
+        ));
+        assert_eq!(lang.value_type, "literal");
+        assert_eq!(lang.lang.as_deref(), Some("fr"));
+        assert!(lang.datatype.is_none());
+    }
+
+    #[test]
+    fn test_error_response() {
+        let error = ErrorResponse {
+            code: "TEST_ERROR".to_string(),
+            message: "Test error".to_string(),
+            details: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        assert_eq!(error.code, "TEST_ERROR");
+    }
+
+    fn read_only_default_state() -> Arc<AppState> {
+        let store = crate::store::Store::new().expect("in-memory store");
+        let mut config = crate::config::ServerConfig::default();
+        config.datasets.insert(
+            "default".to_string(),
+            crate::config::DatasetConfig {
+                name: "default".to_string(),
+                location: String::new(),
+                read_only: true,
+                text_index: None,
+                shacl_shapes: vec![],
+                services: vec![],
+                access_control: None,
+                backup: None,
+            },
+        );
+        Arc::new(crate::server::test_app::build_minimal_app_state(
+            store, config,
+        ))
+    }
+
+    /// Regression for the most severe gap found by the Task 2 route audit:
+    /// `POST /api/v2/datasets/{name}/triples` (`insert_triple`) is a direct
+    /// triple-level write that completely bypassed `read_only` before this
+    /// guard was added -- unlike SPARQL UPDATE / Graph Store Protocol /
+    /// `/upload` / `/patch`, which were already covered.
+    #[tokio::test]
+    async fn test_insert_triple_rejected_when_dataset_read_only() {
+        let state = read_only_default_state();
+        let result = insert_triple(
+            State(state),
+            Path("default".to_string()),
+            Json(InsertTripleRequest {
+                triples: vec![Triple {
+                    subject: "http://example.org/s".to_string(),
+                    predicate: "http://example.org/p".to_string(),
+                    object: "http://example.org/o".to_string(),
+                    object_type: "uri".to_string(),
+                }],
+                graph: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(_))),
+            "expected Forbidden, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_triple_rejected_when_dataset_read_only() {
+        let state = read_only_default_state();
+        let result = delete_triple(
+            State(state),
+            Path("default".to_string()),
+            Json(DeleteTripleRequest {
+                subject: None,
+                predicate: None,
+                object: None,
+                graph: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(_))),
+            "expected Forbidden, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_dataset_rejected_when_target_dataset_read_only() {
+        let state = read_only_default_state();
+        let result = create_dataset(
+            State(state),
+            Json(CreateDatasetRequest {
+                name: "default".to_string(),
+                description: None,
+                storage_type: default_storage_type(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(_))),
+            "expected Forbidden, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_dataset_rejected_when_dataset_read_only() {
+        let state = read_only_default_state();
+        let result = delete_dataset(State(state), Path("default".to_string())).await;
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(_))),
+            "expected Forbidden, got {result:?}"
+        );
+    }
+}

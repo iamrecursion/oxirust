@@ -1,0 +1,10 @@
+{
+  "name": "error_no_output",
+  "args": ["-i", "in.mkv"],
+  "expect": {
+    "success": false,
+    "contains_diagnostic_kinds": ["Error"],
+    "contains_diagnostic_messages": ["no output file"],
+    "jobs": 0
+  }
+}

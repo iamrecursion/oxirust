@@ -1,0 +1,130 @@
+//! # QueryExecutor - execute_single_pattern_group Methods
+//!
+//! This module contains method implementations for `QueryExecutor`.
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+
+pub use super::dataset::{
+    convert_property_path, ConcreteStoreDataset, Dataset, DatasetPathAdapter, InMemoryDataset,
+};
+use crate::algebra::Solution;
+use anyhow::Result;
+
+use super::types::AccessPath;
+
+use super::queryexecutor_type::QueryExecutor;
+
+impl QueryExecutor {
+    /// Execute a single triple pattern with index selection.
+    ///
+    /// Records actual cardinality in the adaptive statistics store so the
+    /// optimizer can improve future cardinality estimates for the same pattern.
+    pub(super) fn execute_single_pattern(
+        &self,
+        pattern: &crate::algebra::TriplePattern,
+        dataset: &dyn Dataset,
+    ) -> Result<Solution> {
+        // A complex property path (`p1/p2`, `^p`, `p+`, `p*`, `p?`, `p1|p2`,
+        // `!p`) cannot be matched by a single triple lookup — `find_triples`
+        // only understands a plain IRI/variable predicate. Route it to the path
+        // engine (`execute_property_path`). A bare `Iri`/`Variable` property-path
+        // predicate stays on the fast triple-lookup path below.
+        if let crate::algebra::Term::PropertyPath(path) = &pattern.predicate {
+            if !matches!(
+                path,
+                crate::algebra::PropertyPath::Iri(_) | crate::algebra::PropertyPath::Variable(_)
+            ) {
+                return self.execute_property_path(
+                    &pattern.subject,
+                    path,
+                    &pattern.object,
+                    dataset,
+                );
+            }
+        }
+        let access_path = self.select_access_path(pattern);
+        let solution = match access_path {
+            AccessPath::SubjectIndex => self.lookup_by_subject(pattern, dataset)?,
+            AccessPath::PredicateIndex => self.lookup_by_predicate(pattern, dataset)?,
+            AccessPath::ObjectIndex => self.lookup_by_object(pattern, dataset)?,
+            AccessPath::FullScan => self.full_scan_pattern(pattern, dataset)?,
+        };
+
+        // Enforce the runtime triple-scan budget on the store hot path. Each
+        // matched triple counts as one scanned triple for this pattern; the
+        // check is incremental so a runaway scan is aborted before the whole
+        // result Solution is materialized further up the pipeline. This also
+        // surfaces any concurrent row-limit breach (see
+        // `ExecutionBudget::record_triple_scan`).
+        if let Some(ref budget) = self.execution_budget {
+            budget
+                .record_triple_scan(solution.len() as u64)
+                .map_err(anyhow::Error::new)?;
+        }
+
+        // Feed actual cardinality back to the adaptive statistics store so
+        // the optimizer can recalibrate future estimates for this pattern.
+        let pattern_id = pattern_fingerprint(pattern);
+        // Estimated cardinality: use 1 as a default when no prior estimate is
+        // available (the correction factor in AdaptiveStatsStore will adjust
+        // over time as more executions are recorded).
+        let estimated: u64 = 1;
+        let actual: u64 = solution.len() as u64;
+        self.adaptive_stats
+            .record_pattern_execution(&pattern_id, estimated, actual);
+
+        Ok(solution)
+    }
+
+    /// Select optimal access path for a pattern
+    pub(super) fn select_access_path(&self, pattern: &crate::algebra::TriplePattern) -> AccessPath {
+        if !matches!(pattern.subject, crate::algebra::Term::Variable(_)) {
+            return AccessPath::SubjectIndex;
+        }
+        if !matches!(pattern.predicate, crate::algebra::Term::Variable(_)) {
+            return AccessPath::PredicateIndex;
+        }
+        if !matches!(pattern.object, crate::algebra::Term::Variable(_)) {
+            return AccessPath::ObjectIndex;
+        }
+        AccessPath::FullScan
+    }
+    /// Lookup by subject index
+    pub(super) fn lookup_by_subject(
+        &self,
+        pattern: &crate::algebra::TriplePattern,
+        dataset: &dyn Dataset,
+    ) -> Result<Solution> {
+        self.execute_pattern_with_dataset(pattern, dataset)
+    }
+    /// Lookup by predicate index
+    pub(super) fn lookup_by_predicate(
+        &self,
+        pattern: &crate::algebra::TriplePattern,
+        dataset: &dyn Dataset,
+    ) -> Result<Solution> {
+        self.execute_pattern_with_dataset(pattern, dataset)
+    }
+    /// Lookup by object index
+    pub(super) fn lookup_by_object(
+        &self,
+        pattern: &crate::algebra::TriplePattern,
+        dataset: &dyn Dataset,
+    ) -> Result<Solution> {
+        self.execute_pattern_with_dataset(pattern, dataset)
+    }
+    /// Full scan pattern
+    pub(super) fn full_scan_pattern(
+        &self,
+        pattern: &crate::algebra::TriplePattern,
+        dataset: &dyn Dataset,
+    ) -> Result<Solution> {
+        self.execute_pattern_with_dataset(pattern, dataset)
+    }
+}
+
+/// Build a compact fingerprint for a triple pattern used as the key in the
+/// adaptive statistics store.
+fn pattern_fingerprint(pattern: &crate::algebra::TriplePattern) -> String {
+    pattern.to_string()
+}

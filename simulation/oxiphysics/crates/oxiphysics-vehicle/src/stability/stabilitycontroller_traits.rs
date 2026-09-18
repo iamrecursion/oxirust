@@ -1,0 +1,16 @@
+//! # StabilityController - Trait Implementations
+//!
+//! This module contains trait implementations for `StabilityController`.
+//!
+//! ## Implemented Traits
+//!
+//! - `Default`
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+use super::types::StabilityController;
+
+impl Default for StabilityController {
+    fn default() -> Self {
+        Self::new()
+    }
+}

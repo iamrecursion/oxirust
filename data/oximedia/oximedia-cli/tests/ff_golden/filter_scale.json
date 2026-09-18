@@ -1,0 +1,10 @@
+{
+  "name": "filter_scale",
+  "args": ["-i", "in.mkv", "-vf", "scale=1920:1080", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_filters": 1,
+    "audio_filters": 0
+  }
+}

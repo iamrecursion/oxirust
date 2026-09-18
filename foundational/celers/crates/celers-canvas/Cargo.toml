@@ -1,0 +1,47 @@
+[package]
+name = "celers-canvas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Workflow primitives for CeleRS (Chain, Chord, Group, Map)"
+readme = "README.md"
+keywords = ["celery", "workflow", "canvas", "chain", "chord"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+async-trait = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+# Optional dependencies
+chrono = { workspace = true, optional = true }
+
+# Core dependencies
+celers-core = { workspace = true }
+celers-protocol = { workspace = true }
+celers-backend-redis = { workspace = true, optional = true }
+
+[features]
+default = []
+backend-redis = ["celers-backend-redis", "chrono"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[[bench]]
+name = "workflow_benchmarks"
+harness = false
+
+[[bench]]
+name = "memory_benchmarks"
+harness = false
+
+[[bench]]
+name = "advanced_benchmarks"
+harness = false

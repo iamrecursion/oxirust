@@ -1,0 +1,26 @@
+[package]
+name = "legalis-chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Smart contract export for Legalis-RS"
+categories = ["cryptography::cryptocurrencies", "compilers", "wasm"]
+keywords = ["legalis", "smart-contract", "solidity", "blockchain", "codegen"]
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/legalis-chain"
+
+[dependencies]
+legalis-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "contract_generation"
+harness = false

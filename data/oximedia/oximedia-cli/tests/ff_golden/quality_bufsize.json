@@ -1,0 +1,9 @@
+{
+  "name": "quality_bufsize",
+  "args": ["-i", "in.mkv", "-bufsize", "10M", "out.webm"],
+  "expect": {
+    "contains_diagnostic_kinds": ["UnknownOptionIgnored"],
+    "contains_diagnostic_messages": ["bufsize"],
+    "jobs": 1
+  }
+}

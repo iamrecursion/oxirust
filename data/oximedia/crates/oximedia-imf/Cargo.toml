@@ -1,0 +1,36 @@
+[package]
+name = "oximedia-imf"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "IMF (Interoperable Master Format) support for OxiMedia"
+keywords = ["edl", "editorial", "post-production", "multimedia", "video"]
+categories = ["multimedia", "parser-implementations"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+quick-xml = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+md-5.workspace = true
+hex.workspace = true
+rayon = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

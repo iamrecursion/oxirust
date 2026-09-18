@@ -1,0 +1,50 @@
+[package]
+name = "oximedia-qc"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Quality control and validation for OxiMedia"
+keywords = ["quality", "video", "metrics", "multimedia", "broadcast"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = ["json", "xml", "pdf"]
+json = ["dep:serde", "dep:serde_json"]
+xml = ["dep:quick-xml", "dep:serde"]
+database = ["dep:oxisql-core", "dep:oxisql-sqlite-compat"]
+pdf = []
+sqlite = []
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-io.workspace = true
+oximedia-container.workspace = true
+oximedia-codec = { workspace = true, default-features = true }
+oximedia-timecode.workspace = true
+oximedia-audio-analysis.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+bitflags.workspace = true
+rayon.workspace = true
+chrono.workspace = true
+
+# Serialization support
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+quick-xml = { workspace = true, features = ["serialize"], optional = true }
+
+# Database support
+oxisql-core = { workspace = true, optional = true }
+oxisql-sqlite-compat = { workspace = true, optional = true }
+
+# Math and statistics
+num-traits = { workspace = true }

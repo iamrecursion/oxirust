@@ -1,0 +1,1105 @@
+//! Prefix-cache-aware inference engine wrapper.
+//!
+//! [`PrefixCachedEngine`] wraps an [`InferenceEngine`] and transparently
+//! intercepts the prefill phase: identical prompt prefixes (e.g. a shared
+//! system prompt) are served from the KV-cache trie rather than being
+//! re-processed by the model, cutting prefill cost to near-zero for cached
+//! prefixes.
+//!
+//! ## Usage
+//!
+//! ```rust,no_run
+//! use oxibonsai_core::config::Qwen3Config;
+//! use oxibonsai_runtime::engine::InferenceEngine;
+//! use oxibonsai_runtime::sampling::SamplingParams;
+//! use oxibonsai_runtime::prefix_cache_engine::PrefixCachedEngine;
+//!
+//! let config = Qwen3Config::tiny_test();
+//! let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+//! // `try_new` is the recommended constructor: it refuses, with a typed
+//! // error, an engine the prefix cache cannot serve (a hybrid model).
+//! let mut cached = PrefixCachedEngine::try_new(engine, 64, 42)?;
+//!
+//! let tokens = cached.generate(&[1, 2, 3, 4], &SamplingParams::default());
+//! let stats = cached.cache_stats();
+//! println!("hit rate: {:.1}%", stats.hit_rate * 100.0);
+//! # Ok::<(), oxibonsai_runtime::error::RuntimeError>(())
+//! ```
+//!
+//! ## Limitations (M-35)
+//!
+//! Real prefix-cache reuse is only correct when the engine's forward path
+//! populates the CPU [`oxibonsai_model::KvCache`]. Two cases where it does
+//! not are handled by refusing to use the cache-aware path at all, rather
+//! than by probing after the fact and hoping the probe is representative:
+//!
+//! * **A GPU-resident KV tier**, detected by asking the engine's own kernel
+//!   dispatcher directly
+//!   ([`oxibonsai_kernels::traits::OneBitKernel::is_gpu_accelerated`] on
+//!   [`InferenceEngine::kernel`]) rather than re-deriving the same
+//!   feature-cfg condition locally — the two can then never silently drift
+//!   apart. Metal/CUDA forward paths keep KV state on the device, separate
+//!   from the CPU cache this trie reads from and writes into; injecting a
+//!   cached prefix into the CPU cache would then be inert (the GPU forward
+//!   never reads it), and extracting "new" blocks afterwards would capture
+//!   zeros — silently and permanently poisoning the trie for every later
+//!   request sharing that prefix. [`PrefixCachedEngine::generate`] detects
+//!   this tier up front and falls back to a plain, uncached generation that
+//!   is always correct.
+//! * **A hybrid (recurrent-attention) architecture.** A model whose layers
+//!   carry Gated-DeltaNet-style recurrent state (e.g. Bonsai 2 27B, GGUF
+//!   `general.architecture = "qwen35"`) has no block-KV representation for
+//!   that state at all — there is nothing to extract or inject, so prefix
+//!   caching is refused unconditionally for such a model.
+//!   [`PrefixCachedEngine::try_new`] — the recommended constructor — turns
+//!   that into the typed [`EngineError::RecurrentRollbackRequired`];
+//!   [`PrefixCachedEngine::new`] keeps serving it uncached (always correct)
+//!   and reports the bypass once at `warn` — never silently.
+//!
+//! Within the cache-aware path, every candidate block is checksummed against
+//! its own live extracted content — not against an unrelated sample range —
+//! before it is allowed into the trie; see
+//! `PrefixCachedEngine::store_new_blocks`.
+//!
+//! ## The "ideal fix" (`cpu_kv_is_authoritative`, M-35)
+//!
+//! The checksum in `block_has_real_content` is a *fallback*: it infers
+//! "was this really written by the CPU forward path" from the data itself
+//! (all-zero is suspicious), which is reliable but, by construction, cannot
+//! catch a forward path that writes *plausible-looking but stale* data.
+//! `cpu_kv_is_authoritative` is the honest alternative the M-35 finding's
+//! review asks for: it reads
+//! [`BonsaiModel::gpu_path_active`](oxibonsai_model::model::BonsaiModel::gpu_path_active)
+//! — already set truthfully by every forward path
+//! (`forward_prefill`/`forward_into`/`mark_host_kv_rebuilt`/
+//! `note_host_kv_written`, all of
+//! which are `pub`) — combined with the same
+//! hybrid-architecture check `generate()` uses. `store_new_blocks` consults
+//! **both** this flag and the checksum; neither replaces the other.
+
+use oxibonsai_core::config_hybrid::HYBRID_ARCHITECTURE as HYBRID_RECURRENT_ARCHITECTURE;
+use oxibonsai_kernels::traits::OneBitKernel;
+use oxibonsai_model::model::BonsaiModel;
+use oxibonsai_model::prefix_cache::{
+    KvBlockPair, PrefixAwarePrefill, PrefixCache, PrefixCacheStats,
+};
+
+use crate::engine::InferenceEngine;
+use crate::engine_seam::EngineError;
+use crate::error::RuntimeResult;
+#[cfg(test)]
+use crate::sampling::PenaltyParams;
+use crate::sampling::{Sampler, SamplingParams};
+
+/// Whether `model`'s CPU-resident `KvCache` currently holds the true,
+/// authoritative KV history for every position already processed (M-35's
+/// "ideal fix" — see the module docs).
+///
+/// `false` in exactly the two cases [`PrefixCachedEngine::generate`]'s
+/// up-front gate already refuses the cache-aware path for: a GPU-resident
+/// forward path (`gpu_path_active()`, tracked honestly per forward call —
+/// distinct from and more precise than that gate's own
+/// [`OneBitKernel::is_gpu_accelerated`], which asks "can this kernel tier
+/// run on the GPU at all" rather than "did the last forward call actually
+/// use it") and a hybrid recurrent-attention architecture (no block-KV
+/// representation exists to be authoritative about in the first place). A
+/// real hybrid engine holds no [`BonsaiModel`] at all, so it never gets
+/// this far — see [`prefix_cache_refused`].
+fn cpu_kv_is_authoritative(model: &BonsaiModel) -> bool {
+    !model.gpu_path_active() && model.config().architecture != HYBRID_RECURRENT_ARCHITECTURE
+}
+
+/// Tokens per cache block — must divide evenly into most prompt lengths.
+const BLOCK_SIZE: usize = 16;
+
+/// Whether prefix caching must be refused for `engine` outright: its
+/// sequence state includes a recurrence (a real hybrid `qwen35` model, or an
+/// attached `RecurrentState`), or its configuration declares the hybrid
+/// architecture.
+fn prefix_cache_refused(engine: &InferenceEngine<'_>) -> bool {
+    !engine.recurrent_rollback_supported() || engine.architecture() == HYBRID_RECURRENT_ARCHITECTURE
+}
+
+/// The typed refusal for prefix caching on an engine whose sequence state
+/// includes a recurrence (a hybrid `qwen35` model): restoring a cached KV
+/// prefix would need the recurrent state *at that position*, which the
+/// block trie has no representation for.
+fn recurrent_prefix_refusal(engine: &InferenceEngine<'_>) -> EngineError {
+    EngineError::RecurrentRollbackRequired {
+        operation: "prefix-cache KV block restore",
+        architecture: engine.architecture().to_string(),
+    }
+}
+
+/// An [`InferenceEngine`] augmented with prefix KV-cache reuse.
+///
+/// On each [`generate`](PrefixCachedEngine::generate) call, unless the
+/// engine's KV tier is GPU-resident or the model is a hybrid
+/// recurrent-attention architecture (see the module docs — M-35), the
+/// engine:
+///
+/// 1. Resets the model's KV cache (single-engine, sequential request model).
+/// 2. Looks up the longest cached prefix in the trie.
+/// 3. Injects the matched KV blocks back into the model's CPU cache.
+/// 4. Runs prefill only on the uncached suffix at the correct `pos_start`.
+/// 5. Checksums and stores any newly computed *and verified non-zero* full
+///    blocks of KV state into the trie for subsequent requests.
+/// 6. Sample-decodes new tokens up to `params.max_tokens` or EOS.
+/// 7. Releases the session (decrements ref counts) when done.
+///
+/// In the refused cases, steps 2/3/5/7 (everything cache-specific) are
+/// skipped entirely and step 4 prefills the whole prompt from position 0;
+/// steps 1 and 6 still run.
+pub struct PrefixCachedEngine<'a> {
+    /// The underlying inference engine.
+    pub inner: InferenceEngine<'a>,
+    /// Prefix-cache-aware prefill helper with the block trie.
+    pub prefix_cache: PrefixAwarePrefill,
+    /// Per-request decode sampler, seeded once at construction and reused
+    /// (state-advancing) across every `generate()` call — mirrors
+    /// [`InferenceEngine::generate_with_params`]'s "swap params, keep RNG
+    /// state" pattern rather than re-seeding on every call.
+    sampler: Sampler,
+    /// Whether the uncached bypass for a hybrid engine has already been
+    /// reported (it is logged once per wrapper, at `warn`, never silently).
+    hybrid_bypass_reported: bool,
+}
+
+impl<'a> PrefixCachedEngine<'a> {
+    /// [`PrefixCachedEngine::new`], refusing an engine prefix caching cannot
+    /// serve.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::RecurrentRollbackRequired`] (as a
+    /// [`RuntimeError`](crate::error::RuntimeError)) for an engine whose
+    /// sequence state includes a recurrence — a hybrid (`qwen35`) model:
+    /// restoring a cached KV prefix would need its recurrent state at that
+    /// position, which the block trie cannot represent. Use this constructor
+    /// where serving without a cache would be a misconfiguration;
+    /// [`PrefixCachedEngine::new`] accepts such an engine and serves it
+    /// uncached (reported at `warn`).
+    pub fn try_new(
+        engine: InferenceEngine<'a>,
+        max_cache_blocks: usize,
+        seed: u64,
+    ) -> RuntimeResult<Self> {
+        if prefix_cache_refused(&engine) {
+            return Err(recurrent_prefix_refusal(&engine).into());
+        }
+        Ok(Self::new(engine, max_cache_blocks, seed))
+    }
+
+    /// Wrap an existing [`InferenceEngine`] with a prefix cache.
+    ///
+    /// **Prefer [`PrefixCachedEngine::try_new`]**, the recommended
+    /// constructor: it refuses, with a typed error, an engine the cache
+    /// cannot serve. This infallible form exists for callers that must not
+    /// fail; it accepts such an engine — a hybrid (`qwen35`) model, whose
+    /// recurrent state the block trie cannot restore — and serves it
+    /// correctly but **uncached**, reporting that once at `warn` on the first
+    /// [`generate`](Self::generate). It never pretends to cache.
+    ///
+    /// Derives `num_layers`, `num_kv_heads`, and `head_dim` directly from
+    /// the engine's model configuration, so no manual wiring is required.
+    ///
+    /// # Parameters
+    ///
+    /// - `engine` — the inference engine to wrap.
+    /// - `max_cache_blocks` — maximum number of simultaneously live cache
+    ///   blocks.  Each block holds `BLOCK_SIZE` (16) tokens of KV data for
+    ///   every layer; memory per block is approximately
+    ///   `2 × num_layers × num_kv_heads × head_dim × 16 × 4` bytes.
+    /// - `seed` — RNG seed for the wrapper's own decode sampler. `0` is
+    ///   remapped to a fixed nonzero constant because the sampler's xorshift64
+    ///   PRNG has `0` as a fixed point (it would otherwise generate the same
+    ///   "random" value forever), matching the precedent in
+    ///   `crate::speculative`.
+    pub fn new(engine: InferenceEngine<'a>, max_cache_blocks: usize, seed: u64) -> Self {
+        // The KV geometry the engine's cache really has: every layer for a
+        // dense model, only the full-attention layers for a hybrid one
+        // (whose trie then stays unused -- see `generate`).
+        let (num_layers, num_kv_heads, head_dim) = engine.kv_cache_geometry();
+        let cache = PrefixCache::new(
+            max_cache_blocks,
+            BLOCK_SIZE,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+        );
+        let prefix_cache = PrefixAwarePrefill::new(cache);
+        let effective_seed = if seed == 0 { 0xdeadbeef_cafebabe } else { seed };
+        // Seed the wrapper's own decode sampler from the WRAPPED engine's
+        // own configured sampling params (e.g. GGUF-derived defaults per
+        // RT-17) rather than a bare `SamplingParams::default()`, so this "at
+        // rest" baseline (restored by `decode_loop` between calls, see its
+        // own doc comment) never silently diverges from what the engine
+        // itself was actually built with. `min_p` and the frequency/presence
+        // `penalties` live outside `SamplingParams`, on the `Sampler`
+        // itself, so `Sampler::new` alone would leave them at their
+        // defaults (`0.0` / disabled) even when the wrapped engine
+        // configures both non-default — carry them across explicitly so the
+        // wrapper's sampler matches the engine's on every axis, not only
+        // the fields `SamplingParams` covers.
+        let mut sampler = Sampler::new(engine.sampling_params().clone(), effective_seed);
+        sampler.set_min_p(engine.min_p());
+        sampler.set_penalties(engine.penalties());
+        Self {
+            inner: engine,
+            prefix_cache,
+            sampler,
+            hybrid_bypass_reported: false,
+        }
+    }
+
+    /// Generate tokens from `prompt_tokens`, reusing any cached prefix when
+    /// it is safe to do so (M-35 — see the module docs for the two refusal
+    /// cases).
+    ///
+    /// Returns the generated token IDs (not including the prompt). On any
+    /// internal error the method logs via `tracing::warn` and returns an
+    /// empty vector — `generate` itself is infallible from the caller's
+    /// perspective so it can be dropped into batch pipelines.
+    pub fn generate(&mut self, prompt_tokens: &[u32], params: &SamplingParams) -> Vec<u32> {
+        if prompt_tokens.is_empty() {
+            return vec![];
+        }
+
+        // M-35: refuse the cache-aware path entirely rather than risk
+        // poisoning the trie (GPU-resident KV) or attempting something that
+        // has no block-KV representation at all (hybrid recurrent state).
+        // See the module docs for both cases. GPU-residency is read straight
+        // off the engine's own kernel dispatcher — the exact predicate
+        // `BonsaiModel::forward`/`prefill` use to pick the Metal path —
+        // rather than re-derived locally, so this refusal cannot silently
+        // drift out of sync with the forward path it is guarding against.
+        if prefix_cache_refused(&self.inner) {
+            // A hybrid (recurrent) engine: restoring a KV prefix would need the
+            // recurrent state at that position, which the trie cannot hold.
+            // Serve it correctly -- uncached -- and say so once, loudly.
+            if !self.hybrid_bypass_reported {
+                self.hybrid_bypass_reported = true;
+                tracing::warn!(
+                    refusal = %recurrent_prefix_refusal(&self.inner),
+                    "prefix cache disabled for this engine: generating without prefix reuse \
+                     (construct with PrefixCachedEngine::try_new to make this an error)"
+                );
+            }
+            return self.generate_without_prefix_cache(prompt_tokens, params);
+        }
+        if self.inner.kernel().is_gpu_accelerated() {
+            return self.generate_without_prefix_cache(prompt_tokens, params);
+        }
+
+        // ── Step 1: reset model KV cache ─────────────────────────────────────
+        // We treat the wrapper as a single-engine, sequential request server.
+        self.inner.reset();
+
+        // ── Step 2: query the prefix cache ───────────────────────────────────
+        let (session, uncached_start) = self.prefix_cache.prepare(prompt_tokens);
+        let block_size = self.prefix_cache.cache.block_size();
+        let (num_layers, _, _) = self.inner.kv_cache_geometry();
+
+        // ── Step 3: restore cached blocks into the model's CPU KV cache ──────
+        if uncached_start > 0 && !session.block_indices.is_empty() {
+            for (block_num, &bidx) in session.block_indices.iter().enumerate() {
+                if bidx == usize::MAX {
+                    continue;
+                }
+                // Snapshot keys/values per layer before mutably borrowing model.
+                let snapshots: Option<Vec<(Vec<f32>, Vec<f32>)>> =
+                    self.prefix_cache.cache.get_block(bidx).map(|block| {
+                        (0..num_layers)
+                            .map(|l| (block.keys[l].clone(), block.values[l].clone()))
+                            .collect()
+                    });
+                let snapshots = match snapshots {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let block_start = block_num * block_size;
+                // Dense by the gate above (`recurrent_rollback_supported`).
+                if let Some(model) = self.inner.dense_model_mut() {
+                    let kv = model.kv_cache_mut();
+                    for (layer, (keys, values)) in snapshots.into_iter().enumerate() {
+                        kv.inject_block(layer, block_start, block_size, &keys, &values);
+                    }
+                }
+            }
+            if let Some(model) = self.inner.dense_model_mut() {
+                model.kv_cache_mut().set_seq_len(uncached_start);
+            }
+        }
+
+        // ── Step 4: prefill on the uncached suffix only ──────────────────────
+        let last_logits = if uncached_start < prompt_tokens.len() {
+            match self
+                .inner
+                .prefill_from_pos(&prompt_tokens[uncached_start..], uncached_start)
+            {
+                Ok(logits) => logits,
+                Err(e) => {
+                    tracing::warn!(error = %e, "prefix-cache prefill failed");
+                    self.prefix_cache.release_session(session);
+                    return vec![];
+                }
+            }
+        } else {
+            // Entire prompt was cached — re-run the final token to get logits
+            // (we still need a fresh logits vector to drive the decode loop).
+            let last_pos = prompt_tokens.len().saturating_sub(1);
+            let last_tok = prompt_tokens[last_pos];
+            match self.inner.decode_step(last_tok, last_pos) {
+                Ok(logits) => logits,
+                Err(e) => {
+                    tracing::warn!(error = %e, "prefix-cache decode_step failed");
+                    self.prefix_cache.release_session(session);
+                    return vec![];
+                }
+            }
+        };
+
+        // ── Step 5/6: checksum-gated store of newly computed blocks ──────────
+        self.store_new_blocks(prompt_tokens, uncached_start, block_size, num_layers);
+
+        // ── Step 7: decode loop ──────────────────────────────────────────────
+        let output = self.decode_loop(prompt_tokens.len(), last_logits, params);
+
+        // ── Step 8: release session ──────────────────────────────────────────
+        self.prefix_cache.release_session(session);
+        output
+    }
+
+    /// Plain, uncached generation: full prefill from position 0, then the
+    /// same seeded decode loop `generate()` uses. Used when the cache-aware
+    /// path is refused outright (M-35 — GPU-resident KV tier, or a hybrid
+    /// recurrent-attention model).
+    fn generate_without_prefix_cache(
+        &mut self,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+    ) -> Vec<u32> {
+        self.inner.reset();
+        let last_logits = match self.inner.prefill_from_pos(prompt_tokens, 0) {
+            Ok(logits) => logits,
+            Err(e) => {
+                tracing::warn!(error = %e, "prefix-cache bypass: plain prefill failed");
+                return vec![];
+            }
+        };
+        self.decode_loop(prompt_tokens.len(), last_logits, params)
+    }
+
+    /// Checksum every candidate new block against its own live extracted
+    /// content and store only the ones that are genuinely non-zero (M-35).
+    ///
+    /// The previous implementation sampled `(layer 0, head 0)` over the
+    /// **whole prompt** `0..prompt_len` to decide whether the CPU cache was
+    /// "real", then used that single answer to gate storing a *different*
+    /// range (`uncached_start..uncached_start + n*block_size`, the newly
+    /// prefilled suffix). The two ranges coincide only when
+    /// `uncached_start == 0`; whenever a request injects a cached prefix
+    /// (making `0..uncached_start` genuinely non-zero) and the *suffix*
+    /// prefill takes a path that leaves the CPU cache untouched, the old
+    /// probe would see the injected prefix, pass, and store all-zero suffix
+    /// blocks as if they were real KV — permanently, for the process
+    /// lifetime.
+    ///
+    /// This checksums the *exact* keys/values about to be stored, for every
+    /// layer of every candidate block, not a one-layer sample of an
+    /// unrelated range — the near-zero probability of a genuinely computed
+    /// RMSNorm-scaled key/value vector being all-zero makes "any nonzero
+    /// value across the whole block, in every layer" a reliable real-content
+    /// check. The first untrustworthy block stops the scan (blocks are
+    /// stored as an unbroken run starting at `uncached_start`, so a later,
+    /// individually-genuine block cannot be spliced in behind a gap without
+    /// misrepresenting the trie's token alignment).
+    fn store_new_blocks(
+        &mut self,
+        prompt_tokens: &[u32],
+        uncached_start: usize,
+        block_size: usize,
+        num_layers: usize,
+    ) {
+        let new_blocks_count = prompt_tokens.len().saturating_sub(uncached_start) / block_size;
+        if new_blocks_count == 0 {
+            return;
+        }
+
+        // M-35 addendum: consult the honest, per-forward-path-tracked flag
+        // *in addition to* the checksum below (never instead of it — the
+        // checksum also catches a partially-populated block within an
+        // otherwise-authoritative run, which this coarse, whole-model flag
+        // cannot see). See `cpu_kv_is_authoritative`'s doc for why this is
+        // additive rather than a replacement for `generate()`'s existing
+        // up-front `is_gpu_accelerated()` gate.
+        if !self
+            .inner
+            .dense_model()
+            .is_some_and(cpu_kv_is_authoritative)
+        {
+            tracing::warn!(
+                uncached_start,
+                "prefix-cache: skipping store — the model's CPU KV cache is not \
+                 authoritative right now (GPU-resident forward path, or a hybrid \
+                 recurrent-attention architecture)"
+            );
+            return;
+        }
+
+        // Authoritative implies dense (checked just above).
+        let Some(model) = self.inner.dense_model() else {
+            return;
+        };
+        let mut keys_by_block: Vec<KvBlockPair> = Vec::with_capacity(new_blocks_count);
+        for blk in 0..new_blocks_count {
+            let block_pos = uncached_start + blk * block_size;
+            let mut layer_keys: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
+            let mut layer_values: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
+            for layer in 0..num_layers {
+                let (k, v) = model.kv_cache().extract_block(layer, block_pos, block_size);
+                layer_keys.push(k);
+                layer_values.push(v);
+            }
+            if !block_has_real_content(&layer_keys, &layer_values) {
+                tracing::warn!(
+                    block_pos,
+                    "prefix-cache: skipping all-zero KV block (the CPU cache is not \
+                     authoritative for this range, likely a GPU-resident forward path) \
+                     instead of poisoning the trie"
+                );
+                break;
+            }
+            keys_by_block.push((layer_keys, layer_values));
+        }
+
+        if !keys_by_block.is_empty() {
+            self.prefix_cache
+                .store_blocks(prompt_tokens, uncached_start, keys_by_block);
+        }
+    }
+
+    /// Shared decode loop used by both the cache-aware and the bypass path.
+    ///
+    /// Swaps `params` onto the wrapper's own seeded sampler (constructed
+    /// once in `new()` from the caller-supplied seed) so that per-call
+    /// sampling parameters are honoured while the PRNG state keeps
+    /// advancing across calls — the same "swap params, keep RNG state"
+    /// pattern [`InferenceEngine::generate_with_params`] uses, rather than
+    /// discarding the configured seed and re-seeding at 0 every call.
+    ///
+    /// Samples with [`Sampler::sample_with_history`], not the plain
+    /// [`Sampler::sample`], so the repetition/frequency/presence penalties
+    /// carried onto this sampler in [`PrefixCachedEngine::new`] actually take
+    /// effect (M-35 addendum: `new()` alone only stores them). `output` is
+    /// the recent-token history: it starts empty for each `generate()` call
+    /// and grows with every token this loop emits, mirroring exactly how
+    /// [`InferenceEngine::generate`]'s own decode loop seeds
+    /// `sample_with_history` from its `output_tokens` — the prompt itself is
+    /// never included, only what this call has generated so far.
+    fn decode_loop(
+        &mut self,
+        prompt_len: usize,
+        mut last_logits: Vec<f32>,
+        params: &SamplingParams,
+    ) -> Vec<u32> {
+        let prev_params = self.sampler.params().clone();
+        self.sampler.set_params(params.clone());
+        let mut output = Vec::with_capacity(params.max_tokens);
+        for (pos, _) in (prompt_len..).zip(0..params.max_tokens) {
+            let next_token = match self.sampler.sample_with_history(&last_logits, &output) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "prefix-cache sampler error");
+                    break;
+                }
+            };
+            if next_token == self.inner.eos_token_id() {
+                break;
+            }
+            output.push(next_token);
+            last_logits = match self.inner.decode_step(next_token, pos) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(error = %e, "prefix-cache decode loop error");
+                    break;
+                }
+            };
+        }
+        self.sampler.set_params(prev_params);
+        output
+    }
+
+    /// Return a snapshot of the current prefix-cache statistics.
+    pub fn cache_stats(&self) -> PrefixCacheStats {
+        self.prefix_cache.stats()
+    }
+
+    /// Clear all entries from the prefix cache.
+    ///
+    /// Does *not* reset the inner engine's KV cache.
+    pub fn clear_cache(&mut self) {
+        self.prefix_cache.cache.clear();
+    }
+}
+
+/// Whether a candidate cache block's extracted keys/values look like real,
+/// live-computed content rather than the zeros a non-CPU-authoritative
+/// forward path would leave behind (M-35). Every layer's keys *and* values
+/// must contain at least one nonzero value — a single all-zero layer among
+/// several is enough to reject the whole block, since a partially-populated
+/// block (some layers written by a CPU fallback mid-prompt, others left
+/// zero by a GPU path) is exactly the "half the block is zeros" failure mode
+/// the finding described.
+fn block_has_real_content(layer_keys: &[Vec<f32>], layer_values: &[Vec<f32>]) -> bool {
+    if layer_keys.is_empty() || layer_values.is_empty() {
+        return false;
+    }
+    layer_keys.iter().all(|k| k.iter().any(|&x| x != 0.0))
+        && layer_values.iter().all(|v| v.iter().any(|&x| x != 0.0))
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxibonsai_core::config::{Qwen3Config, RopeScaling};
+    use oxibonsai_model::model::BonsaiModel;
+
+    fn make_engine_no_blocks(max_blocks: usize) -> PrefixCachedEngine<'static> {
+        let config = Qwen3Config::tiny_test();
+        let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+        PrefixCachedEngine::new(engine, max_blocks, 42)
+    }
+
+    /// Build a config small enough to keep test runtimes tight while still
+    /// satisfying the Q1_0_g128 constraint (in_features must be a multiple
+    /// of 128).
+    fn small_real_config() -> Qwen3Config {
+        Qwen3Config {
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_layers: 1,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 32,
+            value_length: 32,
+            vocab_size: 256,
+            max_context_length: 128,
+            rms_norm_eps: 1e-6,
+            rope_freq_base: 10_000.0,
+            rope_scaling: RopeScaling::None,
+            sliding_window: None,
+            architecture: "qwen3".to_string(),
+            model_name: "PrefixCacheTest".to_string(),
+        }
+    }
+
+    fn make_engine_with_real_blocks(max_blocks: usize) -> PrefixCachedEngine<'static> {
+        use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+        let config = small_real_config();
+        let model = BonsaiModel::new_for_testing_with_blocks(config);
+        // Pin the engine to the Reference (CPU) tier so the CPU KV cache is
+        // populated by the forward path. With auto_detect on a GPU host the
+        // GPU shortcut would bypass the CPU cache entirely.
+        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let engine =
+            InferenceEngine::from_model_with_kernel(model, kernel, SamplingParams::default(), 42);
+        PrefixCachedEngine::new(engine, max_blocks, 42)
+    }
+
+    /// Same as [`make_engine_with_real_blocks`] but with
+    /// `architecture = "qwen35"` (the hybrid recurrent-attention tag) — used
+    /// to exercise M-35's second refusal case.
+    fn make_hybrid_engine_with_real_blocks(max_blocks: usize) -> PrefixCachedEngine<'static> {
+        use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+        let config = Qwen3Config {
+            architecture: "qwen35".to_string(),
+            ..small_real_config()
+        };
+        let model = BonsaiModel::new_for_testing_with_blocks(config);
+        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let engine =
+            InferenceEngine::from_model_with_kernel(model, kernel, SamplingParams::default(), 42);
+        PrefixCachedEngine::new(engine, max_blocks, 42)
+    }
+
+    #[test]
+    fn prefix_cached_engine_construction() {
+        let engine = make_engine_no_blocks(16);
+        let stats = engine.cache_stats();
+        assert_eq!(stats.cached_blocks, 0);
+        assert_eq!(stats.capacity_blocks, 16);
+    }
+
+    #[test]
+    fn prefix_cached_engine_generate_empty() {
+        let mut engine = make_engine_no_blocks(16);
+        let tokens = engine.generate(&[], &SamplingParams::default());
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn prefix_cached_engine_clear_cache() {
+        let mut engine = make_engine_no_blocks(16);
+        // Run a generate so the cache might get some blocks.
+        let prompt: Vec<u32> = (0..32).collect();
+        let fast_params = SamplingParams {
+            max_tokens: 4,
+            top_k: 1,
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let _ = engine.generate(&prompt, &fast_params);
+        engine.clear_cache();
+        let stats = engine.cache_stats();
+        assert_eq!(stats.cached_blocks, 0);
+    }
+
+    #[test]
+    fn prefix_cached_engine_stats_structure() {
+        let engine = make_engine_no_blocks(32);
+        let stats = engine.cache_stats();
+        assert_eq!(stats.capacity_blocks, 32);
+        assert!((stats.hit_rate - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn prefix_cached_engine_repeated_prompt_builds_cache() {
+        // Use a model with real blocks so the CPU KV cache is actually populated.
+        let mut engine = make_engine_with_real_blocks(32);
+        let prompt: Vec<u32> = (0..32).collect();
+        let fast_params = SamplingParams {
+            max_tokens: 1,
+            top_k: 1,
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+
+        // First call: cold cache.
+        let _ = engine.generate(&prompt, &fast_params);
+        let stats_after_first = engine.cache_stats();
+
+        // Second call: same prompt; should record at least one hit and the
+        // cache should contain entries.
+        let _ = engine.generate(&prompt, &fast_params);
+        let stats_after_second = engine.cache_stats();
+
+        assert!(
+            stats_after_first.cached_blocks > 0,
+            "first call should have populated some cache blocks"
+        );
+        assert!(
+            stats_after_second.total_hits > 0,
+            "second call should record cache hits"
+        );
+    }
+
+    /// Acceptance criterion #5 from issue #2: a repeated prompt must
+    /// actually skip prefill work, not merely record bookkeeping hits.
+    #[test]
+    fn prefix_cached_engine_avoids_redundant_prefill_work() {
+        let mut engine = make_engine_with_real_blocks(64);
+        let prompt: Vec<u32> = (0..32).collect();
+        let fast_params = SamplingParams {
+            max_tokens: 2,
+            top_k: 1,
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+
+        let out1 = engine.generate(&prompt, &fast_params);
+        let prefill_after_first = engine.inner.prefill_token_count();
+
+        let out2 = engine.generate(&prompt, &fast_params);
+        let prefill_after_second = engine.inner.prefill_token_count();
+
+        let second_call_prefill = prefill_after_second - prefill_after_first;
+        assert!(
+            second_call_prefill < prompt.len() as u64,
+            "second call prefilled {} tokens, expected < {} (prefix cache should have skipped some)",
+            second_call_prefill,
+            prompt.len()
+        );
+        assert!(
+            engine.cache_stats().total_hits > 0,
+            "cache should report hits"
+        );
+        // AC #3 from issue #2: cached path must produce identical output to
+        // the cold-cache path. With temperature=0 and top_k=1 the sampler is
+        // deterministic, so the two generations must match token-for-token.
+        assert_eq!(
+            out1, out2,
+            "AC #3: cached path must produce identical output ({:?} vs {:?})",
+            out1, out2
+        );
+    }
+
+    fn make_engine_with_real_blocks_and_seed(
+        max_blocks: usize,
+        seed: u64,
+    ) -> PrefixCachedEngine<'static> {
+        use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+        let config = small_real_config();
+        let model = BonsaiModel::new_for_testing_with_blocks(config);
+        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let engine =
+            InferenceEngine::from_model_with_kernel(model, kernel, SamplingParams::default(), 42);
+        PrefixCachedEngine::new(engine, max_blocks, seed)
+    }
+
+    /// Regression test for the "hardcoded seed=0" bug: `generate()` used to
+    /// build a fresh `Sampler::new(params.clone(), 0)` on *every* call,
+    /// discarding whatever seed the wrapper was constructed with. Because the
+    /// sampler's xorshift64 PRNG has `0` as a fixed point, `rng_state=0`
+    /// makes `next_u64()` return `0` forever, so `rand_val` is always `0.0`.
+    /// With `top_k=0` (no truncation) and `top_p=1.0` (no re-sorting),
+    /// `probs_buf` keeps its natural insertion order (token id 0 first), so
+    /// the weighted-selection loop deterministically always picked token 0 —
+    /// *regardless of the model's logits or the configured seed*. This test
+    /// asserts the (fixed) real, model-driven behavior is not that constant
+    /// all-token-0 sequence.
+    #[test]
+    fn prefix_cached_engine_does_not_collapse_to_seed_zero_fixed_point() {
+        let mut engine = make_engine_with_real_blocks_and_seed(64, 0xC0FFEE);
+        let prompt: Vec<u32> = (0..32).collect();
+        let full_vocab_params = SamplingParams {
+            max_tokens: 8,
+            top_k: 0,
+            top_p: 1.0,
+            temperature: 2.0,
+            repetition_penalty: 1.0,
+        };
+
+        let out = engine.generate(&prompt, &full_vocab_params);
+        assert_eq!(out.len(), 8, "expected a full max_tokens decode run");
+        assert!(
+            out.iter().any(|&t| t != 0),
+            "output collapsed to all-zero tokens {out:?}; this is the exact signature of the \
+             seed=0 xorshift64 fixed-point bug (rand_val always 0.0 picks index 0 every step)",
+        );
+    }
+
+    /// Regression test: two wrappers constructed with different explicit
+    /// seeds, run against the identical prompt/model/params, must diverge.
+    /// Before the fix every call built an ephemeral `Sampler::new(_, 0)`
+    /// inside `generate()`, so the seed passed to `PrefixCachedEngine::new`
+    /// was silently discarded and both wrappers would have produced
+    /// byte-identical output.
+    #[test]
+    fn prefix_cached_engine_honours_configured_seed() {
+        let prompt: Vec<u32> = (0..32).collect();
+        let full_vocab_params = SamplingParams {
+            max_tokens: 8,
+            top_k: 0,
+            top_p: 1.0,
+            temperature: 2.0,
+            repetition_penalty: 1.0,
+        };
+
+        let mut engine_a = make_engine_with_real_blocks_and_seed(64, 7);
+        let mut engine_b = make_engine_with_real_blocks_and_seed(64, 424_242);
+
+        let out_a = engine_a.generate(&prompt, &full_vocab_params);
+        let out_b = engine_b.generate(&prompt, &full_vocab_params);
+
+        assert_ne!(
+            out_a, out_b,
+            "two different configured seeds produced identical output; the wrapper is not \
+             using the caller-supplied seed"
+        );
+    }
+
+    /// `PrefixCachedEngine::new` must carry the wrapped engine's `min_p` and
+    /// penalties onto its own decode sampler — before this fix it only
+    /// carried `SamplingParams` (via `sampling_params().clone()`), silently
+    /// leaving `min_p` at `0.0` and the penalties at their default
+    /// (disabled) even when the wrapped engine was configured otherwise.
+    #[test]
+    fn new_carries_the_wrapped_engines_min_p_and_penalties_onto_the_decode_sampler() {
+        use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+
+        let config = small_real_config();
+        let model = BonsaiModel::new_for_testing_with_blocks(config);
+        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        // Repetition penalty lives on `SamplingParams` itself, already
+        // carried by `sampling_params().clone()` before this fix — set it
+        // through the constructor too, so this test also confirms that path
+        // kept working.
+        let params = SamplingParams {
+            repetition_penalty: 1.3,
+            ..SamplingParams::default()
+        };
+        let mut engine = InferenceEngine::from_model_with_kernel(model, kernel, params, 42);
+        engine.set_min_p(0.25);
+        engine.set_penalties(PenaltyParams::new(0.6, 0.4));
+
+        let wrapped = PrefixCachedEngine::new(engine, 64, 42);
+
+        assert_eq!(wrapped.sampler.min_p(), 0.25);
+        assert_eq!(*wrapped.sampler.penalties(), PenaltyParams::new(0.6, 0.4));
+        assert_eq!(wrapped.sampler.params().repetition_penalty, 1.3);
+    }
+
+    /// M-35 addendum, closing the gap `new_carries_the_wrapped_engines_*`
+    /// above does not: carrying the penalties onto the wrapper's sampler is
+    /// not enough by itself — `decode_loop` must also *apply* them by
+    /// sampling with [`Sampler::sample_with_history`] instead of the
+    /// unpenalised [`Sampler::sample`]. This proves both that the wrapper
+    /// now matches an independently-constructed plain engine token-for-token
+    /// under the same repetition/frequency/presence penalties, seed and
+    /// params, and that the penalty is not a no-op (a disabled-penalty
+    /// wrapper must diverge from it).
+    #[test]
+    fn decode_loop_applies_the_carried_penalties_like_the_plain_engines_own_loop() {
+        use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+
+        let prompt: Vec<u32> = (0..32).collect();
+        let params = SamplingParams {
+            max_tokens: 8,
+            top_k: 0,
+            top_p: 1.0,
+            temperature: 2.0,
+            repetition_penalty: 1.8,
+        };
+        let penalties = PenaltyParams::new(0.5, 0.3);
+
+        // The wrapped path: same model bytes (deterministic weight init from
+        // `small_real_config()`), same seed, same penalties as the plain
+        // engine below, driven through `PrefixCachedEngine::generate`.
+        let wrapped_model = BonsaiModel::new_for_testing_with_blocks(small_real_config());
+        let wrapped_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let mut wrapped_engine = InferenceEngine::from_model_with_kernel(
+            wrapped_model,
+            wrapped_kernel,
+            params.clone(),
+            99,
+        );
+        wrapped_engine.set_penalties(penalties);
+        let mut wrapped = PrefixCachedEngine::new(wrapped_engine, 64, 99);
+        let wrapped_out = wrapped.generate(&prompt, &params);
+
+        // The reference: an independently-constructed plain `InferenceEngine`
+        // (never wrapped), driven through its own classic decode loop, which
+        // already calls `sample_with_history(&logits, &output_tokens)`.
+        let plain_model = BonsaiModel::new_for_testing_with_blocks(small_real_config());
+        let plain_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let mut plain_engine =
+            InferenceEngine::from_model_with_kernel(plain_model, plain_kernel, params.clone(), 99);
+        plain_engine.set_penalties(penalties);
+        let plain_out = plain_engine
+            .generate(&prompt, params.max_tokens)
+            .expect("plain engine generate");
+
+        assert_eq!(
+            wrapped_out, plain_out,
+            "PrefixCachedEngine::decode_loop must apply the carried penalties exactly like the \
+             plain engine's own decode loop ({wrapped_out:?} vs {plain_out:?})"
+        );
+
+        // Same model/seed, but every penalty this test controls is neutral:
+        // `PenaltyParams` is left at its default (never set on this engine)
+        // *and* `repetition_penalty` is reset to `1.0` (`params.clone()`
+        // alone would not do this -- `repetition_penalty` lives on
+        // `SamplingParams`, so leaving it at 1.8 would keep it active on
+        // this "no-penalty" leg too and the assertion below would only be
+        // exercising the frequency/presence penalties, not the repetition
+        // penalty the M-35 addendum names specifically). The output must
+        // differ from `wrapped_out`, or this test cannot tell "penalties
+        // applied" from "penalties ignored".
+        let no_penalty_params = SamplingParams {
+            repetition_penalty: 1.0,
+            ..params.clone()
+        };
+        let no_penalty_model = BonsaiModel::new_for_testing_with_blocks(small_real_config());
+        let no_penalty_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let no_penalty_engine = InferenceEngine::from_model_with_kernel(
+            no_penalty_model,
+            no_penalty_kernel,
+            no_penalty_params.clone(),
+            99,
+        );
+        let mut no_penalty_wrapped = PrefixCachedEngine::new(no_penalty_engine, 64, 99);
+        let no_penalty_out = no_penalty_wrapped.generate(&prompt, &no_penalty_params);
+        assert_ne!(
+            wrapped_out, no_penalty_out,
+            "the carried penalties (repetition + frequency/presence) must actually change the \
+             sampled ids, or the two decode paths above cannot be distinguished by this test"
+        );
+    }
+
+    // ── M-35: block_has_real_content ────────────────────────────────────────
+
+    #[test]
+    fn block_has_real_content_rejects_all_zero() {
+        let keys = vec![vec![0.0f32; 8], vec![0.0f32; 8]];
+        let values = vec![vec![0.0f32; 8], vec![0.0f32; 8]];
+        assert!(!block_has_real_content(&keys, &values));
+    }
+
+    #[test]
+    fn block_has_real_content_accepts_genuine_values() {
+        let keys = vec![vec![0.1f32, 0.0, 0.0], vec![0.0, 0.2, 0.0]];
+        let values = vec![vec![0.0f32, 0.0, 0.3], vec![0.4, 0.0, 0.0]];
+        assert!(block_has_real_content(&keys, &values));
+    }
+
+    #[test]
+    fn block_has_real_content_rejects_one_zero_layer_among_several() {
+        // The exact failure mode the finding described: a transient GPU
+        // fallback mid-prompt can leave *some* layers populated and others
+        // still zero within the same block. Any single all-zero layer must
+        // reject the whole block.
+        let keys = vec![vec![0.1f32, 0.2], vec![0.0f32, 0.0]];
+        let values = vec![vec![0.3f32, 0.4], vec![0.5f32, 0.6]];
+        assert!(
+            !block_has_real_content(&keys, &values),
+            "one all-zero layer (keys[1]) must reject the whole block"
+        );
+
+        let keys2 = vec![vec![0.1f32, 0.2], vec![0.3f32, 0.4]];
+        let values2 = vec![vec![0.5f32, 0.6], vec![0.0f32, 0.0]];
+        assert!(
+            !block_has_real_content(&keys2, &values2),
+            "one all-zero layer (values[1]) must reject the whole block"
+        );
+    }
+
+    #[test]
+    fn block_has_real_content_rejects_empty() {
+        assert!(!block_has_real_content(&[], &[]));
+    }
+
+    // ── M-35: GPU-resident KV tier refuses the cache-aware path ─────────────
+    //
+    // These exercise `OneBitKernel::is_gpu_accelerated` directly (the exact
+    // accessor `generate()` now calls) rather than a locally re-derived
+    // predicate, so a change to what counts as GPU-resident is caught here
+    // instead of only silently diverging at the call site.
+
+    #[test]
+    fn cpu_reference_tier_is_not_gpu_accelerated() {
+        use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
+        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        assert!(!kernel.is_gpu_accelerated());
+    }
+
+    #[cfg(any(feature = "metal", feature = "native-cuda"))]
+    #[test]
+    fn gpu_tier_is_gpu_accelerated() {
+        use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
+        let kernel = KernelDispatcher::with_tier(KernelTier::Gpu);
+        assert!(kernel.is_gpu_accelerated());
+    }
+
+    // ── M-35: hybrid recurrent-attention architecture refuses caching ───────
+
+    #[test]
+    fn hybrid_architecture_never_populates_the_prefix_cache() {
+        let mut engine = make_hybrid_engine_with_real_blocks(64);
+        let prompt: Vec<u32> = (0..32).collect();
+        let fast_params = SamplingParams {
+            max_tokens: 2,
+            top_k: 1,
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+
+        let _ = engine.generate(&prompt, &fast_params);
+        assert_eq!(
+            engine.cache_stats().cached_blocks,
+            0,
+            "a hybrid (qwen35) architecture must never populate the prefix-cache trie \
+             (it has recurrent state with no block-KV representation)"
+        );
+
+        // Repeating the identical prompt must still record zero hits — the
+        // bypass path never even queries the trie.
+        let _ = engine.generate(&prompt, &fast_params);
+        assert_eq!(engine.cache_stats().total_hits, 0);
+        assert_eq!(engine.cache_stats().cached_blocks, 0);
+    }
+
+    #[test]
+    fn hybrid_architecture_bypass_still_generates_deterministically() {
+        // The bypass path must still be a fully-functional generation, not
+        // merely "refuses and returns empty".
+        let fast_params = SamplingParams {
+            max_tokens: 4,
+            top_k: 1,
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let prompt: Vec<u32> = (0..32).collect();
+
+        let mut engine_a = make_hybrid_engine_with_real_blocks(64);
+        let mut engine_b = make_hybrid_engine_with_real_blocks(64);
+        let out_a = engine_a.generate(&prompt, &fast_params);
+        let out_b = engine_b.generate(&prompt, &fast_params);
+
+        assert!(
+            !out_a.is_empty(),
+            "the bypass path must still generate tokens"
+        );
+        assert_eq!(
+            out_a, out_b,
+            "greedy decode from two freshly-constructed identical engines must match"
+        );
+    }
+
+    // ── M-35 addendum: cpu_kv_is_authoritative ──────────────────────────────
+
+    #[test]
+    fn cpu_kv_is_authoritative_true_for_a_fresh_non_hybrid_model() {
+        let model = BonsaiModel::new_for_testing_with_blocks(small_real_config());
+        assert!(
+            !model.gpu_path_active(),
+            "a fresh model has not run the GPU path yet"
+        );
+        assert!(cpu_kv_is_authoritative(&model));
+    }
+
+    #[test]
+    fn cpu_kv_is_authoritative_false_for_a_hybrid_qwen35_model() {
+        let config = Qwen3Config {
+            architecture: "qwen35".to_string(),
+            ..small_real_config()
+        };
+        let model = BonsaiModel::new_for_testing_with_blocks(config);
+        // A hybrid model refuses regardless of the GPU-path flag — it has no
+        // block-KV representation to be authoritative about at all.
+        assert!(!model.gpu_path_active());
+        assert!(!cpu_kv_is_authoritative(&model));
+    }
+
+    #[test]
+    fn store_new_blocks_is_a_no_op_when_cpu_kv_is_not_authoritative() {
+        // Direct unit test of the M-35 addendum's belt-and-suspenders check
+        // inside `store_new_blocks` itself, independent of `generate()`'s
+        // own up-front gate (which a hybrid model never reaches this far
+        // past anyway — see `hybrid_architecture_never_populates_the_prefix_cache`).
+        let config = Qwen3Config {
+            architecture: "qwen35".to_string(),
+            ..small_real_config()
+        };
+        let model = BonsaiModel::new_for_testing_with_blocks(config);
+        let kernel = oxibonsai_kernels::KernelDispatcher::with_tier(
+            oxibonsai_kernels::KernelTier::Reference,
+        );
+        let engine =
+            InferenceEngine::from_model_with_kernel(model, kernel, SamplingParams::default(), 42);
+        let mut wrapped = PrefixCachedEngine::new(engine, 64, 42);
+
+        let prompt: Vec<u32> = (0..32).collect();
+        wrapped.store_new_blocks(&prompt, 0, BLOCK_SIZE, 1);
+        assert_eq!(
+            wrapped.cache_stats().cached_blocks,
+            0,
+            "store_new_blocks must refuse to populate the trie for a hybrid model \
+             even when called directly"
+        );
+    }
+}

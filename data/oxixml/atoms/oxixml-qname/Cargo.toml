@@ -1,0 +1,23 @@
+[package]
+name = "oxixml-qname"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XML names, NCName/QName, and namespace-URI handling."
+keywords = ["xml", "namespace", "qname", "ncname", "xml-names"]
+categories = ["parser-implementations", "text-processing"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-unicode = { workspace = true }
+
+[lints]
+workspace = true

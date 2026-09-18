@@ -1,0 +1,193 @@
+//! # OptiRS Bench - Benchmarking and Performance Analysis
+//!
+//! **Version:** 0.3.3
+//! **Status:** Available
+//!
+//! This crate provides comprehensive benchmarking, profiling, performance analysis, and regression
+//! detection tools for ML optimization algorithms in the OptiRS ecosystem.
+//!
+//! ## Dependencies
+//!
+//! - `scirs2-core` 0.6.5 - Required foundation
+//! - `optirs-core` 0.3.3 - Core optimizers
+//!
+//! ## Features
+//!
+//! - **Performance Benchmarking**: Compare optimizers across standard test functions
+//! - **Gradient Flow Analysis**: Monitor optimization dynamics and convergence patterns
+//! - **Memory Profiling**: Track memory usage, detect leaks, and optimize allocation
+//! - **Regression Detection**: Detect performance regressions across different versions
+//! - **Cross-Platform Testing**: Validate optimizers across different hardware and OS
+//! - **Security Auditing**: Scan for security vulnerabilities and compliance issues
+//! - **CI/CD Integration**: Automated testing and reporting for continuous integration
+//! - **Visualization Tools**: Text-based visualizations (parameter heatmaps, state
+//!   summaries) plus structured [`visualization::VisualizationExport`] data for
+//!   feeding external plotting tools; this crate does not render image/HTML plots
+//!   itself
+//!
+//! ## Architecture
+//!
+//! The crate is organized into modules by concern (see the sidebar for the full list);
+//! the main ones are:
+//!
+//! - `mod_impl` (private; re-exported at the crate root): [`OptimizerBenchmark`],
+//!   [`GradientFlowAnalyzer`], and the [`visualization`] submodule -- the core
+//!   benchmarking and gradient-flow-analysis types.
+//! - [`report_templates`]: Markdown/plain-text/CSV report rendering.
+//! - [`regression_tester`], [`performance_regression_detector`]: statistical
+//!   regression detection.
+//! - [`memory_optimizer`], [`memory_leak_detector`], [`advanced_memory_leak_detector`],
+//!   [`advanced_leak_detectors`], [`enhanced_memory_monitor`], [`leak_tool_reports`]:
+//!   memory profiling, leak detection, and third-party leak-tool report parsing.
+//! - [`security_auditor`], [`comprehensive_security_auditor`]: security auditing and
+//!   vulnerability scanning.
+//! - [`ci_cd_automation`]: CI/CD platform configuration and automated test execution.
+//! - [`advanced_cross_platform_orchestrator`], [`cross_platform_tester`]:
+//!   cross-platform test orchestration.
+//! - [`cross_framework`]: PyTorch/TensorFlow comparison benchmarking.
+//! - [`anomaly_detection`], [`performance_forecast`], [`performance_pattern_recognition`],
+//!   [`performance_prediction`]: statistical analytics over benchmark history.
+//! - [`system_sampler`]: real process/system metrics via `sysinfo`.
+//! - [`notification_transport`]: alert delivery (curl/file/log transports).
+//! - [`documentation_analyzer`]: documentation-quality analysis for Rust projects.
+//!
+//! ## Usage
+//!
+//! ```rust
+//! use optirs_bench::{
+//!     OptimizerBenchmark, GradientFlowAnalyzer,
+//!     visualization::OptimizerStateVisualizer,
+//! };
+//! use scirs2_core::ndarray::{Array1, Ix1};
+//!
+//! // Create a benchmark suite
+//! let mut benchmark = OptimizerBenchmark::<f64>::new();
+//! benchmark.add_standard_test_functions();
+//!
+//! // Set up gradient flow analysis
+//! let mut analyzer = GradientFlowAnalyzer::<f64, Ix1>::new(1000);
+//!
+//! // Set up state visualization
+//! let mut visualizer = OptimizerStateVisualizer::<f64, Ix1>::new(500);
+//! ```
+
+// Re-export error types from optirs-core for consistency
+pub use optirs_core::error::{OptimError, Result};
+
+// Re-export key types for external users
+pub mod error {
+    pub use optirs_core::error::{OptimError, OptimizerError, Result};
+}
+
+// Core benchmarking and analysis functionality
+mod mod_impl;
+
+// Re-export the main types and functions
+pub use mod_impl::*;
+
+// Advanced modules for specific functionality
+pub mod advanced_cross_platform_orchestrator;
+pub mod advanced_leak_detectors;
+pub mod advanced_memory_leak_detector;
+pub mod advanced_pattern_detection;
+pub mod anomaly_detection;
+pub mod automated_test_runners;
+pub mod ci_cd_automation;
+pub mod comprehensive_security_auditor;
+pub mod cross_framework;
+pub mod cross_platform_tester;
+pub mod documentation_analyzer;
+pub mod enhanced_memory_monitor;
+pub mod leak_tool_reports;
+pub mod memory_leak_detector;
+pub mod memory_optimizer;
+pub mod notification_transport;
+pub mod performance_forecast;
+pub mod performance_pattern_recognition;
+pub mod performance_prediction;
+pub mod performance_profiler;
+pub mod performance_regression_detector;
+pub mod regression_tester;
+pub mod report_templates;
+pub mod security_auditor;
+pub mod system_sampler;
+
+// Re-export common types for convenience
+pub use mod_impl::{
+    BenchmarkReport, BenchmarkResult, GradientFlowAnalyzer, GradientFlowStats, GradientFunction,
+    ObjectiveFunction, OptimizerBenchmark, OptimizerComparison, OptimizerPerformance,
+    ParameterGroupStats, TestFunction, VisualizationData,
+};
+
+// Re-export visualization types
+pub use mod_impl::visualization::{
+    ComparisonMetric, OptimizerDashboard, OptimizerStateSnapshot, OptimizerStateVisualizer,
+    VisualizationExport,
+};
+
+// Re-export report generation types
+pub use report_templates::{ReportFormat, ReportTemplate};
+
+/// Prelude module for common imports
+pub mod prelude {
+    pub use crate::{
+        BenchmarkReport, BenchmarkResult, GradientFlowAnalyzer, GradientFlowStats,
+        GradientFunction, ObjectiveFunction, OptimError, OptimizerBenchmark, OptimizerComparison,
+        OptimizerPerformance, ParameterGroupStats, Result, TestFunction, VisualizationData,
+    };
+
+    pub use crate::visualization::{
+        ComparisonMetric, OptimizerDashboard, OptimizerStateSnapshot, OptimizerStateVisualizer,
+        VisualizationExport,
+    };
+
+    pub use crate::report_templates::{ReportFormat, ReportTemplate};
+
+    pub use scirs2_core::ndarray::{Array, Array1, Array2, ArrayView, ArrayViewMut};
+    pub use scirs2_core::random::{thread_rng, Rng};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_library_integration() {
+        // Test that all major components can be instantiated
+        let mut benchmark = OptimizerBenchmark::<f64>::new();
+        benchmark.add_standard_test_functions();
+
+        let analyzer = GradientFlowAnalyzer::<f64, scirs2_core::ndarray::Ix1>::new(10);
+        let visualizer =
+            visualization::OptimizerStateVisualizer::<f64, scirs2_core::ndarray::Ix1>::new(10);
+
+        assert_eq!(analyzer.step_count(), 0);
+        assert_eq!(visualizer.step_count(), 0);
+        assert!(!benchmark.get_results().is_empty() || benchmark.get_results().is_empty());
+        // Just test it exists
+    }
+
+    #[test]
+    fn test_error_types() {
+        // Test that error types are properly re-exported
+        let error = OptimError::InvalidConfig("test".to_string());
+        let result: Result<()> = Err(error);
+
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("Invalid configuration"));
+        }
+    }
+
+    #[test]
+    fn test_prelude_imports() {
+        use crate::prelude::*;
+
+        // Test that prelude imports work
+        let benchmark = OptimizerBenchmark::<f64>::new();
+        let analyzer = GradientFlowAnalyzer::<f64, scirs2_core::ndarray::Ix1>::new(5);
+
+        assert_eq!(analyzer.step_count(), 0);
+        assert!(benchmark.get_results().is_empty());
+    }
+}

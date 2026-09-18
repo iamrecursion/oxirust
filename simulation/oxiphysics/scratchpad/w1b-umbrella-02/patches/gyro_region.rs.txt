@@ -1,0 +1,131 @@
+/// Number of Newton iterations of the implicit gyroscopic step.
+///
+/// One iteration is Catto's published scheme; the second one makes the iterate a more accurate
+/// solution of the backward-Euler equation when `|ω| dt` is not small.
+const NEWTON_ITERATIONS: usize = 2;
+
+/// Implicit gyroscopic integration step in the **world** frame for a full inertia tensor.
+///
+/// A torque-free rigid body obeys Euler's equation `d(I_w ω)/dt = 0`. With the world-space
+/// inertia tensor `I_w = R I Rᵀ` frozen at its start-of-step value this is the backward-Euler
+/// problem
+///
+/// ```text
+/// f(ω₁) = I_w (ω₁ − ω₀)/dt + ω₁ × (I_w ω₁) = 0
+/// ```
+///
+/// with the analytic Jacobian `J = I_w/dt + [ω₁]× I_w − [I_w ω₁]×` (Catto, GDC 2015). The equation
+/// is written with `I_w` itself, so the tensor may be any symmetric positive semi-definite matrix
+/// and does **not** have to be diagonal in the body frame: convex hulls, triangle meshes and merged
+/// bodies have products of inertia.
+///
+/// The solution is found with [`NEWTON_ITERATIONS`] Newton iterations started at `ω₀`. For the
+/// exact backward-Euler solution `ω₁ · I_w ω₁ = ω₁ · I_w ω₀`, so the kinetic energy cannot
+/// increase; the step is first-order accurate and slightly dissipative.
+///
+/// `omega` is returned unchanged when
+/// * `dt` is not a positive finite number or `omega` is not finite;
+/// * `ω₀ × (I_w ω₀)` vanishes (body at rest, isotropic, or spinning about a principal axis), where
+///   `ω₀` already is the exact solution;
+/// * the Newton iteration fails (singular Jacobian, non-finite iterate, or a residual that did not
+///   decrease because `|ω| dt` is far too large): the angular velocity is then left as it is
+///   instead of being corrupted.
+pub fn gyroscopic_implicit_step_world(omega: Vec3, inertia_world: &Mat3, dt: Real) -> Vec3 {
+    if !(dt > 0.0 && dt.is_finite()) || !omega.iter().all(|c| c.is_finite()) {
+        return omega;
+    }
+    let residual =
+        |w1: &Vec3| -> Vec3 { inertia_world * (w1 - omega) / dt + w1.cross(&(inertia_world * w1)) };
+    let initial_residual = residual(&omega).norm();
+    if !(initial_residual > 0.0 && initial_residual.is_finite()) {
+        return omega;
+    }
+    let mut w1 = omega;
+    for _ in 0..NEWTON_ITERATIONS {
+        let f = residual(&w1);
+        let momentum = inertia_world * w1;
+        let jacobian =
+            inertia_world / dt + w1.cross_matrix() * inertia_world - momentum.cross_matrix();
+        let Some(inverse) = jacobian.try_inverse() else {
+            return omega;
+        };
+        w1 -= inverse * f;
+    }
+    if w1.iter().all(|c| c.is_finite()) && residual(&w1).norm() < initial_residual {
+        w1
+    } else {
+        omega
+    }
+}
+
+/// Implicit gyroscopic integration step (Catto, GDC 2015) for a body with principal moments.
+///
+/// Builds the world-space inertia tensor `R diag(I) Rᵀ` from the orientation and the principal
+/// moments and solves the backward-Euler Euler equation with
+/// [`gyroscopic_implicit_step_world`]:
+/// ```text
+/// f(ω₁) = I·(ω₁ − ω₀)/dt + ω₁ × (I·ω₁) = 0
+/// ```
+/// with analytic Jacobian `J = I/dt + [ω₁]× · I − [I·ω₁]×`. Use
+/// [`gyroscopic_implicit_step_world`] directly for bodies whose inertia tensor is not diagonal in
+/// the body frame.
+///
+/// # Arguments
+/// * `omega_world` — angular velocity in the **world** frame (rad/s).
+/// * `rotation` — body orientation quaternion, **scalar-last** `[x, y, z, w]`.
+/// * `local_inertia` — diagonal principal moments of inertia `[Ix, Iy, Iz]` (kg·m²).
+/// * `dt` — time step (s).
+///
+/// # Returns
+/// Corrected angular velocity in the **world** frame (rad/s).
+pub fn gyroscopic_implicit_step(
+    omega_world: [f64; 3],
+    rotation: [f64; 4],
+    local_inertia: [f64; 3],
+    dt: f64,
+) -> [f64; 3] {
+    let [qx, qy, qz, qw] = rotation;
+    let r = quat_to_rotation_matrix(qx, qy, qz, qw);
+    let rotation_matrix = Mat3::new(
+        r[0][0], r[0][1], r[0][2], r[1][0], r[1][1], r[1][2], r[2][0], r[2][1], r[2][2],
+    );
+    let principal = Mat3::from_diagonal(&Vec3::new(
+        local_inertia[0],
+        local_inertia[1],
+        local_inertia[2],
+    ));
+    let inertia_world = rotation_matrix * principal * rotation_matrix.transpose();
+    let omega = gyroscopic_implicit_step_world(
+        Vec3::new(omega_world[0], omega_world[1], omega_world[2]),
+        &inertia_world,
+        dt,
+    );
+    [omega.x, omega.y, omega.z]
+}
+
+impl RigidBody {
+    /// Integrate the gyroscopic term of Euler's equation implicitly (Catto, GDC 2015).
+    ///
+    /// The stored angular velocity is expressed in the world frame, so a torque-free body that is
+    /// not isotropic cannot keep it constant: the world-space inertia tensor `I_w = R I Rᵀ`
+    /// rotates with the body and the conserved quantity is the angular momentum `L = I_w ω`, not
+    /// `ω`. This method advances `ω` by one backward-Euler step of `I_w ω̇ = (I_w ω) × ω`
+    /// ([`gyroscopic_implicit_step_world`]), using the full [`RigidBody::local_inertia`] tensor (not
+    /// only its diagonal), so that the following [`RigidBody::integrate_velocity`] keeps the
+    /// world-frame angular momentum constant to first order in `dt`. It reproduces precession,
+    /// nutation and the intermediate-axis (Dzhanibekov) flip.
+    ///
+    /// Call it between [`RigidBody::integrate_forces`] and [`RigidBody::integrate_velocity`]
+    /// ([`integrate_bodies`](crate::integrate_bodies) and
+    /// [`PhysicsWorld::step`](crate::world::PhysicsWorld::step) do). Static, kinematic and sleeping
+    /// bodies are left untouched, and so are isotropic bodies, bodies at rest and bodies spinning
+    /// about a principal axis (the gyroscopic torque vanishes for them).
+    pub fn integrate_gyroscopic(&mut self, dt: Real) {
+        if !self.is_dynamic() || self.state == BodyState::Sleeping {
+            return;
+        }
+        let inertia_world = self.world_inertia();
+        self.angular_velocity =
+            gyroscopic_implicit_step_world(self.angular_velocity, &inertia_world, dt);
+    }
+}

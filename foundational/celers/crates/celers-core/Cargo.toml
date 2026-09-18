@@ -1,0 +1,63 @@
+[package]
+name = "celers-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core traits and types for CeleRS distributed task queue"
+readme = "README.md"
+keywords = ["celery", "task-queue", "distributed", "async", "traits"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+# The Celery wire model. celers-protocol depends on no celers crate (serde,
+# uuid, chrono, base64 and optional codecs only), so this is not a cycle — it
+# is what lets `event::Event <-> celers_protocol::event::EventMessage` be a
+# typed conversion instead of a JSON round trip through string keys.
+celers-protocol = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+rand = { workspace = true }
+num_cpus = { workspace = true }
+
+# Result compression codecs (Pure Rust; see src/result/compression.rs).
+# Optional, but on by default: a `ResultCompressor` with nothing but the
+# identity codec registered is a type whose every real operation fails, which
+# is what these two dependencies exist to fix.
+oxiarc-deflate = { workspace = true, optional = true }  # gzip + zlib
+oxiarc-zstd = { workspace = true, optional = true }     # Zstandard
+
+[features]
+default = ["compression"]
+
+# All result-compression codecs this crate can register.
+compression = ["compression-deflate", "compression-zstd"]
+# gzip (RFC 1952) and zlib (RFC 1950), both DEFLATE-based.
+compression-deflate = ["dep:oxiarc-deflate"]
+# Zstandard (RFC 8878).
+compression-zstd = ["dep:oxiarc-zstd"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which lets the
+# scheduling, background-flush and retention tests run deterministically instead
+# of sleeping on the wall clock. Dev-only: it does not affect the published lib.
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "task_bench"
+harness = false
+
+[[bench]]
+name = "advanced_bench"
+harness = false

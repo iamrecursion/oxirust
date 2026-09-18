@@ -1,0 +1,13 @@
+[package]
+name = "legal-knowledge-graph"
+version.workspace = true
+edition.workspace = true
+description = "Example: Exporting statutes to Linked Open Data (RDF/TTL, JSON-LD, SPARQL)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+legalis-core = { path = "../../crates/legalis-core" }
+legalis-lod = { path = "../../crates/legalis-lod" }
+
+tokio = { version = "1", features = ["full"] }

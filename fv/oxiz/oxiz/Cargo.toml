@@ -1,0 +1,81 @@
+[package]
+name = "oxiz"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Next-Generation SMT Solver in Pure Rust"
+readme = "README.md"
+keywords = ["smt", "solver", "sat", "verification", "logic"]
+categories = ["algorithms", "science", "mathematics"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Core modules - always included (no_std compatible, std propagated via features)
+oxiz-core = { workspace = true }
+oxiz-math = { workspace = true }
+oxiz-sat = { workspace = true }
+oxiz-theories = { workspace = true }
+oxiz-solver = { workspace = true }
+num-bigint = { workspace = true, default-features = false }
+num-traits = { workspace = true, default-features = false }
+
+# Advanced (optional, require std)
+oxiz-nlsat = { workspace = true, optional = true }
+oxiz-opt = { workspace = true, optional = true }
+oxiz-spacer = { workspace = true, optional = true }
+oxiz-proof = { workspace = true, optional = true }
+
+[dev-dependencies]
+num-bigint = { workspace = true, features = ["std"] }
+
+[features]
+# `nlsat` joins the default set here so the meta crate's out-of-the-box
+# behaviour is unchanged: before it existed, `std` reached `oxiz-theories/std`,
+# which pulled `oxiz-nlsat` in unconditionally, so a plain `oxiz = "0.3.2"`
+# already decided nonlinear arithmetic. What is new in the default build is
+# only the `oxiz::nlsat` re-export of a crate that was always being compiled.
+#
+# `scripting` joins it for the same reason: before it existed, `std` reached
+# `oxiz-core/std`, which pulled `rhai` in unconditionally, so a plain
+# `oxiz = "0.3.2"` already compiled `ScriptableTactic`. Nothing about a default
+# build changes.
+default = ["std", "nlsat", "scripting"]
+std = [
+    "oxiz-core/std",
+    "oxiz-math/std",
+    "oxiz-sat/std",
+    "oxiz-theories/std",
+    "oxiz-solver/std",
+]
+# User-defined tactics written in Rhai (`oxiz::core::tactic::ScriptableTactic`).
+# Forwards to `oxiz-core/scripting`, which is what actually pulls `rhai` in.
+#
+# Turning it off (`default-features = false, features = ["std"]`) removes that
+# one type and nothing else -- no solving path degrades, because nothing in the
+# workspace constructs a `ScriptableTactic`; the script has to come from the
+# consumer. What it removes from the dependency graph is `rhai` and, through
+# it, **the only non-permissive crate OxiZ has ever pulled in**: `smartstring`
+# is MPL-2.0. A consumer whose `cargo deny check licenses` allows only
+# Apache/MIT/BSD/ISC/Zlib/CC0/Unicode needs exactly this selection.
+scripting = ["oxiz-core/scripting", "std"]
+# Nonlinear real/integer arithmetic: the `oxiz::nlsat` re-export *and* the
+# solving path that uses it -- `oxiz-theories/nlsat` is what pulls the crate
+# into the theory layer, `oxiz-solver/nlsat` compiles the dispatch back in.
+# Turning it off (`default-features = false, features = ["std"]`) drops the
+# `oxiz-nlsat` crate from the build entirely; QF_NRA/QF_NIA goals then answer
+# `unknown` instead of being decided.
+nlsat = ["dep:oxiz-nlsat", "oxiz-theories/nlsat", "oxiz-solver/nlsat", "std"]
+optimization = ["dep:oxiz-opt", "std"]
+spacer = ["dep:oxiz-spacer", "std"]
+proof = ["dep:oxiz-proof", "std"]
+standard = ["nlsat", "optimization", "proof", "scripting"]
+full = ["standard", "spacer"]

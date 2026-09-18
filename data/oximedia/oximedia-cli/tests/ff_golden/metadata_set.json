@@ -1,0 +1,9 @@
+{
+  "name": "metadata_set",
+  "args": ["-i", "in.mkv", "-metadata", "title=Test Title", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "contains_metadata": [["title", "Test Title"]]
+  }
+}

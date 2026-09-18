@@ -1,0 +1,137 @@
+[package]
+name = "torsh-tensor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Tensor implementation for ToRSh with PyTorch-compatible API"
+readme = "README.md"
+documentation = "https://docs.rs/torsh-tensor"
+rust-version.workspace = true
+build = "build.rs"
+keywords = ["deep-learning", "tensor", "ndarray", "machine-learning", "pytorch"]
+categories = ["science", "data-structures"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Core dependencies
+torsh-core = { workspace = true }
+# torsh-autograd = { workspace = true, optional = true }
+# torsh-backend REMOVED: 0 Rust references in torsh-tensor/src after the Wave-3
+# dead-code deletion. The `simd` path is scirs2-core/simd; `gpu` is the oxicuda
+# stack below. (torsh-backend is still used directly by torsh-jit / torsh-functional.)
+# GPU compute backend (replaces scirs2-core GPU). Pure-Rust CUDA stack; the trait
+# crate is dependency-free and builds on CPU-only CI (no CUDA SDK at build time).
+oxicuda-backend = { workspace = true, optional = true }
+# Leaf crates backing ToRSh's own thin CudaBackend (src/cuda_backend), pulled by `cuda`.
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-launch = { workspace = true, optional = true }
+oxicuda-ptx = { workspace = true, optional = true }
+scirs2-core = { workspace = true }
+scirs2-autograd = { workspace = true }
+scirs2-stats = { workspace = true }
+
+# Utilities
+num-traits = { workspace = true }
+num-complex = { workspace = true }
+half = { workspace = true }
+# Alignment-safe byte<->element reinterpretation (e.g. lazy_loading.rs file chunk
+# reads); avoids raw pointer casts on unaligned `Vec<u8>` buffers. `extern_crate_alloc`
+# is required for `bytemuck::pod_collect_to_vec` (allocates the returned `Vec<T>`).
+bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
+# ndarray = { workspace = true, optional = true }  # REMOVED: Use scirs2_core::ndarray instead (SciRS2 POLICY)
+rayon = { workspace = true }  # Keep temporarily during migration
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"], optional = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+oxicode = { workspace = true, optional = true }
+oxiarc-deflate = { workspace = true, optional = true }
+oxiarc-zstd = { workspace = true, optional = true }
+hdf5 = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+# onnx = { version = "0.1.0", optional = true }  # REMOVED: Unmaintained with security vulnerabilities (RUSTSEC-2024-0437, RUSTSEC-2023-0018)
+# protobuf = { version = "3.7", optional = true }  # REMOVED: Only needed for onnx, which is removed
+
+# Operation logging
+chrono = { workspace = true, optional = true }
+once_cell = { workspace = true }
+
+# Random number generation - USE SCIRS2 ONLY (POLICY COMPLIANCE)
+# rand = "0.9"           # REMOVED: Use scirs2_core::random instead
+# rand_distr = "0.5"     # REMOVED: Use scirs2_core::random::prelude instead
+
+# Mathematical functions
+libm = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+dhat = "0.3.3"
+
+[features]
+default = ["std", "simd", "parallel"]
+std = ["torsh-core/std"]
+autograd = []
+async = ["dep:tokio"]
+simd = ["scirs2-core/simd"]
+# GPU dispatch via oxicuda's ComputeBackend trait (see src/gpu_dispatch.rs).
+gpu = ["dep:oxicuda-backend"]
+# Real CUDA backend via ToRSh's own thin CudaBackend (src/cuda_backend) over the
+# oxicuda leaf crates. No CUDA SDK needed at build time (runtime driver load).
+cuda = ["gpu", "dep:oxicuda-driver", "dep:oxicuda-launch", "dep:oxicuda-ptx"]
+profiling = []
+memory_efficient = ["scirs2-core/memory_efficient"]
+# ndarray-interop = ["ndarray"]  # REMOVED: Use scirs2_core::ndarray instead (SciRS2 POLICY)
+serialize = ["dep:serde", "dep:serde_json", "dep:oxicode", "dep:oxiarc-deflate", "dep:oxiarc-zstd", "torsh-core/serialize"]
+serialize-hdf5 = ["serialize", "dep:hdf5"]
+serialize-arrow = ["serialize", "dep:arrow", "dep:parquet"]
+serialize-onnx = ["serialize"]  # DEPRECATED: Stub feature for backwards compatibility. ONNX serialization disabled due to security vulnerabilities (RUSTSEC-2024-0437, RUSTSEC-2023-0018)
+serialize-all = ["serialize", "serialize-hdf5", "serialize-arrow"]  # Note: serialize-onnx excluded due to security issues
+operation-logging = ["dep:serde", "dep:serde_json", "dep:chrono"]
+memory-profiling = ["dep:serde", "dep:serde_json"]
+debug = []
+trace = []
+bench = []
+parallel = ["scirs2-core/parallel", "scirs2-core/simd", "scirs2-core/memory_efficient"]
+fast-math = []
+python = []
+numpy = []
+custom-types = []
+
+
+[[bench]]
+name = "simd_performance"
+harness = false
+required-features = ["simd"]
+
+[[bench]]
+name = "zero_copy_simd_benchmark"
+harness = false
+required-features = ["simd"]
+
+[[bench]]
+name = "regression_baselines"
+harness = false
+
+[[bench]]
+name = "alloc_tracking"
+harness = false
+
+[[bench]]
+name = "cross_platform_simd"
+harness = false

@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trustformers-server
+  namespace: trustformers
+  labels:
+    app: trustformers-server
+    app.kubernetes.io/name: trustformers-server
+    app.kubernetes.io/instance: trustformers
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: trustformers
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: trustformers-server
+  template:
+    metadata:
+      labels:
+        app: trustformers-server
+        app.kubernetes.io/name: trustformers-server
+        app.kubernetes.io/instance: trustformers
+        app.kubernetes.io/component: api
+      # No prometheus.io/* scrape annotations: trustformers-server exposes no
+      # /metrics endpoint (verified against src/main.rs's route table), so
+      # there is nothing for a Prometheus scraper to read from this pod.
+    spec:
+      serviceAccountName: trustformers-server
+      # The application never calls the Kubernetes API (all configuration
+      # comes from the environment variables below, injected by kubelet, not
+      # fetched by the binary) — see kubernetes/rbac.yaml. No API access
+      # means no reason to mount a token for it.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: trustformers-server
+        # Placeholder — this image is not published anywhere. Build it from
+        # the Dockerfile in this directory and push it to a registry you
+        # control, then point this field (or kustomization.yaml's `images:`
+        # entry) at it before applying these manifests.
+        image: trustformers/server:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        # All four variables are read for real by src/main.rs (see
+        # kubernetes/configmap.yaml). If PORT is overridden away from 8080,
+        # `containerPort` above and the two probes' `port: http` below (and
+        # kubernetes/service.yaml's `targetPort`) must be updated to match —
+        # they are independent values Kubernetes does not derive from PORT.
+        envFrom:
+        - configMapRef:
+            name: trustformers-server-config
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: model-cache
+          mountPath: /var/cache/trustformers
+        - name: tmp
+          mountPath: /tmp
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: trustformers-cache
+      - name: tmp
+        emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - trustformers-server
+              topologyKey: kubernetes.io/hostname

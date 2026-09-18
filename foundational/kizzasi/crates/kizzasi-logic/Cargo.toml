@@ -1,0 +1,72 @@
+[package]
+name = "kizzasi-logic"
+description = "TensorLogic bridge for Kizzasi - constraint enforcement and safety guardrails"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["constraints", "optimization", "guardrails", "safety", "verification"]
+categories = ["algorithms", "mathematics"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi-logic"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[features]
+default = ["std"]
+std = []
+# GPU acceleration (optional, off by default). Forwards candle's Metal
+# backend through `kizzasi-core/metal`, which is live on Apple targets and
+# inert -- but still buildable -- everywhere else, so `--all-features` works on
+# every host; the `kizzasi-metal` crate explains how that target gating is
+# done. There is no `cuda` counterpart -- see kizzasi-core's `[features]` for
+# why a CUDA flag cannot be offered without breaking every non-CUDA build.
+metal = ["kizzasi-core/metal"]
+# Logic features
+#
+# NOT pure Rust: `qp-solver` links the OSQP C library (see the dependency note
+# below). Off by default; the crate's own pure-Rust simplex LP solver
+# (`lp_simplex`) needs no feature.
+qp-solver = ["dep:osqp"]
+# NOTE: a `gpu` feature previously existed here but gated nothing but a
+# hardcoded `true` return with no actual GPU dispatch behind it (every
+# "GPU" code path in gpu_acceleration.rs silently ran the identical CPU
+# implementation). It has been removed rather than reimplemented as a real
+# backend, which is out of scope for this crate today — see the module doc
+# comment on `gpu_acceleration` for why and what a real one would need.
+
+[dependencies]
+# Internal crates
+kizzasi-core.workspace = true
+
+# COOLJAPAN Ecosystem (following KIZZASI_POLICY.md)
+scirs2-core.workspace = true
+tensorlogic-ir.workspace = true
+
+# Parallelism (used by distributed_admm for parallel x-updates)
+rayon.workspace = true
+
+# Core dependencies
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+# Optional QP solver.
+#
+# NOTE: FFI / not pure Rust -- the `osqp` crate builds the OSQP solver's C
+# sources, so `qp-solver` is opt-in and a build with it no longer satisfies
+# the Pure Rust policy.
+osqp = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "projection_benchmarks"
+harness = false
+
+[[bench]]
+name = "comprehensive_benchmarks"
+harness = false

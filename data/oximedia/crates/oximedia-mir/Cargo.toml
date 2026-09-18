@@ -1,0 +1,59 @@
+[package]
+name = "oximedia-mir"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Music Information Retrieval (MIR) system for OxiMedia"
+keywords = ["music", "mir", "beat", "audio", "multimedia"]
+categories = ["multimedia::audio", "science"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = ["all"]
+all = ["tempo", "beat", "key", "chord", "melody", "structure", "genre", "mood", "spectral", "rhythm", "harmonic"]
+tempo = []
+beat = []
+key = []
+chord = []
+melody = []
+structure = []
+genre = []
+mood = []
+spectral = []
+rhythm = []
+harmonic = []
+## Opt-in ML-assisted music tagging / genre classification via the
+## Pure-Rust `oximedia-ml` pipeline. Enabling `onnx` pulls in
+## `oximedia-ml` with its `onnx` feature so callers can load a genre /
+## music-tagging ONNX model and receive ranked `(label, score)`
+## predictions. Default builds remain free of ONNX symbols.
+onnx = [
+    "dep:oximedia-ml",
+    "oximedia-ml/onnx",
+]
+## Enable CUDA dispatch for the ML-assisted music tagger.
+cuda = ["onnx", "oximedia-ml/cuda"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-audio = { workspace = true }
+oximedia-ml = { workspace = true, optional = true }
+thiserror = { workspace = true }
+oxifft = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+bitflags = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

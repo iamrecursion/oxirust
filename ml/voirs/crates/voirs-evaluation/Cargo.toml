@@ -1,0 +1,156 @@
+[package]
+name = "voirs-evaluation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/voirs-evaluation"
+keywords = ["voirs", "evaluation", "quality", "metrics", "mos"]
+categories = ["science", "multimedia::audio", "mathematics"]
+rust-version.workspace = true
+description = "Quality evaluation and assessment framework for VoiRS"
+readme = "README.md"
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core.workspace = true
+scirs2-fft.workspace = true
+
+# Core VoiRS dependencies
+voirs-sdk.workspace = true
+voirs-recognizer.workspace = true
+voirs-g2p.workspace = true
+
+# Async and traits
+async-trait.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-stream.workspace = true
+futures.workspace = true
+
+# Audio processing
+hound.workspace = true
+dasp.workspace = true
+
+# Audio format support
+symphonia = { workspace = true, features = ["all"] }
+# Note: mp3-decoder is included in symphonia features
+ogg.workspace = true
+lewton.workspace = true
+
+# Math and statistics
+ordered-float.workspace = true
+statrs = "0.18"
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+oxicode.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+once_cell.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true
+oxiarc-deflate.workspace = true
+uuid.workspace = true
+base64.workspace = true
+md5.workspace = true
+
+# Machine learning
+candle-core.workspace = true
+candle-nn.workspace = true
+
+# ONNX inference backend
+oxionnx = { workspace = true, optional = true }
+
+# Text processing
+unicode-normalization.workspace = true
+regex.workspace = true
+
+# Web and networking
+# Enable necessary warp features after upgrade (websocket and server)
+warp = { version = "0.4", features = ["websocket", "server"] }
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+
+# Performance
+crossbeam-utils.workspace = true
+num_cpus.workspace = true
+libc.workspace = true
+fastrand.workspace = true
+
+# Python bindings (optional)
+pyo3 = { workspace = true, features = ["abi3-py38"], optional = true }
+numpy = { workspace = true, optional = true }
+
+# CLI dependencies
+clap.workspace = true
+
+# Audio metrics
+# Note: In a real implementation, you might add specialized audio quality libraries
+
+[dev-dependencies]
+tokio-test.workspace = true
+tempfile.workspace = true
+criterion.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = ["quality", "pronunciation", "comparison"]
+quality = []
+pronunciation = []
+comparison = []
+perceptual = []
+python = ["pyo3", "numpy"]
+r-integration = []
+all-metrics = ["quality", "pronunciation", "comparison", "perceptual"]
+onnx = ["dep:oxionnx"]
+gpu = ["oxionnx?/gpu"]
+
+[[example]]
+name = "perceptual_evaluation"
+required-features = ["perceptual"]
+
+[[example]]
+name = "r_statistical_analysis"
+required-features = ["r-integration"]
+
+[[example]]
+name = "evaluation_batch_processing"
+path = "examples/evaluation_batch_processing.rs"
+
+[[bench]]
+name = "evaluation_metrics"
+harness = false
+
+[[bench]]
+name = "memory_benchmark"
+harness = false
+
+[[bench]]
+name = "gpu_acceleration"
+harness = false
+
+[[bench]]
+name = "critical_success_factors"
+harness = false
+
+[[bench]]
+name = "performance_standards"
+harness = false
+
+[[bin]]
+name = "voirs-eval"
+path = "src/bin/voirs-eval.rs"
+required-features = []
+
+[lints]
+workspace = true

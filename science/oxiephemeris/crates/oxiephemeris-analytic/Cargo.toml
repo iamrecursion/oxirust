@@ -1,0 +1,27 @@
+[package]
+name = "oxiephemeris-analytic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: Pure Rust ephemeris engine (analytic fallback: truncated VSOP87E planets + ELP2000-82B Moon, no data files)"
+keywords = ["ephemeris", "vsop87", "elp2000", "astronomy", "moon"]
+categories = ["science", "no-std"]
+
+[features]
+default = []
+
+[dependencies]
+libm.workspace = true
+
+[dev-dependencies]
+oxiephemeris-de = { path = "../oxiephemeris-de", features = ["std"] }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

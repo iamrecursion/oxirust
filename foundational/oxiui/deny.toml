@@ -1,0 +1,89 @@
+# ============================================================================
+# COOLJAPAN Pure Rust Policy v2 — scope model for this deny.toml
+# ----------------------------------------------------------------------------
+# This deny.toml enforces the "never GTK/Qt/SDL/system-font-C/crypto-C" bans
+# across the workspace's DEFAULT-feature closures (see [bans] below).
+#
+# It does NOT set `[graph] all-features = true`. Under Pure Rust Policy v2 the
+# authoritative L1 gate — the `--all-features` no-non-allowlisted-FFI invariant
+# — is verified PER PURE CRATE via:
+#     cargo tree -p <crate> --all-features -e normal,build
+# and NOT via a workspace-wide all-features scan here.
+#
+# `oxiui-tray`, `oxiui-hot-reload-notify`, and `oxiui-slint` are §5 quarantine /
+# known-non-pure crates: they intentionally pull C FFI (tray-icon -> GTK;
+# notify -> inotify-sys/fsevent-sys; slint -> yeslogic-fontconfig-sys) and are
+# EXCLUDED from the L1 pure-set. `cargo deny check bans` is meant to run over the
+# pure-set only; running it against these crates' own graphs is EXPECTED to
+# surface their quarantined FFI and is NOT a violation.
+#
+# The pure facade `oxiui` and `oxiui-compute-wgpu` are verified FFI-free
+# (host + linux target) as of 0.2.0 — meaning free of the GTK/Qt/SDL/
+# system-font-C/crypto-C entries above. That claim does NOT currently extend
+# to the compression-crate entries: `cargo deny check bans` at the workspace
+# root FAILS on `flate2`/`miniz_oxide`, reached in `oxiui`'s DEFAULT feature
+# closure via `png` (a non-optional dep of `oxiui-render-soft` — used by
+# `RgbaBuffer::save_png` — and also pulled by `eframe`'s `image`/`arboard`
+# clipboard-image-data path). Confirmed present since at least 0.2.0 (see
+# `git log -- deny.toml`); not introduced by any 2026-07/08 production wave.
+# Fixing it means replacing `png`, which is out of scope for a hygiene pass;
+# tracked as a TODO.md Production-Readiness Backlog item.
+# ============================================================================
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "ISC", "Unicode-3.0", "BSD-2-Clause", "BSD-3-Clause", "OpenSSL"]
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+deny = [
+  # GTK C bindings
+  { name = "gtk" },
+  { name = "gtk-sys" },
+  { name = "gtk4" },
+  { name = "gtk4-sys" },
+  # Qt C++ bindings
+  { name = "qmetaobject" },
+  { name = "qt_core" },
+  { name = "qt_gui" },
+  { name = "qt_widgets" },
+  # SDL C bindings
+  { name = "sdl2" },
+  { name = "sdl2-sys" },
+  # System font C libraries
+  { name = "freetype-sys" },
+  { name = "harfbuzz-sys" },
+  { name = "pango-sys" },
+  { name = "fontconfig-sys" },
+  # Standard noffi forbids (crypto C)
+  { name = "ring" },
+  { name = "aws-lc-sys" },
+  { name = "openssl-sys" },
+  { name = "native-tls" },
+  # Compression must use oxiarc.
+  # flate2/miniz_oxide wrappers: transitive-only exceptions for the upstream GUI
+  # image stack (image -> png/tiff/exr, pulled in by eframe/egui-winit/arboard and
+  # iced). First-party use stays banned; remove the wrappers once upstream offers
+  # pure-Rust/oxiarc-backed alternatives.
+  { name = "flate2", wrappers = ["png", "tiff"] },
+  { name = "brotli" },
+  { name = "miniz_oxide", wrappers = ["exr", "flate2", "png"] },
+  # Compression must use oxiarc (completing the group)
+  { name = "zip" },
+  { name = "zstd" },
+  { name = "bzip2" },
+  { name = "lz4" },
+  { name = "tar" },
+  { name = "snap" },
+  # Serialization / FFT must use the COOLJAPAN equivalents already in use here
+  { name = "bincode" },   # replaced by oxicode
+  { name = "rustfft" },   # replaced by oxifft
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

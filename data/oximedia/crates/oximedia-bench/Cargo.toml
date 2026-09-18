@@ -1,0 +1,39 @@
+[package]
+name = "oximedia-bench"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Comprehensive codec benchmarking suite for OxiMedia"
+keywords = ["benchmark", "codec", "performance", "multimedia", "video"]
+categories = ["multimedia", "development-tools"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-codec = { workspace = true, default-features = true }
+oximedia-quality = { workspace = true }
+oximedia-graph.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+csv = { workspace = true }
+statistical = "1.0"
+rayon.workspace = true
+bytes.workspace = true
+sysinfo = { workspace = true }
+rand = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
+
+[dev-dependencies]
+tempfile.workspace = true

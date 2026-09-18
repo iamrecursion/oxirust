@@ -1,0 +1,430 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/torsh",
+    "crates/torsh-cli",
+    "crates/torsh-core", 
+    "crates/torsh-tensor",
+    "crates/torsh-autograd",
+    "crates/torsh-nn",
+    "crates/torsh-optim",
+    "crates/torsh-data",
+    "crates/torsh-backend",
+    # Backend crates - DEPRECATED: Use torsh-backend with feature flags instead
+    # "crates/torsh-backend-cpu",     # Deprecated - use torsh-backend with "cpu" feature
+    # "crates/torsh-backend-metal",   # Deprecated - use torsh-backend with "metal" feature
+    # "crates/torsh-backend-cuda",    # Deprecated - use torsh-backend with "cuda" feature
+    "crates/torsh-vision",
+    "crates/torsh-text",
+    "crates/torsh-jit",
+    "crates/torsh-distributed",
+    "crates/torsh-functional",
+    "crates/torsh-sparse",
+    "crates/torsh-linalg",
+    "crates/torsh-special",
+    "crates/torsh-graph",     # NEW: Graph neural networks powered by scirs2-graph
+    "crates/torsh-series",    # NEW: Time series analysis powered by scirs2-series
+    "crates/torsh-metrics",   # NEW: Comprehensive metrics powered by scirs2-metrics
+    "crates/torsh-cluster",   # NEW: Unsupervised learning powered by scirs2-cluster
+    "crates/torsh-signal",
+    "crates/torsh-profiler",
+    "crates/torsh-quantization",
+    "crates/torsh-fx",
+    "crates/torsh-hub",
+    "crates/torsh-utils",
+    "crates/torsh-package",
+    "crates/torsh-python",  # Re-enabled - fixing PyO3 compatibility issues
+    "crates/torsh-models",  # Re-enabled - fixing trait object mutability issues
+    "crates/torsh-ffi",  # Re-enabled - fixing PyO3 API compatibility issues
+    "crates/torsh-benches",
+]
+
+default-members = [
+    "crates/torsh",
+    "crates/torsh-cli",
+    "crates/torsh-core", 
+    "crates/torsh-tensor",
+    "crates/torsh-autograd",
+    "crates/torsh-nn",
+    "crates/torsh-optim",
+    "crates/torsh-data",
+    "crates/torsh-backend",
+    # Backend crates - DEPRECATED: Use torsh-backend with feature flags instead
+    # "crates/torsh-backend-cpu",     # Deprecated - use torsh-backend with "cpu" feature
+    # "crates/torsh-backend-metal",   # Deprecated - use torsh-backend with "metal" feature
+    # "crates/torsh-backend-cuda",    # Deprecated - use torsh-backend with "cuda" feature
+    "crates/torsh-vision",
+    "crates/torsh-text",
+    "crates/torsh-jit",
+    # "crates/torsh-distributed",  # Tests/examples need additional API updates (scheduled for alpha.3)
+    "crates/torsh-functional",
+    "crates/torsh-sparse",
+    "crates/torsh-linalg",
+    "crates/torsh-special",
+    "crates/torsh-graph",     # NEW: Graph neural networks powered by scirs2-graph
+    "crates/torsh-series",    # NEW: Time series analysis powered by scirs2-series
+    "crates/torsh-metrics",   # NEW: Comprehensive metrics powered by scirs2-metrics
+    "crates/torsh-cluster",   # NEW: Unsupervised learning powered by scirs2-cluster
+    "crates/torsh-signal",
+    "crates/torsh-profiler",
+    "crates/torsh-quantization",
+    "crates/torsh-fx",
+    "crates/torsh-hub",
+    "crates/torsh-utils",
+    "crates/torsh-package",
+    # PyO3-based crates excluded from default testing (see CHANGELOG.md Known Limitations)
+    # "crates/torsh-python",  # PyO3 bindings - test executables have symbol resolution issues
+    # "crates/torsh-ffi",     # PyO3 bindings - test executables have symbol resolution issues
+    # "crates/torsh-benches", # PyO3 optional features - test executables have symbol resolution issues with --all-features
+    "crates/torsh-models",
+]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2021"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/torsh/"
+homepage = "https://github.com/cool-japan/torsh/"
+rust-version = "1.87"
+description = "ToRSh - A Pure Rust Deep Learning Framework inspired by PyTorch"
+documentation = "https://docs.rs/torsh"
+readme = "README.md"
+keywords = ["deep-learning", "machine-learning", "neural-network", "tensor", "pytorch"]
+categories = ["science", "mathematics", "algorithms"]
+
+[workspace.dependencies]
+# Internal ToRSh crates - workspace management
+torsh = { version = "0.2.1", path = "crates/torsh" }
+torsh-core = { version = "0.2.1", path = "crates/torsh-core" }
+torsh-backend = { version = "0.2.1", path = "crates/torsh-backend" }
+torsh-tensor = { version = "0.2.1", path = "crates/torsh-tensor" }
+torsh-autograd = { version = "0.2.1", path = "crates/torsh-autograd" }
+torsh-linalg = { version = "0.2.1", path = "crates/torsh-linalg" }
+torsh-optim = { version = "0.2.1", path = "crates/torsh-optim" }
+torsh-sparse = { version = "0.2.1", path = "crates/torsh-sparse" }
+torsh-special = { version = "0.2.1", path = "crates/torsh-special" }
+torsh-functional = { version = "0.2.1", path = "crates/torsh-functional" }
+torsh-data = { version = "0.2.1", path = "crates/torsh-data" }
+torsh-nn = { version = "0.2.1", path = "crates/torsh-nn" }
+torsh-vision = { version = "0.2.1", path = "crates/torsh-vision" }
+torsh-text = { version = "0.2.1", path = "crates/torsh-text" }
+torsh-graph = { version = "0.2.1", path = "crates/torsh-graph" }
+torsh-series = { version = "0.2.1", path = "crates/torsh-series" }
+torsh-signal = { version = "0.2.1", path = "crates/torsh-signal" }
+torsh-cluster = { version = "0.2.1", path = "crates/torsh-cluster" }
+torsh-metrics = { version = "0.2.1", path = "crates/torsh-metrics" }
+torsh-jit = { version = "0.2.1", path = "crates/torsh-jit" }
+torsh-distributed = { version = "0.2.1", path = "crates/torsh-distributed" }
+torsh-quantization = { version = "0.2.1", path = "crates/torsh-quantization" }
+torsh-fx = { version = "0.2.1", path = "crates/torsh-fx" }
+torsh-hub = { version = "0.2.1", path = "crates/torsh-hub" }
+torsh-utils = { version = "0.2.1", path = "crates/torsh-utils" }
+torsh-package = { version = "0.2.1", path = "crates/torsh-package" }
+torsh-profiler = { version = "0.2.1", path = "crates/torsh-profiler" }
+torsh-python = { version = "0.2.1", path = "crates/torsh-python" }
+torsh-ffi = { version = "0.2.1", path = "crates/torsh-ffi" }
+torsh-models = { version = "0.2.1", path = "crates/torsh-models" }
+torsh-benches = { version = "0.2.1", path = "crates/torsh-benches" }
+
+# Core dependencies - CRATES.IO VERSION 0.1.1 (Stable) with SIMD, OxiBLAS 0.1.2, and OxiCode support
+# NOTE: scirs2 meta crate removed to speed up compilation - use specific sub-crates instead
+# NOTE: SciRS2 0.1.1 now includes OxiBLAS 0.1.2 (optimized BLAS/LAPACK) and OxiCode (modern serialization)
+# NOTE: GPU migrated off scirs2-core onto oxicuda (see oxicuda-backend below); "gpu" feature removed.
+scirs2-core = { version = "0.6.5", features = ["simd", "parallel", "memory_management", "serialization", "oxicode", "oxiblas-blas", "oxiblas-lapack", "oxiblas-ndarray", "validation", "types", "random"] }
+scirs2-autograd = { version = "0.6.5" }
+scirs2-special = { version = "0.6.5" }
+scirs2-sparse = { version = "0.6.5" }
+scirs2-optimize = { version = "0.6.5" }
+scirs2-signal = { version = "0.6.5" }
+scirs2-fft = { version = "0.6.5" }
+# Additional SciRS2 crates for comprehensive integration
+scirs2-cluster = { version = "0.6.5" }
+scirs2-datasets = { version = "0.6.5" }
+scirs2-graph = { version = "0.6.5" }
+scirs2-metrics = { version = "0.6.5" }
+scirs2-series = { version = "0.6.5" }
+scirs2-spatial = { version = "0.6.5" }
+scirs2-stats = { version = "0.6.5" }
+scirs2-text = { version = "0.6.5" }
+scirs2-vision = { version = "0.6.5" }
+scirs2-linalg = { version = "0.6.5" }
+scirs2-neural = { version = "0.6.5" }
+# OptiRS - REMOVED: zero use sites in torsh-optim/src (verified). Removing it also
+# drops a duplicate SciRS2 0.4.4 stack + ndarray 0.15 + oxiarc 0.2.8 (dep minimization).
+# polars = { version = "0.48", features = ["lazy"] }  # REMOVED: COOLJAPAN policy - torsh-data now uses csv crate instead (lighter and policy-compliant)
+
+# Parallelism and async
+# ⚠️ SciRS2 POLICY: Use scirs2-core::parallel_ops for parallel operations
+# rayon is kept for LEGACY compatibility only - NEW code should use scirs2-core::parallel_ops
+rayon = "1.12"  # LEGACY ONLY - prefer scirs2-core::parallel_ops
+tokio = { version = "1.52", features = ["full"] }
+crossbeam = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+oxicode = { version = "0.2.6", features = ["serde"] }  # Modern binary serialization - successor to bincode (now on crates.io)
+safetensors = "0.8.0"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# GPU backends
+# REMOVED (dead, zero use sites): `cust`, `cuda-sys`, `cudnn-sys` — the CUDA C-FFI
+# tree was deleted in Wave 3. The real GPU path is torsh-tensor's oxicuda stack.
+# (torsh-core keeps its own optional-off `cudnn-sys` for the `cudnn` feature only.)
+wgpu = "30.0.0"
+metal = "0.33"
+bytemuck = "1.25"
+
+# SIMD
+wide = "1.5"
+packed_simd_2 = "0.3"
+
+# Testing and benchmarking
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1.11"
+approx = "0.5"
+
+# Async traits
+async-trait = "0.1"
+futures = "0.3"
+
+# Logging
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Data structures - SciRS2 POLICY COMPLIANCE
+# ndarray = "0.16"  # REMOVED: Use scirs2_core::ndarray instead (SciRS2 POLICY)
+# ✅ SciRS2 Policy: Use scirs2_core::ndarray::* for all array operations
+petgraph = "0.8"
+indexmap = { version = "2.14", features = ["serde"] }
+
+# FFI
+# libc = "0.2"  # REMOVED: Pure Rust (SciRS2 ecosystem) - replaced with sysinfo
+pyo3 = { version = "0.29.0" }
+numpy = "0.29"
+scirs2-numpy = { version = "0.6.5", default-features = false }  # SciRS2-compatible numpy bindings
+
+# Additional utilities
+hostname = "0.4"
+rustc-version = "0.4"
+which = "8.0"
+sysinfo = "0.39"
+oxiarc-archive = { version = "0.4.2", default-features = false }
+oxiarc-core = { version = "0.4.2" }
+# reqwest with a provider-less rustls backend: no aws-lc-rs (BoringSSL/C) in the
+# default build. The pure-Rust RustCrypto crypto provider + webpki roots are wired
+# in at each client-build site (see the per-crate `tls` helper modules).
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "blocking", "charset", "http2", "system-proxy", "rustls-no-provider"] }
+# Pure-Rust TLS stack for reqwest (replaces the aws-lc-rs default crypto provider).
+# rustls MUST stay default-features = false so it does not pull its `aws_lc_rs`
+# (and `prefer-post-quantum`) default features back in.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+webpki-roots = "1"
+oxitls-rustcrypto-provider = "0.2"
+clap = { version = "4.6.1", features = ["derive"] }
+hdf5 = { version = "0.8" }
+arrow = { version = "59.0" }
+parquet = { version = "59.0" }
+memmap2 = "0.9"
+image = { version = "0.25" }
+csv = { version = "1.4" }
+getrandom = { version = "0.4" }
+hashbrown = { version = "0.17", default-features = false, features = ["alloc"] }
+# protobuf REMOVED: only torsh-utils declared it (optional) and its code never used it
+# (the TensorBoard writer is protobuf-free by design).
+chrono = { version = "0.4", features = ["serde"] }
+
+# Distributed computing dependencies
+prost = "0.14"
+tonic = "0.14"
+tonic-build = "0.14"
+redis = { version = "1.3", features = ["connection-manager"] }
+tokio-test = "0.4"
+futures-util = "0.3"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+
+# Updated dependencies to fix security issues
+cached = "2.0"  # Replace 0.48.1 to fix instant dependency
+tempfile = "3.27"  # Updated version
+
+# Build dependencies
+bindgen = "0.72"
+cc = "1.2"
+
+# Utilities
+# ⚠️ SciRS2 POLICY: Use scirs2-core::numeric for numerical traits
+# num-traits/num-complex are kept for LEGACY compatibility only - NEW code should use scirs2-core::numeric
+num-traits = "0.2"  # LEGACY ONLY - prefer scirs2-core::numeric
+num-derive = "0.4"  # LEGACY ONLY - prefer scirs2-core::numeric
+num-complex = "0.4"  # LEGACY ONLY - prefer scirs2-core::{Complex, Complex32, Complex64}
+once_cell = "1.21"
+parking_lot = "0.12"
+dashmap = "6.2"
+# SciRS2 POLICY COMPLIANCE - Use scirs2_core::random instead
+# rand = "0.9.2"         # REMOVED: Use scirs2_core::random instead (SciRS2 POLICY)
+# rand_distr = "0.5.1"   # REMOVED: Use scirs2_core::random::prelude instead (SciRS2 POLICY)
+# rand_chacha = "0.9.0"  # REMOVED: Use scirs2_core::random instead (SciRS2 POLICY)
+# ✅ SciRS2 Policy: All random number generation handled by scirs2_core::random
+# EXCEPTION: rand is needed for security features (cryptographic randomness)
+rand = "0.10.2"  # Used only for security module (ed25519-dalek requirement)
+half = "2.7"
+lazy_static = "1.5"
+md5 = "0.8"
+sha2 = "0.11"
+hex = "0.4"
+semver = "1.0"
+
+# Advanced compression for package management (COOLJAPAN Pure Rust Policy)
+oxiarc-deflate = "0.4.2"
+oxiarc-zstd = "0.4.2"
+# oxiarc-lzma replaces the non-COOLJAPAN `lzma-rs` crate (Pure Rust LZMA/LZMA2).
+oxiarc-lzma = "0.4.2"
+
+# Security features for package signing and encryption
+# Pure-Rust RustCrypto AEAD + KDF (replaces the C/asm `ring` dependency).
+aes-gcm = "0.11.0"
+chacha20poly1305 = "0.11.0"
+pbkdf2 = "0.13"
+hmac = "0.13"
+ed25519-dalek = "2.2"
+
+# JIT compilation
+cranelift = "0.133"
+cranelift-module = "0.133"
+cranelift-codegen = "0.133"
+cranelift-frontend = "0.133"
+
+# FFT operations
+oxifft = "0.4.2"
+
+# GPU compute backend — pure-Rust CUDA replacement.
+# `oxicuda-backend` = dependency-free `ComputeBackend` trait + CpuBackend (always builds).
+# The lean leaf crates below back ToRSh's own thin `CudaBackend` (torsh-tensor/src/
+# cuda_backend) so we avoid the heavyweight `oxicuda` umbrella facade. No CUDA SDK is
+# needed at build time (the driver is loaded at runtime via libloading).
+oxicuda-backend = "0.5.5"
+oxicuda-driver = "0.5.5"
+oxicuda-launch = "0.5.5"
+oxicuda-ptx = "0.5.5"
+cranelift-native = "0.133"
+cranelift-object = "0.133"
+
+# ── Workspace-ified crate-local deps (COOLJAPAN policy: no version pins in
+#    individual crate Cargo.toml). Versions match what the crates pinned; the
+#    few disagreements were reconciled to the looser spec (toml 1.1.2→1.1,
+#    dirs 6.0.0→6.0, base64 0.22.1→0.22 — all resolve to the same versions).
+#    NOTE: `imageproc` and `tokenizers` are deliberately NOT hoisted — their
+#    `default-features = false` is purity-load-bearing (drops rustfft / onig /
+#    esaxx C++) and is kept next to its explanatory comment at the single use
+#    site. Test-only dev-dependencies are intentionally left crate-local.
+num_cpus = "1.17"
+raw-cpuid = "11.6"
+spin = "0.12"
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-metal-performance-shaders = "0.3"
+itertools = "0.15"
+walkdir = "2.5"
+pyo3-build-config = { version = "0.29", features = ["resolve-config"] }
+clap_complete = "4.6"
+# Maintained pure-Rust YAML (serde_yaml fork); replaces unmaintained serde_yaml.
+serde_norway = "0.9"
+toml = "1.1"
+glob = "0.3"
+indicatif = "0.18"
+console = "0.16"
+dialoguer = "0.12"
+colored = "3.1"
+humantime = "2.4"
+byte-unit = "5.2"
+fastrand = "2.4"
+dirs = "6.0"
+base64 = "0.22"
+oxionnx = { version = "0.1.7", features = ["ndarray"] }
+backtrace = "0.3"
+tokio-tungstenite = "0.29"
+prometheus = "0.14"
+libm = "0.2"
+unicode-segmentation = "1.13"
+regex = "1.12"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = "0.3"
+# System MPI C bindings — OFF-BY-DEFAULT FFI escape hatch (torsh-distributed `mpi`).
+mpi = "0.8"
+# CUDA C bindings — OFF-BY-DEFAULT optional (torsh-sparse GPU features).
+cudarc = { version = "0.19", features = ["cuda-12000"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+debug = false
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.dev]
+opt-level = 0
+incremental = true
+debug = 1              # Reduced from 2 to 1 for faster compilation
+split-debuginfo = "packed"  # Separate debug info for better performance
+
+# Disable debug info for dependencies to speed up builds
+[profile.dev.package."*"]
+debug = 0
+
+# Build script optimizations for CUDA and other build-time compilation
+[profile.dev.build-override]
+opt-level = 0
+debug = false
+
+[profile.test]
+opt-level = 2
+debug = true
+
+# Workspace-wide lints configuration for high code quality
+[workspace.lints.rust]
+# Warn on common issues
+unused_imports = "warn"
+unused_variables = "warn"
+dead_code = "warn"
+unreachable_code = "warn"
+# missing_docs = "warn" # Enable when documentation is more complete
+# Allow unsafe for FFI and performance-critical code
+unsafe_code = "allow"
+
+[workspace.lints.clippy]
+# Deny critical correctness issues
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+# Warn on style and performance issues
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+# Allow certain lints that can be overly strict for this codebase
+pedantic = { level = "allow", priority = -1 }  # Too many false positives
+all = { level = "allow", priority = -1 }       # Too aggressive
+too_many_lines = "allow"
+module_name_repetitions = "allow"
+similar_names = "allow"
+wildcard_imports = "allow"  # Used for prelude patterns
+must_use_candidate = "allow"  # Too noisy for now
+missing_errors_doc = "allow"  # Documentation in progress
+missing_panics_doc = "allow"  # Documentation in progress
+# Allow controlled use of these patterns in specific contexts
+unwrap_used = "allow"  # Allow but should be used carefully
+expect_used = "allow"  # Allow but should be used carefully
+panic = "allow"        # Allow but should be used carefully
+# Performance-critical warnings (not denials to allow flexibility)
+large_stack_arrays = "warn"
+large_types_passed_by_value = "warn"
+
+

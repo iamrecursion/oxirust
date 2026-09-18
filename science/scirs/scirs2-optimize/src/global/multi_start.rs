@@ -1,0 +1,340 @@
+//! Multi-start strategies for global optimization
+//!
+//! These strategies run multiple optimization attempts from different
+//! starting points to increase the chance of finding the global optimum.
+
+use crate::error::OptimizeError;
+use crate::global::qmc::{halton_radical_inverse, SobolGenerator};
+use crate::unconstrained::{
+    minimize, Bounds as UnconstrainedBounds, Method as UnconstrainedMethod, OptimizeResult, Options,
+};
+use scirs2_core::ndarray::{Array1, ArrayView1};
+use scirs2_core::parallel_ops::*;
+use scirs2_core::random::prelude::SliceRandom;
+use scirs2_core::random::rngs::StdRng;
+use scirs2_core::random::{Rng, RngExt, SeedableRng};
+
+/// First 25 primes, used as Halton sequence bases (one per dimension, cycled
+/// if `ndim` exceeds the table).
+const HALTON_PRIMES: [u64; 25] = [
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+];
+
+/// Options for multi-start optimization
+#[derive(Debug, Clone)]
+pub struct MultiStartOptions {
+    /// Number of starting points
+    pub n_starts: usize,
+    /// Local optimization method to use
+    pub local_method: UnconstrainedMethod,
+    /// Whether to use parallel execution
+    pub parallel: bool,
+    /// Random seed for reproducibility
+    pub seed: Option<u64>,
+    /// Strategy for generating starting points
+    pub strategy: StartingPointStrategy,
+}
+
+impl Default for MultiStartOptions {
+    fn default() -> Self {
+        Self {
+            n_starts: 10,
+            local_method: UnconstrainedMethod::BFGS,
+            parallel: true,
+            seed: None,
+            strategy: StartingPointStrategy::Random,
+        }
+    }
+}
+
+/// Strategy for generating starting points
+#[derive(Debug, Clone)]
+pub enum StartingPointStrategy {
+    /// Random uniform sampling within bounds
+    Random,
+    /// Latin hypercube sampling
+    LatinHypercube,
+    /// Halton sequence
+    Halton,
+    /// Sobol sequence
+    Sobol,
+    /// Grid-based sampling
+    Grid,
+}
+
+/// Bounds for variables
+pub type Bounds = Vec<(f64, f64)>;
+
+/// Multi-start optimization solver
+pub struct MultiStart<F>
+where
+    F: Fn(&ArrayView1<f64>) -> f64 + Clone + Send + Sync,
+{
+    func: F,
+    bounds: Bounds,
+    options: MultiStartOptions,
+    ndim: usize,
+    rng: StdRng,
+}
+
+impl<F> MultiStart<F>
+where
+    F: Fn(&ArrayView1<f64>) -> f64 + Clone + Send + Sync,
+{
+    /// Create new multi-start solver
+    pub fn new(func: F, bounds: Bounds, options: MultiStartOptions) -> Self {
+        let ndim = bounds.len();
+        let seed = options
+            .seed
+            .unwrap_or_else(|| scirs2_core::random::rng().random_range(0..u64::MAX));
+        let rng = StdRng::seed_from_u64(seed);
+
+        Self {
+            func,
+            bounds,
+            options,
+            ndim,
+            rng,
+        }
+    }
+
+    /// Generate starting points based on strategy
+    fn generate_starting_points(&mut self) -> Vec<Array1<f64>> {
+        match self.options.strategy {
+            StartingPointStrategy::Random => self.generate_random_points(),
+            StartingPointStrategy::LatinHypercube => self.generate_latin_hypercube_points(),
+            StartingPointStrategy::Halton => self.generate_halton_points(),
+            StartingPointStrategy::Sobol => self.generate_sobol_points(),
+            StartingPointStrategy::Grid => self.generate_grid_points(),
+        }
+    }
+
+    /// Generate random starting points
+    fn generate_random_points(&mut self) -> Vec<Array1<f64>> {
+        let mut points = Vec::with_capacity(self.options.n_starts);
+
+        for _ in 0..self.options.n_starts {
+            let mut point = Array1::zeros(self.ndim);
+            for j in 0..self.ndim {
+                let (lb, ub) = self.bounds[j];
+                point[j] = self.rng.random_range(lb..ub);
+            }
+            points.push(point);
+        }
+
+        points
+    }
+
+    /// Generate Latin hypercube starting points
+    fn generate_latin_hypercube_points(&mut self) -> Vec<Array1<f64>> {
+        let mut points = Vec::with_capacity(self.options.n_starts);
+        let n = self.options.n_starts;
+
+        // Create segment indices for each dimension
+        for i in 0..n {
+            let mut point = Array1::zeros(self.ndim);
+
+            for j in 0..self.ndim {
+                let (lb, ub) = self.bounds[j];
+                let segment_size = (ub - lb) / n as f64;
+
+                // Random offset within segment
+                let offset = self.rng.random_range(0.0..1.0);
+                point[j] = lb + (i as f64 + offset) * segment_size;
+            }
+
+            points.push(point);
+        }
+
+        // Shuffle each dimension independently
+        for j in 0..self.ndim {
+            let mut indices: Vec<usize> = (0..n).collect();
+            indices.shuffle(&mut self.rng);
+
+            for (i, &idx) in indices.iter().enumerate() {
+                let temp = points[i][j];
+                points[i][j] = points[idx][j];
+                points[idx][j] = temp;
+            }
+        }
+
+        points
+    }
+
+    /// Generate Halton sequence starting points (a genuine low-discrepancy
+    /// sequence, one prime base per dimension; see [`crate::global::qmc`]).
+    fn generate_halton_points(&mut self) -> Vec<Array1<f64>> {
+        let mut points = Vec::with_capacity(self.options.n_starts);
+
+        for i in 0..self.options.n_starts {
+            let mut point = Array1::zeros(self.ndim);
+            for j in 0..self.ndim {
+                let base = HALTON_PRIMES[j % HALTON_PRIMES.len()];
+                let (lb, ub) = self.bounds[j];
+                point[j] = lb + halton_radical_inverse(i + 1, base) * (ub - lb);
+            }
+            points.push(point);
+        }
+
+        points
+    }
+
+    /// Generate Sobol sequence starting points (validated direction numbers
+    /// for the first [`crate::global::qmc::MAX_SOBOL_DIM`] dimensions,
+    /// Halton fallback beyond that; see [`crate::global::qmc`]).
+    fn generate_sobol_points(&mut self) -> Vec<Array1<f64>> {
+        let mut sobol_gen = SobolGenerator::new(self.ndim);
+        let mut points = Vec::with_capacity(self.options.n_starts);
+
+        for _ in 0..self.options.n_starts {
+            let sobol_point = sobol_gen.next_point();
+            let mut point = Array1::zeros(self.ndim);
+            for j in 0..self.ndim {
+                let (lb, ub) = self.bounds[j];
+                point[j] = lb + sobol_point[j] * (ub - lb);
+            }
+            points.push(point);
+        }
+
+        points
+    }
+
+    /// Generate grid-based starting points
+    fn generate_grid_points(&self) -> Vec<Array1<f64>> {
+        let points_per_dim = (self.options.n_starts as f64)
+            .powf(1.0 / self.ndim as f64)
+            .ceil() as usize;
+        let mut points = Vec::new();
+
+        // Generate grid points
+        let mut current = vec![0usize; self.ndim];
+        loop {
+            let mut point = Array1::zeros(self.ndim);
+
+            for j in 0..self.ndim {
+                let (lb, ub) = self.bounds[j];
+                let step = (ub - lb) / (points_per_dim - 1).max(1) as f64;
+                point[j] = lb + current[j] as f64 * step;
+            }
+
+            points.push(point);
+
+            // Increment grid position
+            let mut carry = true;
+            for j in current.iter_mut() {
+                if carry {
+                    *j += 1;
+                    if *j >= points_per_dim {
+                        *j = 0;
+                    } else {
+                        carry = false;
+                    }
+                }
+            }
+
+            if carry || points.len() >= self.options.n_starts {
+                break;
+            }
+        }
+
+        points.truncate(self.options.n_starts);
+        points
+    }
+
+    /// Run optimization from a single starting point
+    fn optimize_single(&self, x0: Array1<f64>) -> OptimizeResult<f64> {
+        let bounds = Some(
+            UnconstrainedBounds::from_vecs(
+                self.bounds.iter().map(|&(lb, _)| Some(lb)).collect(),
+                self.bounds.iter().map(|&(_, ub)| Some(ub)).collect(),
+            )
+            .expect("Operation failed"),
+        );
+
+        let options = Options {
+            bounds,
+            ..Default::default()
+        };
+
+        let func = self.func.clone();
+
+        minimize(
+            move |x: &ArrayView1<f64>| func(x),
+            &x0.to_vec(),
+            self.options.local_method,
+            Some(options),
+        )
+        .unwrap_or_else(|_| {
+            // Return a failed result if optimization fails
+            OptimizeResult {
+                x: x0,
+                fun: f64::INFINITY,
+                success: false,
+                ..Default::default()
+            }
+        })
+    }
+
+    /// Run the multi-start optimization
+    pub fn run(&mut self) -> OptimizeResult<f64> {
+        let starting_points = self.generate_starting_points();
+
+        let results = if self.options.parallel {
+            // Parallel execution
+            starting_points
+                .into_par_iter()
+                .map(|x0| self.optimize_single(x0))
+                .collect::<Vec<_>>()
+        } else {
+            // Sequential execution
+            starting_points
+                .into_iter()
+                .map(|x0| self.optimize_single(x0))
+                .collect::<Vec<_>>()
+        };
+
+        // Find the best result
+        let best_result = results
+            .into_iter()
+            .filter(|r| r.success)
+            .min_by(|a, b| {
+                a.fun
+                    .partial_cmp(&b.fun)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or_else(|| OptimizeResult {
+                x: Array1::zeros(self.ndim),
+                fun: f64::INFINITY,
+                success: false,
+                message: "All optimization attempts failed".to_string(),
+                ..Default::default()
+            });
+
+        OptimizeResult {
+            x: best_result.x,
+            fun: best_result.fun,
+            nit: self.options.n_starts,
+            success: best_result.success,
+            message: format!(
+                "Multi-start optimization with {} starts",
+                self.options.n_starts
+            ),
+            ..Default::default()
+        }
+    }
+}
+
+/// Perform multi-start optimization
+#[allow(dead_code)]
+pub fn multi_start<F>(
+    func: F,
+    bounds: Bounds,
+    options: Option<MultiStartOptions>,
+) -> Result<OptimizeResult<f64>, OptimizeError>
+where
+    F: Fn(&ArrayView1<f64>) -> f64 + Clone + Send + Sync,
+{
+    let options = options.unwrap_or_default();
+    let mut solver = MultiStart::new(func, bounds, options);
+    Ok(solver.run())
+}

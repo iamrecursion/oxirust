@@ -1,0 +1,141 @@
+[package]
+name = "scirs2-fft"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Fast Fourier Transform module for SciRS2 (scirs2-fft)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["fft", "fourier", "scientific", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[features]
+# NOTE: Pure Rust by default - OxiFFT provides high-performance Pure Rust FFT
+default = ["helper", "window", "parallel", "oxifft"]
+helper = []
+window = []
+minimal = []
+parallel = []
+simd = [] # SIMD acceleration support
+oxifft = ["dep:oxifft"] # Pure Rust FFT backend (default)
+serde = [] # Serialization support
+cuda = ["dep:oxicuda-driver", "dep:oxicuda-memory", "dep:oxicuda-fft"] # Optional pure-Rust CUDA FFT (oxicuda) - off by default, NVIDIA-only, runtime-probed
+hip = [] # Optional ROCm/HIP support for AMD GPU acceleration
+sycl = [] # Optional SYCL support for cross-platform GPU acceleration
+never = [] # Used to conditionally disable tests during development
+python = ["scirs2-core/python"] # Python bindings support
+wgpu = ["dep:wgpu", "dep:pollster"] # wgpu-based GPU FFT dispatch (optional, behind feature gate)
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+thiserror = { workspace = true }
+scirs2-core = { workspace = true, features = ["simd", "parallel", "gpu", "validation", "random", "array"] }
+
+# FFT specific dependencies
+# OxiFFT - Pure Rust high-performance FFT (FFTW-compatible algorithms) - DEFAULT
+# Non-wasm32: full defaults (std + threading/rayon).
+# wasm32-unknown-unknown cannot spawn OS threads, and oxifft's `threading`
+# feature hard-fails there via compile_error!() (see target table below).
+
+# Serialization dependencies
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# System info and benchmarking
+num_cpus = { workspace = true }
+tempfile = { workspace = true }
+
+# CUDA dependencies (optional) - temporarily disabled
+# cudarc = { version = "0.12", optional = true, features = ["driver", "runtime", "cublas", "curand"] }
+# cufft = { version = "0.3", optional = true } # Temporarily disabled - version not available
+
+# ROCm/HIP dependencies (optional) - temporarily disabled
+# hiprt = { version = "0.2", optional = true }
+# rocblas = { version = "0.2", optional = true }
+
+# wgpu GPU FFT backend (optional, behind wgpu feature)
+wgpu = { workspace = true, optional = true }
+
+# Blocking executor for synchronous wgpu adapter checks (used by wgpu feature)
+pollster = { workspace = true, optional = true }
+
+# OxiCUDA pure-Rust CUDA FFT backend (optional, behind `cuda` feature; off by default).
+# LOCAL-ONLY path deps pending oxicuda 0.4.0 publish. NVIDIA-only at runtime (UnsupportedPlatform elsewhere).
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }
+oxicuda-fft = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# threading (rayon) is not supported on wasm32-unknown-unknown - keep std only
+oxifft = { version = "0.4.2", optional = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+plotly = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "fft_benchmarks"
+harness = false
+
+[[bench]]
+name = "scipy_comparison"
+harness = false
+
+[[bench]]
+name = "butterfly_bench"
+harness = false
+
+[[example]]
+name = "plan_cache_example"
+
+[[example]]
+name = "benchmark_simple"
+
+[[example]]
+name = "memory_usage_benchmarking"
+
+[[example]]
+name = "memory_efficient_fft"
+
+[[example]]
+name = "memory_profiling_example"
+
+[[example]]
+name = "adaptive_planning_example"
+
+[[example]]
+name = "advanced_fft"
+
+[[example]]
+name = "advanced_planning_strategies"
+
+[[example]]
+name = "auto_tuning_example"
+
+[[example]]
+name = "context_example"
+
+[[example]]
+name = "parallel_planning_simple"
+
+[[example]]
+name = "plan_optimization_example"
+
+[[example]]
+name = "strided_fft_example"
+
+[[example]]
+name = "backend_example"

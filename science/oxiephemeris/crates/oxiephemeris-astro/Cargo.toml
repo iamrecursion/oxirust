@@ -1,0 +1,34 @@
+[package]
+name = "oxiephemeris-astro"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: Pure Rust ephemeris engine (astrology layer: houses, aspects, nodes, sidereal zodiac)"
+keywords = ["astrology", "houses", "zodiac", "aspects", "ephemeris"]
+categories = ["science", "no-std"]
+
+[features]
+default = []
+# Enables `std`-only conveniences. The crate is `#![no_std]` when this
+# feature is disabled; all float math goes through `libm`.
+std = ["oxiephemeris-core/std", "oxiephemeris-bodies/std", "oxiephemeris-de/std"]
+
+[dependencies]
+libm.workspace = true
+oxiephemeris-core.workspace = true
+oxiephemeris-bodies.workspace = true
+oxiephemeris-de.workspace = true
+
+[dev-dependencies]
+oxiephemeris-de = { path = "../oxiephemeris-de", features = ["std"] }
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

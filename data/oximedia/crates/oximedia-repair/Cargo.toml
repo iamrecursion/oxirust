@@ -1,0 +1,32 @@
+[package]
+name = "oximedia-repair"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Media file repair and recovery tools for OxiMedia"
+keywords = ["restoration", "denoising", "video", "multimedia", "quality"]
+categories = ["multimedia::video"]
+readme = "README.md"
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-container = { workspace = true }
+oximedia-codec = { workspace = true, default-features = true }
+oximedia-video = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = { workspace = true }
+memchr = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]

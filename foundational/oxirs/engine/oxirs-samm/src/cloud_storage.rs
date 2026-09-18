@@ -1,0 +1,802 @@
+//! Cloud Storage Integration for SAMM Models
+//!
+//! This module provides a flexible trait-based cloud storage abstraction for SAMM models.
+//! Users can implement their own cloud storage backends or use pre-built integrations.
+//!
+//! # Features
+//!
+//! - **Trait-Based Design**: Implement `CloudStorageBackend` for any storage provider
+//! - **Model Caching**: Optional local caching of frequently accessed models
+//! - **Batch Operations**: Upload/download multiple models efficiently
+//! - **Async Support**: Full async/await support for I/O operations
+//!
+//! # Examples
+//!
+//! ```rust,no_run
+//! use oxirs_samm::cloud_storage::{CloudModelStorage, MemoryBackend};
+//! use oxirs_samm::metamodel::Aspect;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create an in-memory storage backend for testing
+//! let backend = MemoryBackend::new();
+//! let mut storage = CloudModelStorage::new(Box::new(backend));
+//!
+//! // Upload a model
+//! let aspect = Aspect::new("urn:samm:org.example:1.0.0#Vehicle".to_string());
+//! storage.upload_model("models/vehicle.ttl", &aspect).await?;
+//!
+//! // Download a model
+//! let downloaded = storage.download_model("models/vehicle.ttl").await?;
+//!
+//! // List all models
+//! let models = storage.list_models("models/").await?;
+//! println!("Found {} models", models.len());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Implementing Custom Backends
+//!
+//! ```rust
+//! use oxirs_samm::cloud_storage::CloudStorageBackend;
+//! use async_trait::async_trait;
+//!
+//! struct MyS3Backend {
+//!     // Your AWS S3 client
+//! }
+//!
+//! #[async_trait]
+//! impl CloudStorageBackend for MyS3Backend {
+//!     async fn upload(&self, key: &str, data: Vec<u8>) -> std::result::Result<(), String> {
+//!         // Upload to S3
+//!         Ok(())
+//!     }
+//!
+//!     async fn download(&self, key: &str) -> std::result::Result<Vec<u8>, String> {
+//!         // Download from S3
+//!         Ok(vec![])
+//!     }
+//!
+//!     async fn exists(&self, key: &str) -> std::result::Result<bool, String> {
+//!         // Check if object exists in S3
+//!         Ok(false)
+//!     }
+//!
+//!     async fn delete(&self, key: &str) -> std::result::Result<(), String> {
+//!         // Delete from S3
+//!         Ok(())
+//!     }
+//!
+//!     async fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, String> {
+//!         // List objects in S3
+//!         Ok(vec![])
+//!     }
+//! }
+//! ```
+
+use crate::error::{Result, SammError};
+use crate::metamodel::Aspect;
+use crate::parser::parse_aspect_from_string;
+use crate::serializer::serialize_aspect_to_string;
+use async_trait::async_trait;
+use lru::LruCache;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+use tracing::{debug, error, info};
+
+/// Default maximum number of distinct model keys retained by the in-process
+/// [`ModelCache`] before the least-recently-used entry is evicted.
+///
+/// Without a bound, a long-running service (e.g. a model registry) that
+/// uploads or downloads many distinct model keys over its lifetime would
+/// accumulate cache entries indefinitely — this caps memory usage
+/// independent of read pattern.
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 1000;
+
+/// Trait for cloud storage backends
+///
+/// Implement this trait to add support for different cloud storage providers
+/// (AWS S3, Google Cloud Storage, Azure Blob Storage, etc.)
+#[async_trait]
+pub trait CloudStorageBackend: Send + Sync {
+    /// Upload data to cloud storage
+    async fn upload(&self, key: &str, data: Vec<u8>) -> std::result::Result<(), String>;
+
+    /// Download data from cloud storage
+    async fn download(&self, key: &str) -> std::result::Result<Vec<u8>, String>;
+
+    /// Check if an object exists
+    async fn exists(&self, key: &str) -> std::result::Result<bool, String>;
+
+    /// Delete an object
+    async fn delete(&self, key: &str) -> std::result::Result<(), String>;
+
+    /// List objects with a given prefix
+    async fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, String>;
+
+    /// Get object metadata (optional, returns empty metadata by default)
+    async fn get_metadata(&self, key: &str) -> std::result::Result<ObjectMetadata, String> {
+        Ok(ObjectMetadata {
+            key: key.to_string(),
+            size: 0,
+            last_modified: None,
+        })
+    }
+}
+
+/// Cloud storage client for SAMM models
+pub struct CloudModelStorage {
+    backend: Box<dyn CloudStorageBackend>,
+    cache: Option<Arc<Mutex<ModelCache>>>,
+}
+
+/// Local cache for cloud models.
+///
+/// Bounded by a maximum entry count with least-recently-used eviction (via
+/// the [`lru`] crate), in addition to the existing per-entry TTL expiry —
+/// so cache memory stays bounded regardless of how many distinct keys a
+/// long-running caller touches over its lifetime, not just how many are
+/// re-read after expiry.
+#[derive(Debug)]
+struct ModelCache {
+    models: LruCache<String, (Aspect, SystemTime)>,
+    ttl: Duration,
+}
+
+impl ModelCache {
+    fn new(ttl: Duration) -> Self {
+        Self::with_capacity(ttl, DEFAULT_MAX_CACHE_ENTRIES)
+    }
+
+    /// Create a cache with an explicit maximum entry count. `max_entries`
+    /// of `0` is treated as `1` (a cache must always hold a positive
+    /// capacity).
+    fn with_capacity(ttl: Duration, max_entries: usize) -> Self {
+        let capacity = NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            models: LruCache::new(capacity),
+            ttl,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Aspect> {
+        let is_expired = match self.models.get(key) {
+            Some((_, timestamp)) => timestamp.elapsed().unwrap_or(Duration::MAX) >= self.ttl,
+            None => return None,
+        };
+        if is_expired {
+            debug!("Cache expired for model: {}", key);
+            self.models.pop(key);
+            return None;
+        }
+        debug!("Cache hit for model: {}", key);
+        self.models.get(key).map(|(model, _)| model.clone())
+    }
+
+    fn put(&mut self, key: String, model: Aspect) {
+        // `push` (rather than `put`) both inserts/refreshes recency AND
+        // returns the previous entry for `key` if one existed, or the
+        // entry evicted to stay within capacity otherwise — so eviction is
+        // an explicit, observable part of the LRU cache's own bookkeeping
+        // rather than something the caller must separately trigger.
+        let inserted_key = key.clone();
+        if let Some((displaced_key, _)) = self.models.push(key, (model, SystemTime::now())) {
+            if displaced_key != inserted_key {
+                debug!(
+                    "Evicted least-recently-used cached model: {}",
+                    displaced_key
+                );
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.models.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.models.len()
+    }
+}
+
+impl CloudModelStorage {
+    /// Create a new cloud model storage client
+    ///
+    /// # Arguments
+    ///
+    /// * `backend` - Cloud storage backend implementation
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use oxirs_samm::cloud_storage::{CloudModelStorage, MemoryBackend};
+    /// let backend = MemoryBackend::new();
+    /// let storage = CloudModelStorage::new(Box::new(backend));
+    /// ```
+    pub fn new(backend: Box<dyn CloudStorageBackend>) -> Self {
+        info!("Initialized cloud model storage");
+        Self {
+            backend,
+            cache: Some(Arc::new(Mutex::new(ModelCache::new(Duration::from_secs(
+                3600,
+            ))))),
+        }
+    }
+
+    /// Create storage without caching
+    pub fn new_without_cache(backend: Box<dyn CloudStorageBackend>) -> Self {
+        info!("Initialized cloud model storage (no cache)");
+        Self {
+            backend,
+            cache: None,
+        }
+    }
+
+    /// Upload a SAMM model to cloud storage
+    pub async fn upload_model(&mut self, key: &str, aspect: &Aspect) -> Result<()> {
+        info!("Uploading model to cloud: {}", key);
+
+        // Serialize aspect to Turtle format
+        let ttl_content = serialize_aspect_to_string(aspect)?;
+
+        // Upload to cloud
+        self.backend
+            .upload(key, ttl_content.into_bytes())
+            .await
+            .map_err(|e| SammError::cloud_error(format!("Upload failed: {}", e)))?;
+
+        // Update cache
+        if let Some(cache) = &self.cache {
+            if let Ok(mut cache_guard) = cache.lock() {
+                cache_guard.put(key.to_string(), aspect.clone());
+            }
+        }
+
+        info!("Successfully uploaded model: {}", key);
+        Ok(())
+    }
+
+    /// Download a SAMM model from cloud storage
+    pub async fn download_model(&mut self, key: &str) -> Result<Aspect> {
+        // Check cache first
+        if let Some(cache) = &self.cache {
+            if let Ok(mut cache_guard) = cache.lock() {
+                if let Some(model) = cache_guard.get(key) {
+                    return Ok(model);
+                }
+            }
+        }
+
+        info!("Downloading model from cloud: {}", key);
+
+        // Download from cloud
+        let data = self
+            .backend
+            .download(key)
+            .await
+            .map_err(|e| SammError::cloud_error(format!("Download failed: {}", e)))?;
+
+        // Parse the Turtle content
+        let ttl_content = String::from_utf8(data)
+            .map_err(|e| SammError::ParseError(format!("Invalid UTF-8: {}", e)))?;
+
+        // Use a dummy base URI for parsing
+        let aspect = parse_aspect_from_string(&ttl_content, "urn:samm:org.eclipse.esmf").await?;
+
+        // Update cache
+        if let Some(cache) = &self.cache {
+            if let Ok(mut cache_guard) = cache.lock() {
+                cache_guard.put(key.to_string(), aspect.clone());
+            }
+        }
+
+        info!("Successfully downloaded model: {}", key);
+        Ok(aspect)
+    }
+
+    /// Check if a model exists in cloud storage
+    pub async fn model_exists(&self, key: &str) -> Result<bool> {
+        self.backend
+            .exists(key)
+            .await
+            .map_err(|e| SammError::cloud_error(format!("Existence check failed: {}", e)))
+    }
+
+    /// Delete a model from cloud storage
+    pub async fn delete_model(&mut self, key: &str) -> Result<()> {
+        info!("Deleting model from cloud: {}", key);
+
+        self.backend
+            .delete(key)
+            .await
+            .map_err(|e| SammError::cloud_error(format!("Delete failed: {}", e)))?;
+
+        // Remove from cache
+        if let Some(cache) = &self.cache {
+            if let Ok(mut cache_guard) = cache.lock() {
+                cache_guard.models.pop(key);
+            }
+        }
+
+        info!("Successfully deleted model: {}", key);
+        Ok(())
+    }
+
+    /// List all models in a directory/prefix
+    pub async fn list_models(&self, prefix: &str) -> Result<Vec<ModelInfo>> {
+        info!("Listing models with prefix: {}", prefix);
+
+        let keys = self
+            .backend
+            .list(prefix)
+            .await
+            .map_err(|e| SammError::cloud_error(format!("List failed: {}", e)))?;
+
+        let mut models = Vec::new();
+        for key in keys {
+            if key.ends_with(".ttl") {
+                if let Ok(metadata) = self.backend.get_metadata(&key).await {
+                    models.push(ModelInfo {
+                        key: metadata.key,
+                        size: metadata.size,
+                        last_modified: metadata.last_modified,
+                    });
+                }
+            }
+        }
+
+        Ok(models)
+    }
+
+    /// Upload multiple models in batch
+    pub async fn upload_models_batch(
+        &mut self,
+        models: Vec<(String, Aspect)>,
+    ) -> Result<BatchResult> {
+        info!("Uploading {} models in batch", models.len());
+
+        let mut successful = 0;
+        let mut failed = Vec::new();
+
+        for (key, aspect) in models {
+            match self.upload_model(&key, &aspect).await {
+                Ok(_) => successful += 1,
+                Err(e) => {
+                    error!("Failed to upload {}: {}", key, e);
+                    failed.push((key, e.to_string()));
+                }
+            }
+        }
+
+        let failed_count = failed.len();
+
+        info!(
+            "Batch upload complete: {} successful, {} failed",
+            successful, failed_count
+        );
+
+        Ok(BatchResult {
+            successful,
+            failed,
+            total: successful + failed_count,
+        })
+    }
+
+    /// Clear the local cache
+    pub fn clear_cache(&mut self) {
+        if let Some(cache) = &self.cache {
+            if let Ok(mut cache_guard) = cache.lock() {
+                cache_guard.clear();
+                info!("Cache cleared");
+            }
+        }
+    }
+
+    /// Get cache statistics
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        self.cache.as_ref().and_then(|cache| {
+            cache.lock().ok().map(|guard| CacheStats {
+                entries: guard.models.len(),
+                ttl_seconds: guard.ttl.as_secs(),
+            })
+        })
+    }
+}
+
+/// In-memory storage backend for testing
+pub struct MemoryBackend {
+    storage: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+impl MemoryBackend {
+    /// Create a new in-memory backend
+    pub fn new() -> Self {
+        Self {
+            storage: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl CloudStorageBackend for MemoryBackend {
+    async fn upload(&self, key: &str, data: Vec<u8>) -> std::result::Result<(), String> {
+        let mut storage = self
+            .storage
+            .lock()
+            .expect("storage mutex should not be poisoned");
+        storage.insert(key.to_string(), data);
+        Ok(())
+    }
+
+    async fn download(&self, key: &str) -> std::result::Result<Vec<u8>, String> {
+        let storage = self.storage.lock().expect("lock should not be poisoned");
+        storage
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("Key not found: {}", key))
+    }
+
+    async fn exists(&self, key: &str) -> std::result::Result<bool, String> {
+        let storage = self.storage.lock().expect("lock should not be poisoned");
+        Ok(storage.contains_key(key))
+    }
+
+    async fn delete(&self, key: &str) -> std::result::Result<(), String> {
+        let mut storage = self
+            .storage
+            .lock()
+            .expect("storage mutex should not be poisoned");
+        storage.remove(key);
+        Ok(())
+    }
+
+    async fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, String> {
+        let storage = self.storage.lock().expect("lock should not be poisoned");
+        Ok(storage
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
+    async fn get_metadata(&self, key: &str) -> std::result::Result<ObjectMetadata, String> {
+        let storage = self.storage.lock().expect("lock should not be poisoned");
+        storage
+            .get(key)
+            .map(|data| ObjectMetadata {
+                key: key.to_string(),
+                size: data.len(),
+                last_modified: Some(SystemTime::now()),
+            })
+            .ok_or_else(|| format!("Key not found: {}", key))
+    }
+}
+
+/// Object metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectMetadata {
+    /// Object key
+    pub key: String,
+    /// Size in bytes
+    pub size: usize,
+    /// Last modification time
+    pub last_modified: Option<SystemTime>,
+}
+
+/// Information about a cloud-stored model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// Cloud storage key
+    pub key: String,
+    /// File size in bytes
+    pub size: usize,
+    /// Last modification timestamp
+    pub last_modified: Option<SystemTime>,
+}
+
+/// Batch operation result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchResult {
+    /// Number of successful operations
+    pub successful: usize,
+    /// Failed operations with error messages
+    pub failed: Vec<(String, String)>,
+    /// Total operations attempted
+    pub total: usize,
+}
+
+/// Cache statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStats {
+    /// Number of cached entries
+    pub entries: usize,
+    /// Cache TTL in seconds
+    pub ttl_seconds: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metamodel::ModelElement;
+
+    #[test]
+    fn test_model_info_creation() {
+        let info = ModelInfo {
+            key: "models/test.ttl".to_string(),
+            size: 1024,
+            last_modified: Some(SystemTime::now()),
+        };
+
+        assert_eq!(info.key, "models/test.ttl");
+        assert_eq!(info.size, 1024);
+        assert!(info.last_modified.is_some());
+    }
+
+    #[test]
+    fn test_batch_result() {
+        let result = BatchResult {
+            successful: 5,
+            failed: vec![("model1.ttl".to_string(), "Error".to_string())],
+            total: 6,
+        };
+
+        assert_eq!(result.successful, 5);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.total, 6);
+    }
+
+    #[test]
+    fn test_cache_stats() {
+        let stats = CacheStats {
+            entries: 10,
+            ttl_seconds: 3600,
+        };
+
+        assert_eq!(stats.entries, 10);
+        assert_eq!(stats.ttl_seconds, 3600);
+    }
+
+    #[tokio::test]
+    async fn test_memory_backend() {
+        let backend = MemoryBackend::new();
+
+        // Test upload
+        let data = b"test data".to_vec();
+        backend
+            .upload("test.txt", data.clone())
+            .await
+            .expect("async operation should succeed");
+
+        // Test exists
+        assert!(backend
+            .exists("test.txt")
+            .await
+            .expect("async operation should succeed"));
+        assert!(!backend
+            .exists("nonexistent.txt")
+            .await
+            .expect("async operation should succeed"));
+
+        // Test download
+        let downloaded = backend
+            .download("test.txt")
+            .await
+            .expect("async operation should succeed");
+        assert_eq!(downloaded, data);
+
+        // Test list
+        backend
+            .upload("dir/file1.txt", vec![])
+            .await
+            .expect("async operation should succeed");
+        backend
+            .upload("dir/file2.txt", vec![])
+            .await
+            .expect("async operation should succeed");
+        let files = backend
+            .list("dir/")
+            .await
+            .expect("async operation should succeed");
+        assert_eq!(files.len(), 2);
+
+        // Test delete
+        backend
+            .delete("test.txt")
+            .await
+            .expect("async operation should succeed");
+        assert!(!backend
+            .exists("test.txt")
+            .await
+            .expect("async operation should succeed"));
+    }
+
+    #[tokio::test]
+    async fn test_cloud_model_storage() {
+        let backend = MemoryBackend::new();
+        let mut storage = CloudModelStorage::new(Box::new(backend));
+
+        // Create a test aspect
+        let aspect = Aspect::new("urn:samm:org.test:1.0.0#TestAspect".to_string());
+
+        // Test upload
+        storage
+            .upload_model("models/test.ttl", &aspect)
+            .await
+            .expect("operation should succeed");
+
+        // Test exists
+        assert!(storage
+            .model_exists("models/test.ttl")
+            .await
+            .expect("async operation should succeed"));
+
+        // Test download
+        let downloaded = storage
+            .download_model("models/test.ttl")
+            .await
+            .expect("async operation should succeed");
+        assert_eq!(downloaded.name(), aspect.name());
+
+        // Test list
+        let models = storage
+            .list_models("models/")
+            .await
+            .expect("async operation should succeed");
+        assert_eq!(models.len(), 1);
+
+        // Test delete
+        storage
+            .delete_model("models/test.ttl")
+            .await
+            .expect("async operation should succeed");
+        assert!(!storage
+            .model_exists("models/test.ttl")
+            .await
+            .expect("async operation should succeed"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_functionality() {
+        let backend = MemoryBackend::new();
+        let mut storage = CloudModelStorage::new(Box::new(backend));
+
+        let aspect = Aspect::new("urn:samm:org.test:1.0.0#CachedAspect".to_string());
+
+        // Upload model
+        storage
+            .upload_model("cached/model.ttl", &aspect)
+            .await
+            .expect("operation should succeed");
+
+        // First download (from backend)
+        let _first = storage
+            .download_model("cached/model.ttl")
+            .await
+            .expect("async operation should succeed");
+
+        // Check cache stats
+        let stats = storage.cache_stats().expect("operation should succeed");
+        assert_eq!(stats.entries, 1);
+
+        // Second download (from cache)
+        let _second = storage
+            .download_model("cached/model.ttl")
+            .await
+            .expect("async operation should succeed");
+
+        // Clear cache
+        storage.clear_cache();
+        let stats_after_clear = storage.cache_stats().expect("clear should succeed");
+        assert_eq!(stats_after_clear.entries, 0);
+    }
+
+    // ─── ModelCache bounded-eviction regression tests ──────────────────────
+
+    #[test]
+    fn regression_model_cache_evicts_least_recently_used_beyond_capacity() {
+        let mut cache = ModelCache::with_capacity(Duration::from_secs(3600), 2);
+
+        cache.put(
+            "a".to_string(),
+            Aspect::new("urn:samm:org.example:1.0.0#A".to_string()),
+        );
+        cache.put(
+            "b".to_string(),
+            Aspect::new("urn:samm:org.example:1.0.0#B".to_string()),
+        );
+        assert_eq!(cache.len(), 2);
+
+        // A third distinct key beyond capacity must evict the
+        // least-recently-used entry ("a"), not grow the cache unbounded.
+        cache.put(
+            "c".to_string(),
+            Aspect::new("urn:samm:org.example:1.0.0#C".to_string()),
+        );
+        assert_eq!(cache.len(), 2, "cache must stay bounded at max_entries");
+        assert!(
+            cache.get("a").is_none(),
+            "least-recently-used entry must be evicted"
+        );
+        assert!(cache.get("b").is_some());
+        assert!(cache.get("c").is_some());
+    }
+
+    #[test]
+    fn regression_model_cache_recently_accessed_entry_survives_eviction() {
+        let mut cache = ModelCache::with_capacity(Duration::from_secs(3600), 2);
+        cache.put(
+            "a".to_string(),
+            Aspect::new("urn:samm:org.example:1.0.0#A".to_string()),
+        );
+        cache.put(
+            "b".to_string(),
+            Aspect::new("urn:samm:org.example:1.0.0#B".to_string()),
+        );
+
+        // Touching "a" makes "b" the least-recently-used entry.
+        assert!(cache.get("a").is_some());
+
+        cache.put(
+            "c".to_string(),
+            Aspect::new("urn:samm:org.example:1.0.0#C".to_string()),
+        );
+        assert!(
+            cache.get("b").is_none(),
+            "b should have been evicted as LRU"
+        );
+        assert!(cache.get("a").is_some(), "recently-touched a must survive");
+        assert!(cache.get("c").is_some());
+    }
+
+    #[test]
+    fn regression_model_cache_zero_capacity_falls_back_to_one() {
+        // Requesting a zero-sized cache must not panic; it falls back to a
+        // minimum capacity of 1 rather than being rejected.
+        let mut cache = ModelCache::with_capacity(Duration::from_secs(3600), 0);
+        cache.put(
+            "a".to_string(),
+            Aspect::new("urn:samm:org.example:1.0.0#A".to_string()),
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn regression_cloud_model_storage_cache_stays_bounded_across_many_keys() {
+        let backend = MemoryBackend::new();
+        let mut storage = CloudModelStorage::new(Box::new(backend));
+
+        // Swap in a small, deterministic cache capacity for this test.
+        storage.cache = Some(Arc::new(Mutex::new(ModelCache::with_capacity(
+            Duration::from_secs(3600),
+            3,
+        ))));
+
+        // Upload far more distinct keys than the cache's capacity.
+        for i in 0..20 {
+            let key = format!("models/model-{i}.ttl");
+            let aspect = Aspect::new(format!("urn:samm:org.example:1.0.0#Model{i}"));
+            storage
+                .upload_model(&key, &aspect)
+                .await
+                .expect("upload should succeed");
+        }
+
+        let stats = storage.cache_stats().expect("cache should be enabled");
+        assert!(
+            stats.entries <= 3,
+            "cache must stay bounded at its configured capacity regardless of how many \
+             distinct keys are written, got {} entries",
+            stats.entries
+        );
+    }
+}

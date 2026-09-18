@@ -1,0 +1,311 @@
+//! Version compatibility checking.
+
+use super::version::Version;
+
+/// Level of compatibility between versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibilityLevel {
+    /// Fully compatible - no changes needed
+    Compatible,
+
+    /// Compatible but with warnings (minor version difference)
+    CompatibleWithWarnings,
+
+    /// Incompatible - cannot be used together
+    Incompatible,
+}
+
+impl CompatibilityLevel {
+    /// Returns true if this level allows use.
+    #[inline]
+    pub const fn is_usable(&self) -> bool {
+        !matches!(self, CompatibilityLevel::Incompatible)
+    }
+
+    /// Returns true if this level is fully compatible.
+    #[inline]
+    pub const fn is_fully_compatible(&self) -> bool {
+        matches!(self, CompatibilityLevel::Compatible)
+    }
+
+    /// Returns true if there are warnings.
+    #[inline]
+    pub const fn has_warnings(&self) -> bool {
+        matches!(self, CompatibilityLevel::CompatibleWithWarnings)
+    }
+}
+
+/// Check compatibility between a data version and expected version.
+///
+/// # Arguments
+///
+/// * `data_version` - The version of the data being read
+/// * `current_version` - The current expected version
+/// * `min_compatible` - Optional minimum compatible version
+///
+/// # Returns
+///
+/// The compatibility level between the versions.
+pub fn check_compatibility(
+    data_version: Version,
+    current_version: Version,
+    min_compatible: Option<Version>,
+) -> CompatibilityLevel {
+    // Check minimum version if specified
+    if let Some(min) = min_compatible {
+        if data_version < min {
+            return CompatibilityLevel::Incompatible;
+        }
+    }
+
+    // Pre-1.0 versions have stricter compatibility
+    if current_version.major == 0 && data_version.major == 0 {
+        // In 0.x, minor version must match
+        if data_version.minor != current_version.minor {
+            return CompatibilityLevel::Incompatible;
+        }
+        // Patch differences are allowed
+        return CompatibilityLevel::Compatible;
+    }
+
+    // Major version must match for compatibility
+    if data_version.major != current_version.major {
+        return CompatibilityLevel::Incompatible;
+    }
+
+    // If data version is newer than current, might have issues
+    if data_version > current_version {
+        return CompatibilityLevel::CompatibleWithWarnings;
+    }
+
+    // Data version is older or same, should be compatible
+    if data_version.minor < current_version.minor {
+        // Older minor version - compatible with warnings
+        return CompatibilityLevel::CompatibleWithWarnings;
+    }
+
+    CompatibilityLevel::Compatible
+}
+
+/// Check if a data version can be migrated to a target version.
+///
+/// Returns true if migration is possible (not necessarily automatic).
+pub fn can_migrate(from: Version, to: Version) -> bool {
+    // Can always migrate within same major version
+    if from.major == to.major {
+        return true;
+    }
+
+    // Can migrate forward through breaking changes (with explicit handling)
+    from < to
+}
+
+/// Determine the migration path between versions.
+///
+/// Returns a list of intermediate versions that should be migrated through.
+/// An empty list means direct migration is possible.
+///
+/// This is kept in agreement with [`can_migrate`]: when `can_migrate(from,
+/// to)` is `false` (which, by that function's rules, only happens for a
+/// *backward* migration across a major-version boundary, i.e. `from.major >
+/// to.major`), this function does **not** return an empty path — doing so
+/// would misleadingly report the migration as trivially direct, which is
+/// exactly the inconsistency this function used to have with
+/// [`can_migrate`]. Instead it returns `[to]`, a single-element path
+/// containing only the requested target. This value can never occur for a
+/// migratable pair: every element pushed by the forward-migration loop below
+/// has a strictly greater major version than `from`, and the `from == to`
+/// case returns the (also unambiguous) empty path before reaching the loop.
+/// Callers that need a hard yes/no answer before acting on the path — rather
+/// than inferring it from `path.is_empty()` — should call [`can_migrate`]
+/// directly.
+#[cfg(feature = "alloc")]
+pub fn migration_path(from: Version, to: Version) -> alloc::vec::Vec<Version> {
+    let mut path = alloc::vec::Vec::new();
+
+    if from == to {
+        return path;
+    }
+
+    if !can_migrate(from, to) {
+        return alloc::vec![to];
+    }
+
+    // If major versions differ, we need intermediate major version bumps.
+    // `can_migrate` above already guarantees `from < to` here (the only
+    // other case, same major, is unreachable in this branch since it always
+    // returns `true` above), so this loop always terminates.
+    let mut current = from;
+    while current.major < to.major {
+        // Add the next major version as a migration step
+        current = Version::new(current.major + 1, 0, 0);
+        if current != to {
+            path.push(current);
+        }
+    }
+
+    path
+}
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compatible_same_version() {
+        let v = Version::new(1, 0, 0);
+        let compat = check_compatibility(v, v, None);
+        assert_eq!(compat, CompatibilityLevel::Compatible);
+    }
+
+    #[test]
+    fn test_compatible_patch_difference() {
+        let data = Version::new(1, 0, 0);
+        let current = Version::new(1, 0, 5);
+        let compat = check_compatibility(data, current, None);
+        assert_eq!(compat, CompatibilityLevel::Compatible);
+    }
+
+    #[test]
+    fn test_compatible_with_warnings_minor() {
+        let data = Version::new(1, 0, 0);
+        let current = Version::new(1, 5, 0);
+        let compat = check_compatibility(data, current, None);
+        assert_eq!(compat, CompatibilityLevel::CompatibleWithWarnings);
+    }
+
+    #[test]
+    fn test_compatible_with_warnings_newer() {
+        let data = Version::new(1, 5, 0);
+        let current = Version::new(1, 0, 0);
+        let compat = check_compatibility(data, current, None);
+        assert_eq!(compat, CompatibilityLevel::CompatibleWithWarnings);
+    }
+
+    #[test]
+    fn test_incompatible_major() {
+        let data = Version::new(1, 0, 0);
+        let current = Version::new(2, 0, 0);
+        let compat = check_compatibility(data, current, None);
+        assert_eq!(compat, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_incompatible_below_minimum() {
+        let data = Version::new(1, 0, 0);
+        let current = Version::new(1, 5, 0);
+        let min = Some(Version::new(1, 2, 0));
+        let compat = check_compatibility(data, current, min);
+        assert_eq!(compat, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_0x_compatibility() {
+        // Same minor in 0.x is compatible
+        let data = Version::new(0, 1, 0);
+        let current = Version::new(0, 1, 5);
+        assert_eq!(
+            check_compatibility(data, current, None),
+            CompatibilityLevel::Compatible
+        );
+
+        // Different minor in 0.x is incompatible
+        let current2 = Version::new(0, 2, 0);
+        assert_eq!(
+            check_compatibility(data, current2, None),
+            CompatibilityLevel::Incompatible
+        );
+    }
+
+    #[test]
+    fn test_can_migrate() {
+        // Same major can migrate
+        assert!(can_migrate(Version::new(1, 0, 0), Version::new(1, 5, 0)));
+
+        // Forward through major bump can migrate
+        assert!(can_migrate(Version::new(1, 0, 0), Version::new(2, 0, 0)));
+
+        // Backward cannot migrate
+        assert!(!can_migrate(Version::new(2, 0, 0), Version::new(1, 0, 0)));
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_migration_path() {
+        // Same version - empty path
+        let path = migration_path(Version::new(1, 0, 0), Version::new(1, 0, 0));
+        assert!(path.is_empty());
+
+        // Same major - empty path
+        let path = migration_path(Version::new(1, 0, 0), Version::new(1, 5, 0));
+        assert!(path.is_empty());
+
+        // One major bump - empty path (direct)
+        let path = migration_path(Version::new(1, 0, 0), Version::new(2, 0, 0));
+        assert!(path.is_empty());
+
+        // Two major bumps - one intermediate
+        let path = migration_path(Version::new(1, 0, 0), Version::new(3, 0, 0));
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0], Version::new(2, 0, 0));
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_migration_path_backward_is_not_falsely_direct() {
+        // Backward migrations are rejected by `can_migrate`; `migration_path`
+        // must not report them as an empty (i.e. trivially direct) path,
+        // which would contradict `can_migrate`.
+        let from = Version::new(3, 0, 0);
+        let to = Version::new(1, 0, 0);
+        assert!(!can_migrate(from, to));
+        assert!(!migration_path(from, to).is_empty());
+        assert_eq!(migration_path(from, to), alloc::vec![to]);
+
+        let from2 = Version::new(2, 0, 0);
+        let to2 = Version::new(1, 5, 0);
+        assert!(!can_migrate(from2, to2));
+        assert!(!migration_path(from2, to2).is_empty());
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_migration_path_agrees_with_can_migrate() {
+        // Property: whenever `can_migrate` reports a pair as unmigratable,
+        // `migration_path` must never report an empty (achievable-looking)
+        // path for that same pair. This is the specific agreement the two
+        // APIs must uphold; it does not assert an "iff" relationship since
+        // a *reachable* pair can validly still yield a non-empty path (e.g.
+        // a multi-step major bump).
+        let versions: alloc::vec::Vec<Version> = (0u16..4)
+            .flat_map(|major| (0u16..3).map(move |minor| Version::new(major, minor, 0)))
+            .collect();
+
+        for &from in &versions {
+            for &to in &versions {
+                if !can_migrate(from, to) {
+                    assert!(
+                        !migration_path(from, to).is_empty(),
+                        "migration_path({from}, {to}) must not be empty when can_migrate is false"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_compatibility_level_methods() {
+        assert!(CompatibilityLevel::Compatible.is_usable());
+        assert!(CompatibilityLevel::CompatibleWithWarnings.is_usable());
+        assert!(!CompatibilityLevel::Incompatible.is_usable());
+
+        assert!(CompatibilityLevel::Compatible.is_fully_compatible());
+        assert!(!CompatibilityLevel::CompatibleWithWarnings.is_fully_compatible());
+
+        assert!(!CompatibilityLevel::Compatible.has_warnings());
+        assert!(CompatibilityLevel::CompatibleWithWarnings.has_warnings());
+    }
+}

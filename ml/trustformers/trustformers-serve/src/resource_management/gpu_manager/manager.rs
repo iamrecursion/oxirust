@@ -1,0 +1,1572 @@
+//! Main GPU Resource Manager Implementation
+//!
+//! This module provides the core GpuResourceManager that orchestrates all GPU management
+//! operations including device allocation, monitoring system coordination, alert management,
+//! performance tracking, health monitoring, and load balancing.
+//!
+//! The GpuResourceManager serves as the central coordinator that brings together all the
+//! specialized GPU management components to provide a unified interface for GPU resource
+//! management in the TrustformeRS framework.
+
+use anyhow::Context;
+use chrono::Utc;
+use parking_lot::{Mutex, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{sync::broadcast, task::JoinHandle, time::interval};
+use tracing::{debug, error, info, instrument, warn};
+
+// Import types and specialized components
+use super::types::*;
+use super::{
+    GpuAlertSystem, GpuHealthMonitor, GpuLoadBalancer, GpuMonitoringSystem, GpuPerformanceTracker,
+};
+// Import health_monitor's GpuHealthStatus which has more fields
+use super::health_monitor::GpuHealthStatus as HealthMonitorGpuHealthStatus;
+
+// Import config types from resource_management::types for components that expect them
+// GpuMonitoringSystem uses resource_management::types
+use crate::resource_management::types::{
+    GpuAlertConfig as ResourceGpuAlertConfig, GpuClockSpeeds as ResourceGpuClockSpeeds,
+    GpuMonitoringConfig, GpuRealTimeMetrics,
+};
+
+// GpuManagerError and GpuResult are imported from super::types::*
+use super::GpuTelemetrySample;
+
+/// Comprehensive GPU resource management system
+///
+/// This is the main entry point for all GPU-related operations in the system.
+/// It coordinates device discovery, allocation, monitoring, and health management.
+///
+/// The GpuResourceManager orchestrates multiple specialized components:
+/// - **Monitoring System**: Real-time metrics collection and device monitoring
+/// - **Alert System**: Proactive monitoring with configurable alerts for hardware issues
+/// - **Performance Tracker**: Benchmarking, performance analysis, and baseline establishment
+/// - **Health Monitor**: Device health monitoring with failure detection and recovery
+/// - **Load Balancer**: Intelligent distribution of workloads across available devices
+#[derive(Debug)]
+pub struct GpuResourceManager {
+    /// Configuration settings
+    config: Arc<RwLock<GpuPoolConfig>>,
+
+    /// Available GPU devices catalog
+    available_devices: Arc<RwLock<HashMap<usize, GpuDeviceInfo>>>,
+
+    /// Currently allocated GPU resources
+    allocated_resources: Arc<RwLock<HashMap<String, GpuAllocation>>>,
+
+    /// GPU monitoring system for real-time tracking
+    monitoring_system: Arc<GpuMonitoringSystem>,
+
+    /// GPU alert system for proactive health monitoring
+    alert_system: Arc<GpuAlertSystem>,
+
+    /// Performance tracking and benchmarking system
+    performance_tracker: Arc<GpuPerformanceTracker>,
+
+    /// Usage statistics and analytics
+    usage_stats: Arc<RwLock<GpuUsageStatistics>>,
+
+    /// Device health monitor
+    health_monitor: Arc<GpuHealthMonitor>,
+
+    /// Load balancer for optimal device distribution
+    load_balancer: Arc<GpuLoadBalancer>,
+
+    /// Background task handles
+    background_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+
+    /// Shutdown signal for graceful cleanup
+    shutdown_sender: broadcast::Sender<()>,
+
+    /// System running state
+    running: Arc<AtomicBool>,
+
+    /// Total operation counter
+    operation_counter: Arc<AtomicU64>,
+}
+
+impl GpuResourceManager {
+    /// Create a new GPU resource manager with the specified configuration
+    ///
+    /// This performs comprehensive system initialization including:
+    /// - Device discovery and capability detection
+    /// - Monitoring system setup
+    /// - Alert system configuration
+    /// - Background task initialization
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - GPU pool configuration parameters
+    ///
+    /// # Returns
+    ///
+    /// A configured GPU resource manager ready for operation
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - GPU device discovery fails
+    /// - Monitoring system initialization fails
+    /// - Alert system setup fails
+    #[instrument(skip(config))]
+    pub async fn new(config: GpuPoolConfig) -> GpuResult<Self> {
+        info!("Initializing GPU resource manager");
+
+        // Validate configuration
+        Self::validate_config(&config)?;
+
+        // Discover available GPU devices
+        let available_devices = Self::discover_gpu_devices(&config).await?;
+        info!("Discovered {} GPU devices", available_devices.len());
+
+        // Initialize monitoring system
+        let monitoring_config = GpuMonitoringConfig {
+            monitoring_interval: Duration::from_secs(config.monitoring_interval_secs),
+            retention_period: Duration::from_secs(3600),
+            real_time_monitoring: config.enable_monitoring,
+            alert_thresholds: Default::default(),
+            monitored_metrics: vec![],
+            alert_config: ResourceGpuAlertConfig::default(),
+            enable_alerts: true,
+            enable_performance_tracking: config.enable_performance_tracking,
+        };
+
+        let monitoring_system = Arc::new(
+            GpuMonitoringSystem::new(monitoring_config)
+                .await
+                .context("Failed to initialize monitoring system")?,
+        );
+
+        // Initialize alert system
+        let alert_system = Arc::new(
+            GpuAlertSystem::new(GpuAlertConfig::default())
+                .await
+                .context("Failed to initialize alert system")?,
+        );
+
+        // Initialize performance tracker
+        let performance_tracker = Arc::new(GpuPerformanceTracker::new());
+
+        // Initialize health monitor
+        let health_monitor = Arc::new(GpuHealthMonitor::new());
+
+        // Initialize load balancer
+        let load_balancer = Arc::new(GpuLoadBalancer::new());
+
+        // Set up shutdown channel
+        let (shutdown_sender, _) = broadcast::channel(1);
+
+        let manager = Self {
+            config: Arc::new(RwLock::new(config)),
+            available_devices: Arc::new(RwLock::new(available_devices)),
+            allocated_resources: Arc::new(RwLock::new(HashMap::new())),
+            monitoring_system,
+            alert_system,
+            performance_tracker,
+            usage_stats: Arc::new(RwLock::new(GpuUsageStatistics::default())),
+            health_monitor,
+            load_balancer,
+            background_tasks: Arc::new(Mutex::new(Vec::new())),
+            shutdown_sender,
+            running: Arc::new(AtomicBool::new(false)),
+            operation_counter: Arc::new(AtomicU64::new(0)),
+        };
+
+        info!("GPU resource manager initialized successfully");
+        Ok(manager)
+    }
+
+    /// Validate configuration parameters
+    fn validate_config(config: &GpuPoolConfig) -> GpuResult<()> {
+        if config.max_devices == 0 {
+            return Err(GpuManagerError::ConfigurationError {
+                field: "max_devices".to_string(),
+                message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        if config.memory_threshold < 0.0 || config.memory_threshold > 1.0 {
+            return Err(GpuManagerError::ConfigurationError {
+                field: "memory_threshold".to_string(),
+                message: "Must be between 0.0 and 1.0".to_string(),
+            });
+        }
+
+        if config.temperature_threshold < 0.0 || config.temperature_threshold > 150.0 {
+            return Err(GpuManagerError::ConfigurationError {
+                field: "temperature_threshold".to_string(),
+                message: "Must be between 0.0 and 150.0 Celsius".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Discover and catalog available NVIDIA GPU devices via nvidia-smi
+    ///
+    /// Enumerates real GPU hardware by invoking `nvidia-smi` as a subprocess and
+    /// parsing its CSV output.  If `nvidia-smi` is unavailable (non-NVIDIA system,
+    /// driver not installed, container without GPU passthrough, etc.) an honest empty
+    /// `HashMap` is returned — no fake devices are ever inserted.
+    ///
+    /// Discovery is capped at `config.max_devices` to respect operator limits.
+    #[instrument(skip(config))]
+    async fn discover_gpu_devices(
+        config: &GpuPoolConfig,
+    ) -> GpuResult<HashMap<usize, GpuDeviceInfo>> {
+        let mut devices = HashMap::new();
+        let device_limit = config.max_devices;
+
+        info!(
+            "Starting GPU device discovery via nvidia-smi (limit={})",
+            device_limit
+        );
+
+        // Detect CUDA runtime version once; used to populate device capabilities.
+        let cuda_version = Self::detect_cuda_version().await;
+        if let Some(ref v) = cuda_version {
+            debug!("Detected CUDA runtime version: {}", v);
+        } else {
+            debug!("CUDA runtime version not detected; omitting Cuda capability");
+        }
+
+        // Query the list of real NVIDIA GPU devices.
+        let real_devices = Self::query_nvidia_devices().await?;
+
+        for (device_id, device_name, total_memory_mb, free_memory_mb) in
+            real_devices.into_iter().take(device_limit)
+        {
+            let mut capabilities = Vec::new();
+            if let Some(ref version) = cuda_version {
+                capabilities.push(GpuCapability::Cuda(version.clone()));
+            }
+
+            let device = GpuDeviceInfo {
+                device_id,
+                device_name,
+                total_memory_mb,
+                available_memory_mb: free_memory_mb,
+                utilization_percent: 0.0,
+                capabilities,
+                status: GpuDeviceStatus::Available,
+                last_updated: Utc::now(),
+            };
+
+            if Self::assess_device_health(&device).await? {
+                info!(
+                    "Discovered GPU device {}: {} ({}MB total, {}MB free)",
+                    device.device_id,
+                    device.device_name,
+                    device.total_memory_mb,
+                    device.available_memory_mb
+                );
+                devices.insert(device_id, device);
+            } else {
+                warn!(
+                    "GPU device {} failed health assessment, skipping",
+                    device_id
+                );
+            }
+        }
+
+        if devices.is_empty() {
+            info!(
+                "No NVIDIA GPU devices discovered; system will operate in CPU-only mode. \
+                 Install NVIDIA drivers and ensure nvidia-smi is on PATH to enable GPU support."
+            );
+        }
+
+        info!(
+            "GPU device discovery completed, found {} healthy device(s)",
+            devices.len()
+        );
+        Ok(devices)
+    }
+
+    /// Enumerate NVIDIA GPU devices by parsing `nvidia-smi` CSV output.
+    ///
+    /// Runs: `nvidia-smi --query-gpu=index,name,memory.total,memory.free
+    ///                    --format=csv,noheader,nounits`
+    ///
+    /// Returns `Vec<(device_id, name, total_memory_mb, free_memory_mb)>`.
+    /// Returns an empty `Vec` without error if `nvidia-smi` is absent or fails.
+    async fn query_nvidia_devices() -> GpuResult<Vec<(usize, String, u64, u64)>> {
+        // Spawn blocking because std::process::Command is synchronous.
+        let spawn_result = tokio::task::spawn_blocking(|| {
+            std::process::Command::new("nvidia-smi")
+                .args([
+                    "--query-gpu=index,name,memory.total,memory.free",
+                    "--format=csv,noheader,nounits",
+                ])
+                .output()
+        })
+        .await
+        .map_err(|e| GpuManagerError::MonitoringError {
+            source: anyhow::anyhow!("spawn_blocking for nvidia-smi failed: {}", e),
+        })?;
+
+        let output = match spawn_result {
+            Err(e) => {
+                // nvidia-smi not found or not executable.
+                info!(
+                    "nvidia-smi unavailable ({}); returning empty GPU device list",
+                    e
+                );
+                return Ok(Vec::new());
+            },
+            Ok(o) => o,
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "nvidia-smi exited with status {:?}: {}; returning empty GPU device list",
+                output.status,
+                stderr.trim()
+            );
+            return Ok(Vec::new());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut devices: Vec<(usize, String, u64, u64)> = Vec::new();
+
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Expected CSV format: "0, NVIDIA RTX A4000, 16376, 16101"
+            // Use splitn(4) so that commas inside the device name are preserved.
+            let parts: Vec<&str> = line.splitn(4, ',').collect();
+            if parts.len() < 4 {
+                warn!(
+                    "Skipping nvidia-smi output line with unexpected format (expected 4 \
+                     comma-separated fields): {:?}",
+                    line
+                );
+                continue;
+            }
+
+            let device_id = match parts[0].trim().parse::<usize>() {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(
+                        "Failed to parse GPU index from {:?}: {}; skipping line",
+                        parts[0].trim(),
+                        e
+                    );
+                    continue;
+                },
+            };
+
+            let device_name = parts[1].trim().to_string();
+
+            let total_memory_mb = match parts[2].trim().parse::<u64>() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        "Failed to parse total memory from {:?}: {}; skipping device {}",
+                        parts[2].trim(),
+                        e,
+                        device_id
+                    );
+                    continue;
+                },
+            };
+
+            let free_memory_mb = match parts[3].trim().parse::<u64>() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        "Failed to parse free memory from {:?}: {}; skipping device {}",
+                        parts[3].trim(),
+                        e,
+                        device_id
+                    );
+                    continue;
+                },
+            };
+
+            debug!(
+                "Parsed GPU entry: index={}, name={:?}, total={}MB, free={}MB",
+                device_id, device_name, total_memory_mb, free_memory_mb
+            );
+
+            devices.push((device_id, device_name, total_memory_mb, free_memory_mb));
+        }
+
+        Ok(devices)
+    }
+
+    /// Detect the CUDA runtime version from `nvidia-smi` header output.
+    ///
+    /// Parses the top section of standard `nvidia-smi` output looking for a line
+    /// that contains `"CUDA Version: X.Y"` and returns the version string.  Returns
+    /// `None` if the version cannot be determined.
+    async fn detect_cuda_version() -> Option<String> {
+        let spawn_result =
+            tokio::task::spawn_blocking(|| std::process::Command::new("nvidia-smi").output())
+                .await
+                .ok()?;
+
+        let output = spawn_result.ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(pos) = line.find("CUDA Version:") {
+                let after = &line[pos + "CUDA Version:".len()..];
+                // Strip trailing pipe characters and whitespace from the table border.
+                let version = after.trim().trim_end_matches('|').trim().to_string();
+                if !version.is_empty() && version != "N/A" {
+                    return Some(version);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Assess initial health of a discovered device.
+    ///
+    /// Devices returned by `query_nvidia_devices` are known to the NVIDIA driver and
+    /// are considered healthy at discovery time.  Runtime failure detection (thermal
+    /// events, ECC errors, power issues) is handled by `GpuHealthMonitor` during
+    /// ongoing operation, not at discovery.
+    async fn assess_device_health(device: &GpuDeviceInfo) -> GpuResult<bool> {
+        // A device must have at least some memory to be usable.
+        if device.total_memory_mb == 0 {
+            warn!(
+                "Device {} ({}) reports zero total memory; marking unhealthy",
+                device.device_id, device.device_name
+            );
+            return Ok(false);
+        }
+
+        debug!(
+            "Device {} ({}) passed initial health assessment ({}MB total)",
+            device.device_id, device.device_name, device.total_memory_mb
+        );
+        Ok(true)
+    }
+
+    /// Start all monitoring and background systems
+    ///
+    /// This initiates:
+    /// - Real-time device monitoring
+    /// - Health monitoring and failure detection
+    /// - Performance tracking and benchmarking
+    /// - Alert system activation
+    /// - Load balancing optimization
+    #[instrument(skip(self))]
+    pub async fn start_monitoring(&self) -> GpuResult<()> {
+        if self.running.load(Ordering::Acquire) {
+            warn!("GPU monitoring is already running");
+            return Ok(());
+        }
+
+        info!("Starting GPU monitoring systems");
+
+        // Start monitoring system
+        self.monitoring_system
+            .start_monitoring()
+            .await
+            .context("Failed to start monitoring system")?;
+
+        // Start alert system
+        self.alert_system.start().await.context("Failed to start alert system")?;
+
+        // Start health monitoring
+        self.health_monitor
+            .start_monitoring(
+                self.available_devices.clone(),
+                self.shutdown_sender.subscribe(),
+            )
+            .await
+            .map_err(|e| GpuManagerError::MonitoringError {
+                source: anyhow::anyhow!("Failed to start health monitoring: {}", e),
+            })?;
+
+        // Start performance tracking
+        self.start_performance_tracking().await?;
+
+        // Start metrics collection
+        self.start_metrics_collection().await?;
+
+        self.running.store(true, Ordering::Release);
+        info!("GPU monitoring systems started successfully");
+
+        Ok(())
+    }
+
+    /// Stop all monitoring and background systems
+    #[instrument(skip(self))]
+    pub async fn stop_monitoring(&self) -> GpuResult<()> {
+        if !self.running.load(Ordering::Acquire) {
+            warn!("GPU monitoring is not running");
+            return Ok(());
+        }
+
+        info!("Stopping GPU monitoring systems");
+
+        // Signal shutdown to all background tasks
+        let _ = self.shutdown_sender.send(());
+
+        // Stop monitoring system
+        self.monitoring_system
+            .stop_monitoring()
+            .await
+            .context("Failed to stop monitoring system")?;
+
+        // Stop alert system
+        self.alert_system.stop().await.context("Failed to stop alert system")?;
+
+        // Wait for background tasks to complete
+        let mut tasks = self.background_tasks.lock();
+        for task in tasks.drain(..) {
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+
+        self.running.store(false, Ordering::Release);
+        info!("GPU monitoring systems stopped successfully");
+
+        Ok(())
+    }
+
+    /// Start performance tracking background task
+    async fn start_performance_tracking(&self) -> GpuResult<()> {
+        let performance_tracker = self.performance_tracker.clone();
+        let available_devices = self.available_devices.clone();
+        let mut shutdown_rx = self.shutdown_sender.subscribe();
+
+        let task = tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(300)); // Run every 5 minutes
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let available_device_ids: Vec<_> = {
+                            let devices = available_devices.read();
+                            devices.values()
+                                .filter(|device| device.status == GpuDeviceStatus::Available)
+                                .map(|device| device.device_id)
+                                .collect()
+                        };
+
+                        for device_id in available_device_ids {
+                            // Run lightweight performance benchmark
+                            if let Err(e) = performance_tracker
+                                .run_benchmark(device_id, GpuBenchmarkType::Compute)
+                                .await
+                            {
+                                error!("Failed to run benchmark for device {}: {}", device_id, e);
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        debug!("Performance tracking task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.background_tasks.lock().push(task);
+        Ok(())
+    }
+
+    /// Start metrics collection background task
+    async fn start_metrics_collection(&self) -> GpuResult<()> {
+        let monitoring_system = self.monitoring_system.clone();
+        let available_devices = self.available_devices.clone();
+        let mut shutdown_rx = self.shutdown_sender.subscribe();
+        let config = {
+            let guard = self.config.read();
+            guard.clone()
+        };
+
+        let task = tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(config.monitoring_interval_secs));
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let devices_to_monitor: Vec<_> = {
+                            let devices = available_devices.read();
+                            devices.values().cloned().collect()
+                        };
+
+                        for device in devices_to_monitor {
+                            // Read live telemetry from the driver. Devices the
+                            // driver does not report are skipped, never faked.
+                            match Self::collect_device_metrics(&device).await {
+                                Ok(Some(metrics)) => {
+                                    if let Err(e) = monitoring_system.update_metrics(device.device_id, metrics).await {
+                                        error!("Failed to update metrics for device {}: {}", device.device_id, e);
+                                    }
+                                },
+                                Ok(None) => {
+                                    debug!(
+                                        "No telemetry available for GPU device {}; skipping this sample",
+                                        device.device_id
+                                    );
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        "Telemetry query failed for GPU device {}: {}",
+                                        device.device_id, e
+                                    );
+                                },
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        debug!("Metrics collection task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.background_tasks.lock().push(task);
+        Ok(())
+    }
+
+    /// Read live telemetry for one device from the NVIDIA driver.
+    ///
+    /// Queries `nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,power.draw,
+    /// clocks.sm,clocks.mem,memory.used,fan.speed`. Returns `Ok(None)` when the
+    /// tool is unavailable or does not report the requested device: no value in
+    /// the returned metrics is ever synthesized.
+    async fn collect_device_metrics(
+        device: &GpuDeviceInfo,
+    ) -> GpuResult<Option<GpuRealTimeMetrics>> {
+        let Some(sample) = Self::query_nvidia_telemetry(device.device_id).await? else {
+            return Ok(None);
+        };
+
+        // `GpuRealTimeMetrics` has no `Option` for these, so a sample missing
+        // the memory or utilization reading cannot be represented on it
+        // honestly -- and publishing it with a zero would put an "idle, empty"
+        // GPU into the monitoring stream. Skip the sample instead.
+        let (Some(memory_usage_mb), Some(utilization_percent)) =
+            (sample.memory_used_mb, sample.utilization_percent)
+        else {
+            debug!(
+                "GPU {} reported no memory/utilization reading; skipping this sample",
+                device.device_id
+            );
+            return Ok(None);
+        };
+
+        Ok(Some(GpuRealTimeMetrics {
+            device_id: device.device_id,
+            timestamp: Utc::now(),
+            memory_usage_mb,
+            utilization_percent,
+            // NaN, not zero: no comparison against a threshold passes on NaN,
+            // so an unread thermal/power sensor cannot read as "cool and idle".
+            temperature_celsius: sample.temperature_celsius.unwrap_or(f32::NAN),
+            power_consumption_watts: sample.power_watts.unwrap_or(f32::NAN),
+            clock_speeds: ResourceGpuClockSpeeds {
+                core_clock_mhz: sample.sm_clock_mhz.unwrap_or(0),
+                memory_clock_mhz: sample.memory_clock_mhz.unwrap_or(0),
+                shader_clock_mhz: None,
+            },
+            fan_speeds: sample.fan_percent.map(|f| vec![f]).unwrap_or_default(),
+            // The size the driver reported for this device at discovery, so
+            // consumers can compute a real memory percentage. Zero means
+            // discovery could not read it, which is an absence, not a size.
+            total_memory_mb: (device.total_memory_mb > 0).then_some(device.total_memory_mb),
+        }))
+    }
+
+    /// Live telemetry for a single GPU, exactly as reported by the driver.
+    pub async fn device_telemetry(device_id: usize) -> GpuResult<Option<GpuTelemetrySample>> {
+        Self::query_nvidia_telemetry(device_id).await
+    }
+
+    async fn query_nvidia_telemetry(device_id: usize) -> GpuResult<Option<GpuTelemetrySample>> {
+        let spawn_result = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("nvidia-smi")
+                .args([
+                    &format!("--id={}", device_id),
+                    "--query-gpu=utilization.gpu,temperature.gpu,power.draw,clocks.sm,clocks.mem,memory.used,fan.speed",
+                    "--format=csv,noheader,nounits",
+                ])
+                .output()
+        })
+        .await
+        .map_err(|e| GpuManagerError::MonitoringError {
+            source: anyhow::anyhow!("spawn_blocking for nvidia-smi failed: {}", e),
+        })?;
+
+        let output = match spawn_result {
+            Ok(output) => output,
+            Err(e) => {
+                debug!("nvidia-smi unavailable for telemetry ({})", e);
+                return Ok(None);
+            },
+        };
+
+        if !output.status.success() {
+            debug!(
+                "nvidia-smi telemetry query for device {} exited with {:?}",
+                device_id, output.status
+            );
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let Some(line) = stdout.lines().map(str::trim).find(|l| !l.is_empty()) else {
+            return Ok(None);
+        };
+
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        if fields.len() < 7 {
+            warn!(
+                "nvidia-smi telemetry line has {} fields, expected 7: {:?}",
+                fields.len(),
+                line
+            );
+            return Ok(None);
+        }
+
+        // "[N/A]" and "[Not Supported]" are the driver's way of saying a sensor
+        // is absent; propagate that as `None` rather than as a number.
+        fn parse_f32(value: &str) -> Option<f32> {
+            value.parse::<f32>().ok()
+        }
+        fn parse_u32(value: &str) -> Option<u32> {
+            value.parse::<u32>().ok()
+        }
+
+        // Every field is `None` when the driver would not report it. 0.2.1:
+        // utilization, the clocks and memory-used fell back to `0` here, so an
+        // unreadable utilization sensor reported an *idle* GPU and every
+        // threshold downstream passed.
+        Ok(Some(GpuTelemetrySample {
+            device_id,
+            utilization_percent: parse_f32(fields[0]),
+            temperature_celsius: parse_f32(fields[1]),
+            power_watts: parse_f32(fields[2]),
+            sm_clock_mhz: parse_u32(fields[3]),
+            memory_clock_mhz: parse_u32(fields[4]),
+            memory_used_mb: fields[5].parse::<u64>().ok(),
+            fan_percent: parse_f32(fields[6]),
+        }))
+    }
+
+    /// Enumerate the real GPU devices on this host.
+    ///
+    /// An empty list means the host genuinely has no discoverable NVIDIA GPU.
+    pub async fn enumerate_devices(config: &GpuPoolConfig) -> GpuResult<Vec<GpuDeviceInfo>> {
+        let devices = Self::discover_gpu_devices(config).await?;
+        let mut devices: Vec<GpuDeviceInfo> = devices.into_values().collect();
+        devices.sort_by_key(|d| d.device_id);
+        Ok(devices)
+    }
+
+    /// Allocate GPU devices based on performance requirements
+    ///
+    /// This method performs intelligent device allocation considering:
+    /// - Performance requirements and constraints
+    /// - Device capabilities and compatibility
+    /// - Current load balancing and utilization
+    /// - Health status and availability
+    ///
+    /// # Arguments
+    ///
+    /// * `requirements` - List of GPU performance requirements
+    /// * `test_id` - Unique identifier for the test requesting resources
+    ///
+    /// # Returns
+    ///
+    /// List of allocation IDs for successfully allocated devices
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - No suitable devices available
+    /// - Device capabilities don't match requirements
+    /// - Hardware failure detected during allocation
+    #[instrument(skip(self, requirements))]
+    pub async fn allocate_devices(
+        &self,
+        requirements: &[GpuPerformanceRequirements],
+        test_id: &str,
+    ) -> GpuResult<Vec<String>> {
+        if requirements.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.operation_counter.fetch_add(1, Ordering::Relaxed);
+        info!(
+            "Allocating {} GPU devices for test {}",
+            requirements.len(),
+            test_id
+        );
+
+        // Read live utilization for every candidate BEFORE taking the locks:
+        // `device_telemetry` is async, and these are `parking_lot` guards.
+        let mut utilizations: HashMap<usize, Option<f32>> = HashMap::new();
+        {
+            let candidate_ids: Vec<usize> = self.available_devices.read().keys().copied().collect();
+            for device_id in candidate_ids {
+                let measured = Self::device_telemetry(device_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|sample| sample.utilization_percent);
+                utilizations.insert(device_id, measured);
+            }
+        }
+
+        let mut available_devices = self.available_devices.write();
+        let mut allocated_resources = self.allocated_resources.write();
+        let mut usage_stats = self.usage_stats.write();
+
+        let mut allocated_device_ids = Vec::new();
+
+        for (idx, req) in requirements.iter().enumerate() {
+            // Use load balancer to select optimal device
+            let device_id = self
+                .load_balancer
+                .select_device(&available_devices, req)
+                .await
+                .ok_or_else(|| GpuManagerError::DeviceNotFound { device_id: 0 })?;
+
+            // Get and validate the device
+            let device = available_devices
+                .get_mut(&device_id)
+                .ok_or_else(|| GpuManagerError::DeviceNotFound { device_id })?;
+
+            // Verify device meets requirements. Utilization is read live from
+            // the driver: the device record's own figure is a discovery-time
+            // constant (see `GpuDeviceInfo::utilization_percent`).
+            self.verify_device_requirements(
+                device,
+                req,
+                utilizations.get(&device_id).copied().flatten(),
+            )?;
+
+            // Check device health
+            let health_status = self.health_monitor.get_health_status().await;
+            if let Some(health) = health_status.get(&device_id) {
+                if !health.is_healthy {
+                    return Err(GpuManagerError::HardwareFailure {
+                        device_id,
+                        details: health.issues.join(", "),
+                    });
+                }
+            }
+
+            // Allocate the device
+            device.status = GpuDeviceStatus::Busy;
+            device.available_memory_mb =
+                device.available_memory_mb.saturating_sub(req.min_memory_mb);
+            device.last_updated = Utc::now();
+
+            let allocation_id = format!("gpu_{}_{}_req_{}", device_id, test_id, idx);
+            let allocation = GpuAllocation {
+                device: device.clone(),
+                test_id: test_id.to_string(),
+                memory_allocated_mb: req.min_memory_mb,
+                allocated_at: Utc::now(),
+                expected_release: None,
+                usage_type: GpuUsageType::Custom("test".to_string()),
+                performance_requirements: req.clone(),
+            };
+
+            allocated_resources.insert(allocation_id.clone(), allocation);
+            allocated_device_ids.push(allocation_id);
+
+            debug!("Allocated GPU device {} for test {}", device_id, test_id);
+        }
+
+        // Update statistics
+        usage_stats.total_allocations += allocated_device_ids.len() as u64;
+        usage_stats.currently_allocated = allocated_resources.len();
+        usage_stats.peak_usage = usage_stats.peak_usage.max(allocated_resources.len());
+
+        // Calculate efficiency
+        let total_devices = available_devices.len();
+        if total_devices > 0 {
+            usage_stats.efficiency = allocated_resources.len() as f32 / total_devices as f32;
+        }
+
+        info!(
+            "Successfully allocated {} GPU devices for test {}: {:?}",
+            allocated_device_ids.len(),
+            test_id,
+            allocated_device_ids
+        );
+
+        Ok(allocated_device_ids)
+    }
+
+    /// Verify device meets performance requirements.
+    ///
+    /// `measured_utilization` is the live driver reading for this device, or
+    /// `None` when the driver would not give one. It is passed in rather than
+    /// fetched here because both call sites hold a lock guard across the check;
+    /// see [`Self::device_telemetry`].
+    fn verify_device_requirements(
+        &self,
+        device: &GpuDeviceInfo,
+        requirements: &GpuPerformanceRequirements,
+        measured_utilization: Option<f32>,
+    ) -> GpuResult<()> {
+        // Check memory requirements
+        if device.available_memory_mb < requirements.min_memory_mb {
+            return Err(GpuManagerError::InsufficientMemory {
+                required_mb: requirements.min_memory_mb,
+                available_mb: device.available_memory_mb,
+            });
+        }
+
+        // Check device status
+        if device.status != GpuDeviceStatus::Available {
+            return Err(GpuManagerError::DeviceUnavailable {
+                device_id: device.device_id,
+                status: format!("{:?}", device.status),
+            });
+        }
+
+        // Check framework requirements
+        for required_framework in &requirements.required_frameworks {
+            let has_framework = device.capabilities.iter().any(|capability| match capability {
+                GpuCapability::MachineLearning(frameworks) => {
+                    frameworks.contains(required_framework)
+                },
+                GpuCapability::Cuda(_version) => required_framework == "CUDA",
+                GpuCapability::OpenCl(_version) => required_framework == "OpenCL",
+                GpuCapability::Vulkan(_version) => required_framework == "Vulkan",
+                _ => false,
+            });
+
+            if !has_framework {
+                return Err(GpuManagerError::FrameworkNotSupported {
+                    framework: required_framework.clone(),
+                });
+            }
+        }
+
+        // Check constraints
+        for constraint in &requirements.constraints {
+            self.verify_constraint(device, constraint, measured_utilization)?;
+        }
+
+        Ok(())
+    }
+
+    /// Verify individual constraint.
+    ///
+    /// `measured_utilization` is the live driver reading, threaded down from
+    /// [`Self::verify_device_requirements`]; see that function's doc.
+    fn verify_constraint(
+        &self,
+        device: &GpuDeviceInfo,
+        constraint: &GpuConstraint,
+        measured_utilization: Option<f32>,
+    ) -> GpuResult<()> {
+        match &constraint.constraint_type {
+            GpuConstraintType::MaxMemoryUsage => {
+                let memory_usage_ratio = (device.total_memory_mb - device.available_memory_mb)
+                    as f64
+                    / device.total_memory_mb as f64;
+                if memory_usage_ratio > constraint.value {
+                    return Err(GpuManagerError::ConstraintViolated {
+                        constraint: format!(
+                            "Memory usage {:.1}% exceeds limit {:.1}%",
+                            memory_usage_ratio * 100.0,
+                            constraint.value * 100.0
+                        ),
+                    });
+                }
+            },
+            GpuConstraintType::MaxUtilization => {
+                // Read live from the driver. 0.2.1: this compared
+                // `GpuDeviceInfo::utilization_percent`, which discovery fixes at
+                // 0.0 and never updates, so a MaxUtilization constraint was
+                // satisfied by every device unconditionally. A device whose
+                // driver will not report utilization now fails the constraint
+                // rather than passing it: an unverifiable limit is not a met one.
+                match measured_utilization {
+                    Some(utilization) if (utilization as f64) <= constraint.value => {},
+                    Some(utilization) => {
+                        return Err(GpuManagerError::ConstraintViolated {
+                            constraint: format!(
+                                "Utilization {:.1}% exceeds limit {:.1}%",
+                                utilization, constraint.value
+                            ),
+                        });
+                    },
+                    None => {
+                        return Err(GpuManagerError::ConstraintViolated {
+                            constraint: format!(
+                                "Utilization limit {:.1}% cannot be verified: device {} reports \
+                                 no utilization",
+                                constraint.value, device.device_id
+                            ),
+                        });
+                    },
+                }
+            },
+            GpuConstraintType::MinPerformance => {
+                // Not enforced: a performance floor needs a benchmark score, and
+                // `GpuPerformanceTracker::run_benchmark` correctly refuses to
+                // produce one in a build with no GPU compute backend. Passing
+                // here means "not checked", not "meets the minimum".
+            },
+            GpuConstraintType::PowerLimit => {
+                // Would check current power consumption
+            },
+            GpuConstraintType::TemperatureLimit => {
+                // Would check current temperature
+            },
+            GpuConstraintType::Custom(_name) => {
+                // Handle custom constraints
+            },
+        }
+
+        Ok(())
+    }
+
+    /// Deallocate a specific GPU device allocation
+    #[instrument(skip(self))]
+    pub async fn deallocate_device(&self, allocation_id: &str) -> GpuResult<()> {
+        info!("Deallocating GPU device: {}", allocation_id);
+
+        let mut available_devices = self.available_devices.write();
+        let mut allocated_resources = self.allocated_resources.write();
+        let mut usage_stats = self.usage_stats.write();
+
+        if let Some(allocation) = allocated_resources.remove(allocation_id) {
+            // Return memory to device and mark as available
+            if let Some(device) = available_devices.get_mut(&allocation.device.device_id) {
+                device.available_memory_mb += allocation.memory_allocated_mb;
+                device.status = GpuDeviceStatus::Available;
+                device.last_updated = Utc::now();
+            }
+
+            // Update statistics
+            usage_stats.currently_allocated = allocated_resources.len();
+
+            // Calculate GPU hours usage
+            let usage_duration = Utc::now().signed_duration_since(allocation.allocated_at);
+            let hours = usage_duration.num_seconds() as f64 / 3600.0;
+            usage_stats.total_gpu_hours += hours;
+
+            // Update efficiency
+            let total_devices = available_devices.len();
+            if total_devices > 0 {
+                usage_stats.efficiency = allocated_resources.len() as f32 / total_devices as f32;
+            }
+
+            info!("Successfully deallocated GPU device: {}", allocation_id);
+            Ok(())
+        } else {
+            warn!(
+                "Attempted to deallocate unknown GPU allocation: {}",
+                allocation_id
+            );
+            Err(GpuManagerError::DeviceNotFound { device_id: 0 })
+        }
+    }
+
+    /// Deallocate all GPU devices for a specific test
+    #[instrument(skip(self))]
+    pub async fn deallocate_devices_for_test(&self, test_id: &str) -> GpuResult<()> {
+        info!("Deallocating all GPU devices for test: {}", test_id);
+
+        let mut available_devices = self.available_devices.write();
+        let mut allocated_resources = self.allocated_resources.write();
+        let mut usage_stats = self.usage_stats.write();
+
+        let mut deallocated_count = 0;
+        let mut total_gpu_hours = 0.0;
+
+        // Find and deallocate devices for this test
+        allocated_resources.retain(|_allocation_id, allocation| {
+            if allocation.test_id == test_id {
+                // Return device to available pool
+                if let Some(device) = available_devices.get_mut(&allocation.device.device_id) {
+                    device.available_memory_mb += allocation.memory_allocated_mb;
+                    device.status = GpuDeviceStatus::Available;
+                    device.last_updated = Utc::now();
+                }
+
+                // Calculate usage time
+                let usage_duration = Utc::now().signed_duration_since(allocation.allocated_at);
+                let hours = usage_duration.num_seconds() as f64 / 3600.0;
+                total_gpu_hours += hours;
+
+                deallocated_count += 1;
+                debug!(
+                    "Deallocated GPU device {} for test {}",
+                    allocation.device.device_id, test_id
+                );
+
+                false // Remove from allocated_resources
+            } else {
+                true // Keep in allocated_resources
+            }
+        });
+
+        // Update statistics
+        usage_stats.currently_allocated = allocated_resources.len();
+        usage_stats.total_gpu_hours += total_gpu_hours;
+
+        // Update efficiency
+        let total_devices = available_devices.len();
+        if total_devices > 0 {
+            usage_stats.efficiency = allocated_resources.len() as f32 / total_devices as f32;
+        }
+
+        if deallocated_count > 0 {
+            info!(
+                "Successfully deallocated {} GPU devices for test {} (total GPU hours: {:.2})",
+                deallocated_count, test_id, total_gpu_hours
+            );
+        } else {
+            debug!("No GPU devices were allocated to test {}", test_id);
+        }
+
+        Ok(())
+    }
+
+    /// Check if requested GPU devices are available
+    #[instrument(skip(self, requirements))]
+    pub async fn check_availability(
+        &self,
+        requirements: &[GpuPerformanceRequirements],
+    ) -> GpuResult<bool> {
+        // Same ordering constraint as `allocate_gpu_devices`: telemetry is
+        // async, the device map is behind a `parking_lot` guard.
+        let mut utilizations: HashMap<usize, Option<f32>> = HashMap::new();
+        {
+            let candidate_ids: Vec<usize> = self.available_devices.read().keys().copied().collect();
+            for device_id in candidate_ids {
+                let measured = Self::device_telemetry(device_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|sample| sample.utilization_percent);
+                utilizations.insert(device_id, measured);
+            }
+        }
+
+        let available_devices = self.available_devices.read();
+        let health_status = self.health_monitor.get_health_status().await;
+
+        for req in requirements {
+            let has_suitable_device = available_devices.values().any(|device| {
+                // Check basic availability
+                if device.status != GpuDeviceStatus::Available {
+                    return false;
+                }
+
+                // Check memory requirements
+                if device.available_memory_mb < req.min_memory_mb {
+                    return false;
+                }
+
+                // Check health status
+                if let Some(health) = health_status.get(&device.device_id) {
+                    if !health.is_healthy {
+                        return false;
+                    }
+                }
+
+                // Check other requirements
+                self.verify_device_requirements(
+                    device,
+                    req,
+                    utilizations.get(&device.device_id).copied().flatten(),
+                )
+                .is_ok()
+            });
+
+            if !has_suitable_device {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Get current GPU usage statistics
+    pub async fn get_statistics(&self) -> GpuResult<GpuUsageStatistics> {
+        let stats = self.usage_stats.read();
+        Ok(stats.clone())
+    }
+
+    /// Get available GPU devices
+    pub async fn get_available_devices(&self) -> Vec<GpuDeviceInfo> {
+        let available_devices = self.available_devices.read();
+        available_devices
+            .values()
+            .filter(|device| device.status == GpuDeviceStatus::Available)
+            .cloned()
+            .collect()
+    }
+
+    /// Get all GPU devices (available and allocated)
+    pub async fn get_all_devices(&self) -> Vec<GpuDeviceInfo> {
+        let available_devices = self.available_devices.read();
+        available_devices.values().cloned().collect()
+    }
+
+    /// Get allocated GPU resources
+    pub async fn get_allocated_resources(&self) -> HashMap<String, GpuAllocation> {
+        let allocated_resources = self.allocated_resources.read();
+        allocated_resources.clone()
+    }
+
+    /// Get GPU device information by ID
+    pub async fn get_device_info(&self, device_id: usize) -> Option<GpuDeviceInfo> {
+        let available_devices = self.available_devices.read();
+        available_devices.get(&device_id).cloned()
+    }
+
+    /// Update GPU device status
+    #[instrument(skip(self))]
+    pub async fn update_device_status(
+        &self,
+        device_id: usize,
+        status: GpuDeviceStatus,
+    ) -> GpuResult<()> {
+        let mut available_devices = self.available_devices.write();
+
+        if let Some(device) = available_devices.get_mut(&device_id) {
+            let old_status = device.status.clone();
+            device.status = status;
+            device.last_updated = Utc::now();
+
+            info!(
+                "Updated GPU device {} status from {:?} to {:?}",
+                device_id, old_status, device.status
+            );
+            Ok(())
+        } else {
+            Err(GpuManagerError::DeviceNotFound { device_id })
+        }
+    }
+
+    /// Get GPU utilization percentage across all devices
+    pub async fn get_utilization(&self) -> f32 {
+        let available_devices = self.available_devices.read();
+        let allocated_resources = self.allocated_resources.read();
+
+        let total_devices = available_devices.len();
+        let allocated_count = allocated_resources.len();
+
+        if total_devices == 0 {
+            0.0
+        } else {
+            allocated_count as f32 / total_devices as f32
+        }
+    }
+
+    /// Get real-time GPU metrics for all devices
+    pub async fn get_realtime_metrics(&self) -> HashMap<usize, GpuRealTimeMetrics> {
+        self.monitoring_system.get_realtime_metrics().await
+    }
+
+    /// Run performance benchmark on a specific device
+    #[instrument(skip(self))]
+    pub async fn run_benchmark(
+        &self,
+        device_id: usize,
+        benchmark_type: GpuBenchmarkType,
+    ) -> GpuResult<GpuPerformanceBenchmark> {
+        // Verify device exists and is available
+        let available_devices = self.available_devices.read();
+        if !available_devices.contains_key(&device_id) {
+            return Err(GpuManagerError::DeviceNotFound { device_id });
+        }
+
+        // Run benchmark through performance tracker
+        self.performance_tracker
+            .run_benchmark(device_id, benchmark_type)
+            .await
+            .map_err(|e| GpuManagerError::MonitoringError {
+                source: anyhow::anyhow!("Benchmark failed: {}", e),
+            })
+    }
+
+    /// Get performance analysis for all devices
+    pub async fn get_performance_analysis(&self) -> GpuPerformanceAnalysis {
+        self.performance_tracker.get_analysis().await
+    }
+
+    /// Get health status for all devices
+    pub async fn get_health_status(&self) -> HashMap<usize, HealthMonitorGpuHealthStatus> {
+        self.health_monitor.get_health_status().await
+    }
+
+    /// Get active alerts
+    pub async fn get_active_alerts(&self) -> HashMap<String, GpuAlert> {
+        self.alert_system.get_active_alerts().await
+    }
+
+    /// Acknowledge an alert
+    #[instrument(skip(self))]
+    pub async fn acknowledge_alert(&self, alert_id: &str) -> GpuResult<()> {
+        self.alert_system.acknowledge_alert(alert_id).await.map_err(|e| {
+            GpuManagerError::MonitoringError {
+                source: anyhow::anyhow!("Alert acknowledgment failed: {}", e),
+            }
+        })
+    }
+
+    /// Update GPU pool configuration
+    ///
+    /// This method allows dynamic reconfiguration of the GPU pool without
+    /// requiring a restart of the system.
+    #[instrument(skip(self, new_config))]
+    pub async fn update_config(&self, new_config: GpuPoolConfig) -> GpuResult<()> {
+        info!("Updating GPU pool configuration");
+
+        // Validate new configuration
+        Self::validate_config(&new_config)?;
+
+        // Save new device count before moving
+        let new_device_count = new_config.max_devices;
+
+        // Update configuration
+        {
+            let mut config = self.config.write();
+            *config = new_config;
+        }
+
+        // If device count changed, trigger rediscovery
+        let current_device_count = {
+            let devices = self.available_devices.read();
+            devices.len()
+        };
+
+        if new_device_count != current_device_count {
+            warn!(
+                "Device count changed from {} to {}, restart required for full effect",
+                current_device_count, new_device_count
+            );
+        }
+
+        info!("GPU pool configuration updated successfully");
+        Ok(())
+    }
+
+    /// Get current configuration
+    pub async fn get_config(&self) -> GpuPoolConfig {
+        let config = self.config.read();
+        config.clone()
+    }
+
+    /// Generate comprehensive GPU allocation report
+    pub async fn generate_allocation_report(&self) -> String {
+        let stats = self.get_statistics().await.unwrap_or_default();
+        let available_devices = self.get_available_devices().await;
+        let all_devices = self.get_all_devices().await;
+        let allocated_resources = self.get_allocated_resources().await;
+        let utilization = self.get_utilization().await;
+        let health_status = self.get_health_status().await;
+        let active_alerts = self.get_active_alerts().await;
+
+        // Count healthy devices
+        let healthy_devices = health_status.values().filter(|h| h.is_healthy).count();
+        let unhealthy_devices = health_status.len() - healthy_devices;
+
+        // Calculate average GPU hours per allocation
+        let avg_gpu_hours = if stats.total_allocations > 0 {
+            stats.total_gpu_hours / stats.total_allocations as f64
+        } else {
+            0.0
+        };
+
+        format!(
+            "GPU Resource Management Report\n\
+             =====================================\n\
+             \n\
+             Device Overview:\n\
+             - Total devices: {}\n\
+             - Available devices: {}\n\
+             - Allocated devices: {}\n\
+             - Healthy devices: {}\n\
+             - Unhealthy devices: {}\n\
+             \n\
+             Allocation Statistics:\n\
+             - Total allocations: {}\n\
+             - Peak usage: {} devices\n\
+             - Current utilization: {:.1}%\n\
+             - Total GPU hours: {:.2}\n\
+             - Average hours per allocation: {:.2}\n\
+             - Allocation efficiency: {:.1}%\n\
+             \n\
+             System Health:\n\
+             - Active alerts: {}\n\
+             - Operations completed: {}\n\
+             - Monitoring active: {}\n\
+             \n\
+             Performance:\n\
+             - Average memory per device: {:.0}MB\n\
+             - Peak memory usage: {:.1}%\n\
+             \n\
+             Detailed Device Information:\n",
+            all_devices.len(),
+            available_devices.len(),
+            allocated_resources.len(),
+            healthy_devices,
+            unhealthy_devices,
+            stats.total_allocations,
+            stats.peak_usage,
+            utilization * 100.0,
+            stats.total_gpu_hours,
+            avg_gpu_hours,
+            stats.efficiency * 100.0,
+            active_alerts.len(),
+            self.operation_counter.load(Ordering::Relaxed),
+            self.running.load(Ordering::Relaxed),
+            stats.average_memory_allocated_mb,
+            stats.peak_memory_usage_percent
+        ) + &self.generate_device_details_report(all_devices, health_status).await
+    }
+
+    /// Generate detailed device information
+    async fn generate_device_details_report(
+        &self,
+        devices: Vec<GpuDeviceInfo>,
+        health_status: HashMap<usize, HealthMonitorGpuHealthStatus>,
+    ) -> String {
+        let mut report = String::new();
+
+        for device in devices {
+            let health = health_status.get(&device.device_id);
+            let health_score = health.map(|h| h.health_score).unwrap_or(0.0);
+            let issues = health.map(|h| h.issues.join(", ")).unwrap_or_default();
+
+            report.push_str(&format!(
+                "Device {}: {} ({:?})\n\
+                 - Memory: {}MB total, {}MB available\n\
+                 - Utilization: {:.1}%\n\
+                 - Health Score: {:.2}\n\
+                 - Issues: {}\n\
+                 - Capabilities: {:?}\n\
+                 - Last Updated: {}\n\
+                 \n",
+                device.device_id,
+                device.device_name,
+                device.status,
+                device.total_memory_mb,
+                device.available_memory_mb,
+                device.utilization_percent,
+                health_score,
+                if issues.is_empty() { "None" } else { &issues },
+                device.capabilities,
+                device.last_updated.format("%Y-%m-%d %H:%M:%S UTC")
+            ));
+        }
+
+        report
+    }
+
+    /// Force device refresh - rediscover and update device information
+    ///
+    /// This is useful when hardware changes have occurred or when devices
+    /// need to be re-evaluated for health and capabilities.
+    #[instrument(skip(self))]
+    pub async fn refresh_devices(&self) -> GpuResult<()> {
+        info!("Refreshing GPU device information");
+
+        let config = {
+            let guard = self.config.read();
+            guard.clone()
+        };
+        let new_devices = Self::discover_gpu_devices(&config).await?;
+
+        // Update device information while preserving allocations
+        {
+            let mut available_devices = self.available_devices.write();
+            let allocated_resources = self.allocated_resources.read();
+
+            // Preserve allocation status for currently allocated devices
+            for (device_id, new_device) in new_devices {
+                if let Some(existing_device) = available_devices.get(&device_id) {
+                    if existing_device.status == GpuDeviceStatus::Busy {
+                        // Keep the device as busy if it's currently allocated
+                        let mut updated_device = new_device;
+                        updated_device.status = GpuDeviceStatus::Busy;
+
+                        // Update available memory based on current allocations
+                        let allocated_memory: u64 = allocated_resources
+                            .values()
+                            .filter(|alloc| alloc.device.device_id == device_id)
+                            .map(|alloc| alloc.memory_allocated_mb)
+                            .sum();
+
+                        updated_device.available_memory_mb =
+                            updated_device.total_memory_mb.saturating_sub(allocated_memory);
+
+                        available_devices.insert(device_id, updated_device);
+                    } else {
+                        available_devices.insert(device_id, new_device);
+                    }
+                } else {
+                    available_devices.insert(device_id, new_device);
+                }
+            }
+        }
+
+        info!("GPU device refresh completed");
+        Ok(())
+    }
+
+    /// Graceful shutdown of the GPU manager
+    #[instrument(skip(self))]
+    pub async fn shutdown(&self) -> GpuResult<()> {
+        info!("Shutting down GPU resource manager");
+
+        // Stop monitoring systems
+        if self.running.load(Ordering::Acquire) {
+            self.stop_monitoring().await?;
+        }
+
+        // Deallocate all remaining resources
+        let allocated_resources: Vec<_> = {
+            let resources = self.allocated_resources.read();
+            resources.keys().cloned().collect()
+        };
+
+        for allocation_id in allocated_resources {
+            if let Err(e) = self.deallocate_device(&allocation_id).await {
+                warn!("Failed to deallocate device during shutdown: {}", e);
+            }
+        }
+
+        info!("GPU resource manager shutdown completed");
+        Ok(())
+    }
+}
+
+impl Drop for GpuResourceManager {
+    fn drop(&mut self) {
+        // Ensure clean shutdown when the manager is dropped
+        if self.running.load(Ordering::Acquire) {
+            let _ = self.shutdown_sender.send(());
+        }
+    }
+}

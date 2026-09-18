@@ -1,0 +1,287 @@
+[package]
+name = "voirs-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[example]]
+name = "examples_simple_synthesis"
+path = "simple_synthesis.rs"
+
+[[example]]
+name = "examples_batch_synthesis"  
+path = "batch_synthesis.rs"
+
+[[example]]
+name = "examples_streaming_synthesis"
+path = "streaming_synthesis.rs"
+
+[[example]]
+name = "examples_ssml_synthesis"
+path = "ssml_synthesis.rs"
+
+[[example]]
+name = "examples_complete_pipeline"
+path = "complete_pipeline.rs"
+
+[[example]]
+name = "performance_benchmarking"
+path = "performance_benchmarking.rs"
+
+[[example]]
+name = "examples_ab_testing_quality_comparison"
+path = "ab_testing_quality_comparison.rs"
+
+[[example]]
+name = "examples_comprehensive_benchmark_suite"
+path = "comprehensive_benchmark_suite.rs"
+
+[[example]]
+name = "memory_profiling_analysis"
+path = "memory_profiling_analysis.rs"
+
+[[example]]
+name = "robust_error_handling_patterns"
+path = "robust_error_handling_patterns.rs"
+
+[[example]]
+name = "debug_troubleshooting_example"
+path = "debug_troubleshooting_example.rs"
+
+[[example]]
+name = "testing_framework_example"
+path = "testing_framework_example.rs"
+
+[[example]]
+name = "production_monitoring_example"
+path = "production_monitoring_example.rs"
+
+[[example]]
+name = "cloud_deployment_example"
+path = "cloud_deployment_example.rs"
+
+[[example]]
+name = "multimodal_integration_example"
+path = "multimodal_integration_example.rs"
+
+[[example]]
+name = "examples_ai_integration_example"
+path = "ai_integration_example.rs"
+
+[[example]]
+name = "educational_tools_example"
+path = "educational_tools_example.rs"
+
+[[example]]
+name = "mobile_integration_example"
+path = "mobile_integration_example.rs"
+
+[[example]]
+name = "creative_applications_example"
+path = "creative_applications_example.rs"
+
+[[example]]
+name = "profiling_optimization_example"
+path = "profiling_optimization_example.rs"
+
+[[example]]
+name = "documentation_testing_example"
+path = "documentation_testing_example.rs"
+
+[[example]]
+name = "community_contributions_gallery"
+path = "community_contributions_gallery.rs"
+
+[[example]]
+name = "use_case_gallery"
+path = "use_case_gallery.rs"
+
+[[example]]
+name = "best_practices_guide"
+path = "best_practices_guide.rs"
+
+[[example]]
+name = "faq_examples"
+path = "faq_examples.rs"
+
+[[example]]
+name = "wasm_integration_example"
+path = "wasm_integration_example.rs"
+
+[[example]]
+name = "streaming_synthesis_optimization"
+path = "streaming_synthesis_optimization.rs"
+
+[[example]]
+name = "performance_optimization_techniques"
+path = "performance_optimization_techniques.rs"
+
+[[example]]
+name = "low_latency_optimization"
+path = "low_latency_optimization.rs"
+
+[[example]]
+name = "audio_quality_assessment"
+path = "audio_quality_assessment.rs"
+
+[[example]]
+name = "emotion_control_example_fixed"
+path = "emotion_control_example_fixed.rs"
+
+[[example]]
+name = "test_audio_demo"
+path = "test_audio_demo.rs"
+
+[[example]]
+name = "hello_world_tts"
+path = "hello_world_tts.rs"
+
+[[example]]
+name = "hello_world_real_tts"
+path = "hello_world_real_tts.rs"
+
+[[example]]
+name = "chinese_tts_demo"
+path = "chinese_tts_demo.rs"
+
+[[example]]
+name = "kokoro_chinese_demo"
+path = "kokoro_chinese_demo.rs"
+
+[[example]]
+name = "kokoro_japanese_demo"
+path = "kokoro_japanese_demo.rs"
+
+[[example]]
+name = "kokoro_multilingual_demo"
+path = "kokoro_multilingual_demo.rs"
+
+[[example]]
+name = "kokoro_espeak_auto_demo"
+path = "kokoro_espeak_auto_demo.rs"
+
+[[example]]
+name = "basic_configuration"
+path = "basic_configuration.rs"
+
+[[example]]
+name = "batch_evaluation_comparison"
+path = "batch_evaluation_comparison.rs"
+
+[[example]]
+name = "complete_voice_pipeline"
+path = "complete_voice_pipeline.rs"
+
+[[example]]
+name = "comprehensive_testing_framework"
+path = "comprehensive_testing_framework.rs"
+
+[[example]]
+name = "desktop_integration_example"
+path = "desktop_integration_example.rs"
+
+[[example]]
+name = "emotion_control_example"
+path = "emotion_control_example.rs"
+
+[[example]]
+name = "examples_testing_framework"
+path = "examples_testing_framework.rs"
+
+[[example]]
+name = "game_integration_example"
+path = "game_integration_example.rs"
+
+[[example]]
+name = "hello_world"
+path = "hello_world.rs"
+
+[[example]]
+name = "iot_edge_synthesis_example"
+path = "iot_edge_synthesis_example.rs"
+
+[[example]]
+name = "production_pipeline_example"
+path = "production_pipeline_example.rs"
+
+[[example]]
+name = "production_whisper_example"
+path = "production_whisper_example.rs"
+
+[[example]]
+name = "realtime_voice_coach"
+path = "realtime_voice_coach.rs"
+
+[[example]]
+name = "singing_synthesis_example"
+path = "singing_synthesis_example.rs"
+
+[[example]]
+name = "spatial_audio_example"
+path = "spatial_audio_example.rs"
+
+[[example]]
+name = "voice_cloning_example"
+path = "voice_cloning_example.rs"
+
+[[example]]
+name = "voice_cloning_example_fixed"
+path = "voice_cloning_example_fixed.rs"
+
+[[example]]
+name = "voice_conversion_example"
+path = "voice_conversion_example.rs"
+
+[[example]]
+name = "vr_ar_immersive_example"
+path = "vr_ar_immersive_example.rs"
+
+[dependencies]
+voirs-integration-tests = { workspace = true }
+voirs-g2p = { workspace = true }
+voirs-acoustic = { workspace = true, features = ["onnx"] }
+voirs-vocoder = { workspace = true }
+voirs-sdk = { workspace = true, features = ["emotion", "cloning", "conversion", "singing", "spatial"] }
+voirs-recognizer = { workspace = true, features = ["whisper-pure"] }
+voirs-evaluation = { workspace = true }
+voirs-feedback = { workspace = true, features = ["gamification"] }
+voirs-singing = { workspace = true }
+voirs-spatial = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+sysinfo = "0.39"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+scirs2-core = { workspace = true }  # For random number generation (replaced rand)
+fastrand = { workspace = true }     # For simple random simulation in examples
+thiserror = { workspace = true }
+num_cpus = { workspace = true }
+md5 = { workspace = true }
+regex = { workspace = true }
+crossbeam = "0.8"
+
+[features]
+onnx = ["voirs-acoustic/onnx"]
+gamification = ["voirs-feedback/gamification"]
+
+# WebAssembly dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+  "console",
+  "AudioContext",
+  "AudioBuffer",
+  "AudioBufferSourceNode",
+  "Window",
+  "Document"
+] }
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"

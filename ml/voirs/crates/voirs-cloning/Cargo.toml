@@ -1,0 +1,131 @@
+[package]
+name = "voirs-cloning"
+version.workspace = true
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+documentation = "https://docs.rs/voirs-cloning"
+keywords = ["voirs", "cloning", "voice-cloning", "speaker", "adaptation"]
+categories = ["multimedia::audio", "science", "algorithms"]
+rust-version.workspace = true
+description = "Voice cloning and speaker adaptation system for VoiRS"
+readme = "README.md"
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core = { workspace = true }
+scirs2-fft = { workspace = true }
+
+# Core ML and tensor operations
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
+# Audio processing
+hound = { workspace = true }
+dasp = { workspace = true }
+
+# Async and concurrency
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+
+# Error handling and utilities
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# Math and random
+fastrand = { workspace = true }
+
+# Cryptography and security (pure Rust)
+ed25519-dalek = "2.2"
+x25519-dalek = "2.0"
+hmac = "0.13"
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+# ONNX Runtime (optional)
+oxionnx = { workspace = true, optional = true }
+
+# File handling
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+memmap2 = { workspace = true }
+
+# Compression (COOLJAPAN OxiARC)
+oxiarc-deflate = { workspace = true }
+oxiarc-zstd = { workspace = true }
+
+# VoiRS dependencies
+voirs-acoustic = { workspace = true, optional = true }
+voirs-g2p = { workspace = true, optional = true }
+
+# WebAssembly dependencies (optional)
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true, features = [
+    "console",
+    "AudioContext",
+    "AudioBuffer",
+] }
+console_error_panic_hook = { workspace = true, optional = true }
+wasm-logger = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+criterion = { workspace = true }
+tracing-subscriber = { workspace = true }
+wasm-bindgen-test = { workspace = true }
+proptest = { workspace = true }
+futures = { workspace = true }
+
+# Platform-specific dependencies for memory monitoring
+[target.'cfg(windows)'.dev-dependencies]
+winapi = { workspace = true }
+
+[features]
+default = ["acoustic-integration"]
+acoustic-integration = ["voirs-acoustic"]
+g2p-integration = ["voirs-g2p"]
+vocoder-integration = []  # Marker feature for vocoder integration code paths
+gpu = ["oxionnx?/gpu"]
+cuda = ["candle-core/cuda"]
+metal = ["dep:metal-rs"]
+emotion-integration = []
+wasm = [
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "js-sys",
+    "web-sys",
+    "console_error_panic_hook",
+    "wasm-logger"
+]
+onnx = ["dep:oxionnx"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal-rs = { version = "0.27", optional = true, package = "metal" }
+
+[[bench]]
+name = "performance_benchmarks"
+harness = false
+
+[[bench]]
+name = "embedding_benchmarks"
+harness = false
+
+[[bench]]
+name = "simd_performance_benchmarks"
+harness = false
+
+[lints]
+workspace = true

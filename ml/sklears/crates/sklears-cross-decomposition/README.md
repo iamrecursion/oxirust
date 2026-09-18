@@ -1,0 +1,51 @@
+# sklears-cross-decomposition
+
+[![Crates.io](https://img.shields.io/crates/v/sklears-cross-decomposition.svg)](https://crates.io/crates/sklears-cross-decomposition)
+[![Documentation](https://docs.rs/sklears-cross-decomposition/badge.svg)](https://docs.rs/sklears-cross-decomposition)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](../../LICENSE)
+[![Minimum Rust Version](https://img.shields.io/badge/rustc-1.70+-blue.svg)](https://www.rust-lang.org)
+
+> **Latest release:** `0.2.1` (Unreleased). See the [workspace release notes](../../docs/releases/0.2.1.md) for highlights and upgrade guidance.
+
+## Overview
+
+`sklears-cross-decomposition` offers Partial Least Squares (PLS) regressors/classifiers, Canonical Correlation Analysis (CCA), and related cross-decomposition utilities. The APIs mirror scikit-learn 1.5, while Rust-native optimizations deliver consistent performance gains.
+
+## Key Features
+
+- **PLS Family**: PLSRegression, PLSCanonical, and sparse PLS extensions.
+- **CCA & Variants**: Dense (`CCA`), ridge-regularized (`RidgeCCA`), sparse (`SparseCCA`), and kernel (`KernelCCA`) canonical correlation, plus a GPU-accelerated `GpuCCA` solver.
+- **Cross-Validation**: `CrossValidator`/`NestedCrossValidator` utilities for model evaluation and hyperparameter selection.
+- **Robust Numerics**: Regularization, deflation strategies, and whitening controls ensure stability on real-world datasets.
+
+## Quick Start
+
+```rust
+use sklears_cross_decomposition::PLSRegression;
+use scirs2_core::ndarray::{array, Array2};
+
+let x: Array2<f64> = array![
+    [0.0, 1.0, 2.0],
+    [1.0, 2.0, 3.0],
+    [2.0, 3.0, 4.0],
+];
+let y: Array2<f64> = array![
+    [1.0, 0.0],
+    [2.0, 1.0],
+    [3.0, 2.0],
+];
+
+let pls = PLSRegression::new(2)
+    .scale(true)
+    .max_iter(500)
+    .tol(1e-6);
+
+let fitted = pls.fit(&x, &y)?;
+let y_pred = fitted.predict(&x)?;
+```
+
+## Status
+
+- Fully validated by 551 passing tests in `0.2.0` (Stable).
+- Benchmarks show 8–20× speedups versus scikit-learn for large PLS problems.
+- Upcoming enhancements (incremental fit, streaming CCA) tracked in `TODO.md`.

@@ -1,0 +1,28 @@
+[package]
+name = "oximedia-metering"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Professional broadcast audio metering: ITU-R BS.1770-4, EBU R128, ATSC A/85"
+readme = "README.md"
+keywords = ["audio", "metering", "loudness", "broadcast", "ebu-r128"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-audio = { workspace = true }
+thiserror = { workspace = true }
+oxifft = { workspace = true }
+rayon = { workspace = true }
+
+[lints]
+workspace = true
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

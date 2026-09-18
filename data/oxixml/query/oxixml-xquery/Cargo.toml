@@ -1,0 +1,28 @@
+[package]
+name = "oxixml-xquery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XQuery 3.1 engine: FLWOR, node constructors, the query prolog and modules."
+keywords = ["xquery", "xml", "flwor", "xpath", "query"]
+categories = ["parser-implementations", "text-processing", "data-structures"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-infoset = { workspace = true }
+oxixml-xsd = { workspace = true }
+oxixml-fn = { workspace = true }
+oxixml-xpath = { workspace = true }
+oxixml-qname = { workspace = true }
+
+[lints]
+workspace = true

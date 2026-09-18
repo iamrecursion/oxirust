@@ -1,0 +1,79 @@
+[package]
+name = "celers-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for CeleRS worker and queue management"
+readme = "README.md"
+keywords = ["celery", "cli", "worker", "queue", "management"]
+categories = ["asynchronous", "command-line-utilities"]
+
+[[bin]]
+name = "celers"
+path = "src/main.rs"
+
+[dependencies]
+celers-beat.workspace = true
+celers-core = { workspace = true }
+celers-worker = { workspace = true }
+celers-broker-redis = { workspace = true }
+celers-broker-postgres = { workspace = true }
+celers-metrics = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+uuid = { workspace = true }
+redis = { workspace = true }
+chrono = { workspace = true }
+oxisql-core = { workspace = true }
+oxisql-postgres = { workspace = true }
+oxisql-mysql = { workspace = true }
+oxitls = { workspace = true }
+rustls = { workspace = true }
+toml = { workspace = true }
+tabled = { workspace = true }
+colored = { workspace = true }
+oxihttp-client = { workspace = true }
+url = { workspace = true }
+rustyline = { workspace = true }
+csv = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxiarc-archive = { workspace = true }
+dialoguer = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+# Lets `commands::worker`'s built-in demo tasks (`--demo-tasks`) and the
+# integration tests write `#[async_trait] impl Task` as a plain `async fn`
+# instead of hand-desugaring the boxed-future signature. Promoted from
+# dev-dependencies (test-only) because the demo tasks are production code.
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which is what
+# lets `commands::worker_demo_tasks`'s `demo_sleep_task_caps_an_excessive_duration`
+# assert the 60s sleep cap without an actual 60-second wait. Dev-only: it does
+# not affect the published binary. Matches the same declaration (and rationale)
+# in celers-worker's and celers-core's own `[dev-dependencies]` -- without it,
+# `cargo test -p celers-cli`/`cargo nextest run -p celers-cli` run in isolation
+# (rather than as part of a `--workspace` build that unifies the feature in via
+# those other crates' dev-dependencies) fail with `tokio::time::advance` and
+# `start_paused` not found.
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "serialization"
+harness = false

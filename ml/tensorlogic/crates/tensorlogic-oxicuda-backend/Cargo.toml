@@ -1,0 +1,42 @@
+[package]
+name = "tensorlogic-oxicuda-backend"
+version.workspace = true
+description = "OxiCUDA-powered GPU tensor execution backend for TensorLogic (Pure Rust CUDA via OxiCUDA)"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords = ["tensor", "gpu", "cuda", "oxicuda", "backend"]
+categories = ["science", "algorithms", "mathematics"]
+
+[features]
+default = []
+# `gpu` enables the OxiCUDA backend. Requires the NVIDIA driver at runtime (libcuda.so / nvcuda.dll).
+# No CUDA SDK, no nvcc, no C/C++ toolchain needed — OxiCUDA is Pure Rust.
+gpu = ["dep:oxicuda-backend", "dep:oxicuda-blas", "dep:oxicuda-driver", "dep:oxicuda-memory"]
+fft = ["gpu", "dep:oxicuda-fft"]
+# `native-broadcast` enables native GPU fill/broadcast kernels in the autodiff backward pass.
+# When active, ReduceSum, ReduceMean gradients call oxicuda_blas::elementwise::fill /
+# broadcast_axes with a host-upload → kernel → readback round-trip (Round 5 architecture).
+# Round 6 will convert to true device-resident tensors, eliminating the round-trips.
+# Implies `gpu`.
+native-broadcast = ["gpu"]
+
+[dependencies]
+tensorlogic-infer.workspace = true
+tensorlogic-ir.workspace = true
+thiserror.workspace = true
+oxicuda-backend = { workspace = true, optional = true }
+oxicuda-blas    = { workspace = true, optional = true }
+oxicuda-driver  = { workspace = true, optional = true }
+oxicuda-memory  = { workspace = true, optional = true }
+oxicuda-fft     = { workspace = true, optional = true }
+
+[[bench]]
+name = "gpu_vs_cpu_matmul"
+harness = false
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+tensorlogic-scirs-backend = { path = "../tensorlogic-scirs-backend" }
+scirs2-core = { workspace = true }

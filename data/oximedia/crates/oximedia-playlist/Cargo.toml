@@ -1,0 +1,35 @@
+[package]
+name = "oximedia-playlist"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Broadcast playlist and scheduling system for OxiMedia"
+keywords = ["streaming", "multimedia", "network", "video", "hls"]
+categories = ["multimedia", "network-programming"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-timecode = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+
+[features]
+default = []
+
+[lib]
+name = "oximedia_playlist"
+path = "src/lib.rs"

@@ -1,0 +1,9 @@
+{
+  "name": "quality_profile",
+  "args": ["-i", "in.mkv", "-profile:v", "high", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "profile": "high"
+  }
+}

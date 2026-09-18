@@ -1,0 +1,294 @@
+// Advanced morphological operations kernels for GPU execution
+// Includes hit-or-miss transform, skeleton, and other advanced operations
+
+__kernel void hit_or_miss_2d(
+    __global const float* input,
+    __global const float* foreground_struct,
+    __global const float* background_struct,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    bool foreground_match = true;
+    bool background_match = true;
+    
+    // Check both foreground and background structures
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            int ix = x + sx - shalf_w;
+            int iy = y + sy - shalf_h;
+            
+            // Skip if outside image boundaries
+            if (ix < 0 || ix >= width || iy < 0 || iy >= height) {
+                continue;
+            }
+            
+            float pixel_val = input[iy * width + ix];
+            float fg_struct = foreground_struct[sy * struct_width + sx];
+            float bg_struct = background_struct[sy * struct_width + sx];
+            
+            // Check foreground structure match
+            if (fg_struct > 0.5f) {
+                if (pixel_val < 0.5f) {
+                    foreground_match = false;
+                }
+            }
+            
+            // Check background structure match
+            if (bg_struct > 0.5f) {
+                if (pixel_val > 0.5f) {
+                    background_match = false;
+                }
+            }
+        }
+    }
+    
+    output[y * width + x] = (foreground_match && background_match) ? 1.0f : 0.0f;
+}
+
+__kernel void morphological_gradient_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    float max_val = -INFINITY;
+    float min_val = INFINITY;
+    
+    // Compute erosion and dilation simultaneously
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                // Erosion coordinates
+                int ix_erosion = x + sx - shalf_w;
+                int iy_erosion = y + sy - shalf_h;
+                
+                // Dilation coordinates (structure flipped)
+                int ix_dilation = x - sx + shalf_w;
+                int iy_dilation = y - sy + shalf_h;
+                
+                // Erosion (minimum)
+                if (ix_erosion >= 0 && ix_erosion < width && iy_erosion >= 0 && iy_erosion < height) {
+                    float val = input[iy_erosion * width + ix_erosion];
+                    min_val = fmin(min_val, val);
+                }
+                
+                // Dilation (maximum)
+                if (ix_dilation >= 0 && ix_dilation < width && iy_dilation >= 0 && iy_dilation < height) {
+                    float val = input[iy_dilation * width + ix_dilation];
+                    max_val = fmax(max_val, val);
+                }
+            }
+        }
+    }
+    
+    // Morphological gradient = dilation - erosion
+    output[y * width + x] = max_val - min_val;
+}
+
+__kernel void tophat_transform_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width,
+    const int is_white_tophat // 1 for white tophat, 0 for black tophat
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    float max_val = -INFINITY;
+    float min_val = INFINITY;
+    float original_val = input[y * width + x];
+    
+    // Compute erosion and dilation
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                // Erosion coordinates
+                int ix_erosion = x + sx - shalf_w;
+                int iy_erosion = y + sy - shalf_h;
+                
+                // Dilation coordinates (structure flipped)
+                int ix_dilation = x - sx + shalf_w;
+                int iy_dilation = y - sy + shalf_h;
+                
+                // Erosion (minimum)
+                if (ix_erosion >= 0 && ix_erosion < width && iy_erosion >= 0 && iy_erosion < height) {
+                    float val = input[iy_erosion * width + ix_erosion];
+                    min_val = fmin(min_val, val);
+                }
+                
+                // Dilation (maximum)
+                if (ix_dilation >= 0 && ix_dilation < width && iy_dilation >= 0 && iy_dilation < height) {
+                    float val = input[iy_dilation * width + ix_dilation];
+                    max_val = fmax(max_val, val);
+                }
+            }
+        }
+    }
+    
+    if (is_white_tophat) {
+        // White tophat: original - opening (erosion followed by dilation)
+        // Approximation: original - dilation(erosion)
+        output[y * width + x] = original_val - max_val;
+    } else {
+        // Black tophat: closing - original (dilation followed by erosion)
+        // Approximation: erosion(dilation) - original
+        output[y * width + x] = min_val - original_val;
+    }
+}
+
+__kernel void skeleton_2d(
+    __global const float* input,
+    __global float* output,
+    __global float* temp_buffer,
+    const int height,
+    const int width,
+    const int iteration
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float center = input[y * width + x];
+    
+    if (center < 0.5f) {
+        output[y * width + x] = 0.0f;
+        return;
+    }
+    
+    // Simple skeletonization using hit-or-miss transform patterns
+    // This is a simplified version - full implementation would use multiple patterns
+    
+    // Check 3x3 neighborhood for thinning conditions
+    float neighbors[8];
+    int idx = 0;
+    
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            
+            int nx = clamp(x + dx, 0, width - 1);
+            int ny = clamp(y + dy, 0, height - 1);
+            neighbors[idx++] = input[ny * width + nx];
+        }
+    }
+    
+    // Count transitions from 0 to 1 in circular order
+    int transitions = 0;
+    for (int i = 0; i < 8; i++) {
+        int next = (i + 1) % 8;
+        if (neighbors[i] < 0.5f && neighbors[next] > 0.5f) {
+            transitions++;
+        }
+    }
+    
+    // Count foreground neighbors
+    int fg_neighbors = 0;
+    for (int i = 0; i < 8; i++) {
+        if (neighbors[i] > 0.5f) {
+            fg_neighbors++;
+        }
+    }
+    
+    // Zhang-Suen thinning conditions
+    bool condition1 = (fg_neighbors >= 2 && fg_neighbors <= 6);
+    bool condition2 = (transitions == 1);
+    bool condition3 = true; // Additional pattern-specific conditions would go here
+    
+    if (condition1 && condition2 && condition3) {
+        output[y * width + x] = 0.0f; // Remove pixel
+    } else {
+        output[y * width + x] = center; // Keep pixel
+    }
+}
+
+__kernel void distance_transform_chamfer_2d(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const int forward_pass // 1 for forward, 0 for backward
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    if (input[y * width + x] < 0.5f) {
+        output[y * width + x] = 0.0f;
+        return;
+    }
+    
+    float min_dist = INFINITY;
+    
+    if (forward_pass) {
+        // Forward pass: check neighbors from top-left
+        for (int dy = -1; dy <= 0; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                if (dy == 0 && dx > 0) continue; // Skip right neighbors in forward pass
+                
+                int nx = x + dx;
+                int ny = y + dy;
+                
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                    float neighbor_dist = output[ny * width + nx];
+                    float edge_weight = (dx == 0 || dy == 0) ? 1.0f : 1.414213562f; // sqrt(2)
+                    min_dist = fmin(min_dist, neighbor_dist + edge_weight);
+                }
+            }
+        }
+    } else {
+        // Backward pass: check neighbors from bottom-right
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                if (dy == 0 && dx < 0) continue; // Skip left neighbors in backward pass
+                
+                int nx = x + dx;
+                int ny = y + dy;
+                
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                    float neighbor_dist = output[ny * width + nx];
+                    float edge_weight = (dx == 0 || dy == 0) ? 1.0f : 1.414213562f; // sqrt(2)
+                    min_dist = fmin(min_dist, neighbor_dist + edge_weight);
+                }
+            }
+        }
+    }
+    
+    if (min_dist != INFINITY) {
+        output[y * width + x] = min_dist;
+    }
+}

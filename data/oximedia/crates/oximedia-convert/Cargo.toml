@@ -1,0 +1,54 @@
+[package]
+name = "oximedia-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Universal media format converter for OxiMedia"
+keywords = ["transcoding", "encoding", "video", "audio", "multimedia"]
+categories = ["multimedia::encoding"]
+readme = "README.md"
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "oximedia-convert"
+path = "src/bin/convert.rs"
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-colormgmt = { workspace = true }
+oximedia-io = { workspace = true }
+oximedia-transcode = { workspace = true }
+oximedia-container = { workspace = true }
+oximedia-codec = { workspace = true, features = ["image-io"] }
+oximedia-audio = { workspace = true }
+oximedia-image = { workspace = true }
+oximedia-subtitle = { workspace = true }
+oximedia-metadata = { workspace = true }
+oximedia-qc = { workspace = true }
+oximedia-quality = { workspace = true }
+oximedia-batch = { workspace = true }
+oximedia-normalize = { workspace = true }
+oximedia-effects = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+rayon = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

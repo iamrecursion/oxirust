@@ -1,0 +1,9 @@
+{
+  "name": "quality_preset",
+  "args": ["-i", "in.mkv", "-preset", "slow", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "preset": "slow"
+  }
+}

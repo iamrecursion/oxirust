@@ -1,0 +1,1701 @@
+//! Raw CUDA Driver API FFI types, constants, and enums.
+//!
+//! This module provides the low-level type definitions that mirror the CUDA Driver API
+//! (`cuda.h`). No functions are defined here — only types, opaque pointer aliases,
+//! result-code constants, and `#[repr]` enums used by the dynamically loaded driver
+//! entry points.
+//!
+//! # Safety
+//!
+//! All pointer types in this module are raw pointers intended for FFI use.
+//! They must only be used through the safe wrappers provided by higher-level
+//! modules in `oxicuda-driver`.
+
+use std::ffi::c_void;
+use std::fmt;
+
+// ---------------------------------------------------------------------------
+// Core scalar type aliases
+// ---------------------------------------------------------------------------
+
+/// Return code from every CUDA Driver API call.
+///
+/// A value of `0` (`CUDA_SUCCESS`) indicates success; any other value is an
+/// error code. See the `CUDA_*` constants below for the full catalogue.
+pub type CUresult = u32;
+
+/// Ordinal identifier for a CUDA-capable device (0-based).
+pub type CUdevice = i32;
+
+/// Device-side pointer (64-bit address in GPU virtual memory).
+pub type CUdeviceptr = u64;
+
+// ---------------------------------------------------------------------------
+// Opaque handle helpers
+// ---------------------------------------------------------------------------
+
+macro_rules! define_handle {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $name(pub *mut c_void);
+
+        // SAFETY: an opaque CUDA handle is a plain value (a driver-side
+        // identifier), not something this crate ever dereferences. Every
+        // operation on it is performed by the driver through an
+        // `unsafe extern "C"` entry point, and the CUDA Driver API is
+        // documented as thread-safe (a context may even be current on several
+        // threads at once, CUDA >= 4.0). It is therefore sound to send and
+        // share these handles across threads. This is a deliberate part of the
+        // crate's threading model — `DevicePool` shares `Arc<Context>` across
+        // threads and so requires `Context: Sync`.
+        unsafe impl Send for $name {}
+        unsafe impl Sync for $name {}
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}({:p})", stringify!($name), self.0)
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self(std::ptr::null_mut())
+            }
+        }
+
+        impl $name {
+            /// Returns `true` if the handle is null (uninitialised).
+            #[inline]
+            pub fn is_null(self) -> bool {
+                self.0.is_null()
+            }
+        }
+    };
+}
+
+/// Like [`define_handle!`] but for CUDA handles that the header types as a
+/// plain `unsigned long long` value rather than an opaque pointer (e.g.
+/// `CUtexObject`, `CUsurfObject`). Using a `u64` payload keeps the ABI correct
+/// on 32-bit targets (where a pointer is only 4 bytes) and renders the numeric
+/// value in `Debug`.
+macro_rules! define_value_handle {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $name(pub u64);
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}(0x{:x})", stringify!($name), self.0)
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self(0)
+            }
+        }
+
+        impl $name {
+            /// Returns `true` if the handle is null (uninitialised, i.e. `0`).
+            #[inline]
+            pub fn is_null(self) -> bool {
+                self.0 == 0
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Handle types
+// ---------------------------------------------------------------------------
+
+define_handle! {
+    /// Opaque handle to a CUDA context.
+    CUcontext
+}
+
+define_handle! {
+    /// Opaque handle to a loaded CUDA module (PTX / cubin).
+    CUmodule
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA kernel function within a module.
+    CUfunction
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA stream (command queue).
+    CUstream
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA event (used for timing and synchronisation).
+    CUevent
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA memory pool (`cuMemPool*` family).
+    CUmemoryPool
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA texture reference (legacy API).
+    CUtexref
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA surface reference (legacy API).
+    CUsurfref
+}
+
+define_value_handle! {
+    /// Handle to a CUDA texture object (modern bindless API).
+    ///
+    /// `cuda.h` types this as `unsigned long long`, so it is modelled as a
+    /// `u64` value rather than an opaque pointer.
+    CUtexObject
+}
+
+define_value_handle! {
+    /// Handle to a CUDA surface object (modern bindless API).
+    ///
+    /// `cuda.h` types this as `unsigned long long`, so it is modelled as a
+    /// `u64` value rather than an opaque pointer.
+    CUsurfObject
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA kernel (CUDA 12.8+ library-based kernels).
+    ///
+    /// Used with `cuKernelGetLibrary` to retrieve the library a kernel
+    /// belongs to.
+    CUkernel
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA library (CUDA 12.8+ JIT library API).
+    ///
+    /// Retrieved via `cuKernelGetLibrary` to identify the JIT-compiled
+    /// library that contains a given kernel.
+    CUlibrary
+}
+
+define_handle! {
+    /// Opaque handle to an NVLink multicast object (CUDA 12.8+).
+    ///
+    /// Used with `cuMulticastCreate`, `cuMulticastAddDevice`, and related
+    /// functions to manage NVLink multicast memory regions across devices.
+    CUmulticastObject
+}
+
+define_handle! {
+    /// Opaque handle to a CUDA JIT linker state (`CUlinkState`).
+    ///
+    /// Created by `cuLinkCreate_v2`, populated by repeated calls to
+    /// `cuLinkAddData_v2`, finalised by `cuLinkComplete`, and freed by
+    /// `cuLinkDestroy`.
+    CUlinkState
+}
+
+// =========================================================================
+// CUmemGenericAllocationHandle — VMM allocation handle (CUDA 11.2+)
+// =========================================================================
+
+/// Opaque handle to a generic memory allocation managed by the CUDA virtual
+/// memory management (VMM) APIs (`cuMemCreate`, `cuMemRelease`, `cuMemMap`).
+///
+/// Although the CUDA header types this as `unsigned long long`, it is an opaque
+/// driver-side identifier and must not be interpreted as a numeric address.
+pub type CUmemGenericAllocationHandle = u64;
+
+// =========================================================================
+// CUmemorytype — memory type identifiers
+// =========================================================================
+
+/// Memory type identifiers returned by pointer attribute queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum CUmemorytype {
+    /// Host (system) memory.
+    Host = 1,
+    /// Device (GPU) memory.
+    Device = 2,
+    /// Array memory.
+    Array = 3,
+    /// Unified (managed) memory.
+    Unified = 4,
+}
+
+// =========================================================================
+// CUpointer_attribute — pointer attribute query keys
+// =========================================================================
+
+/// Pointer attribute identifiers passed to `cuPointerGetAttribute`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+#[allow(non_camel_case_types)]
+pub enum CUpointer_attribute {
+    /// Query the CUDA context associated with a pointer.
+    Context = 1,
+    /// Query the memory type (host / device / unified) of a pointer.
+    MemoryType = 2,
+    /// Query the device pointer corresponding to a host pointer.
+    DevicePointer = 3,
+    /// Query the host pointer corresponding to a device pointer.
+    HostPointer = 4,
+    /// Query whether the memory is managed (unified).
+    IsManaged = 8,
+    /// Query the device ordinal for the pointer.
+    DeviceOrdinal = 9,
+}
+
+// =========================================================================
+// CUlimit — context limit identifiers
+// =========================================================================
+
+/// Context limit identifiers for `cuCtxSetLimit` / `cuCtxGetLimit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum CUlimit {
+    /// Stack size for each GPU thread.
+    StackSize = 0,
+    /// Size of the printf FIFO.
+    PrintfFifoSize = 1,
+    /// Size of the heap used by `malloc()` on the device.
+    MallocHeapSize = 2,
+    /// Maximum nesting depth of a device runtime launch.
+    DevRuntimeSyncDepth = 3,
+    /// Maximum number of outstanding device runtime launches.
+    DevRuntimePendingLaunchCount = 4,
+    /// L2 cache fetch granularity.
+    MaxL2FetchGranularity = 5,
+    /// Maximum persisting L2 cache size.
+    PersistingL2CacheSize = 6,
+}
+
+// =========================================================================
+// CUfunction_attribute — function attribute query keys
+// =========================================================================
+
+/// Function attribute identifiers passed to `cuFuncGetAttribute`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+#[non_exhaustive]
+#[allow(non_camel_case_types)]
+pub enum CUfunction_attribute {
+    /// Maximum threads per block for this function.
+    MaxThreadsPerBlock = 0,
+    /// Shared memory used by this function (bytes).
+    SharedSizeBytes = 1,
+    /// Size of user-allocated constant memory (bytes).
+    ConstSizeBytes = 2,
+    /// Size of local memory used by each thread (bytes).
+    LocalSizeBytes = 3,
+    /// Number of registers used by each thread.
+    NumRegs = 4,
+    /// PTX virtual architecture version.
+    PtxVersion = 5,
+    /// Binary architecture version.
+    BinaryVersion = 6,
+    /// Whether this function has been cached.
+    CacheModeCa = 7,
+    /// Maximum dynamic shared memory size (bytes).
+    MaxDynamicSharedSizeBytes = 8,
+    /// Preferred shared memory carve-out.
+    PreferredSharedMemoryCarveout = 9,
+}
+
+// =========================================================================
+// CUresult constants — every documented CUDA Driver API error code
+// =========================================================================
+
+/// The API call returned with no errors.
+pub const CUDA_SUCCESS: CUresult = 0;
+
+/// One or more parameters passed to the API call are not acceptable.
+pub const CUDA_ERROR_INVALID_VALUE: CUresult = 1;
+
+/// The API call failed because it was unable to allocate enough memory.
+pub const CUDA_ERROR_OUT_OF_MEMORY: CUresult = 2;
+
+/// The CUDA driver has not been initialised via `cuInit`.
+pub const CUDA_ERROR_NOT_INITIALIZED: CUresult = 3;
+
+/// The CUDA driver is shutting down.
+pub const CUDA_ERROR_DEINITIALIZED: CUresult = 4;
+
+/// Profiler is not initialised for this run.
+pub const CUDA_ERROR_PROFILER_DISABLED: CUresult = 5;
+
+/// (Deprecated) Profiler not started.
+pub const CUDA_ERROR_PROFILER_NOT_INITIALIZED: CUresult = 6;
+
+/// (Deprecated) Profiler already started.
+pub const CUDA_ERROR_PROFILER_ALREADY_STARTED: CUresult = 7;
+
+/// (Deprecated) Profiler already stopped.
+pub const CUDA_ERROR_PROFILER_ALREADY_STOPPED: CUresult = 8;
+
+/// Stub library loaded instead of the real driver.
+pub const CUDA_ERROR_STUB_LIBRARY: CUresult = 34;
+
+/// Device-side assert triggered.
+pub const CUDA_ERROR_DEVICE_UNAVAILABLE: CUresult = 46;
+
+/// No CUDA-capable device is detected.
+pub const CUDA_ERROR_NO_DEVICE: CUresult = 100;
+
+/// The device ordinal supplied is out of range.
+pub const CUDA_ERROR_INVALID_DEVICE: CUresult = 101;
+
+/// The device does not have a valid licence.
+pub const CUDA_ERROR_DEVICE_NOT_LICENSED: CUresult = 102;
+
+/// The PTX or cubin image is invalid.
+pub const CUDA_ERROR_INVALID_IMAGE: CUresult = 200;
+
+/// The supplied context is not valid.
+pub const CUDA_ERROR_INVALID_CONTEXT: CUresult = 201;
+
+/// (Deprecated) Context already current.
+pub const CUDA_ERROR_CONTEXT_ALREADY_CURRENT: CUresult = 202;
+
+/// A map or register operation has failed.
+pub const CUDA_ERROR_MAP_FAILED: CUresult = 205;
+
+/// An unmap or unregister operation has failed.
+pub const CUDA_ERROR_UNMAP_FAILED: CUresult = 206;
+
+/// The specified array is currently mapped.
+pub const CUDA_ERROR_ARRAY_IS_MAPPED: CUresult = 207;
+
+/// The resource is already mapped.
+pub const CUDA_ERROR_ALREADY_MAPPED: CUresult = 208;
+
+/// There is no kernel image available for execution on the device.
+pub const CUDA_ERROR_NO_BINARY_FOR_GPU: CUresult = 209;
+
+/// A resource has already been acquired.
+pub const CUDA_ERROR_ALREADY_ACQUIRED: CUresult = 210;
+
+/// The resource is not mapped.
+pub const CUDA_ERROR_NOT_MAPPED: CUresult = 211;
+
+/// A mapped resource is not available for access as an array.
+pub const CUDA_ERROR_NOT_MAPPED_AS_ARRAY: CUresult = 212;
+
+/// A mapped resource is not available for access as a pointer.
+pub const CUDA_ERROR_NOT_MAPPED_AS_POINTER: CUresult = 213;
+
+/// An uncorrectable ECC error was detected.
+pub const CUDA_ERROR_ECC_UNCORRECTABLE: CUresult = 214;
+
+/// A PTX JIT limit has been reached.
+pub const CUDA_ERROR_UNSUPPORTED_LIMIT: CUresult = 215;
+
+/// The context already has work from another thread bound to it.
+pub const CUDA_ERROR_CONTEXT_ALREADY_IN_USE: CUresult = 216;
+
+/// Peer access is not supported across the given devices.
+pub const CUDA_ERROR_PEER_ACCESS_UNSUPPORTED: CUresult = 217;
+
+/// The PTX JIT compilation was disabled or the PTX is invalid.
+pub const CUDA_ERROR_INVALID_PTX: CUresult = 218;
+
+/// Invalid graphics context.
+pub const CUDA_ERROR_INVALID_GRAPHICS_CONTEXT: CUresult = 219;
+
+/// NVLINK is uncorrectable.
+pub const CUDA_ERROR_NVLINK_UNCORRECTABLE: CUresult = 220;
+
+/// JIT compiler not found.
+pub const CUDA_ERROR_JIT_COMPILER_NOT_FOUND: CUresult = 221;
+
+/// Unsupported PTX version.
+pub const CUDA_ERROR_UNSUPPORTED_PTX_VERSION: CUresult = 222;
+
+/// JIT compilation disabled.
+pub const CUDA_ERROR_JIT_COMPILATION_DISABLED: CUresult = 223;
+
+/// Unsupported exec-affinity type.
+pub const CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY: CUresult = 224;
+
+/// Unsupported device-side synchronisation on this device.
+pub const CUDA_ERROR_UNSUPPORTED_DEVSIDE_SYNC: CUresult = 225;
+
+/// The requested source is invalid.
+pub const CUDA_ERROR_INVALID_SOURCE: CUresult = 300;
+
+/// The named file was not found.
+pub const CUDA_ERROR_FILE_NOT_FOUND: CUresult = 301;
+
+/// A shared-object symbol lookup failed.
+pub const CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND: CUresult = 302;
+
+/// The shared-object init function failed.
+pub const CUDA_ERROR_SHARED_OBJECT_INIT_FAILED: CUresult = 303;
+
+/// An OS call failed.
+pub const CUDA_ERROR_OPERATING_SYSTEM: CUresult = 304;
+
+/// The supplied handle is invalid.
+pub const CUDA_ERROR_INVALID_HANDLE: CUresult = 400;
+
+/// The requested resource is in an illegal state.
+pub const CUDA_ERROR_ILLEGAL_STATE: CUresult = 401;
+
+/// A loss-less compression buffer was detected while doing uncompressed access.
+pub const CUDA_ERROR_LOSSY_QUERY: CUresult = 402;
+
+/// A named symbol was not found.
+pub const CUDA_ERROR_NOT_FOUND: CUresult = 500;
+
+/// The operation is not ready (asynchronous).
+pub const CUDA_ERROR_NOT_READY: CUresult = 600;
+
+/// An illegal memory address was encountered.
+pub const CUDA_ERROR_ILLEGAL_ADDRESS: CUresult = 700;
+
+/// The kernel launch uses too many resources (registers / shared memory).
+pub const CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: CUresult = 701;
+
+/// The kernel launch exceeded the time-out enforced by the driver.
+pub const CUDA_ERROR_LAUNCH_TIMEOUT: CUresult = 702;
+
+/// A launch did not occur on a compatible texturing mode.
+pub const CUDA_ERROR_LAUNCH_INCOMPATIBLE_TEXTURING: CUresult = 703;
+
+/// Peer access already enabled.
+pub const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: CUresult = 704;
+
+/// Peer access has not been enabled.
+pub const CUDA_ERROR_PEER_ACCESS_NOT_ENABLED: CUresult = 705;
+
+/// The primary context has already been initialised.
+pub const CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE: CUresult = 708;
+
+/// The context is being destroyed.
+pub const CUDA_ERROR_CONTEXT_IS_DESTROYED: CUresult = 709;
+
+/// A 64-bit device assertion triggered.
+pub const CUDA_ERROR_ASSERT: CUresult = 710;
+
+/// Hardware resources to enable peer access are exhausted.
+pub const CUDA_ERROR_TOO_MANY_PEERS: CUresult = 711;
+
+/// The host-side memory region is already registered.
+pub const CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED: CUresult = 712;
+
+/// The host-side memory region is not registered.
+pub const CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED: CUresult = 713;
+
+/// Hardware stack overflow on the device.
+pub const CUDA_ERROR_HARDWARE_STACK_ERROR: CUresult = 714;
+
+/// Illegal instruction encountered on the device.
+pub const CUDA_ERROR_ILLEGAL_INSTRUCTION: CUresult = 715;
+
+/// Misaligned address on the device.
+pub const CUDA_ERROR_MISALIGNED_ADDRESS: CUresult = 716;
+
+/// Invalid address space.
+pub const CUDA_ERROR_INVALID_ADDRESS_SPACE: CUresult = 717;
+
+/// Invalid program counter on the device.
+pub const CUDA_ERROR_INVALID_PC: CUresult = 718;
+
+/// The kernel launch failed.
+pub const CUDA_ERROR_LAUNCH_FAILED: CUresult = 719;
+
+/// Cooperative launch is too large for the device/kernel.
+pub const CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE: CUresult = 720;
+
+/// The API call is not permitted in the active context.
+pub const CUDA_ERROR_NOT_PERMITTED: CUresult = 800;
+
+/// The API call is not supported by the current driver/device combination.
+pub const CUDA_ERROR_NOT_SUPPORTED: CUresult = 801;
+
+/// System not ready for CUDA operations.
+pub const CUDA_ERROR_SYSTEM_NOT_READY: CUresult = 802;
+
+/// System driver mismatch.
+pub const CUDA_ERROR_SYSTEM_DRIVER_MISMATCH: CUresult = 803;
+
+/// Old-style context incompatible with CUDA 3.2+ API.
+pub const CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE: CUresult = 804;
+
+/// MPS connection failed.
+pub const CUDA_ERROR_MPS_CONNECTION_FAILED: CUresult = 805;
+
+/// MPS RPC failure.
+pub const CUDA_ERROR_MPS_RPC_FAILURE: CUresult = 806;
+
+/// MPS server not ready.
+pub const CUDA_ERROR_MPS_SERVER_NOT_READY: CUresult = 807;
+
+/// MPS maximum clients reached.
+pub const CUDA_ERROR_MPS_MAX_CLIENTS_REACHED: CUresult = 808;
+
+/// MPS maximum connections reached.
+pub const CUDA_ERROR_MPS_MAX_CONNECTIONS_REACHED: CUresult = 809;
+
+/// MPS client terminated.
+pub const CUDA_ERROR_MPS_CLIENT_TERMINATED: CUresult = 810;
+
+/// CDP not supported.
+pub const CUDA_ERROR_CDP_NOT_SUPPORTED: CUresult = 811;
+
+/// CDP version mismatch.
+pub const CUDA_ERROR_CDP_VERSION_MISMATCH: CUresult = 812;
+
+/// Stream capture unsupported.
+pub const CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED: CUresult = 900;
+
+/// Stream capture invalidated.
+pub const CUDA_ERROR_STREAM_CAPTURE_INVALIDATED: CUresult = 901;
+
+/// Stream capture merge not permitted.
+pub const CUDA_ERROR_STREAM_CAPTURE_MERGE: CUresult = 902;
+
+/// Stream capture unmatched.
+pub const CUDA_ERROR_STREAM_CAPTURE_UNMATCHED: CUresult = 903;
+
+/// Stream capture unjoined.
+pub const CUDA_ERROR_STREAM_CAPTURE_UNJOINED: CUresult = 904;
+
+/// Stream capture isolation violation.
+pub const CUDA_ERROR_STREAM_CAPTURE_ISOLATION: CUresult = 905;
+
+/// Implicit stream in graph capture.
+pub const CUDA_ERROR_STREAM_CAPTURE_IMPLICIT: CUresult = 906;
+
+/// Captured event error.
+pub const CUDA_ERROR_CAPTURED_EVENT: CUresult = 907;
+
+/// Stream capture wrong thread.
+pub const CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD: CUresult = 908;
+
+/// The async operation timed out.
+pub const CUDA_ERROR_TIMEOUT: CUresult = 909;
+
+/// The graph update failed.
+pub const CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE: CUresult = 910;
+
+/// External device error.
+pub const CUDA_ERROR_EXTERNAL_DEVICE: CUresult = 911;
+
+/// Invalid cluster size.
+pub const CUDA_ERROR_INVALID_CLUSTER_SIZE: CUresult = 912;
+
+/// Function not loaded.
+pub const CUDA_ERROR_FUNCTION_NOT_LOADED: CUresult = 913;
+
+/// Invalid resource type.
+pub const CUDA_ERROR_INVALID_RESOURCE_TYPE: CUresult = 914;
+
+/// Invalid resource configuration.
+pub const CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION: CUresult = 915;
+
+/// An unknown internal error occurred.
+pub const CUDA_ERROR_UNKNOWN: CUresult = 999;
+
+// =========================================================================
+// CUdevice_attribute — device property query keys
+// =========================================================================
+
+/// Device attribute identifiers passed to `cuDeviceGetAttribute`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+#[non_exhaustive]
+#[allow(non_camel_case_types)]
+pub enum CUdevice_attribute {
+    /// Maximum number of threads per block.
+    MaxThreadsPerBlock = 1,
+    /// Maximum x-dimension of a block.
+    MaxBlockDimX = 2,
+    /// Maximum y-dimension of a block.
+    MaxBlockDimY = 3,
+    /// Maximum z-dimension of a block.
+    MaxBlockDimZ = 4,
+    /// Maximum x-dimension of a grid.
+    MaxGridDimX = 5,
+    /// Maximum y-dimension of a grid.
+    MaxGridDimY = 6,
+    /// Maximum z-dimension of a grid.
+    MaxGridDimZ = 7,
+    /// Maximum shared memory available per block (bytes).
+    MaxSharedMemoryPerBlock = 8,
+    /// Total amount of constant memory on the device (bytes).
+    TotalConstantMemory = 9,
+    /// Warp size in threads.
+    WarpSize = 10,
+    /// Maximum pitch allowed by memory copies (bytes).
+    MaxPitch = 11,
+    /// Maximum number of 32-bit registers per block.
+    MaxRegistersPerBlock = 12,
+    /// Peak clock frequency in kHz.
+    ClockRate = 13,
+    /// Alignment requirement for textures.
+    TextureAlignment = 14,
+    /// Device can possibly copy memory and execute a kernel concurrently.
+    GpuOverlap = 15,
+    /// Number of multiprocessors on the device.
+    MultiprocessorCount = 16,
+    /// Whether there is a run-time limit on kernels.
+    KernelExecTimeout = 17,
+    /// Device is integrated (shares host memory).
+    Integrated = 18,
+    /// Device can map host memory with `cuMemHostAlloc` / `cuMemHostRegister`.
+    CanMapHostMemory = 19,
+    /// Compute mode: default, exclusive, prohibited, etc.
+    ComputeMode = 20,
+    /// Maximum 1D texture width.
+    MaxTexture1DWidth = 21,
+    /// Maximum 2D texture width.
+    MaxTexture2DWidth = 22,
+    /// Maximum 2D texture height.
+    MaxTexture2DHeight = 23,
+    /// Maximum 3D texture width.
+    MaxTexture3DWidth = 24,
+    /// Maximum 3D texture height.
+    MaxTexture3DHeight = 25,
+    /// Maximum 3D texture depth.
+    MaxTexture3DDepth = 26,
+    /// Maximum 2D layered texture width.
+    MaxTexture2DLayeredWidth = 27,
+    /// Maximum 2D layered texture height.
+    MaxTexture2DLayeredHeight = 28,
+    /// Maximum layers in a 2D layered texture.
+    MaxTexture2DLayeredLayers = 29,
+    /// Alignment requirement for surfaces.
+    SurfaceAlignment = 30,
+    /// Device can execute multiple kernels concurrently.
+    ConcurrentKernels = 31,
+    /// Device supports ECC memory.
+    EccEnabled = 32,
+    /// PCI bus ID of the device.
+    PciBusId = 33,
+    /// PCI device ID of the device.
+    PciDeviceId = 34,
+    /// Device is using TCC (Tesla Compute Cluster) driver model.
+    TccDriver = 35,
+    /// Peak memory clock frequency in kHz.
+    MemoryClockRate = 36,
+    /// Global memory bus width in bits.
+    GlobalMemoryBusWidth = 37,
+    /// Size of L2 cache in bytes.
+    L2CacheSize = 38,
+    /// Maximum resident threads per multiprocessor.
+    MaxThreadsPerMultiprocessor = 39,
+    /// Number of asynchronous engines.
+    AsyncEngineCount = 40,
+    /// Device shares a unified address space with the host.
+    UnifiedAddressing = 41,
+    /// Maximum 1D layered texture width.
+    MaxTexture1DLayeredWidth = 42,
+    /// Maximum layers in a 1D layered texture.
+    MaxTexture1DLayeredLayers = 43,
+    /// Device can gather 2D textures (`CAN_TEX2D_GATHER`, deprecated).
+    CanTex2dGather = 44,
+    /// Maximum 2D texture gather width.
+    MaxTexture2DGatherWidth = 45,
+    /// Maximum 2D texture gather height.
+    MaxTexture2DGatherHeight = 46,
+    /// Alternate maximum 3D texture width.
+    MaxTexture3DWidthAlt = 47,
+    /// Alternate maximum 3D texture height.
+    MaxTexture3DHeightAlt = 48,
+    /// Alternate maximum 3D texture depth.
+    MaxTexture3DDepthAlt = 49,
+    /// PCI domain ID.
+    PciDomainId = 50,
+    /// Texture pitch alignment.
+    TexturePitchAlignment = 51,
+    /// Maximum width for a cubemap texture.
+    MaxTextureCubemapWidth = 52,
+    /// Maximum width for a cubemap layered texture.
+    MaxTextureCubemapLayeredWidth = 53,
+    /// Maximum layers in a cubemap layered texture.
+    MaxTextureCubemapLayeredLayers = 54,
+    /// Maximum 1D surface width.
+    MaxSurface1DWidth = 55,
+    /// Maximum 2D surface width.
+    MaxSurface2DWidth = 56,
+    /// Maximum 2D surface height.
+    MaxSurface2DHeight = 57,
+    /// Maximum 3D surface width.
+    MaxSurface3DWidth = 58,
+    /// Maximum 3D surface height.
+    MaxSurface3DHeight = 59,
+    /// Maximum 3D surface depth.
+    MaxSurface3DDepth = 60,
+    /// Maximum 1D layered surface width.
+    MaxSurface1DLayeredWidth = 61,
+    /// Maximum layers in a 1D layered surface.
+    MaxSurface1DLayeredLayers = 62,
+    /// Maximum 2D layered surface width.
+    MaxSurface2DLayeredWidth = 63,
+    /// Maximum 2D layered surface height.
+    MaxSurface2DLayeredHeight = 64,
+    /// Maximum layers in a 2D layered surface.
+    MaxSurface2DLayeredLayers = 65,
+    /// Maximum cubemap surface width.
+    MaxSurfaceCubemapWidth = 66,
+    /// Maximum cubemap layered surface width.
+    MaxSurfaceCubemapLayeredWidth = 67,
+    /// Maximum layers in a cubemap layered surface.
+    MaxSurfaceCubemapLayeredLayers = 68,
+    /// Maximum 1D linear texture width (deprecated).
+    MaxTexture1DLinearWidth = 69,
+    /// Maximum 2D linear texture width.
+    MaxTexture2DLinearWidth = 70,
+    /// Maximum 2D linear texture height.
+    MaxTexture2DLinearHeight = 71,
+    /// Maximum 2D linear texture pitch (bytes).
+    MaxTexture2DLinearPitch = 72,
+    /// Maximum mipmapped 2D texture width.
+    MaxTexture2DMipmappedWidth = 73,
+    /// Maximum mipmapped 2D texture height.
+    MaxTexture2DMipmappedHeight = 74,
+    /// Major compute capability version number.
+    ComputeCapabilityMajor = 75,
+    /// Minor compute capability version number.
+    ComputeCapabilityMinor = 76,
+    /// Maximum mipmapped 1D texture width.
+    MaxTexture1DMipmappedWidth = 77,
+    /// Device supports stream priorities.
+    StreamPrioritiesSupported = 78,
+    /// Device supports caching globals in L1 cache.
+    GlobalL1CacheSupported = 79,
+    /// Device supports caching locals in L1 cache.
+    LocalL1CacheSupported = 80,
+    /// Maximum shared memory per multiprocessor (bytes).
+    MaxSharedMemoryPerMultiprocessor = 81,
+    /// Maximum registers per multiprocessor.
+    MaxRegistersPerMultiprocessor = 82,
+    /// Device supports managed memory.
+    ManagedMemory = 83,
+    /// Device is on a multi-GPU board.
+    IsMultiGpuBoard = 84,
+    /// Unique identifier for the multi-GPU board group.
+    MultiGpuBoardGroupId = 85,
+    /// Host-visible native-atomic support for float operations.
+    HostNativeAtomicSupported = 86,
+    /// Ratio of single-to-double precision performance.
+    SingleToDoublePrecisionPerfRatio = 87,
+    /// Device supports pageable memory access.
+    PageableMemoryAccess = 88,
+    /// Device can access host registered memory at the same virtual address.
+    ConcurrentManagedAccess = 89,
+    /// Device supports compute preemption.
+    ComputePreemptionSupported = 90,
+    /// Device can access host memory via pageable accesses.
+    CanUseHostPointerForRegisteredMem = 91,
+    /// Deprecated: use of stream memory operations v1 (CUDA internal).
+    CanUseStreamMemOpsV1 = 92,
+    /// Deprecated: use of 64-bit stream memory operations v1 (CUDA internal).
+    CanUse64BitStreamMemOpsV1 = 93,
+    /// Deprecated: use of stream wait-value NOR v1 (CUDA internal).
+    CanUseStreamWaitValueNorV1 = 94,
+    /// Device supports cooperative kernel launches.
+    CooperativeLaunch = 95,
+    /// Device supports cooperative kernel launches across multiple GPUs.
+    CooperativeMultiDeviceLaunch = 96,
+    /// Maximum optin shared memory per block.
+    MaxSharedMemoryPerBlockOptin = 97,
+    /// Device supports flushing of outstanding remote writes.
+    CanFlushRemoteWrites = 98,
+    /// Device supports host-side memory-register functions.
+    HostRegisterSupported = 99,
+    /// Device supports pageable memory access using host page tables.
+    PageableMemoryAccessUsesHostPageTables = 100,
+    /// Device supports direct access to managed memory on the host.
+    DirectManagedMemAccessFromHost = 101,
+    /// Device supports virtual memory management APIs.
+    VirtualMemoryManagementSupported = 102,
+    /// Device supports handle-type POSIX file descriptors for IPC.
+    HandleTypePosixFileDescriptorSupported = 103,
+    /// Device supports handle-type Win32 handles for IPC.
+    HandleTypeWin32HandleSupported = 104,
+    /// Device supports handle-type Win32 KMT handles for IPC.
+    HandleTypeWin32KmtHandleSupported = 105,
+    /// Maximum blocks per multiprocessor.
+    MaxBlocksPerMultiprocessor = 106,
+    /// Device supports generic compression for memory.
+    GenericCompressionSupported = 107,
+    /// Maximum persisting L2 cache size (bytes).
+    MaxPersistingL2CacheSize = 108,
+    /// Maximum access-policy window size for L2 cache.
+    MaxAccessPolicyWindowSize = 109,
+    /// Device supports RDMA APIs via `cuMemRangeGetAttribute`.
+    GpuDirectRdmaWithCudaVmmSupported = 110,
+    /// Reserved range of shared memory per SM (bytes).
+    ReservedSharedMemoryPerBlock = 111,
+    /// Device supports sparse CUDA arrays.
+    SparseCudaArraySupported = 112,
+    /// Device supports read-only registration of host memory.
+    ReadOnlyHostRegisterSupported = 113,
+    /// Device supports timeline semaphore interop.
+    TimelineSemaphoreInteropSupported = 114,
+    /// Device supports memory pools (`cudaMallocAsync`).
+    MemoryPoolsSupported = 115,
+    /// GPU direct RDMA is supported.
+    GpuDirectRdmaSupported = 116,
+    /// GPU direct RDMA flush-writes order.
+    GpuDirectRdmaFlushWritesOptions = 117,
+    /// GPU direct RDMA writes ordering.
+    GpuDirectRdmaWritesOrdering = 118,
+    /// Memory pool supported handle types.
+    MemoryPoolSupportedHandleTypes = 119,
+    /// Device supports cluster launch.
+    ClusterLaunch = 120,
+    /// Deferred mapping CUDA array supported.
+    DeferredMappingCudaArraySupported = 121,
+    /// Device supports 64-bit stream memory operations.
+    CanUse64BitStreamMemOps = 122,
+    /// Device supports stream wait-value NOR.
+    CanUseStreamWaitValueNor = 123,
+    /// Device supports importing memory from a Linux `dma_buf`.
+    DmaBufSupported = 124,
+    /// Device supports IPC event handles.
+    IpcEventSupported = 125,
+    /// Device supports mem-sync domain count.
+    MemSyncDomainCount = 126,
+    /// Device supports tensor-map access to data.
+    TensorMapAccessSupported = 127,
+    /// Device supports exporting memory as a fabric handle
+    /// (`HANDLE_TYPE_FABRIC_SUPPORTED`).
+    GpuDirectRdmaFabricSupported = 128,
+    /// Unified function pointers supported.
+    UnifiedFunctionPointers = 129,
+    /// NUMA config.
+    NumaConfig = 130,
+    /// NUMA id.
+    NumaId = 131,
+    /// Device supports multicast.
+    MulticastSupported = 132,
+    /// Device supports MPS features.
+    MpsEnabled = 133,
+    /// Host-NUMA identifier.
+    HostNumaId = 134,
+}
+
+// =========================================================================
+// CUjit_option — options for the JIT compiler
+// =========================================================================
+
+/// JIT compilation options passed to `cuModuleLoadDataEx` and related functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+#[allow(non_camel_case_types)]
+pub enum CUjit_option {
+    /// Maximum number of registers that a thread may use.
+    MaxRegisters = 0,
+    /// Number of threads per block for the JIT target.
+    ThreadsPerBlock = 1,
+    /// Wall-clock time (ms) for compilation.
+    WallTime = 2,
+    /// Pointer to a buffer for info log output.
+    InfoLogBuffer = 3,
+    /// Size (bytes) of the info-log buffer.
+    InfoLogBufferSizeBytes = 4,
+    /// Pointer to a buffer for error log output.
+    ErrorLogBuffer = 5,
+    /// Size (bytes) of the error-log buffer.
+    ErrorLogBufferSizeBytes = 6,
+    /// Optimisation level (0-4).
+    OptimizationLevel = 7,
+    /// Determines the target based on the current attached context.
+    TargetFromCuContext = 8,
+    /// Specific compute target (sm_XX).
+    Target = 9,
+    /// Fallback strategy when exact match is not found.
+    FallbackStrategy = 10,
+    /// Specifies whether to generate debug info.
+    GenerateDebugInfo = 11,
+    /// Generate verbose log messages.
+    LogVerbose = 12,
+    /// Generate line-number information.
+    GenerateLineInfo = 13,
+    /// Cache mode (on / off).
+    CacheMode = 14,
+    /// (Internal) New SM3X option.
+    Sm3xOpt = 15,
+    /// Fast compile flag.
+    FastCompile = 16,
+    /// Global symbol names.
+    GlobalSymbolNames = 17,
+    /// Global symbol addresses.
+    GlobalSymbolAddresses = 18,
+    /// Number of global symbols.
+    GlobalSymbolCount = 19,
+    /// LTO flag.
+    Lto = 20,
+    /// FTZ (flush-to-zero) flag.
+    Ftz = 21,
+    /// Prec-div flag.
+    PrecDiv = 22,
+    /// Prec-sqrt flag.
+    PrecSqrt = 23,
+    /// FMA flag.
+    Fma = 24,
+    /// Referenced kernel names.
+    ReferencedKernelNames = 25,
+    /// Referenced kernel count.
+    ReferencedKernelCount = 26,
+    /// Referenced variable names.
+    ReferencedVariableNames = 27,
+    /// Referenced variable count.
+    ReferencedVariableCount = 28,
+    /// Optimise unused device variables.
+    OptimizeUnusedDeviceVariables = 29,
+    /// Position-independent code.
+    PositionIndependentCode = 30,
+}
+
+// =========================================================================
+// CUjitInputType — input types for the linker
+// =========================================================================
+
+/// Input types for `cuLinkAddData` / `cuLinkAddFile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum CUjitInputType {
+    /// PTX source code.
+    Ptx = 1,
+    /// Compiled device code (cubin).
+    Cubin = 2,
+    /// Fat binary bundle.
+    Fatbin = 3,
+    /// Relocatable device object.
+    Object = 4,
+    /// Device code library.
+    Library = 5,
+}
+
+// =========================================================================
+// CUmemLocationType — location-type discriminant (CUDA 11.2+ VMM)
+// =========================================================================
+
+/// Specifies the kind of location described by a [`CUmemLocation`].
+///
+/// Mirrors `CUmemLocationType` in `cuda.h`.  Used by the virtual-memory
+/// management APIs to identify where a memory allocation resides or which
+/// device should be granted access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum CUmemLocationType {
+    /// Invalid / uninitialised location type.
+    Invalid = 0,
+    /// Location is a CUDA device (the `id` field is a device ordinal).
+    Device = 1,
+    /// Location is the host (CPU) memory.
+    Host = 2,
+    /// Location is a specific NUMA node on the host.
+    HostNuma = 3,
+    /// Location is the NUMA node currently bound to the calling thread.
+    HostNumaCurrent = 4,
+}
+
+// =========================================================================
+// CUmemAllocationType — allocation-kind discriminant (CUDA 11.2+ VMM)
+// =========================================================================
+
+/// Type of memory allocation requested via the VMM APIs.
+///
+/// Mirrors `CUmemAllocationType` in `cuda.h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum CUmemAllocationType {
+    /// Invalid / uninitialised allocation type.
+    Invalid = 0,
+    /// Pinned (page-locked) GPU memory backed by physical device frames.
+    Pinned = 1,
+    /// Sentinel value used by the CUDA driver to mark forward-compatible
+    /// extensions; always equal to the maximum 32-bit signed integer.
+    Max = 0x7fff_ffff,
+}
+
+// =========================================================================
+// CUmemAllocationHandleType — exportable handle bitfield (CUDA 11.2+ VMM)
+// =========================================================================
+
+/// Set of operating-system handle types that the driver may export for a
+/// VMM allocation.  Treated as a bitfield in the CUDA C API.
+///
+/// Mirrors `CUmemAllocationHandleType` in `cuda.h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum CUmemAllocationHandleType {
+    /// No exportable handle is requested.
+    None = 0,
+    /// POSIX file descriptor (Linux).
+    PosixFileDescriptor = 1,
+    /// Win32 NT handle.
+    Win32 = 2,
+    /// Win32 KMT handle (legacy kernel-mode-thunk).
+    Win32Kmt = 4,
+    /// Fabric handle for multi-host shared memory (CUDA 12.0+).
+    Fabric = 8,
+}
+
+// =========================================================================
+// CUmemAccessFlags — peer-access permissions for VMM allocations
+// =========================================================================
+
+/// Access flags applied via `cuMemSetAccess` to a VMM allocation, controlling
+/// whether a particular [`CUmemLocation`] may read or write the mapping.
+///
+/// Mirrors `CUmemAccess_flags` in `cuda.h`.  Renamed to follow Rust naming
+/// conventions; the discriminant values are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum CUmemAccessFlags {
+    /// No access permitted from the location.
+    None = 0,
+    /// Read-only access permitted.
+    Read = 1,
+    /// Read-write access permitted.
+    ReadWrite = 3,
+    /// Sentinel value used by the CUDA driver for forward compatibility.
+    Max = 0x7fff_ffff,
+}
+
+// =========================================================================
+// CUmemLocation — memory-location descriptor (CUDA 11.2+ VMM)
+// =========================================================================
+
+/// Describes a physical memory location for the VMM and pool APIs.
+///
+/// Mirrors `CUmemLocation` in `cuda.h`.  The interpretation of `id` depends on
+/// `loc_type`: for [`CUmemLocationType::Device`] it is a device ordinal, for
+/// [`CUmemLocationType::HostNuma`] it is a NUMA node identifier, and for the
+/// other variants it must be set to `0`.
+///
+/// The `loc_type` field is stored as a raw `u32` so that any forward-compatible
+/// value emitted by a future driver can be round-tripped without UB; convert
+/// to / from [`CUmemLocationType`] manually when interpreting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct CUmemLocation {
+    /// Location type; see [`CUmemLocationType`].
+    pub loc_type: u32,
+    /// Identifier whose meaning depends on `loc_type`.
+    pub id: i32,
+}
+
+// =========================================================================
+// CUmemcpyAttributes — per-copy attributes for cuMemcpyBatchAsync (CUDA 12.8+)
+// =========================================================================
+
+/// Attributes describing one entry (or group of entries) in a
+/// `cuMemcpyBatchAsync` batch.
+///
+/// Mirrors `CUmemcpyAttributes` in `cuda.h` (CUDA 12.8+). `src_access_order`
+/// is stored as a raw `u32` (the `CUmemcpySrcAccessOrder` enum) so that a
+/// forward-compatible value emitted by a future driver can be round-tripped
+/// without UB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct CUmemcpyAttributes {
+    /// Source access order; see `CUmemcpySrcAccessOrder` in `cuda.h`.
+    pub src_access_order: u32,
+    /// Hint for the source memory location.
+    pub src_loc_hint: CUmemLocation,
+    /// Hint for the destination memory location.
+    pub dst_loc_hint: CUmemLocation,
+    /// Additional copy flags (reserved; `0` on current drivers).
+    pub flags: u32,
+}
+
+// =========================================================================
+// CUmemAllocationProp — properties of a VMM allocation request
+// =========================================================================
+
+/// Properties passed to `cuMemCreate` to describe a new VMM allocation.
+///
+/// Mirrors `CUmemAllocationProp` in `cuda.h`.
+///
+/// The `alloc_type`, `requested_handle_types` and `alloc_flags` fields are
+/// stored as raw integers so that future driver extensions cannot trigger UB
+/// via unknown discriminants; convert them to / from
+/// [`CUmemAllocationType`] / [`CUmemAllocationHandleType`] when interpreting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct CUmemAllocationProp {
+    /// Allocation type; see [`CUmemAllocationType`].
+    pub alloc_type: u32,
+    /// Bitfield of OS handle types to export; see
+    /// [`CUmemAllocationHandleType`].
+    pub requested_handle_types: u32,
+    /// Physical location of the allocation.
+    pub location: CUmemLocation,
+    /// Win32 security attributes pointer; null on non-Windows platforms or
+    /// when no specific security descriptor is required.
+    pub win32_handle_meta_data: *mut c_void,
+    /// Reserved for future allocation flags; must be `0` on current drivers.
+    pub alloc_flags: u64,
+}
+
+// SAFETY: The struct contains a raw pointer (`win32_handle_meta_data`) that
+// callers are responsible for managing.  The CUDA driver treats the pointer
+// as opaque, so the struct itself is logically Send+Sync.
+unsafe impl Send for CUmemAllocationProp {}
+unsafe impl Sync for CUmemAllocationProp {}
+
+impl Default for CUmemAllocationProp {
+    fn default() -> Self {
+        Self {
+            alloc_type: 0,
+            requested_handle_types: 0,
+            location: CUmemLocation::default(),
+            win32_handle_meta_data: std::ptr::null_mut(),
+            alloc_flags: 0,
+        }
+    }
+}
+
+// =========================================================================
+// CUmemAccessDesc — per-location access permissions for `cuMemSetAccess`
+// =========================================================================
+
+/// Per-location access descriptor for `cuMemSetAccess`.
+///
+/// Mirrors `CUmemAccessDesc` in `cuda.h`.  The `flags` field stores a
+/// [`CUmemAccessFlags`] value as a raw `u32` for FFI safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct CUmemAccessDesc {
+    /// Memory location whose access permission is being changed.
+    pub location: CUmemLocation,
+    /// Access flags; see [`CUmemAccessFlags`].
+    pub flags: u32,
+}
+
+// =========================================================================
+// CUmemPoolProps — properties of a stream-ordered memory pool
+// =========================================================================
+
+/// Properties passed to `cuMemPoolCreate`.
+///
+/// Mirrors `CUmemPoolProps` in `cuda.h`.  The trailing `reserved` field is
+/// part of the public ABI: the CUDA driver expects 56 zero bytes there to
+/// preserve forward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct CUmemPoolProps {
+    /// Allocation type to use when servicing pool requests; see
+    /// [`CUmemAllocationType`].
+    pub alloc_type: u32,
+    /// Bitfield of OS handle types to export; see
+    /// [`CUmemAllocationHandleType`].
+    pub handle_types: u32,
+    /// Physical location backing the pool.
+    pub location: CUmemLocation,
+    /// Win32 security-attributes pointer; null on non-Windows platforms or
+    /// when no specific security descriptor is required.
+    pub win32_security_attributes: *mut c_void,
+    /// Maximum aggregate size (bytes) the pool may hold.  `0` means
+    /// unlimited.
+    pub max_size: usize,
+    /// Reserved padding required by the CUDA ABI; must remain zeroed.
+    pub reserved: [u8; 56],
+}
+
+// SAFETY: The struct contains a raw pointer (`win32_security_attributes`) that
+// callers are responsible for managing.  The CUDA driver treats the pointer
+// as opaque, so the struct itself is logically Send+Sync.
+unsafe impl Send for CUmemPoolProps {}
+unsafe impl Sync for CUmemPoolProps {}
+
+impl Default for CUmemPoolProps {
+    fn default() -> Self {
+        Self {
+            alloc_type: 0,
+            handle_types: 0,
+            location: CUmemLocation::default(),
+            win32_security_attributes: std::ptr::null_mut(),
+            max_size: 0,
+            reserved: [0u8; 56],
+        }
+    }
+}
+
+// =========================================================================
+// CUDA_MEMCPY2D — descriptor for `cuMemcpy2D_v2`
+// =========================================================================
+
+/// Descriptor for a 2-D memory copy executed via `cuMemcpy2D_v2`.
+///
+/// Mirrors `CUDA_MEMCPY2D` in `cuda.h`.  The CUDA driver inspects only the
+/// fields appropriate for the source / destination memory types; the
+/// remaining fields **must** be zeroed.  Use [`CUDA_MEMCPY2D::default`] to
+/// obtain a zero-initialised descriptor and only set the fields you need.
+///
+/// `src_memory_type` and `dst_memory_type` are stored as raw `u32` for FFI
+/// safety; convert to / from [`CUmemorytype`] manually.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct CUDA_MEMCPY2D {
+    /// Source X offset in bytes.
+    pub src_x_in_bytes: usize,
+    /// Source Y offset in rows.
+    pub src_y: usize,
+    /// Source memory type; see [`CUmemorytype`].
+    pub src_memory_type: u32,
+    /// Source host pointer (only valid when `src_memory_type == Host`).
+    pub src_host: *const c_void,
+    /// Source device pointer (only valid when `src_memory_type == Device`).
+    pub src_device: CUdeviceptr,
+    /// Source CUDA array (only valid when `src_memory_type == Array`).
+    pub src_array: crate::ffi::CUarray,
+    /// Source pitch in bytes (`0` selects a tightly-packed layout).
+    pub src_pitch: usize,
+    /// Destination X offset in bytes.
+    pub dst_x_in_bytes: usize,
+    /// Destination Y offset in rows.
+    pub dst_y: usize,
+    /// Destination memory type; see [`CUmemorytype`].
+    pub dst_memory_type: u32,
+    /// Destination host pointer (only valid when `dst_memory_type == Host`).
+    pub dst_host: *mut c_void,
+    /// Destination device pointer (only valid when `dst_memory_type == Device`).
+    pub dst_device: CUdeviceptr,
+    /// Destination CUDA array (only valid when `dst_memory_type == Array`).
+    pub dst_array: crate::ffi::CUarray,
+    /// Destination pitch in bytes (`0` selects a tightly-packed layout).
+    pub dst_pitch: usize,
+    /// Width of the copied region in bytes.
+    pub width_in_bytes: usize,
+    /// Height of the copied region in rows.
+    pub height: usize,
+}
+
+// SAFETY: The struct contains raw pointers and a CUDA array handle; callers
+// are responsible for managing the underlying memory and handles.  Treating
+// the descriptor itself as Send+Sync mirrors the C-side struct, which the
+// driver may inspect from any thread.
+unsafe impl Send for CUDA_MEMCPY2D {}
+unsafe impl Sync for CUDA_MEMCPY2D {}
+
+impl Default for CUDA_MEMCPY2D {
+    fn default() -> Self {
+        Self {
+            src_x_in_bytes: 0,
+            src_y: 0,
+            src_memory_type: 0,
+            src_host: std::ptr::null(),
+            src_device: 0,
+            src_array: crate::ffi::CUarray::default(),
+            src_pitch: 0,
+            dst_x_in_bytes: 0,
+            dst_y: 0,
+            dst_memory_type: 0,
+            dst_host: std::ptr::null_mut(),
+            dst_device: 0,
+            dst_array: crate::ffi::CUarray::default(),
+            dst_pitch: 0,
+            width_in_bytes: 0,
+            height: 0,
+        }
+    }
+}
+
+// =========================================================================
+// Submodules — extracted per refactoring policy (<2000 lines per file)
+// =========================================================================
+
+#[path = "ffi_constants.rs"]
+mod ffi_constants;
+pub use ffi_constants::*;
+
+#[path = "ffi_launch.rs"]
+mod ffi_launch;
+pub use ffi_launch::*;
+
+#[path = "ffi_descriptors.rs"]
+mod ffi_descriptors;
+pub use ffi_descriptors::*;
+
+#[path = "ffi_graph.rs"]
+mod ffi_graph;
+pub use ffi_graph::*;
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cuda_success_is_zero() {
+        assert_eq!(CUDA_SUCCESS, 0);
+    }
+
+    #[test]
+    fn test_opaque_types_are_pointer_sized() {
+        assert_eq!(
+            std::mem::size_of::<CUcontext>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            std::mem::size_of::<CUmodule>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            std::mem::size_of::<CUstream>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            std::mem::size_of::<CUevent>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            std::mem::size_of::<CUfunction>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            std::mem::size_of::<CUmemoryPool>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+    }
+
+    #[test]
+    fn test_handle_default_is_null() {
+        assert!(CUcontext::default().is_null());
+        assert!(CUmodule::default().is_null());
+        assert!(CUfunction::default().is_null());
+        assert!(CUstream::default().is_null());
+        assert!(CUevent::default().is_null());
+        assert!(CUmemoryPool::default().is_null());
+    }
+
+    #[test]
+    fn test_device_attribute_repr() {
+        // Original variants
+        assert_eq!(CUdevice_attribute::MaxThreadsPerBlock as i32, 1);
+        assert_eq!(CUdevice_attribute::WarpSize as i32, 10);
+        assert_eq!(CUdevice_attribute::MultiprocessorCount as i32, 16);
+        assert_eq!(CUdevice_attribute::ComputeCapabilityMajor as i32, 75);
+        assert_eq!(CUdevice_attribute::ComputeCapabilityMinor as i32, 76);
+        assert_eq!(CUdevice_attribute::MaxBlocksPerMultiprocessor as i32, 106);
+        assert_eq!(CUdevice_attribute::L2CacheSize as i32, 38);
+        assert_eq!(
+            CUdevice_attribute::MaxSharedMemoryPerMultiprocessor as i32,
+            81
+        );
+        assert_eq!(CUdevice_attribute::ManagedMemory as i32, 83);
+
+        // Corrected discriminants (cuda.h `CUdevice_attribute` values)
+        assert_eq!(CUdevice_attribute::CanTex2dGather as i32, 44);
+        assert_eq!(CUdevice_attribute::MaxTexture2DGatherWidth as i32, 45);
+        assert_eq!(CUdevice_attribute::MaxTexture2DGatherHeight as i32, 46);
+        assert_eq!(CUdevice_attribute::MaxTexture3DWidthAlt as i32, 47);
+        assert_eq!(CUdevice_attribute::MaxTexture3DHeightAlt as i32, 48);
+        assert_eq!(CUdevice_attribute::MaxTexture3DDepthAlt as i32, 49);
+        assert_eq!(CUdevice_attribute::MaxTextureCubemapWidth as i32, 52);
+        assert_eq!(CUdevice_attribute::CanUseStreamMemOpsV1 as i32, 92);
+        assert_eq!(CUdevice_attribute::CanUse64BitStreamMemOpsV1 as i32, 93);
+        assert_eq!(CUdevice_attribute::CanUseStreamWaitValueNorV1 as i32, 94);
+        assert_eq!(CUdevice_attribute::GlobalL1CacheSupported as i32, 79);
+        assert_eq!(CUdevice_attribute::LocalL1CacheSupported as i32, 80);
+        assert_eq!(
+            CUdevice_attribute::VirtualMemoryManagementSupported as i32,
+            102
+        );
+        assert_eq!(
+            CUdevice_attribute::HandleTypePosixFileDescriptorSupported as i32,
+            103
+        );
+        assert_eq!(
+            CUdevice_attribute::HandleTypeWin32HandleSupported as i32,
+            104
+        );
+        assert_eq!(
+            CUdevice_attribute::HandleTypeWin32KmtHandleSupported as i32,
+            105
+        );
+        assert_eq!(CUdevice_attribute::MaxAccessPolicyWindowSize as i32, 109);
+        assert_eq!(CUdevice_attribute::ReservedSharedMemoryPerBlock as i32, 111);
+        assert_eq!(CUdevice_attribute::SparseCudaArraySupported as i32, 112);
+        assert_eq!(
+            CUdevice_attribute::ReadOnlyHostRegisterSupported as i32,
+            113
+        );
+        assert_eq!(
+            CUdevice_attribute::TimelineSemaphoreInteropSupported as i32,
+            114
+        );
+        assert_eq!(CUdevice_attribute::MemoryPoolsSupported as i32, 115);
+        assert_eq!(CUdevice_attribute::DmaBufSupported as i32, 124);
+        assert_eq!(CUdevice_attribute::IpcEventSupported as i32, 125);
+        assert_eq!(CUdevice_attribute::MemSyncDomainCount as i32, 126);
+        assert_eq!(CUdevice_attribute::TensorMapAccessSupported as i32, 127);
+        assert_eq!(CUdevice_attribute::ClusterLaunch as i32, 120);
+        assert_eq!(CUdevice_attribute::UnifiedFunctionPointers as i32, 129);
+        assert_eq!(CUdevice_attribute::NumaConfig as i32, 130);
+        assert_eq!(CUdevice_attribute::NumaId as i32, 131);
+        assert_eq!(CUdevice_attribute::GpuDirectRdmaFabricSupported as i32, 128);
+        assert_eq!(CUdevice_attribute::MulticastSupported as i32, 132);
+        assert_eq!(CUdevice_attribute::HostNumaId as i32, 134);
+    }
+
+    #[test]
+    fn test_jit_option_repr() {
+        assert_eq!(CUjit_option::MaxRegisters as u32, 0);
+        assert_eq!(CUjit_option::ThreadsPerBlock as u32, 1);
+        assert_eq!(CUjit_option::WallTime as u32, 2);
+        assert_eq!(CUjit_option::InfoLogBuffer as u32, 3);
+        assert_eq!(CUjit_option::InfoLogBufferSizeBytes as u32, 4);
+        assert_eq!(CUjit_option::ErrorLogBuffer as u32, 5);
+        assert_eq!(CUjit_option::ErrorLogBufferSizeBytes as u32, 6);
+        assert_eq!(CUjit_option::OptimizationLevel as u32, 7);
+        assert_eq!(CUjit_option::Target as u32, 9);
+        assert_eq!(CUjit_option::FallbackStrategy as u32, 10);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_error_code_ranges() {
+        // Basic errors: 1-8
+        assert!(CUDA_ERROR_INVALID_VALUE < 10);
+        // Device errors: 100-102
+        assert!((100..=102).contains(&CUDA_ERROR_NO_DEVICE));
+        assert!((100..=102).contains(&CUDA_ERROR_INVALID_DEVICE));
+        assert!((100..=102).contains(&CUDA_ERROR_DEVICE_NOT_LICENSED));
+        // Image/context errors: 200+
+        assert!(CUDA_ERROR_INVALID_IMAGE >= 200);
+        // Launch errors: 700+
+        assert!(CUDA_ERROR_LAUNCH_FAILED >= 700);
+        assert!(CUDA_ERROR_ILLEGAL_ADDRESS >= 700);
+        assert!(CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES >= 700);
+        // Stream capture errors: 900+
+        assert!(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED >= 900);
+        // Unknown is 999
+        assert_eq!(CUDA_ERROR_UNKNOWN, 999);
+    }
+
+    #[test]
+    fn test_handle_debug_format() {
+        let ctx = CUcontext::default();
+        let debug_str = format!("{ctx:?}");
+        assert!(debug_str.starts_with("CUcontext("));
+    }
+
+    #[test]
+    fn test_handle_equality() {
+        let a = CUcontext::default();
+        let b = CUcontext::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_new_handle_types_are_pointer_sized() {
+        assert_eq!(
+            std::mem::size_of::<CUtexref>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            std::mem::size_of::<CUsurfref>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        // Bindless texture / surface objects are `unsigned long long` values,
+        // not opaque pointers (correct on 32-bit targets too).
+        assert_eq!(
+            std::mem::size_of::<CUtexObject>(),
+            std::mem::size_of::<u64>()
+        );
+        assert_eq!(
+            std::mem::size_of::<CUsurfObject>(),
+            std::mem::size_of::<u64>()
+        );
+    }
+
+    #[test]
+    fn test_new_handle_defaults_are_null() {
+        assert!(CUtexref::default().is_null());
+        assert!(CUsurfref::default().is_null());
+        assert!(CUtexObject::default().is_null());
+        assert!(CUsurfObject::default().is_null());
+    }
+
+    #[test]
+    fn test_memory_type_enum() {
+        assert_eq!(CUmemorytype::Host as u32, 1);
+        assert_eq!(CUmemorytype::Device as u32, 2);
+        assert_eq!(CUmemorytype::Array as u32, 3);
+        assert_eq!(CUmemorytype::Unified as u32, 4);
+    }
+
+    #[test]
+    fn test_pointer_attribute_enum() {
+        assert_eq!(CUpointer_attribute::Context as u32, 1);
+        assert_eq!(CUpointer_attribute::MemoryType as u32, 2);
+        assert_eq!(CUpointer_attribute::DevicePointer as u32, 3);
+        assert_eq!(CUpointer_attribute::HostPointer as u32, 4);
+        assert_eq!(CUpointer_attribute::IsManaged as u32, 8);
+        assert_eq!(CUpointer_attribute::DeviceOrdinal as u32, 9);
+    }
+
+    #[test]
+    fn test_limit_enum() {
+        assert_eq!(CUlimit::StackSize as u32, 0);
+        assert_eq!(CUlimit::PrintfFifoSize as u32, 1);
+        assert_eq!(CUlimit::MallocHeapSize as u32, 2);
+        assert_eq!(CUlimit::DevRuntimeSyncDepth as u32, 3);
+        assert_eq!(CUlimit::DevRuntimePendingLaunchCount as u32, 4);
+        assert_eq!(CUlimit::MaxL2FetchGranularity as u32, 5);
+        assert_eq!(CUlimit::PersistingL2CacheSize as u32, 6);
+    }
+
+    #[test]
+    fn test_function_attribute_enum() {
+        assert_eq!(CUfunction_attribute::MaxThreadsPerBlock as i32, 0);
+        assert_eq!(CUfunction_attribute::SharedSizeBytes as i32, 1);
+        assert_eq!(CUfunction_attribute::NumRegs as i32, 4);
+        assert_eq!(CUfunction_attribute::PtxVersion as i32, 5);
+        assert_eq!(CUfunction_attribute::BinaryVersion as i32, 6);
+        assert_eq!(CUfunction_attribute::MaxDynamicSharedSizeBytes as i32, 8);
+        assert_eq!(
+            CUfunction_attribute::PreferredSharedMemoryCarveout as i32,
+            9
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // VMM / Pool / Linker FFI types — added by Wave 1
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_link_state_handle_is_pointer_sized_and_default_null() {
+        assert_eq!(
+            std::mem::size_of::<CUlinkState>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        assert!(CUlinkState::default().is_null());
+    }
+
+    #[test]
+    fn test_mem_generic_allocation_handle_is_u64() {
+        assert_eq!(
+            std::mem::size_of::<CUmemGenericAllocationHandle>(),
+            std::mem::size_of::<u64>()
+        );
+        let _: CUmemGenericAllocationHandle = 0u64;
+    }
+
+    #[test]
+    fn test_mem_location_type_repr() {
+        assert_eq!(CUmemLocationType::Invalid as u32, 0);
+        assert_eq!(CUmemLocationType::Device as u32, 1);
+        assert_eq!(CUmemLocationType::Host as u32, 2);
+        assert_eq!(CUmemLocationType::HostNuma as u32, 3);
+        assert_eq!(CUmemLocationType::HostNumaCurrent as u32, 4);
+    }
+
+    #[test]
+    fn test_mem_allocation_type_repr() {
+        assert_eq!(CUmemAllocationType::Invalid as u32, 0);
+        assert_eq!(CUmemAllocationType::Pinned as u32, 1);
+        assert_eq!(CUmemAllocationType::Max as u32, 0x7fff_ffff);
+    }
+
+    #[test]
+    fn test_mem_allocation_handle_type_repr() {
+        assert_eq!(CUmemAllocationHandleType::None as u32, 0);
+        assert_eq!(CUmemAllocationHandleType::PosixFileDescriptor as u32, 1);
+        assert_eq!(CUmemAllocationHandleType::Win32 as u32, 2);
+        assert_eq!(CUmemAllocationHandleType::Win32Kmt as u32, 4);
+        assert_eq!(CUmemAllocationHandleType::Fabric as u32, 8);
+    }
+
+    #[test]
+    fn test_mem_access_flags_repr() {
+        assert_eq!(CUmemAccessFlags::None as u32, 0);
+        assert_eq!(CUmemAccessFlags::Read as u32, 1);
+        assert_eq!(CUmemAccessFlags::ReadWrite as u32, 3);
+        assert_eq!(CUmemAccessFlags::Max as u32, 0x7fff_ffff);
+    }
+
+    #[test]
+    fn test_mem_location_layout() {
+        // Two consecutive 4-byte fields → 8 bytes, alignment 4.
+        assert_eq!(std::mem::size_of::<CUmemLocation>(), 8);
+        assert_eq!(std::mem::align_of::<CUmemLocation>(), 4);
+        let loc = CUmemLocation::default();
+        assert_eq!(loc.loc_type, 0);
+        assert_eq!(loc.id, 0);
+    }
+
+    #[test]
+    fn test_mem_access_desc_layout() {
+        // CUmemLocation (8) + flags (u32 = 4) → 12 bytes, alignment 4.
+        assert_eq!(std::mem::size_of::<CUmemAccessDesc>(), 12);
+        assert_eq!(std::mem::align_of::<CUmemAccessDesc>(), 4);
+        let desc = CUmemAccessDesc::default();
+        assert_eq!(desc.flags, 0);
+    }
+
+    #[test]
+    fn test_mem_allocation_prop_default_zeroed() {
+        let prop = CUmemAllocationProp::default();
+        assert_eq!(prop.alloc_type, 0);
+        assert_eq!(prop.requested_handle_types, 0);
+        assert_eq!(prop.location.loc_type, 0);
+        assert_eq!(prop.location.id, 0);
+        assert!(prop.win32_handle_meta_data.is_null());
+        assert_eq!(prop.alloc_flags, 0);
+    }
+
+    #[test]
+    fn test_mem_pool_props_default_zeroed_and_padded() {
+        let props = CUmemPoolProps::default();
+        assert_eq!(props.alloc_type, 0);
+        assert_eq!(props.handle_types, 0);
+        assert_eq!(props.location.loc_type, 0);
+        assert_eq!(props.location.id, 0);
+        assert!(props.win32_security_attributes.is_null());
+        assert_eq!(props.max_size, 0);
+        assert!(props.reserved.iter().all(|&b| b == 0));
+        // The CUDA ABI mandates 56 reserved bytes.
+        assert_eq!(props.reserved.len(), 56);
+    }
+
+    #[test]
+    fn test_memcpy2d_default_zeroed() {
+        let m = CUDA_MEMCPY2D::default();
+        assert_eq!(m.src_x_in_bytes, 0);
+        assert_eq!(m.src_y, 0);
+        assert_eq!(m.src_memory_type, 0);
+        assert!(m.src_host.is_null());
+        assert_eq!(m.src_device, 0);
+        assert!(m.src_array.is_null());
+        assert_eq!(m.src_pitch, 0);
+        assert_eq!(m.dst_x_in_bytes, 0);
+        assert_eq!(m.dst_y, 0);
+        assert_eq!(m.dst_memory_type, 0);
+        assert!(m.dst_host.is_null());
+        assert_eq!(m.dst_device, 0);
+        assert!(m.dst_array.is_null());
+        assert_eq!(m.dst_pitch, 0);
+        assert_eq!(m.width_in_bytes, 0);
+        assert_eq!(m.height, 0);
+    }
+}

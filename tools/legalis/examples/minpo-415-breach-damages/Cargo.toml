@@ -1,0 +1,12 @@
+[package]
+name = "minpo-415-breach-damages"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "minpo-415-breach-damages"
+path = "src/main.rs"
+
+[dependencies]
+legalis-jp = { path = "../../jurisdictions/jp" }

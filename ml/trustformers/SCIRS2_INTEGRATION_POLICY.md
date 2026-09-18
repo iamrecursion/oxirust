@@ -1,0 +1,875 @@
+# TrustformeRS SciRS2 Integration Policy
+
+## 🚨 CRITICAL REQUIREMENT: Complete SciRS2-Core Integration
+
+**TrustformeRS MUST use SciRS2-Core as its complete CPU scientific computing foundation** (arrays, RNG, SIMD, parallelism, BLAS). This policy establishes mandatory requirements for proper integration following the [SciRS2 POLICY](https://github.com/cool-japan/scirs/blob/master/SCIRS2_POLICY.md). **GPU compute is out of scope for scirs2-core**: it is handled exclusively by `trustformers-core`'s `gpu_ops` module, backed by the Pure Rust **OxiCUDA** crate family (see [GPU Operations Critical Policy](#gpu-operations-critical-policy)).
+
+**Status**: 🔴 **PARTIAL COMPLIANCE** - Systematic remediation required
+
+## Table of Contents
+
+1. [Core Architectural Principles](#core-architectural-principles)
+2. [Dual-Layer Architecture](#dual-layer-architecture)
+3. [Forbidden Direct Dependencies](#forbidden-direct-dependencies)
+4. [Required Abstractions](#required-abstractions)
+5. [Performance & Hardware Acceleration](#performance--hardware-acceleration)
+6. [GPU Operations Critical Policy](#gpu-operations-critical-policy)
+7. [Implementation Patterns](#implementation-patterns)
+8. [Migration from Current State](#migration-from-current-state)
+9. [Enforcement](#enforcement)
+
+---
+
+## Core Architectural Principles
+
+### Layered Architecture (MANDATORY)
+
+```
+Application Layer (trustformers-models, trustformers-serve, etc.)
+                    ↓ MUST use abstractions only
+    TrustformeRS-Core (ML-specific: tensors, layers, models, tokenizers)
+                    ↓ delegates CPU scientific computing to      ↓ delegates GPU compute to
+         SciRS2-Core (CPU: SIMD, parallel, BLAS, random)    gpu_ops (OxiCUDA backends: cuda/metal)
+                    ↓ manages                                    ↓ manages
+      External Dependencies (rand, ndarray, rayon, etc.)    oxicuda-blas/dnn/memory/driver, oxicuda-metal/backend
+```
+
+**Critical Rule**: Only `trustformers-core` and `scirs2-core` may import external dependencies directly.
+
+### Compliance Requirement
+
+**ALL TrustformeRS crates EXCEPT `trustformers-core` source code MUST**:
+- ✅ Use `trustformers_core::*` for ML/DL operations
+- ✅ Use `scirs2_core::*` for scientific computing
+- ❌ NEVER import external dependencies directly
+
+**Applies to**:
+- All module crates (`trustformers-models`, `trustformers-training`, etc.)
+- **ALL tests** (including in `trustformers-core`)
+- **ALL examples** and benchmarks
+- **ALL documentation code**
+
+---
+
+## Dual-Layer Architecture
+
+### Layer 1: TrustformeRS-Core (ML/DL Framework)
+
+**Purpose**: Transformer-specific operations and model abstractions
+
+```rust
+// ✅ Use trustformers-core for:
+use trustformers_core::tensor::Tensor;           // Unified tensor type
+use trustformers_core::device::Device;           // Device management
+use trustformers_core::layers::*;                // Attention, FFN, LayerNorm, etc.
+use trustformers_core::models::*;                // AutoModel, model loading
+use trustformers_core::tokenizer::*;             // AutoTokenizer, encoding
+use trustformers_core::quantization::*;          // Quantization operations
+use trustformers_core::error::TrustformersError; // Error types
+```
+
+### Layer 2: SciRS2-Core (Scientific Computing)
+
+**Purpose**: CPU scientific computing primitives (SIMD, parallel, BLAS, random)
+
+```rust
+// ✅ Use scirs2-core for:
+use scirs2_core::ndarray::*;              // Arrays (Array, Array1, array!, s!)
+use scirs2_core::random::*;               // RNG + distributions (Normal, Uniform, etc.)
+use scirs2_core::{Complex, Complex32, Complex64};  // Complex numbers (root level)
+use scirs2_core::parallel_ops::*;        // Parallel processing (rayon replacement)
+use scirs2_core::simd_ops::*;            // SIMD operations
+```
+
+**Note**: `scirs2-core` is the CPU scientific substrate only. **GPU compute does NOT go
+through scirs2-core** — it goes through `trustformers-core`'s `gpu_ops` module, which is
+backed by the OxiCUDA family of crates (see [GPU Operations Critical Policy](#gpu-operations-critical-policy)).
+
+---
+
+## Forbidden Direct Dependencies
+
+### Core Scientific Computing - Use SciRS2-Core Instead
+
+```rust
+// ❌ FORBIDDEN in ALL crates (including tests)
+
+// Random Number Generation
+use rand::*;
+use rand::Rng;
+use rand::thread_rng;
+use rand_distr::{Normal, Uniform, Beta, Gamma, Exp, Cauchy, StudentT};
+
+// Array Operations
+use ndarray::*;
+use ndarray::{Array, Array1, Array2, ArrayD, IxDyn, Axis};
+use ndarray::{array, s, azip};  // Macros
+use ndarray_rand::*;
+
+// Complex Numbers
+use num_complex::{Complex, Complex32, Complex64};
+
+// Numerical Traits
+use num_traits::{Float, Zero, One, NumCast};
+```
+
+### Parallelization - Use SciRS2-Core Instead
+
+```rust
+// ❌ FORBIDDEN - Direct parallelization
+
+use rayon::*;
+use rayon::prelude::*;
+use rayon::iter::ParallelIterator;
+use rayon_core::*;
+```
+
+**Rationale**: SciRS2-core provides unified, optimized parallel operations. Direct rayon use:
+1. Bypasses SciRS2's unified performance layer
+2. Creates fragmented parallelization strategies
+3. Prevents centralized tuning
+
+### GPU & Hardware Acceleration - Use TrustformeRS-Core `gpu_ops` (OxiCUDA)
+
+```rust
+// ❌ FORBIDDEN - Direct GPU libraries (bypassing trustformers-core::gpu_ops)
+
+// Raw CUDA bindings
+use cudarc::*;
+use cuda_sys::*;
+
+// Raw Metal bindings
+use metal::*;
+use objc2_metal::*;
+use objc2_metal_performance_shaders::*;
+
+// WebGPU
+use wgpu::*;
+use pollster::*;
+
+// OpenCL
+use opencl3::*;
+
+// Vulkan
+use vulkano::*;
+
+// ❌ ALSO FORBIDDEN - scirs2-core does NOT provide GPU APIs
+use scirs2_core::gpu_ops::*;   // scirs2-core has no GPU surface; this is not a real module
+```
+
+**Rationale**: GPU backend selection is **not** a scirs2-core responsibility. All GPU compute
+goes through `trustformers_core::gpu_ops`, which is implemented on top of the **OxiCUDA**
+Pure Rust GPU ecosystem:
+- `cuda` feature → `oxicuda-blas`, `oxicuda-dnn`, `oxicuda-memory`, `oxicuda-driver` (NVIDIA)
+- `metal` feature → `oxicuda-metal`, `oxicuda-backend` (Apple)
+
+`scirs2-core` remains mandatory, but strictly for the **CPU** substrate (`ndarray`, `random`,
+`simd_ops`, `parallel_ops`) — it is never the path for GPU dispatch.
+
+### ML/DL Frameworks - Use TrustformeRS-Core Instead
+
+```rust
+// ❌ FORBIDDEN - Direct ML framework usage
+
+// Tensor Backends
+use tch::*;                    // PyTorch
+use tch::Tensor;
+use candle_core::*;            // Candle
+use candle_core::Tensor;
+use ort::*;                    // ONNX Runtime (replaced by oxionnx)
+
+// Tokenization
+use tokenizers::*;
+use tokenizers::Tokenizer;
+```
+
+```rust
+// ✅ ALLOWED - Use oxionnx (COOLJAPAN Pure Rust ONNX)
+use oxionnx::*;                // Pure Rust ONNX Runtime replacement
+```
+
+**Rationale**: TrustformeRS-core provides unified abstractions. Use `trustformers_core::tensor` and `trustformers_core::tokenizer`. For ONNX inference, use `oxionnx` (COOLJAPAN Pure Rust ONNX Runtime) instead of `ort`.
+
+---
+
+## Required Abstractions
+
+### Complete Import Reference Card
+
+```rust
+// ═══════════════════════════════════════════════════════════════════════
+// TRUSTFORMERS-CORE USAGE (ML/DL Operations)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Tensor Operations
+use trustformers_core::tensor::{Tensor, TensorOps};
+use trustformers_core::device::Device;
+
+// Model Components
+use trustformers_core::layers::{Linear, LayerNorm, Dropout, MultiHeadAttention};
+use trustformers_core::models::{AutoModel, Model};
+use trustformers_core::tokenizer::{AutoTokenizer, Tokenizer, Encoding};
+
+// Quantization
+use trustformers_core::quantization::{QuantizationEngine, QuantizationMethod};
+
+// Error Handling
+use trustformers_core::error::{TrustformersError, Result};
+
+// ═══════════════════════════════════════════════════════════════════════
+// SCIRS2-CORE USAGE (Scientific Computing)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Arrays and Numerical Operations (COMPLETE functionality including macros)
+use scirs2_core::ndarray::*;  // Full ndarray + ALL macros (array!, s!, azip!)
+// OR selective:
+use scirs2_core::ndarray::{Array, Array1, Array2, ArrayD, Axis, IxDyn, array, s};
+
+// Random Number Generation (COMPLETE rand + rand_distr)
+use scirs2_core::random::*;  // Full RNG + all distributions
+// OR selective:
+use scirs2_core::random::{thread_rng, Normal, Uniform, RandBeta, Gamma, Exp};
+
+// Complex Numbers (at ROOT level, not in submodule)
+use scirs2_core::{Complex, Complex32, Complex64};
+
+// Parallel Processing (rayon replacement)
+use scirs2_core::parallel_ops::*;
+
+// SIMD Operations
+use scirs2_core::simd_ops::{SimdUnifiedOps, PlatformCapabilities};
+
+// ═══════════════════════════════════════════════════════════════════════
+// GPU OPERATIONS (OxiCUDA, via trustformers-core — NOT scirs2-core)
+// ═══════════════════════════════════════════════════════════════════════
+use trustformers_core::gpu_ops::*;  // Requires 'cuda' and/or 'metal' feature
+```
+
+### Cargo.toml Configuration Examples
+
+#### Application Crate (trustformers-models, etc.)
+
+```toml
+[dependencies]
+# TrustformeRS abstractions
+trustformers-core = { workspace = true }
+
+# SciRS2 scientific computing (NO direct external deps!)
+scirs2-core = { workspace = true, features = ["random", "parallel", "simd"] }
+
+# ❌ FORBIDDEN (SciRS2 Policy Violations):
+# rand = { workspace = true }         # Use scirs2_core::random
+# ndarray = { workspace = true }      # Use scirs2_core::ndarray
+# rayon = { workspace = true }        # Use scirs2_core::parallel_ops
+# cudarc = "0.17"                     # Use trustformers-core 'cuda' feature (OxiCUDA)
+# metal = "0.32"                      # Use trustformers-core 'metal' feature (OxiCUDA)
+```
+
+#### TrustformeRS-Core (Foundation Layer)
+
+```toml
+[dependencies]
+# SciRS2 foundation (CPU scientific substrate only)
+scirs2-core = { workspace = true, features = ["random", "parallel", "simd", "linalg"] }
+
+# ML/DL frameworks (ONLY in trustformers-core!)
+tokenizers = { workspace = true }
+safetensors = { workspace = true }
+
+# External dependencies (ONLY in trustformers-core!)
+ndarray = { workspace = true, features = ["blas"] }
+rand = { workspace = true }
+rayon = { workspace = true }
+
+# GPU compute (OxiCUDA, ONLY in trustformers-core! feature-gated, optional)
+oxicuda-blas = { workspace = true, optional = true }      # cuda feature
+oxicuda-dnn = { workspace = true, optional = true }       # cuda feature
+oxicuda-memory = { workspace = true, optional = true }    # cuda feature
+oxicuda-driver = { workspace = true, optional = true }    # cuda feature
+oxicuda-metal = { workspace = true, optional = true }     # metal feature
+oxicuda-backend = { workspace = true, optional = true }   # metal feature
+
+# ⚠️ Note: trustformers-core re-exports CPU primitives through scirs2-core for modules.
+# GPU primitives are exposed to modules exclusively via trustformers_core::gpu_ops —
+# scirs2-core has no GPU surface and must never be used for GPU dispatch.
+```
+
+---
+
+## Performance & Hardware Acceleration
+
+### SIMD Operations (MANDATORY scirs2-core)
+
+```rust
+// ✅ REQUIRED: Use scirs2-core SIMD operations
+use scirs2_core::simd_ops::SimdUnifiedOps;
+
+let result = f32::simd_add(&a.view(), &b.view());
+let dot = f64::simd_dot(&x.view(), &y.view());
+
+// ❌ FORBIDDEN: Direct SIMD
+// use wide::f32x8;             // POLICY VIOLATION
+// use std::arch::x86_64::*;    // POLICY VIOLATION
+```
+
+### Parallel Processing (MANDATORY scirs2-core)
+
+```rust
+// ✅ REQUIRED: Use scirs2-core parallel ops
+use scirs2_core::parallel_ops::*;
+
+let results: Vec<_> = data
+    .par_iter()  // From scirs2_core::parallel_ops
+    .map(|x| expensive_computation(x))
+    .collect();
+
+// ❌ FORBIDDEN: Direct Rayon
+// use rayon::prelude::*;       // POLICY VIOLATION
+```
+
+### BLAS Operations (MANDATORY scirs2-core)
+
+All BLAS operations go through scirs2-core's backend selection:
+
+```rust
+// ✅ REQUIRED: ndarray with BLAS via scirs2-core
+use scirs2_core::ndarray::{Array2, s};
+
+let a = Array2::zeros((1000, 1000));
+let b = Array2::ones((1000, 1000));
+let c = a.dot(&b);  // Uses Accelerate/OpenBLAS/MKL via scirs2-core
+
+// ❌ FORBIDDEN: Direct BLAS dependency
+// use cblas_sys::*;            // POLICY VIOLATION
+// use openblas_src::*;         // POLICY VIOLATION
+```
+
+---
+
+## GPU Operations Critical Policy
+
+### The Three Rules of GPU Usage
+
+1. **High-level tensor ops** → `trustformers_core::tensor`
+2. **Low-level GPU primitives** → `trustformers_core::gpu_ops` (backed by OxiCUDA)
+3. **Direct GPU libraries (raw CUDA/Metal bindings, or `scirs2_core::gpu_ops`)** → ❌ FORBIDDEN
+
+**`scirs2-core` has no role in GPU dispatch.** It supplies CPU-side scientific computing
+(`ndarray`, `random`, `simd_ops`, `parallel_ops`) only. All GPU acceleration is implemented
+inside `trustformers-core`'s `gpu_ops` module on top of the Pure Rust **OxiCUDA** crate family.
+
+### Feature Flag Configuration
+
+```toml
+# ✅ CORRECT: Enable GPU through trustformers-core features (OxiCUDA-backed)
+[dependencies]
+trustformers-core = { workspace = true, features = ["metal"] }   # Apple (oxicuda-metal, oxicuda-backend)
+trustformers-core = { workspace = true, features = ["cuda"] }    # NVIDIA (oxicuda-blas/dnn/memory/driver)
+
+# ❌ INCORRECT: Direct GPU dependencies
+# metal = "0.32"               # Use trustformers-core with 'metal' feature
+# cudarc = "0.17"               # Use trustformers-core with 'cuda' feature
+
+# ❌ INCORRECT: scirs2-core GPU features (do not exist / must not be used)
+# scirs2-core = { workspace = true, features = ["gpu", "metal"] }
+# scirs2-core = { workspace = true, features = ["gpu", "cuda"] }
+```
+
+### GPU Usage Patterns
+
+```rust
+// ✅ High-Level (Recommended)
+use trustformers_core::tensor::Tensor;
+use trustformers_core::device::Device;
+
+let device = Device::cuda_if_available()?;
+let tensor = Tensor::randn(&[1024, 768])?.to_device(&device)?;
+let result = tensor.matmul(&weights)?.relu()?;
+
+// ✅ Low-Level (Advanced) — trustformers-core::gpu_ops, backed by OxiCUDA
+use trustformers_core::gpu_ops::*;
+use scirs2_core::simd_ops::PlatformCapabilities;  // CPU capability detection only
+
+let caps = PlatformCapabilities::detect();
+if caps.metal_available {
+    // Use GPU-accelerated operations from trustformers-core's OxiCUDA-backed gpu_ops
+    let result = gpu_matmul(&a, &b)?;
+}
+
+// ❌ FORBIDDEN: Direct GPU usage
+// use metal::*;                // POLICY VIOLATION
+// use cudarc::*;               // POLICY VIOLATION
+// use scirs2_core::gpu_ops::*; // POLICY VIOLATION (no such GPU surface in scirs2-core)
+```
+
+### Historical Note
+
+`trustformers-core/src/gpu_ops/metal.rs` and `gpu_ops/cuda.rs` implement Metal and CUDA
+backends directly inside `trustformers-core`. This is **by design**: `trustformers-core` is
+the one layer permitted to own GPU dispatch, and it does so through the OxiCUDA Pure Rust
+crates rather than raw `metal`/`cudarc` bindings.
+
+```rust
+// ❌ NOT ALLOWED (raw platform bindings)
+use metal::{Device as MetalDevice, CommandQueue};  // Direct Metal usage
+
+// ✅ POLICY COMPLIANT: gpu_ops wraps OxiCUDA internally, exposed via trustformers-core
+use trustformers_core::gpu_ops::MetalBackend;  // OxiCUDA-backed (oxicuda-metal, oxicuda-backend)
+```
+
+**Note**: `trustformers-core::gpu_ops` may use `objc2-metal`/`mpsgraph` internally as
+interop shims for the OxiCUDA Metal backend where required by the platform, but the public
+GPU surface consumed by other crates is always `trustformers_core::gpu_ops`, never a raw
+platform crate and never `scirs2_core` (which has no GPU API).
+
+---
+
+## Forbidden Direct Dependencies
+
+### Complete Prohibited List
+
+| Category | Forbidden Crates | Use Instead |
+|----------|-----------------|-------------|
+| **Arrays** | `ndarray`, `ndarray-rand`, `ndarray-stats` | `scirs2_core::ndarray` |
+| **Random** | `rand`, `rand_distr`, `rand_chacha` | `scirs2_core::random` |
+| **Complex** | `num-complex` | `scirs2_core::Complex*` |
+| **Parallel** | `rayon`, `rayon-core` | `scirs2_core::parallel_ops` |
+| **SIMD** | `wide`, `packed_simd`, `std::arch` | `scirs2_core::simd_ops` |
+| **BLAS** | `cblas-sys`, `openblas-src`, `mkl-src` | `scirs2_core` (auto-selects) |
+| **GPU-CUDA** | `cudarc`, `cuda-sys`, direct `scirs2_core::gpu_ops` | `trustformers_core::gpu_ops` + `features = ["cuda"]` (OxiCUDA: `oxicuda-blas`/`dnn`/`memory`/`driver`) |
+| **GPU-Metal** | `metal`, `objc2-metal`, `objc2-metal-performance-shaders`, direct `scirs2_core::gpu_ops` | `trustformers_core::gpu_ops` + `features = ["metal"]` (OxiCUDA: `oxicuda-metal`, `oxicuda-backend`) |
+| **GPU-WebGPU** | `wgpu`, `pollster` | `trustformers_core::gpu_ops` + `features = ["wgpu_backend"]` |
+| **GPU-OpenCL** | `opencl3` | `trustformers_core::gpu_ops` + `features = ["opencl"]` |
+| **Tensors** | `tch`, `candle-core`, `ort` | `trustformers_core::tensor` |
+| **Tokenizers** | `tokenizers` | `trustformers_core::tokenizer` |
+
+---
+
+## Required Abstractions
+
+### Typical Model Implementation Imports
+
+```rust
+// Complete example for trustformers-models crate
+
+// TrustformeRS Core (ML/DL operations)
+use trustformers_core::{
+    tensor::Tensor,
+    device::Device,
+    layers::{Linear, LayerNorm, Dropout, MultiHeadAttention},
+    error::{TrustformersError, Result},
+};
+
+// SciRS2 Core (Scientific computing)
+use scirs2_core::random::*;              // Weight initialization
+use scirs2_core::ndarray::{Array2, s};   // If array operations needed
+
+// Now you have access to:
+// - Tensor operations (from trustformers_core)
+// - Random distributions (from scirs2_core)
+// - Array manipulation (from scirs2_core)
+// - Parallel processing (from scirs2_core::parallel_ops)
+```
+
+### Test Code Imports
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ✅ REQUIRED test imports
+    use trustformers_core::tensor::Tensor;
+    use scirs2_core::random::*;        // For test data generation
+    use scirs2_core::ndarray::{array, Array1, s};  // For test assertions
+
+    #[test]
+    fn test_forward_pass() {
+        let mut rng = thread_rng();  // From scirs2_core::random
+        let normal = Normal::new(0.0, 1.0).unwrap();
+
+        let input = Tensor::randn(&[2, 4, 512])?;  // From trustformers_core
+        let test_arr = array![1.0, 2.0, 3.0];      // From scirs2_core::ndarray
+
+        let model = MyModel::new(&config)?;
+        let output = model.forward(input)?;
+
+        assert_eq!(output.shape(), &[2, 4, 512]);
+    }
+}
+```
+
+---
+
+## Implementation Patterns
+
+### Pattern 1: Weight Initialization
+
+```rust
+use trustformers_core::layers::Linear;
+use scirs2_core::random::*;
+
+pub struct TransformerBlock {
+    self_attn: MultiHeadAttention,
+    feed_forward: FeedForward,
+}
+
+impl TransformerBlock {
+    pub fn new(config: &Config) -> Result<Self> {
+        // ✅ Use scirs2_core for RNG
+        let mut rng = thread_rng();
+        let normal = Normal::new(0.0, 0.02).unwrap();
+
+        Ok(Self {
+            self_attn: MultiHeadAttention::new(config)?,
+            feed_forward: FeedForward::new(config)?,
+        })
+    }
+}
+```
+
+### Pattern 2: Batch Processing with Parallelization
+
+```rust
+use trustformers_core::tokenizer::AutoTokenizer;
+use scirs2_core::parallel_ops::*;
+
+pub fn batch_tokenize(texts: &[String], model: &str) -> Result<Vec<Encoding>> {
+    let tokenizer = AutoTokenizer::from_pretrained(model)?;
+
+    // ✅ Parallel processing via scirs2_core
+    let results: Vec<_> = texts
+        .par_iter()  // From scirs2_core::parallel_ops
+        .map(|text| tokenizer.encode(text, true))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(results)
+}
+```
+
+### Pattern 3: Platform-Aware Device Selection
+
+```rust
+use trustformers_core::device::Device;
+use scirs2_core::simd_ops::PlatformCapabilities;
+
+pub fn get_optimal_device() -> Device {
+    let caps = PlatformCapabilities::detect();  // From scirs2_core
+
+    if caps.cuda_available {
+        Device::cuda(0).unwrap()
+    } else if caps.metal_available {
+        Device::metal(0).unwrap()
+    } else {
+        Device::cpu()
+    }
+}
+```
+
+### Pattern 4: Array Operations in Tests
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scirs2_core::ndarray::{array, Array2, s};  // Complete functionality
+
+    #[test]
+    fn test_layer_forward() {
+        // ✅ array! macro from scirs2_core
+        let input = array![[1.0, 2.0], [3.0, 4.0]];
+
+        // ✅ Slicing with s! macro
+        let slice = input.slice(s![0..1, ..]);
+
+        // ✅ Array construction
+        let weights = Array2::zeros((4, 8));
+
+        assert_eq!(slice.shape(), &[1, 2]);
+    }
+}
+```
+
+---
+
+## Migration from Current State
+
+### Current Violations in TrustformeRS
+
+**Identified Issues**:
+
+1. **trustformers-core uses direct dependencies**:
+   - `use ndarray::*;` - Should use `scirs2_core::ndarray`
+   - `use rand::*;` - Should use `scirs2_core::random`
+   - `use rayon::*;` - Should use `scirs2_core::parallel_ops`
+   - GPU: raw `metal`/`cudarc` internals - Should route through `trustformers_core::gpu_ops`
+     (OxiCUDA-backed) — **not** through `scirs2_core`, which has no GPU API
+
+2. **trustformers-models has inline violations**:
+   - `ndarray::Array2::zeros()` - Should import from scirs2_core
+   - `ndarray::s![]` - Should import macro from scirs2_core
+
+3. **Performance impact**:
+   - Missing SciRS2's Accelerate BLAS integration (CPU path)
+   - Missing SciRS2's SIMD optimizations (CPU path)
+   - Naive matmul kernel instead of optimized BLAS (CPU path)
+   - GPU-side optimization (MPS, cuBLAS-equivalent) is delivered via OxiCUDA
+     inside `trustformers_core::gpu_ops`, independent of the scirs2-core migration
+
+### Migration Priority
+
+#### Phase 1: Enable SciRS2 Features in Workspace (HIGH PRIORITY, CPU only)
+```toml
+# Cargo.toml workspace dependencies
+scirs2-core = { version = "0.3.0", features = [
+    "random",       # Replaces rand/rand_distr
+    "parallel",     # Replaces rayon
+    "simd",         # SIMD optimizations
+    "linalg",       # BLAS operations
+]}
+# GPU features are NOT requested from scirs2-core (no such surface).
+# GPU is enabled on trustformers-core instead: features = ["cuda"] / ["metal"]
+```
+
+#### Phase 2: Update trustformers-core to Re-Export SciRS2 (CPU primitives)
+
+```rust
+// trustformers-core/src/lib.rs
+
+// Re-export SciRS2 scientific computing (for module access)
+pub use scirs2_core::{
+    ndarray,        // Complete ndarray functionality
+    random,         // Complete rand + rand_distr
+    parallel_ops,   // Parallel processing
+    simd_ops,       // SIMD operations
+    Complex, Complex32, Complex64,  // Complex numbers
+};
+
+// Note: Direct usage of external deps in trustformers-core source is OK,
+// but tests and examples should use scirs2_core::* imports.
+// GPU primitives are NOT re-exported from scirs2_core (see Phase 3).
+```
+
+#### Phase 3: GPU Backend — OxiCUDA via `trustformers_core::gpu_ops`
+
+```rust
+// trustformers-core/src/gpu_ops/mod.rs
+
+#[cfg(feature = "metal")]
+pub use metal_backend::MetalBackend;   // Backed by oxicuda-metal + oxicuda-backend
+
+#[cfg(feature = "cuda")]
+pub use cuda_backend::CudaBackend;     // Backed by oxicuda-blas/dnn/memory/driver
+
+// scirs2_core is never imported here for GPU purposes — it has no gpu_ops module.
+// trustformers-core owns GPU dispatch end-to-end via the OxiCUDA crate family.
+```
+
+#### Phase 4: Fix Modules (trustformers-models, etc.)
+
+```rust
+// ❌ BEFORE (Policy Violation)
+use ndarray::{Array2, s};
+let arr = ndarray::Array2::zeros((10, 10));
+
+// ✅ AFTER (Policy Compliant)
+use scirs2_core::ndarray::{Array2, s};
+let arr = Array2::zeros((10, 10));
+```
+
+### Expected Performance Gains from Full SciRS2 + OxiCUDA Integration
+
+| Component | Current (naive) | With SciRS2 / OxiCUDA | Speedup |
+|-----------|----------------|-------------|---------|
+| matmul (GPU) | Custom kernel | OxiCUDA (`oxicuda-blas`/`oxicuda-metal`) | **100-500x** |
+| ndarray.dot() (CPU) | Pure Rust | Accelerate BLAS via scirs2-core | **10-50x** |
+| Random generation (CPU) | Generic impl | Optimized RNG via scirs2-core | **2-5x** |
+| Parallel ops (CPU) | Manual rayon | Tuned scirs2-core | **1.5-3x** |
+| **TOTAL** | ~1 tok/sec | **50-200 tok/sec** | **50-200x** |
+
+---
+
+## Enforcement
+
+### CI/CD Checks
+
+```yaml
+# .github/workflows/policy-check.yml
+- name: SciRS2 Policy Compliance Check
+  run: |
+    # Scientific computing violations
+    ! grep -r "^use ndarray::" trustformers-models/src trustformers-training/src
+    ! grep -r "^use rand::" trustformers-models/src trustformers-training/src
+    ! grep -r "^use rayon::" trustformers-models/src trustformers-training/src
+
+    # GPU violations
+    ! grep -r "^use metal::" trustformers-models/src
+    ! grep -r "^use cudarc::" trustformers-models/src
+    ! grep -r "scirs2_core::gpu_ops" trustformers-models/src trustformers-training/src  # scirs2-core has no GPU API
+
+    # Inline usage violations
+    ! grep -r "ndarray::" trustformers-models/src | grep -v "scirs2_core::ndarray"
+    ! grep -r "rand::" trustformers-models/src | grep -v "scirs2_core::random"
+
+    # Cargo.toml violations
+    ! grep -E '^(ndarray|rand|rayon|metal|cudarc)[[:space:]]*=' \
+      trustformers-models/Cargo.toml \
+      trustformers-training/Cargo.toml
+```
+
+### Code Review Checklist
+
+#### Scientific Computing
+- [ ] All array operations use `scirs2_core::ndarray`
+- [ ] RNG uses `scirs2_core::random`
+- [ ] Complex numbers use `scirs2_core::Complex*`
+- [ ] No `ndarray::` inline qualified paths
+
+#### Parallelization
+- [ ] No `rayon` dependency in Cargo.toml
+- [ ] Parallel ops use `scirs2_core::parallel_ops`
+- [ ] No direct rayon imports
+
+#### GPU Operations
+- [ ] No direct GPU dependencies (raw `metal`, `cudarc`) in downstream crates' Cargo.toml
+- [ ] GPU features enabled via `trustformers-core = { features = ["metal"] }` / `["cuda"]` (OxiCUDA-backed)
+- [ ] Device management via `trustformers_core::device::Device`
+- [ ] GPU dispatch goes exclusively through `trustformers_core::gpu_ops` (OxiCUDA)
+- [ ] `scirs2_core::gpu_ops` is never referenced — scirs2-core has no GPU surface
+
+#### ML/DL Operations
+- [ ] Tensors use `trustformers_core::tensor`
+- [ ] Tokenization uses `trustformers_core::tokenizer`
+- [ ] Layers use `trustformers_core::layers`
+
+---
+
+## Quick Reference
+
+### Dos and Don'ts
+
+#### ✅ DO
+
+```rust
+// Scientific computing (CPU)
+use scirs2_core::ndarray::{Array2, array, s};
+use scirs2_core::random::{thread_rng, Normal};
+use scirs2_core::parallel_ops::*;
+
+// GPU compute (OxiCUDA, via trustformers-core)
+use trustformers_core::gpu_ops::*;
+
+// ML/DL operations
+use trustformers_core::tensor::Tensor;
+use trustformers_core::layers::Linear;
+use trustformers_core::tokenizer::AutoTokenizer;
+
+// Test code
+#[cfg(test)]
+use scirs2_core::random::*;  // For generating test data
+```
+
+#### ❌ DON'T
+
+```rust
+// ❌ Direct scientific computing imports
+use ndarray::Array2;
+use rand::thread_rng;
+use rayon::prelude::*;
+
+// ❌ Direct GPU imports
+use metal::*;
+use cudarc::*;
+
+// ❌ scirs2-core GPU imports (no such API exists — GPU is OxiCUDA via trustformers-core)
+use scirs2_core::gpu_ops::*;
+
+// ❌ Direct ML framework imports
+use tokenizers::Tokenizer;
+use tch::Tensor;
+
+// ❌ Inline qualified paths
+let arr = ndarray::Array2::zeros((10, 10));
+let mut rng = rand::thread_rng();
+```
+
+### Import Template for New Modules
+
+```rust
+// Standard imports for TrustformeRS modules
+
+// TrustformeRS Core (ML/DL)
+use trustformers_core::{
+    tensor::Tensor,
+    device::Device,
+    layers::{Linear, LayerNorm},
+    error::{Result, TrustformersError},
+};
+
+// SciRS2 Core (CPU Scientific Computing)
+use scirs2_core::random::*;           // RNG + distributions
+use scirs2_core::ndarray::{Array1, Array2, array, s};  // Arrays + macros
+use scirs2_core::parallel_ops::*;    // Parallel processing (if needed)
+
+// GPU Compute (OxiCUDA, via trustformers-core — only when GPU acceleration is needed)
+use trustformers_core::gpu_ops::*;
+
+// Module-specific imports
+use crate::config::ModelConfig;
+```
+
+---
+
+## Benefits of Full SciRS2 + OxiCUDA Integration
+
+1. **Performance**: Accelerate BLAS on CPU (100-500x faster matmul)
+2. **GPU Optimization**: Pure Rust OxiCUDA backends (`oxicuda-blas`/`oxicuda-metal`) for optimized kernels
+3. **Consistency**: Unified APIs across all modules
+4. **Maintainability**: Single dependency management point per layer (CPU: scirs2-core, GPU: OxiCUDA)
+5. **Type Safety**: No mixing of external types
+6. **Cross-Platform**: Automatic backend selection
+7. **Future-Proof**: Benefit from SciRS2 and OxiCUDA improvements automatically
+
+## Current Status & Action Items
+
+### 🔴 Current Compliance: ~30%
+
+**Violations**:
+- trustformers-core uses direct `ndarray`, `rand`, `rayon` outside the sanctioned re-export layer
+- trustformers-models has inline `ndarray::` usage
+- No Accelerate BLAS via scirs2-core (CPU path)
+
+**Resolved / not a violation**: GPU compute is intentionally implemented in
+`trustformers_core::gpu_ops` on top of OxiCUDA (`oxicuda-blas`, `oxicuda-dnn`,
+`oxicuda-memory`, `oxicuda-driver`, `oxicuda-metal`, `oxicuda-backend`) — this is the
+correct architecture, not a pending migration. `scirs2-core` must never be asked to
+provide GPU features; it has no such surface.
+
+### 🎯 Target: 100% Compliance
+
+**Action Items** (Priority Order):
+1. ✅ Enable `scirs2-core` features: `random`, `parallel`, `simd`, `linalg` (CPU only)
+2. ⏳ Update trustformers-core to delegate CPU scientific computing to scirs2-core
+3. ✅ GPU backend implemented via `trustformers_core::gpu_ops` (OxiCUDA) — complete
+4. ⏳ Fix inline `ndarray::`, `rand::` usage in modules
+5. ⏳ Benchmark performance gains
+
+---
+
+## Policy Version
+
+- **Version**: 2.1.0 - Complete SciRS2 (CPU) + OxiCUDA (GPU) Integration
+- **Effective Date**: 2026-03-20
+- **Last Updated**: 2026-07-06
+- **Status**: **ACTIVE - REMEDIATION REQUIRED (CPU); GPU policy is OxiCUDA-based and stable**
+- **Based On**:
+  - [SciRS2 POLICY v3.0.0](https://github.com/cool-japan/scirs/blob/master/SCIRS2_POLICY.md)
+  - [ToRSh SCIRS2 Policy v3.0](https://github.com/cool-japan/torsh/blob/master/SCIRS2_INTEGRATION_POLICY.md) - **96.7% compliance achieved**
+  - [TensorLogic SCIRS2 Policy](https://github.com/cool-japan/tensorlogic/blob/master/SCIRS2_INTEGRATION_POLICY.md)
+- **SciRS2 Version**: v0.3.0
+- **Next Review**: Q3 2026
+- **Owner**: COOLJAPAN OU (Team KitaSan)
+
+---
+
+**Remember**: When in doubt, use SciRS2-Core abstractions for scientific computing and TrustformeRS-Core abstractions for ML/DL operations!

@@ -1,0 +1,164 @@
+[package]
+name = "voirs-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/voirs-cli"
+keywords = ["voirs", "cli", "tts", "command-line", "speech"]
+categories = ["command-line-utilities", "multimedia::audio"]
+rust-version.workspace = true
+description = "Command-line interface for VoiRS speech synthesis"
+readme = "README.md"
+
+[[bin]]
+name = "voirs"
+path = "src/main.rs"
+
+[dependencies]
+# Core VoiRS crates
+voirs-sdk.workspace = true
+voirs-g2p.workspace = true
+voirs-acoustic.workspace = true
+voirs-evaluation.workspace = true
+voirs-vocoder.workspace = true
+voirs-dataset.workspace = true
+voirs-emotion = { workspace = true, optional = true }
+voirs-cloning = { workspace = true, optional = true }
+voirs-conversion = { workspace = true, optional = true }
+voirs-singing = { workspace = true, optional = true }
+voirs-spatial = { workspace = true, optional = true }
+
+# CLI framework
+clap.workspace = true
+clap_complete.workspace = true
+
+# Async support
+async-trait.workspace = true
+
+# Audio I/O
+hound.workspace = true
+cpal.workspace = true
+dasp.workspace = true
+
+# File handling and formats
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Progress and user interaction
+indicatif.workspace = true
+console.workspace = true
+dialoguer.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Additional utilities
+chrono.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+csv.workspace = true
+tempfile.workspace = true
+num_cpus.workspace = true
+dirs.workspace = true
+fastrand.workspace = true
+semver.workspace = true
+oxiarc-deflate.workspace = true
+lru.workspace = true
+uuid.workspace = true
+term_size = "0.3"
+
+# ML frameworks (for training)
+candle-core.workspace = true
+candle-nn.workspace = true
+
+# Platform-specific utilities
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Serialization formats for config
+serde_yaml.workspace = true
+base64.workspace = true
+
+# Model management
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+futures-util.workspace = true
+
+# AWS SigV4 / Azure Shared Key request signing (cloud/sigv4.rs, cloud/azure_backend.rs)
+hmac.workspace = true
+
+# Pure-Rust TLS provider (rustls + RustCrypto) — installed as process default in main()
+oxitls-adapter-rustls-rustcrypto.workspace = true
+rustls.workspace = true
+safetensors.workspace = true
+oxionnx-proto.workspace = true  # ONNX initializer extraction for `convert-model`
+bytemuck.workspace = true
+oxionnx = { workspace = true, optional = true }
+
+# Cloud storage encryption
+aes-gcm.workspace = true
+
+# Real asymmetric signature verification for the self-updater
+# (crates::packaging::update / packaging::signature)
+ed25519-dalek.workspace = true
+rsa.workspace = true
+p256.workspace = true
+
+# HTTP server
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+
+# Plugin system
+libloading.workspace = true
+wasmtime.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.2"
+predicates = "3.1"
+tempfile = "3.27"
+# Real OS-backed CSPRNG, used only to generate ephemeral test keypairs for
+# packaging::signature's unit tests (see doc-comment there for why 0.6.4).
+rand_core = { workspace = true, features = ["getrandom"] }
+
+[features]
+default = ["emotion", "cloning", "conversion", "singing", "spatial", "cloud"]
+gpu = ["voirs-acoustic/gpu", "voirs-vocoder/gpu", "voirs-sdk/gpu", "metal"]
+metal = ["voirs-acoustic/metal", "voirs-vocoder/metal"]
+cuda = ["voirs-acoustic/cuda", "voirs-vocoder/cuda"]
+onnx = ["voirs-acoustic/onnx", "voirs-vocoder/onnx", "voirs-sdk/onnx", "dep:oxionnx"]
+emotion = ["dep:voirs-emotion"]
+cloning = ["dep:voirs-cloning"]
+conversion = ["dep:voirs-conversion"]
+singing = ["dep:voirs-singing", "voirs-singing/midi-support"]
+# MusicXML score input for `voirs sing`. OFF by default: voirs-singing's
+# `musicxml-support` pulls the `musicxml` crate, whose .mxl handling depends on
+# miniz_oxide (COOLJAPAN policy keeps it out of default builds). Without it,
+# MusicXML scores are rejected with an error naming this feature.
+musicxml = ["singing", "voirs-singing/musicxml-support"]
+spatial = ["dep:voirs-spatial"]
+cloud = []
+# Forwards to voirs-dataset's `ffi-codecs` feature (Pure-Rust FLAC encode via
+# OxiAudio, plus C-FFI MP3 decode/encode). OFF by default to keep the default
+# build Pure Rust; `commands::dataset` tests use this to know, at compile
+# time, whether `voirs_dataset::audio::io::save_flac` will actually encode
+# FLAC or fall back to WAV.
+ffi-codecs = ["voirs-dataset/ffi-codecs"]
+[lints]
+workspace = true

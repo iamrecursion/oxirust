@@ -1,0 +1,42 @@
+[package]
+name = "oximedia-plugin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Plugin system for OxiMedia - dynamic codec loading"
+readme = "README.md"
+keywords = ["media", "plugin", "codec", "dynamic"]
+categories = ["multimedia::encoding"]
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-codec = { workspace = true, default-features = false, features = ["image-io"] }
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[features]
+default = []
+# `sha2` powers the optional plugin-file integrity check (SHA-256 digest
+# verification) in the dynamic loader; it travels with `libloading` since
+# both are only needed once dynamic loading is in play.
+dynamic-loading = ["libloading", "sha2"]
+
+[dependencies.libloading]
+workspace = true
+optional = true
+
+[dependencies.sha2]
+workspace = true
+optional = true
+
+[dev-dependencies]
+tempfile.workspace = true

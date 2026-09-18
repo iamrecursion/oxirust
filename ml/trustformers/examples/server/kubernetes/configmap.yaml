@@ -1,0 +1,41 @@
+# The previous version of this ConfigMap held a `server.yaml` / `log4rs.yaml`
+# pair describing a config-file schema (workers, keep_alive, a
+# `default_models` auto-load list, `inference.max_batch_size`, a `log4rs`
+# logging pipeline, ...) that `trustformers-server` never reads — the binary
+# has no config-file loader at all (see `src/main.rs`) and logs through
+# `tracing`/`tracing-subscriber`, not `log4rs`. It also was never wired into
+# `deployment.yaml` (no `envFrom`/`configMapKeyRef` referenced it), so it did
+# nothing either way.
+#
+# What follows instead is the real, complete list of environment variables
+# this binary reads (grep `std::env::var` in `src/main.rs`), consumed by
+# `deployment.yaml` via `envFrom`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trustformers-server-config
+  namespace: trustformers
+  labels:
+    app: trustformers-server
+    app.kubernetes.io/name: trustformers-server-config
+    app.kubernetes.io/instance: trustformers
+    app.kubernetes.io/component: config
+data:
+  RUST_LOG: "trustformers_server=info,tower_http=info"
+  PORT: "8080"
+  # Maximum number of checkpoints held in memory at once; `POST /models`
+  # is refused with 503 once this many are loaded.
+  MAX_MODELS: "10"
+  # A relative `model_name` in `POST /models` resolves under this directory
+  # (see `kubernetes/pvc.yaml`, mounted here by `deployment.yaml`). An
+  # absolute `model_name` ignores this and is used as-is.
+  MODEL_CACHE_DIR: "/var/cache/trustformers"
+  # Uncomment to load one checkpoint at startup instead of requiring a
+  # POST /models call first. PRELOAD_MODEL_NAME must name a real subdirectory
+  # of MODEL_CACHE_DIR containing config.json + model.safetensors + tokenizer
+  # files, and PRELOAD_MODEL_TASK is required alongside it (one of
+  # text-classification, token-classification, question-answering,
+  # text-generation) — see README.md.
+  # PRELOAD_MODEL_NAME: "my-model"
+  # PRELOAD_MODEL_TASK: "text-classification"
+  # PRELOAD_NUM_LABELS: "2"

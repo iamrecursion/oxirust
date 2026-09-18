@@ -1,0 +1,37 @@
+[package]
+name = "oxify-connect-comm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Communication connectors for OxiFY - Slack, SMTP, and more"
+categories = ["api-bindings", "email", "network-programming"]
+keywords = ["oxify", "slack", "smtp", "email", "connector"]
+repository = "https://github.com/cool-japan/oxify"
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+oxihttp = { workspace = true }
+tokio = { workspace = true }
+tracing.workspace = true
+chrono.workspace = true
+jsonwebtoken = { workspace = true, optional = true, features = ["rust_crypto"] }
+lettre = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+wiremock.workspace = true
+
+[features]
+default = ["slack"]
+slack = []
+smtp = ["lettre"]
+discord = []
+twilio = []
+onesignal = []
+firebase = ["jsonwebtoken"]
+all-providers = ["slack", "smtp", "discord", "twilio", "onesignal", "firebase"]

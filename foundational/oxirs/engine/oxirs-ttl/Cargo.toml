@@ -1,0 +1,44 @@
+[package]
+name = "oxirs-ttl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Turtle-family RDF parser and serializer for OxiRS - ported from Oxigraph"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["turtle", "rdf", "parser", "n-triples", "trig"]
+categories = ["parser-implementations", "encoding", "data-structures"]
+readme = "README.md"
+rust-version.workspace = true
+
+[dependencies]
+oxirs-core.workspace = true
+memchr = "2.8"
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+once_cell.workspace = true
+serde_json = { workspace = true }
+
+# Optional async support
+tokio = { workspace = true, features = ["io-util", "fs"], optional = true }
+async-trait = { workspace = true, optional = true }
+
+# Optional parallel processing
+rayon = { workspace = true, optional = true }
+
+[features]
+default = ["rdf-12"]  # Enable RDF 1.2 by default (quoted triples, directional language tags)
+async-tokio = ["tokio", "async-trait"]
+parallel = ["rayon"]
+rdf-12 = ["oxirs-core/rdf-12"]  # RDF 1.2 features (quoted triples, directional language tags)
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

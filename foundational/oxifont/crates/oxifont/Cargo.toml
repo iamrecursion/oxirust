@@ -1,0 +1,90 @@
+[package]
+name = "oxifont"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust font discovery + parsing (OxiFont facade crate)"
+keywords = ["font", "ttf", "opentype", "typography", "pure-rust"]
+categories = ["text-processing", "graphics"]
+
+[features]
+default = ["pure", "discovery"]
+pure   = ["dep:oxifont-adapter-pure"]
+db     = ["dep:oxifont-db"]
+woff1  = ["dep:oxifont-webfont", "oxifont-webfont/woff1"]
+woff2  = ["dep:oxifont-webfont", "oxifont-webfont/woff2"]
+subset = ["dep:oxifont-subset"]
+discovery = ["dep:oxifont-discovery"]
+hinting = ["dep:oxifont-hinting"]
+bundled-noto        = ["dep:oxifont-bundled", "oxifont-bundled/bundled-noto"]
+bundled-noto-serif  = ["dep:oxifont-bundled", "oxifont-bundled/bundled-noto-serif"]
+bundled-noto-emoji  = ["dep:oxifont-bundled", "oxifont-bundled/bundled-noto-emoji"]
+bundled-noto-cjk    = ["dep:oxifont-bundled", "oxifont-bundled/bundled-noto-cjk"]
+bundled-noto-cjk-jp = ["dep:oxifont-bundled", "oxifont-bundled/bundled-noto-cjk-jp"]
+bundled-noto-cjk-kr = ["dep:oxifont-bundled", "oxifont-bundled/bundled-noto-cjk-kr"]
+bundled-noto-cjk-sc = ["dep:oxifont-bundled", "oxifont-bundled/bundled-noto-cjk-sc"]
+bundled-noto-cjk-tc = ["dep:oxifont-bundled", "oxifont-bundled/bundled-noto-cjk-tc"]
+
+[dependencies]
+oxifont-core = { workspace = true }
+oxifont-parser = { workspace = true }
+
+[dependencies.oxifont-adapter-pure]
+workspace = true
+optional = true
+
+[dependencies.oxifont-db]
+workspace = true
+optional = true
+
+[dependencies.oxifont-webfont]
+workspace = true
+optional = true
+
+[dependencies.oxifont-subset]
+workspace = true
+optional = true
+
+[dependencies.oxifont-bundled]
+workspace = true
+optional = true
+
+[dependencies.oxifont-discovery]
+workspace = true
+optional = true
+
+[dependencies.oxifont-hinting]
+workspace = true
+optional = true
+
+[dev-dependencies.oxifont-webfont]
+path = "../oxifont-webfont"
+features = ["woff2"]
+
+[dev-dependencies.oxifont-subset]
+path = "../oxifont-subset"
+
+[dev-dependencies.oxifont-parser]
+path = "../oxifont-parser"
+
+[dev-dependencies.oxifont-discovery]
+path = "../oxifont-discovery"
+
+# `discover_query_match` needs no extra features (default `pure` + `discovery`
+# cover it) and is left to plain auto-discovery. The examples below need
+# features that are off by default, so `cargo build --examples` /
+# `cargo run --example` skip them unless those features are enabled.
+[[example]]
+name = "parse_metrics_outline"
+required-features = ["bundled-noto"]
+
+[[example]]
+name = "subset_woff2_roundtrip"
+required-features = ["subset", "woff2", "bundled-noto"]
+
+[[example]]
+name = "hinting_at_ppem"
+required-features = ["hinting", "bundled-noto"]

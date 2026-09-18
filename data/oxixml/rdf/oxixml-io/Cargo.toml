@@ -1,0 +1,59 @@
+[package]
+name = "oxixml-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Unified RDF format detection, parsing, and serialization (replaces oxrdfio)."
+keywords = ["rdf", "turtle", "json-ld", "trix", "io"]
+categories = ["parser-implementations", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+# RDF 1.2 (RDF-star): triple terms and directional language-tagged strings, in the formats whose
+# grammar defines them (Turtle/TriG/N-Triples/N-Quads/N3). The RDF/XML, TriX and JSON-LD backends
+# report an error for a triple term, since those syntaxes cannot express one.
+rdf-12 = ["oxixml-model/rdf-12", "oxixml-turtle/rdf-12"]
+
+## Enables asynchronous parsing and serialization on top of `tokio`'s
+## `AsyncRead` / `AsyncWrite`, mirroring `oxrdfio`'s `async-tokio` feature:
+## `RdfParser::for_tokio_async_reader` and
+## `RdfSerializer::for_tokio_async_writer`. Forwarded to every format backend.
+## Off by default, so the crate stays third-party-free in its default
+## configuration.
+async-tokio = [
+    "dep:tokio",
+    "oxixml-turtle/async-tokio",
+    "oxixml-rdfxml/async-tokio",
+    "oxixml-jsonld/async-tokio",
+    "oxixml-trix/async-tokio",
+]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-model = { workspace = true }
+oxixml-turtle = { workspace = true }
+oxixml-rdfxml = { workspace = true }
+oxixml-jsonld = { workspace = true }
+oxixml-trix = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+
+[dev-dependencies]
+# Regression guard for the Cargo feature-unification hazard: enabling `oxixml-model/rdf-12` here
+# (without enabling this crate's own `rdf-12`) reproduces the exact build configuration in which
+# `Term::Triple`/`N3Term::Triple` exist while the local `#[cfg(feature = "rdf-12")]` match arms are
+# compiled out. `cargo test -p oxixml-io` therefore fails to compile if the fallbacks are removed.
+oxixml-model = { path = "../oxixml-model", features = ["rdf-12"] }
+oxixml-turtle = { path = "../oxixml-turtle", features = ["rdf-12"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[lints]
+workspace = true

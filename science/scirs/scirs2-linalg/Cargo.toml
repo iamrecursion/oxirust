@@ -1,0 +1,154 @@
+[package]
+name = "scirs2-linalg"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Linear algebra module for SciRS2 (scirs2-linalg)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["linear-algebra", "matrix", "scientific", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Core dependencies - ALL numeric/array functionality from scirs2-core (SciRS2 POLICY)
+# NOTE: linalg feature now uses OxiBLAS (pure Rust) instead of OpenBLAS
+scirs2-core = { workspace = true, features = ["linalg", "parallel", "simd", "random", "array"] }
+thiserror = { workspace = true }
+approx = { workspace = true }
+half = { workspace = true }
+scirs2-autograd = { workspace = true, optional = true }
+scirs2-symbolic = { workspace = true, optional = true }
+# OxiBLAS - Pure Rust BLAS/LAPACK (accessed via scirs2-core/linalg feature)
+# NOTE: ndarray-linalg/OpenBLAS removed - using pure Rust OxiBLAS
+# Dependencies for distributed computing
+serde = { workspace = true, features = ["derive"] }
+oxicode = { workspace = true }  # Binary serialization (SIMD-optimized)
+num_cpus = { workspace = true }
+# oxicuda - optional NVIDIA-only CUDA acceleration (pure Rust, off by default)
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }
+oxicuda-blas = { workspace = true, optional = true }
+oxicuda-solver = { workspace = true, optional = true }
+
+[[example]]
+name = "test_precision"
+path = "examples/test_precision.rs"
+
+[[example]]
+name = "hardware_optimization_showcase"
+path = "examples/hardware_optimization_showcase.rs"
+required-features = ["simd"]
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+scirs2-sparse = { path = "../scirs2-sparse" }
+scirs2-autograd = { path = "../scirs2-autograd" }
+
+[features]
+# Default features - OxiBLAS (pure Rust) is used for all platforms
+default = ["linalg", "simd"]
+
+# NOTE: OpenBLAS/Netlib/Accelerate features removed - using pure Rust OxiBLAS for all platforms
+
+# Core functionality features
+linalg = ["scirs2-core/linalg"] # Linear algebra with BLAS/LAPACK bindings
+tensor_contraction = [] # Optional tensor contraction functionality
+simd = ["scirs2-core/simd"] # SIMD-accelerated operations
+autograd = ["dep:scirs2-autograd"] # Automatic differentiation support
+symbolic = ["dep:scirs2-symbolic"] # Symbolic computation support
+parallel = ["scirs2-core/parallel"] # Parallel processing support
+extended-test = [] # For extended precision tests
+python = ["scirs2-core/python"] # Python bindings support
+
+# GPU acceleration features (experimental)
+cuda = ["dep:oxicuda-driver", "dep:oxicuda-memory", "dep:oxicuda-blas", "dep:oxicuda-solver"] # NVIDIA CUDA support
+opencl = [] # OpenCL support
+cpu-fallback = [] # CPU fallback when no GPU backend available
+rocm = [] # AMD ROCm support
+metal = [] # Apple Metal support
+vulkan = [] # Vulkan compute support (cross-platform)
+gpu = ["scirs2-core/gpu"] # GPU abstraction layer using scirs2-core GPU backends
+
+[[bench]]
+name = "linalg_bench"
+harness = false
+path = "benches/linalg_bench.rs"
+
+[[bench]]
+name = "simd_bench"
+harness = false
+path = "benches/simd_bench.rs"
+
+# Disabled due to missing function implementations
+# [[bench]]
+# name = "tensor_operations_bench"
+# harness = false
+# path = "benches/tensor_operations_bench.rs"
+# required-features = ["tensor_contraction"]
+
+[[bench]]
+name = "structured_matrices_bench"
+harness = false
+path = "benches/structured_matrices_bench.rs"
+
+[[bench]]
+name = "tensor_operations_bench_simple"
+harness = false
+path = "benches/tensor_operations_bench_simple.rs"
+required-features = ["tensor_contraction"]
+
+[[bench]]
+name = "attention_bench"
+harness = false
+path = "benches/attention_bench.rs"
+
+[[bench]]
+name = "comprehensive_decomposition_bench"
+harness = false
+path = "benches/comprehensive_decomposition_bench.rs"
+
+[[bench]]
+name = "comprehensive_solvers_bench"
+harness = false
+path = "benches/comprehensive_solvers_bench.rs"
+
+[[bench]]
+name = "matrix_functions_bench"
+harness = false
+path = "benches/matrix_functions_bench.rs"
+
+[[bench]]
+name = "matrix_operations"
+harness = false
+path = "benches/matrix_operations.rs"
+
+[[bench]]
+name = "perf_opt_bench"
+harness = false
+path = "benches/perf_opt_bench.rs"
+
+[[bench]]
+name = "quantization_bench"
+harness = false
+path = "benches/quantization_bench.rs"
+
+[[bench]]
+name = "quantized_solvers_bench"
+harness = false
+path = "benches/quantized_solvers_bench.rs"
+
+[[bench]]
+name = "scipy_compat_benchmarks"
+harness = false
+path = "benches/scipy_compat_benchmarks.rs"
+

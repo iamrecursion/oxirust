@@ -1,0 +1,86 @@
+[package]
+name = "scirs2-metrics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Machine Learning evaluation metrics module for SciRS2 (scirs2-metrics)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["metrics", "evaluation", "scientific", "ai", "machine-learning"]
+categories = ["science", "mathematics", "algorithms"]
+build = "build.rs"
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["parallel", "simd", "array", "random"] }
+# Optional dependencies for integration with other modules
+# Note: scirs2-optim integration is handled via external trait implementations to avoid circular dependencies
+# scirs2-neural = { workspace = true, optional = true, default-features = false }
+# scirs2-optim = { workspace = true, optional = true, default-features = false }
+# Temporarily removed for publishing
+# # # scirs2-stats = { workspace = true }
+# # # scirs2-linalg = { workspace = true }
+thiserror = { workspace = true }
+approx = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-utils = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+ciborium = { workspace = true }  # CBOR serialization
+chrono = { workspace = true }
+statrs = { workspace = true }
+
+# Visualization dependencies (optional)
+plotters = { workspace = true, default-features = false, optional = true }
+plotly = { workspace = true, optional = true }
+
+# Async runtime for dashboard server (optional)
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "io-util"] }
+
+# BLAS dependencies handled through scirs2-core
+
+# Future dependency for PandRS with appropriate abstractions
+# pandrs_wrapper = { path = "../wrappers/pandrs_wrapper", optional = true }
+
+[features]
+default = ["plotly_backend", "optim_integration"]
+# Integration with other scirs2 modules
+# Integration features 
+neural_common = [] # Common neural functionality without dependency on scirs2-neural
+optim_integration = [] # Common optimization functionality - external integration via traits
+# neural_integration = ["dep:scirs2-neural", "neural_common"] # Disabled due to circular dependency
+# Visualization backends
+plotters_backend = ["dep:plotters"]
+plotly_backend = ["dep:plotly"]
+# Dashboard server (requires tokio)
+dashboard_server = ["dep:tokio"]
+# Enable external ML library wrappers
+# pandrs = ["dep:pandrs_wrapper"]
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+proptest = { workspace = true }
+pollster = { workspace = true }
+
+[[bench]]
+name = "performance_regression"
+harness = false
+
+[[bench]]
+name = "v020_validation"
+harness = false
+
+[[bench]]
+name = "sklearn_comparison"
+harness = false

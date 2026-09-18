@@ -1,0 +1,39 @@
+[package]
+name = "oximedia-subtitle"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Subtitle and closed caption rendering for OxiMedia"
+keywords = ["subtitle", "captions", "srt", "vtt", "multimedia"]
+categories = ["multimedia", "parser-implementations"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-codec = { workspace = true, default-features = true }
+thiserror.workspace = true
+bytes.workspace = true
+nom.workspace = true
+serde = { workspace = true, features = ["derive"] }
+rayon.workspace = true
+
+# Font rendering and text layout
+fontdue.workspace = true
+ab_glyph.workspace = true
+unicode-bidi = "0.3"
+unicode-segmentation = { workspace = true }
+
+# XML parsing for TTML
+quick-xml = { workspace = true }
+
+[features]
+default = []
+# Enable CEA-608/708 closed caption support
+closed-captions = []

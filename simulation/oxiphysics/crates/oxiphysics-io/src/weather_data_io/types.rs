@@ -1,0 +1,1383 @@
+//! Auto-generated module
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+
+use super::functions::*;
+use super::grib2_decode::assemble_fields;
+use std::collections::{HashMap, VecDeque};
+
+/// A coordinate variable in a NetCDF-CF dataset.
+#[derive(Debug, Clone)]
+pub struct CfCoordinate {
+    /// Variable name.
+    pub name: String,
+    /// Units string (e.g. `"degrees_north"`, `"Pa"`, `"days since 1850-01-01"`).
+    pub units: String,
+    /// Axis designation: `"X"`, `"Y"`, `"Z"`, or `"T"`.
+    pub axis: String,
+    /// Coordinate values.
+    pub values: Vec<f64>,
+    /// Whether the coordinate is monotonically increasing.
+    pub positive: Option<String>,
+}
+/// Climate time series with anomaly calculation and trend detection.
+#[derive(Debug, Clone)]
+pub struct ClimateTimeSeries {
+    /// Station or grid-point identifier.
+    pub id: String,
+    /// Temporal resolution.
+    pub resolution: TimeResolution,
+    /// Records sorted chronologically.
+    pub records: Vec<ClimateRecord>,
+    /// Baseline period start year for anomaly calculation.
+    pub baseline_start: i32,
+    /// Baseline period end year for anomaly calculation.
+    pub baseline_end: i32,
+}
+impl ClimateTimeSeries {
+    /// Create a new empty time series.
+    pub fn new(id: &str, resolution: TimeResolution) -> Self {
+        Self {
+            id: id.to_string(),
+            resolution,
+            records: Vec::new(),
+            baseline_start: 1961,
+            baseline_end: 1990,
+        }
+    }
+    /// Set the baseline period for anomaly calculations.
+    pub fn set_baseline(&mut self, start: i32, end: i32) {
+        self.baseline_start = start;
+        self.baseline_end = end;
+    }
+    /// Add a record.
+    pub fn add_record(&mut self, rec: ClimateRecord) {
+        self.records.push(rec);
+    }
+    /// Mean temperature across all records (Celsius).
+    pub fn mean_temperature(&self) -> Option<f64> {
+        if self.records.is_empty() {
+            return None;
+        }
+        let sum: f64 = self.records.iter().map(|r| r.temperature).sum();
+        Some(sum / self.records.len() as f64)
+    }
+    /// Total precipitation across all records (mm).
+    pub fn total_precipitation(&self) -> f64 {
+        self.records.iter().map(|r| r.precipitation).sum()
+    }
+    /// Compute temperature anomalies relative to the baseline period.
+    ///
+    /// Returns a vector of anomaly values (one per record).
+    pub fn temperature_anomalies(&self) -> Vec<f64> {
+        let baseline_records: Vec<&ClimateRecord> = self
+            .records
+            .iter()
+            .filter(|r| r.year >= self.baseline_start && r.year <= self.baseline_end)
+            .collect();
+        if baseline_records.is_empty() {
+            return vec![0.0; self.records.len()];
+        }
+        let baseline_mean: f64 = baseline_records.iter().map(|r| r.temperature).sum::<f64>()
+            / baseline_records.len() as f64;
+        self.records
+            .iter()
+            .map(|r| r.temperature - baseline_mean)
+            .collect()
+    }
+    /// Detect a linear temperature trend using least-squares regression.
+    ///
+    /// Returns `(slope, intercept)` where slope is degrees per record step.
+    pub fn temperature_trend(&self) -> Option<(f64, f64)> {
+        let n = self.records.len();
+        if n < 2 {
+            return None;
+        }
+        let nf = n as f64;
+        let mut sx = 0.0_f64;
+        let mut sy = 0.0_f64;
+        let mut sxx = 0.0_f64;
+        let mut sxy = 0.0_f64;
+        for (i, r) in self.records.iter().enumerate() {
+            let x = i as f64;
+            let y = r.temperature;
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
+        }
+        let denom = nf * sxx - sx * sx;
+        if denom.abs() < 1e-15 {
+            return None;
+        }
+        let slope = (nf * sxy - sx * sy) / denom;
+        let intercept = (sy - slope * sx) / nf;
+        Some((slope, intercept))
+    }
+    /// Monthly mean temperatures (index 0 = January).
+    ///
+    /// Only meaningful when resolution is [`TimeResolution::Daily`] or
+    /// [`TimeResolution::Monthly`].
+    pub fn monthly_means(&self) -> [f64; 12] {
+        let mut sums = [0.0f64; 12];
+        let mut counts = [0u32; 12];
+        for r in &self.records {
+            if r.month >= 1 && r.month <= 12 {
+                let idx = (r.month - 1) as usize;
+                sums[idx] += r.temperature;
+                counts[idx] += 1;
+            }
+        }
+        let mut means = [0.0f64; 12];
+        for i in 0..12 {
+            if counts[i] > 0 {
+                means[i] = sums[i] / counts[i] as f64;
+            }
+        }
+        means
+    }
+}
+/// Section type identifier for GRIB2 section parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GribSectionType {
+    /// Section 0 — Indicator.
+    Indicator,
+    /// Section 1 — Identification.
+    Identification,
+    /// Section 2 — Local use (optional).
+    LocalUse,
+    /// Section 3 — Grid definition.
+    GridDefinitionSection,
+    /// Section 4 — Product definition.
+    ProductDefinition,
+    /// Section 5 — Data representation.
+    DataRepresentationSection,
+    /// Section 6 — Bitmap.
+    Bitmap,
+    /// Section 7 — Data.
+    Data,
+    /// Section 8 — End.
+    End,
+}
+/// Decoded METAR report.
+#[derive(Debug, Clone)]
+pub struct MetarReport {
+    /// ICAO airport identifier.
+    pub station_id: String,
+    /// Observation day of month.
+    pub day: u8,
+    /// Observation hour (UTC).
+    pub hour: u8,
+    /// Observation minute (UTC).
+    pub minute: u8,
+    /// Wind information.
+    pub wind: MetarWind,
+    /// Visibility in metres.
+    pub visibility: f64,
+    /// Temperature in degrees Celsius.
+    pub temperature: f64,
+    /// Dew-point temperature in degrees Celsius.
+    pub dewpoint: f64,
+    /// QNH (altimeter setting) in hPa.
+    pub altimeter: f64,
+    /// Raw METAR string.
+    pub raw: String,
+}
+/// Wind rose: directional wind frequency distribution.
+#[derive(Debug, Clone)]
+pub struct WindRose {
+    /// Number of direction bins (typically 16 or 36).
+    pub direction_bins: usize,
+    /// Speed bin edges in m/s (e.g. `[0, 2, 5, 10, 15, 20]`).
+    pub speed_edges: Vec<f64>,
+    /// Frequency matrix: `frequencies[dir_bin][speed_bin]`.
+    /// Each value is a count.
+    pub frequencies: Vec<Vec<u32>>,
+    /// Total observation count (including calms).
+    pub total_count: u32,
+    /// Number of calm observations (wind speed below threshold).
+    pub calm_count: u32,
+    /// Calm threshold in m/s.
+    pub calm_threshold: f64,
+}
+impl WindRose {
+    /// Create a new wind rose with the specified binning.
+    pub fn new(direction_bins: usize, speed_edges: Vec<f64>, calm_threshold: f64) -> Self {
+        let n_speed = if speed_edges.len() > 1 {
+            speed_edges.len() - 1
+        } else {
+            1
+        };
+        let frequencies = vec![vec![0u32; n_speed]; direction_bins];
+        Self {
+            direction_bins,
+            speed_edges,
+            frequencies,
+            total_count: 0,
+            calm_count: 0,
+            calm_threshold,
+        }
+    }
+    /// Add a wind observation.
+    pub fn add_observation(&mut self, direction_deg: f64, speed: f64) {
+        self.total_count += 1;
+        if speed < self.calm_threshold {
+            self.calm_count += 1;
+            return;
+        }
+        let bin_width = 360.0 / self.direction_bins as f64;
+        let mut dir = direction_deg % 360.0;
+        if dir < 0.0 {
+            dir += 360.0;
+        }
+        let dir_bin = ((dir + bin_width / 2.0) / bin_width) as usize % self.direction_bins;
+        let speed_bin = self.speed_bin_index(speed);
+        if dir_bin < self.frequencies.len() && speed_bin < self.frequencies[dir_bin].len() {
+            self.frequencies[dir_bin][speed_bin] += 1;
+        }
+    }
+    /// Find the speed bin index for a given speed.
+    fn speed_bin_index(&self, speed: f64) -> usize {
+        for i in 1..self.speed_edges.len() {
+            if speed < self.speed_edges[i] {
+                return i - 1;
+            }
+        }
+        if self.speed_edges.len() > 1 {
+            self.speed_edges.len() - 2
+        } else {
+            0
+        }
+    }
+    /// Total non-calm observation count.
+    pub fn non_calm_count(&self) -> u32 {
+        self.total_count - self.calm_count
+    }
+    /// Frequency of a given direction bin as a fraction of total count.
+    pub fn direction_frequency(&self, dir_bin: usize) -> f64 {
+        if self.total_count == 0 || dir_bin >= self.direction_bins {
+            return 0.0;
+        }
+        let bin_total: u32 = self.frequencies[dir_bin].iter().sum();
+        bin_total as f64 / self.total_count as f64
+    }
+    /// Sum of all frequencies (should equal `total_count - calm_count`).
+    pub fn frequency_sum(&self) -> u32 {
+        self.frequencies.iter().flat_map(|row| row.iter()).sum()
+    }
+    /// Fit a Weibull distribution to the overall speed data.
+    ///
+    /// Returns `(shape_k, scale_c)` estimated from mean and variance.
+    pub fn weibull_fit(&self, observations: &[(f64, f64)]) -> (f64, f64) {
+        let speeds: Vec<f64> = observations
+            .iter()
+            .map(|&(_, s)| s)
+            .filter(|&s| s >= self.calm_threshold)
+            .collect();
+        if speeds.is_empty() {
+            return (1.0, 1.0);
+        }
+        let n = speeds.len() as f64;
+        let mean: f64 = speeds.iter().sum::<f64>() / n;
+        let variance: f64 = speeds.iter().map(|&s| (s - mean).powi(2)).sum::<f64>() / n;
+        if variance < 1e-15 || mean < 1e-15 {
+            return (1.0, mean.max(1.0));
+        }
+        let cv = variance.sqrt() / mean;
+        let k = (1.0 / cv).powf(1.086);
+        let k = k.clamp(0.5, 10.0);
+        let c = mean / gamma_approx(1.0 + 1.0 / k);
+        (k, c)
+    }
+    /// Mean direction (vector-average) in degrees.
+    pub fn mean_direction(&self) -> f64 {
+        let bin_width = 360.0 / self.direction_bins as f64;
+        let mut sin_sum = 0.0_f64;
+        let mut cos_sum = 0.0_f64;
+        for (i, row) in self.frequencies.iter().enumerate() {
+            let angle = (i as f64 * bin_width).to_radians();
+            let count: u32 = row.iter().sum();
+            sin_sum += angle.sin() * count as f64;
+            cos_sum += angle.cos() * count as f64;
+        }
+        let mean_rad = sin_sum.atan2(cos_sum);
+        let mut deg = mean_rad.to_degrees();
+        if deg < 0.0 {
+            deg += 360.0;
+        }
+        deg
+    }
+}
+/// Intensity-Duration-Frequency (IDF) curve entry.
+#[derive(Debug, Clone, Copy)]
+pub struct IdfEntry {
+    /// Duration in minutes.
+    pub duration_min: f64,
+    /// Return period in years.
+    pub return_period_yr: f64,
+    /// Intensity in mm/h.
+    pub intensity: f64,
+}
+/// A single surface weather observation.
+#[derive(Debug, Clone)]
+pub struct SynopObservation {
+    /// Observation time (seconds since epoch).
+    pub time: i64,
+    /// Temperature in Kelvin.
+    pub temperature: f64,
+    /// Dew-point temperature in Kelvin.
+    pub dewpoint: f64,
+    /// Station-level pressure in Pa.
+    pub pressure: f64,
+    /// Wind direction in degrees (0–360, from which the wind blows).
+    pub wind_direction: f64,
+    /// Wind speed in m/s.
+    pub wind_speed: f64,
+    /// Present weather code (WMO table 4677).
+    pub weather_code: u8,
+    /// Total cloud cover in oktas (0–8).
+    pub cloud_cover: u8,
+    /// Visibility in metres.
+    pub visibility: f64,
+    /// Precipitation accumulated since last observation (mm).
+    pub precipitation: f64,
+}
+/// Temporal resolution for a climate time series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeResolution {
+    /// Daily values.
+    Daily,
+    /// Monthly values.
+    Monthly,
+    /// Annual values.
+    Annual,
+}
+/// CF cell method describing how data was derived over a cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellMethod {
+    /// Point value (instantaneous).
+    Point,
+    /// Mean over the cell.
+    Mean,
+    /// Sum accumulated over the cell.
+    Sum,
+    /// Maximum within the cell.
+    Maximum,
+    /// Minimum within the cell.
+    Minimum,
+    /// Standard deviation over the cell.
+    StandardDeviation,
+}
+impl CellMethod {
+    /// Parse from a CF cell_methods attribute fragment.
+    pub fn from_keyword(s: &str) -> Self {
+        Self::from(s)
+    }
+}
+impl From<&str> for CellMethod {
+    fn from(s: &str) -> Self {
+        match s.trim() {
+            "point" => Self::Point,
+            "mean" => Self::Mean,
+            "sum" => Self::Sum,
+            "maximum" => Self::Maximum,
+            "minimum" => Self::Minimum,
+            "standard_deviation" => Self::StandardDeviation,
+            _ => Self::Mean,
+        }
+    }
+}
+/// Parameters of a Generalised Extreme Value (GEV) distribution.
+#[derive(Debug, Clone, Copy)]
+pub struct GevParameters {
+    /// Location parameter (mu).
+    pub location: f64,
+    /// Scale parameter (sigma > 0).
+    pub scale: f64,
+    /// Shape parameter (xi) in the Coles (2001) convention used by
+    /// [`GevParameters::quantile`] and [`GevParameters::pdf`]: `xi > 0` is the
+    /// heavy-tailed Frechet type, `xi < 0` the bounded-tail Weibull type and
+    /// `xi = 0` the Gumbel limit.  It is the negative of Hosking's shape `k`.
+    pub shape: f64,
+}
+impl GevParameters {
+    /// Create new GEV parameters.
+    pub fn new(location: f64, scale: f64, shape: f64) -> Self {
+        Self {
+            location,
+            scale: scale.max(1e-10),
+            shape,
+        }
+    }
+    /// Quantile (return level) for a given exceedance probability.
+    ///
+    /// `p` is the exceedance probability (e.g. 0.01 for 1% annual chance).
+    pub fn quantile(&self, p: f64) -> f64 {
+        let y = -(-(1.0_f64 - p).ln()).ln();
+        if self.shape.abs() < 1e-10 {
+            self.location + self.scale * y
+        } else {
+            self.location
+                + self.scale / self.shape * ((-(1.0_f64 - p).ln()).powf(-self.shape) - 1.0)
+        }
+    }
+    /// Return level for a given return period in years.
+    pub fn return_level(&self, return_period: f64) -> f64 {
+        let p = 1.0 / return_period;
+        self.quantile(p)
+    }
+    /// Probability density at value `x`.
+    pub fn pdf(&self, x: f64) -> f64 {
+        let z = (x - self.location) / self.scale;
+        if self.shape.abs() < 1e-10 {
+            let e = (-z).exp();
+            (1.0 / self.scale) * e * (-e).exp()
+        } else {
+            let t = 1.0 + self.shape * z;
+            if t <= 0.0 {
+                return 0.0;
+            }
+            let tp = t.powf(-1.0 / self.shape - 1.0);
+            (1.0 / self.scale) * tp * (-t.powf(-1.0 / self.shape)).exp()
+        }
+    }
+}
+/// Writer for weather data in CSV and gridded formats.
+#[derive(Debug, Clone)]
+pub struct WeatherWriter {
+    /// Whether to include a header row in CSV output.
+    pub include_header: bool,
+    /// Separator character for CSV.
+    pub separator: char,
+    /// Missing value representation string.
+    pub missing_value: String,
+    /// Number of decimal places for floating-point values.
+    pub precision: usize,
+}
+impl WeatherWriter {
+    /// Create a new writer with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Write station observations to CSV-format string.
+    pub fn write_station_csv(&self, station: &WeatherStation) -> String {
+        let mut out = String::new();
+        if self.include_header {
+            out.push_str(&format!(
+                "# Station: {} ({}){}\n",
+                station.name, station.id, ""
+            ));
+            out.push_str(&format!(
+                "# Location: {:.4} N{}{:.4} E{}elevation {:.1} m\n",
+                station.latitude,
+                self.separator,
+                station.longitude,
+                self.separator,
+                station.elevation
+            ));
+            let fields = [
+                "time",
+                "temperature_K",
+                "dewpoint_K",
+                "pressure_Pa",
+                "wind_dir_deg",
+                "wind_speed_ms",
+                "weather_code",
+                "cloud_oktas",
+                "visibility_m",
+                "precip_mm",
+            ];
+            out.push_str(&fields.join(&self.separator.to_string()));
+            out.push('\n');
+        }
+        for obs in &station.observations {
+            let line = format!(
+                "{1}{0}{2:.prec$}{0}{3:.prec$}{0}{4:.prec$}{0}{5:.prec$}{0}{6:.prec$}{0}{7}{0}{8}{0}{9:.prec$}{0}{10:.prec$}\n",
+                self.separator,
+                obs.time,
+                obs.temperature,
+                obs.dewpoint,
+                obs.pressure,
+                obs.wind_direction,
+                obs.wind_speed,
+                obs.weather_code,
+                obs.cloud_cover,
+                obs.visibility,
+                obs.precipitation,
+                prec = self.precision,
+            );
+            out.push_str(&line);
+        }
+        out
+    }
+    /// Write a climate time series to CSV-format string.
+    pub fn write_climate_csv(&self, ts: &ClimateTimeSeries) -> String {
+        let mut out = String::new();
+        if self.include_header {
+            out.push_str(&format!("# Climate series: {}\n", ts.id));
+            let fields = ["year", "month", "day", "temperature_C", "precip_mm"];
+            out.push_str(&fields.join(&self.separator.to_string()));
+            out.push('\n');
+        }
+        for r in &ts.records {
+            let line = format!(
+                "{1}{0}{2}{0}{3}{0}{4:.prec$}{0}{5:.prec$}\n",
+                self.separator,
+                r.year,
+                r.month,
+                r.day,
+                r.temperature,
+                r.precipitation,
+                prec = self.precision,
+            );
+            out.push_str(&line);
+        }
+        out
+    }
+    /// Write gridded data in a simple NetCDF-like text format.
+    ///
+    /// Format: one header line per dimension, then row-major data values.
+    pub fn write_gridded(&self, msg: &GribMessage) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "# GRIB2 discipline={} category={} parameter={}\n",
+            msg.discipline, msg.parameter_category, msg.parameter_number
+        ));
+        out.push_str(&format!("# description: {}\n", msg.parameter_description()));
+        match &msg.grid_definition {
+            GridDefinition::LatLon {
+                ni,
+                nj,
+                lat_first,
+                lat_last,
+                lon_first,
+                lon_last,
+                ..
+            } => {
+                out.push_str(&format!(
+                    "# grid: lat_lon ni={} nj={} lat=[{},{}] lon=[{},{}]\n",
+                    ni, nj, lat_first, lat_last, lon_first, lon_last
+                ));
+            }
+            GridDefinition::LambertConformal { nx, ny, .. } => {
+                out.push_str(&format!("# grid: lambert nx={} ny={}\n", nx, ny));
+            }
+            GridDefinition::PolarStereographic { nx, ny, .. } => {
+                out.push_str(&format!("# grid: polar_stereo nx={} ny={}\n", nx, ny));
+            }
+        }
+        for (i, &val) in msg.data.iter().enumerate() {
+            if i > 0 {
+                out.push(self.separator);
+            }
+            out.push_str(&format!("{:.prec$}", val, prec = self.precision));
+        }
+        out.push('\n');
+        out
+    }
+    /// Write wind rose statistics to a CSV-format string.
+    pub fn write_wind_rose_csv(&self, wr: &WindRose) -> String {
+        let mut out = String::new();
+        if self.include_header {
+            out.push_str("# Wind Rose\n");
+            out.push_str(&format!(
+                "# direction_bins={} calm_count={} total_count={}\n",
+                wr.direction_bins, wr.calm_count, wr.total_count
+            ));
+            out.push_str("direction_deg");
+            for i in 0..wr.speed_edges.len().saturating_sub(1) {
+                out.push(self.separator);
+                out.push_str(&format!(
+                    "{:.1}-{:.1}_ms",
+                    wr.speed_edges[i],
+                    wr.speed_edges[i + 1]
+                ));
+            }
+            out.push('\n');
+        }
+        let bin_width = 360.0 / wr.direction_bins as f64;
+        for (i, row) in wr.frequencies.iter().enumerate() {
+            let dir = i as f64 * bin_width;
+            out.push_str(&format!("{:.1}", dir));
+            for &count in row {
+                out.push(self.separator);
+                out.push_str(&count.to_string());
+            }
+            out.push('\n');
+        }
+        out
+    }
+    /// Format a floating-point value, using the missing value string for NaN.
+    pub fn format_value(&self, val: f64) -> String {
+        if val.is_nan() {
+            self.missing_value.clone()
+        } else {
+            format!("{:.prec$}", val, prec = self.precision)
+        }
+    }
+}
+/// A CF data variable.
+#[derive(Debug, Clone)]
+pub struct CfVariable {
+    /// Variable name.
+    pub name: String,
+    /// CF standard name.
+    pub standard_name: CfStandardName,
+    /// Units.
+    pub units: String,
+    /// Cell method.
+    pub cell_method: CellMethod,
+    /// Dimension names (e.g. `["time", "lat", "lon"]`).
+    pub dimensions: Vec<String>,
+    /// Fill value for missing data.
+    pub fill_value: f64,
+    /// Flattened data array (row-major).
+    pub data: Vec<f64>,
+}
+/// A climate time-series record.
+#[derive(Debug, Clone)]
+pub struct ClimateRecord {
+    /// Year.
+    pub year: i32,
+    /// Month (1–12), or 0 for annual.
+    pub month: u8,
+    /// Day of month (1–31), or 0 for monthly/annual.
+    pub day: u8,
+    /// Temperature in degrees Celsius.
+    pub temperature: f64,
+    /// Precipitation in mm.
+    pub precipitation: f64,
+}
+/// Precipitation analysis: IDF curves and GEV distribution fitting.
+#[derive(Debug, Clone)]
+pub struct PrecipitationAnalysis {
+    /// Annual maximum series for each duration (key = duration in minutes).
+    pub annual_maxima: HashMap<u32, Vec<f64>>,
+    /// Fitted GEV parameters per duration.
+    pub gev_fits: HashMap<u32, GevParameters>,
+    /// Computed IDF entries.
+    pub idf_entries: Vec<IdfEntry>,
+}
+impl PrecipitationAnalysis {
+    /// Create a new empty analysis.
+    pub fn new() -> Self {
+        Self {
+            annual_maxima: HashMap::new(),
+            gev_fits: HashMap::new(),
+            idf_entries: Vec::new(),
+        }
+    }
+    /// Add an annual maximum value for a given duration.
+    pub fn add_annual_max(&mut self, duration_min: u32, value: f64) {
+        self.annual_maxima
+            .entry(duration_min)
+            .or_default()
+            .push(value);
+    }
+    /// Fit GEV distribution to annual maxima using the method of L-moments.
+    ///
+    /// Returns `None` when no maxima were recorded for `duration_min`, when
+    /// there are fewer than three of them, or when any value is not finite.
+    pub fn fit_gev(&mut self, duration_min: u32) -> Option<GevParameters> {
+        let data = self.annual_maxima.get(&duration_min)?;
+        if data.len() < 3 {
+            return None;
+        }
+        let params = fit_gev_lmoments(data)?;
+        self.gev_fits.insert(duration_min, params);
+        Some(params)
+    }
+    /// Fit GEV for all durations.
+    pub fn fit_all(&mut self) {
+        let durations: Vec<u32> = self.annual_maxima.keys().copied().collect();
+        for d in durations {
+            self.fit_gev(d);
+        }
+    }
+    /// Compute IDF entries for given return periods.
+    pub fn compute_idf(&mut self, return_periods: &[f64]) {
+        self.idf_entries.clear();
+        let mut durations: Vec<u32> = self.gev_fits.keys().copied().collect();
+        durations.sort();
+        for &dur in &durations {
+            if let Some(params) = self.gev_fits.get(&dur) {
+                for &rp in return_periods {
+                    let depth_mm = params.return_level(rp);
+                    let intensity = depth_mm / (dur as f64 / 60.0);
+                    self.idf_entries.push(IdfEntry {
+                        duration_min: dur as f64,
+                        return_period_yr: rp,
+                        intensity,
+                    });
+                }
+            }
+        }
+    }
+    /// Check IDF curve monotonicity: for a fixed return period,
+    /// intensity should decrease as duration increases.
+    pub fn check_idf_monotonicity(&self, return_period: f64) -> bool {
+        let mut entries: Vec<&IdfEntry> = self
+            .idf_entries
+            .iter()
+            .filter(|e| (e.return_period_yr - return_period).abs() < 1e-6)
+            .collect();
+        entries.sort_by(|a, b| {
+            a.duration_min
+                .partial_cmp(&b.duration_min)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for w in entries.windows(2) {
+            if w[1].intensity > w[0].intensity + 1e-10 {
+                return false;
+            }
+        }
+        true
+    }
+}
+/// NetCDF-CF dataset reader (in-memory representation).
+#[derive(Debug, Clone)]
+pub struct NetCdfCfReader {
+    /// Global attributes.
+    pub global_attributes: HashMap<String, String>,
+    /// Coordinate variables.
+    pub coordinates: Vec<CfCoordinate>,
+    /// Data variables.
+    pub variables: Vec<CfVariable>,
+    /// Time axis (if present).
+    pub time_axis: Option<CfTimeAxis>,
+}
+impl NetCdfCfReader {
+    /// Create an empty reader.
+    pub fn new() -> Self {
+        Self {
+            global_attributes: HashMap::new(),
+            coordinates: Vec::new(),
+            variables: Vec::new(),
+            time_axis: None,
+        }
+    }
+    /// Set a global attribute.
+    pub fn set_attribute(&mut self, key: &str, value: &str) {
+        self.global_attributes
+            .insert(key.to_string(), value.to_string());
+    }
+    /// Add a coordinate variable.
+    pub fn add_coordinate(&mut self, coord: CfCoordinate) {
+        if coord.axis == "T" {
+            self.time_axis = Some(CfTimeAxis {
+                units: coord.units.clone(),
+                calendar: "standard".to_string(),
+                values: coord.values.clone(),
+            });
+        }
+        self.coordinates.push(coord);
+    }
+    /// Add a data variable.
+    pub fn add_variable(&mut self, var: CfVariable) {
+        self.variables.push(var);
+    }
+    /// Find a variable by its CF standard name.
+    pub fn find_by_standard_name(&self, name: &CfStandardName) -> Option<&CfVariable> {
+        self.variables.iter().find(|v| &v.standard_name == name)
+    }
+    /// Find a coordinate by axis designation.
+    pub fn find_coordinate_by_axis(&self, axis: &str) -> Option<&CfCoordinate> {
+        self.coordinates.iter().find(|c| c.axis == axis)
+    }
+    /// List all variable names.
+    pub fn variable_names(&self) -> Vec<&str> {
+        self.variables.iter().map(|v| v.name.as_str()).collect()
+    }
+}
+/// A parsed GRIB2 section.
+#[derive(Debug, Clone)]
+pub struct GribSection {
+    /// Section type.
+    pub section_type: GribSectionType,
+    /// Total byte length of the section.
+    pub length: u32,
+    /// Raw section payload (excluding the length and section-number bytes).
+    pub payload: Vec<u8>,
+}
+/// A fixed weather station.
+#[derive(Debug, Clone)]
+pub struct WeatherStation {
+    /// Station identifier.
+    pub id: String,
+    /// Station name.
+    pub name: String,
+    /// Latitude in degrees (north positive).
+    pub latitude: f64,
+    /// Longitude in degrees (east positive).
+    pub longitude: f64,
+    /// Elevation above mean sea level in metres.
+    pub elevation: f64,
+    /// Chronological list of SYNOP observations.
+    pub observations: Vec<SynopObservation>,
+}
+impl WeatherStation {
+    /// Create a new station.
+    pub fn new(id: &str, name: &str, lat: f64, lon: f64, elev: f64) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            latitude: lat,
+            longitude: lon,
+            elevation: elev,
+            observations: Vec::new(),
+        }
+    }
+    /// Append an observation.
+    pub fn add_observation(&mut self, obs: SynopObservation) {
+        self.observations.push(obs);
+    }
+    /// Mean temperature (K) across all observations.
+    pub fn mean_temperature(&self) -> Option<f64> {
+        if self.observations.is_empty() {
+            return None;
+        }
+        let sum: f64 = self.observations.iter().map(|o| o.temperature).sum();
+        Some(sum / self.observations.len() as f64)
+    }
+    /// Maximum wind speed observed (m/s).
+    pub fn max_wind_speed(&self) -> Option<f64> {
+        self.observations
+            .iter()
+            .map(|o| o.wind_speed)
+            .fold(None, |acc, v| {
+                Some(match acc {
+                    Some(mx) => {
+                        if v > mx {
+                            v
+                        } else {
+                            mx
+                        }
+                    }
+                    None => v,
+                })
+            })
+    }
+    /// Total precipitation accumulated over all observations (mm).
+    pub fn total_precipitation(&self) -> f64 {
+        self.observations.iter().map(|o| o.precipitation).sum()
+    }
+}
+/// Data representation method inside a GRIB2 data section.
+///
+/// [`GribReader`] decodes `SimplePacking` (template 5.0) and `IeeeFloat`
+/// (template 5.4); the other methods are reported as errors by the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataRepresentation {
+    /// Simple packing (template 5.0).
+    SimplePacking,
+    /// Complex packing (template 5.2).
+    ComplexPacking,
+    /// JPEG-2000 compression (template 5.40).
+    Jpeg2000,
+    /// PNG compression (template 5.41).
+    Png,
+    /// Run-length packing for pre-defined bitmaps.
+    RunLength,
+    /// Raw IEEE floating point values (template 5.4).
+    IeeeFloat,
+}
+/// CF-convention standard name for a coordinate or data variable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CfStandardName {
+    /// Air temperature.
+    AirTemperature,
+    /// Air pressure.
+    AirPressure,
+    /// Specific humidity.
+    SpecificHumidity,
+    /// Precipitation flux.
+    PrecipitationFlux,
+    /// Wind speed.
+    WindSpeed,
+    /// Geopotential height.
+    GeopotentialHeight,
+    /// Sea surface temperature.
+    SeaSurfaceTemperature,
+    /// Custom standard name.
+    Custom(String),
+}
+impl CfStandardName {
+    /// Parse a CF standard_name attribute string.
+    pub fn from_keyword(s: &str) -> Self {
+        Self::from(s)
+    }
+}
+impl From<&str> for CfStandardName {
+    fn from(s: &str) -> Self {
+        match s {
+            "air_temperature" => Self::AirTemperature,
+            "air_pressure" => Self::AirPressure,
+            "specific_humidity" => Self::SpecificHumidity,
+            "precipitation_flux" => Self::PrecipitationFlux,
+            "wind_speed" => Self::WindSpeed,
+            "geopotential_height" => Self::GeopotentialHeight,
+            "sea_surface_temperature" => Self::SeaSurfaceTemperature,
+            other => Self::Custom(other.to_string()),
+        }
+    }
+}
+impl CfStandardName {
+    /// String representation matching the CF table.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::AirTemperature => "air_temperature",
+            Self::AirPressure => "air_pressure",
+            Self::SpecificHumidity => "specific_humidity",
+            Self::PrecipitationFlux => "precipitation_flux",
+            Self::WindSpeed => "wind_speed",
+            Self::GeopotentialHeight => "geopotential_height",
+            Self::SeaSurfaceTemperature => "sea_surface_temperature",
+            Self::Custom(s) => s.as_str(),
+        }
+    }
+}
+/// A single GRIB2 message.
+#[derive(Debug, Clone)]
+pub struct GribMessage {
+    /// WMO discipline code (0 = meteorological, 1 = hydrological, …).
+    pub discipline: u8,
+    /// Parameter category within the discipline.
+    pub parameter_category: u8,
+    /// Parameter number within the category.
+    pub parameter_number: u8,
+    /// Grid definition describing the spatial layout.
+    pub grid_definition: GridDefinition,
+    /// Data representation method.
+    pub data_representation: DataRepresentation,
+    /// Reference time (seconds since 1970-01-01T00:00 UTC).
+    pub reference_time: i64,
+    /// Forecast time offset in seconds.
+    pub forecast_time: i64,
+    /// Generating centre ID.
+    pub centre_id: u16,
+    /// Decoded data values, one per grid point in the scanning order of the
+    /// message. Points that a bit-map marks missing are `NaN`.
+    pub data: Vec<f64>,
+    /// Optional bitmap, one flag per grid point: `true` = valid, `false` = missing.
+    pub bitmap: Option<Vec<bool>>,
+}
+impl GribMessage {
+    /// Create a new GRIB message with the given parameters.
+    pub fn new(
+        discipline: u8,
+        parameter_category: u8,
+        parameter_number: u8,
+        grid_definition: GridDefinition,
+        data_representation: DataRepresentation,
+    ) -> Self {
+        Self {
+            discipline,
+            parameter_category,
+            parameter_number,
+            grid_definition,
+            data_representation,
+            reference_time: 0,
+            forecast_time: 0,
+            centre_id: 0,
+            data: Vec::new(),
+            bitmap: None,
+        }
+    }
+    /// Total number of grid points implied by the grid definition.
+    pub fn grid_point_count(&self) -> usize {
+        match &self.grid_definition {
+            GridDefinition::LatLon { ni, nj, .. } => (*ni as usize) * (*nj as usize),
+            GridDefinition::LambertConformal { nx, ny, .. } => (*nx as usize) * (*ny as usize),
+            GridDefinition::PolarStereographic { nx, ny, .. } => (*nx as usize) * (*ny as usize),
+        }
+    }
+    /// Return non-missing data values (applying the bitmap mask).
+    pub fn valid_data(&self) -> Vec<f64> {
+        match &self.bitmap {
+            Some(bm) => self
+                .data
+                .iter()
+                .zip(bm.iter())
+                .filter_map(|(&v, &valid)| if valid { Some(v) } else { None })
+                .collect(),
+            None => self.data.clone(),
+        }
+    }
+    /// WMO parameter short description.
+    pub fn parameter_description(&self) -> &'static str {
+        match (
+            self.discipline,
+            self.parameter_category,
+            self.parameter_number,
+        ) {
+            (0, 0, 0) => "Temperature",
+            (0, 0, 6) => "Dew point temperature",
+            (0, 1, 1) => "Relative humidity",
+            (0, 1, 8) => "Total precipitation",
+            (0, 2, 2) => "U-component of wind",
+            (0, 2, 3) => "V-component of wind",
+            (0, 3, 0) => "Pressure",
+            (0, 3, 5) => "Geopotential height",
+            (0, 6, 1) => "Total cloud cover",
+            (1, 0, 0) => "Flash flood guidance",
+            (2, 0, 0) => "Land cover",
+            _ => "Unknown parameter",
+        }
+    }
+}
+/// GRIB2 grid definition template.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GridDefinition {
+    /// Regular latitude–longitude grid (template 3.0).
+    LatLon {
+        /// Number of points along a parallel, i.e. in the longitude
+        /// direction (GRIB2 `Ni`).
+        ni: u32,
+        /// Number of points along a meridian, i.e. in the latitude
+        /// direction (GRIB2 `Nj`).
+        nj: u32,
+        /// Latitude of the first grid point in degrees (south is negative).
+        lat_first: f64,
+        /// Latitude of the last grid point in degrees.
+        lat_last: f64,
+        /// Longitude of the first grid point in degrees, as stored in the
+        /// message (usually 0 to 360 eastwards).
+        lon_first: f64,
+        /// Longitude of the last grid point in degrees.
+        lon_last: f64,
+        /// i-direction (longitude) increment in degrees (GRIB2 `Di`); `NaN`
+        /// when the message does not give it.
+        di: f64,
+        /// j-direction (latitude) increment in degrees (GRIB2 `Dj`); `NaN`
+        /// when the message does not give it.
+        dj: f64,
+    },
+    /// Lambert conformal conic projection (template 3.30).
+    LambertConformal {
+        /// Number of x-direction points.
+        nx: u32,
+        /// Number of y-direction points.
+        ny: u32,
+        /// Latitude in degrees where `dx` and `dy` are specified (GRIB2 `LaD`).
+        lat_ref: f64,
+        /// Longitude in degrees of the meridian parallel to the y axis (GRIB2 `LoV`).
+        lon_ref: f64,
+        /// First standard parallel in degrees.
+        latin1: f64,
+        /// Second standard parallel in degrees.
+        latin2: f64,
+        /// Grid spacing in the x direction (metres).
+        dx: f64,
+        /// Grid spacing in the y direction (metres).
+        dy: f64,
+    },
+    /// Polar stereographic projection (template 3.20).
+    PolarStereographic {
+        /// Number of x-direction points.
+        nx: u32,
+        /// Number of y-direction points.
+        ny: u32,
+        /// Latitude of first grid point.
+        lat_first: f64,
+        /// Longitude of first grid point.
+        lon_first: f64,
+        /// Grid spacing in metres.
+        dx: f64,
+        /// Grid spacing in metres.
+        dy: f64,
+    },
+}
+/// Reader that parses GRIB2 byte streams into messages.
+///
+/// A GRIB2 message with repeated sections 4 to 7 holds several fields;
+/// [`next_message`](GribReader::next_message) returns one [`GribMessage`] per
+/// field, in order. The stream is untrusted input: lengths and counts read
+/// from it are checked against the bytes that are really present before any
+/// allocation is sized from them.
+#[derive(Debug)]
+pub struct GribReader {
+    /// Raw byte buffer.
+    pub(super) buf: Vec<u8>,
+    /// Current read position.
+    pub(super) pos: usize,
+    /// Parsed sections for the current message.
+    pub(super) sections: Vec<GribSection>,
+    /// Fields of the current message that have not been returned yet.
+    pub(super) pending: VecDeque<Result<GribMessage, String>>,
+    /// Largest grid, in points, that will be decoded.
+    pub(super) max_points: usize,
+}
+/// Length of the indicator section (section 0).
+const GRIB_INDICATOR_LEN: usize = 16;
+/// Length of the end section (`"7777"`).
+const GRIB_END_LEN: usize = 4;
+/// Shortest possible message: the indicator and the end section.
+const GRIB_MIN_MESSAGE_LEN: usize = GRIB_INDICATOR_LEN + GRIB_END_LEN;
+impl GribReader {
+    /// Default limit on the number of grid points of one field (2^27).
+    ///
+    /// A constant field needs no data bytes, so the size of the decoded
+    /// values cannot be derived from the stream; this limit keeps a
+    /// few-hundred-byte message from requesting terabytes.
+    pub const DEFAULT_MAX_POINTS: usize = 1 << 27;
+    /// Create a reader from a byte slice.
+    pub fn new(data: &[u8]) -> Self {
+        Self {
+            buf: data.to_vec(),
+            pos: 0,
+            sections: Vec::new(),
+            pending: VecDeque::new(),
+            max_points: Self::DEFAULT_MAX_POINTS,
+        }
+    }
+    /// Set the largest grid, in points, that the reader will decode
+    /// (default [`DEFAULT_MAX_POINTS`](Self::DEFAULT_MAX_POINTS)). A field
+    /// whose grid is larger is reported as an error.
+    pub fn with_max_points(mut self, max_points: usize) -> Self {
+        self.max_points = max_points;
+        self
+    }
+    /// Read the next GRIB2 field from the stream.
+    ///
+    /// * `Ok(Some(message))`: a field was decoded. A message with several
+    ///   fields yields them one per call, in order.
+    /// * `Ok(None)`: the stream holds no further message.
+    /// * `Err(reason)`: a message was found but is corrupt, truncated or uses
+    ///   a feature that is not decoded (complex packing, JPEG 2000, ...). The
+    ///   reader has already moved past the problem, so calling again resumes
+    ///   with the next message: after a bad header it rescans from the byte
+    ///   after the `GRIB` magic, after a bad body it continues behind the
+    ///   message.
+    ///
+    /// Every call that does not return `Ok(None)` makes progress: it either
+    /// hands out the next field that was already decoded from the current
+    /// message (the position is then already behind that message, and only a
+    /// finite number of fields is queued) or it moves the position forward. A
+    /// loop that stops at `Ok(None)` therefore terminates whatever the input.
+    ///
+    /// Only edition 2 is supported. Grid definition templates 3.0 (regular
+    /// latitude/longitude), 3.20 (polar stereographic) and 3.30 (Lambert
+    /// conformal), product definition templates 4.0 to 4.15, data
+    /// representation templates 5.0 (simple packing) and 5.4 (IEEE floating
+    /// point), and the bit-map indicators 0 (explicit), 254 (reuse) and 255
+    /// (none) are decoded; anything else is reported as an `Err`.
+    pub fn next_message(&mut self) -> Result<Option<GribMessage>, String> {
+        if let Some(queued) = self.pending.pop_front() {
+            return queued.map(Some);
+        }
+        let Some(start) = self.find_magic() else {
+            // The end of the stream keeps the sections of the last message.
+            self.pos = self.buf.len();
+            return Ok(None);
+        };
+        self.sections.clear();
+        // A header problem resumes scanning after this magic.
+        self.pos = start + 4;
+        let (discipline, msg_end) = self.read_indicator(start)?;
+        // From here the whole message is skipped, whatever its content.
+        self.pos = msg_end;
+        self.read_sections(start, msg_end)?;
+        self.pending = assemble_fields(&self.sections, discipline, self.max_points).into();
+        match self.pending.pop_front() {
+            Some(first) => first.map(Some),
+            None => Ok(None),
+        }
+    }
+    /// Offset of the next `GRIB` magic at or after the read position.
+    fn find_magic(&self) -> Option<usize> {
+        let tail = self.buf.get(self.pos..)?;
+        tail.windows(4)
+            .position(|window| window == b"GRIB")
+            .map(|offset| self.pos + offset)
+    }
+    /// Validate the indicator section at `start` and return the discipline
+    /// and the end offset of the message.
+    fn read_indicator(&self, start: usize) -> Result<(u8, usize), String> {
+        let header: [u8; GRIB_INDICATOR_LEN] = start
+            .checked_add(GRIB_INDICATOR_LEN)
+            .and_then(|end| self.buf.get(start..end))
+            .and_then(|bytes| <[u8; GRIB_INDICATOR_LEN]>::try_from(bytes).ok())
+            .ok_or_else(|| format!("GRIB2: truncated indicator section at offset {start}"))?;
+        let discipline = header[6];
+        let edition = header[7];
+        if edition != 2 {
+            return Err(format!(
+                "GRIB: unsupported edition {edition} at offset {start} (only edition 2 is supported)"
+            ));
+        }
+        let declared = u64::from_be_bytes([
+            header[8], header[9], header[10], header[11], header[12], header[13], header[14],
+            header[15],
+        ]);
+        let remaining = self.buf.len() - start;
+        let truncated = || {
+            format!(
+                "GRIB2: message at offset {start} declares {declared} bytes but only {remaining} remain (truncated stream)"
+            )
+        };
+        let total_len = usize::try_from(declared).map_err(|_| truncated())?;
+        if total_len < GRIB_MIN_MESSAGE_LEN {
+            return Err(format!(
+                "GRIB2: message length {declared} at offset {start} is below the {GRIB_MIN_MESSAGE_LEN}-byte minimum"
+            ));
+        }
+        let end = start
+            .checked_add(total_len)
+            .filter(|&end| end <= self.buf.len())
+            .ok_or_else(truncated)?;
+        Ok((discipline, end))
+    }
+    /// Split the message `start..msg_end` into its sections.
+    ///
+    /// The sections must tile the message exactly between the indicator and
+    /// the `"7777"` end section.
+    fn read_sections(&mut self, start: usize, msg_end: usize) -> Result<(), String> {
+        let body_end = msg_end - GRIB_END_LEN;
+        if self.buf.get(body_end..msg_end) != Some(b"7777".as_slice()) {
+            return Err(format!(
+                "GRIB2: message at offset {start} does not end with the '7777' end section"
+            ));
+        }
+        let indicator_end = start + GRIB_INDICATOR_LEN;
+        self.sections.push(GribSection {
+            section_type: GribSectionType::Indicator,
+            length: GRIB_INDICATOR_LEN as u32,
+            payload: self
+                .buf
+                .get(start..indicator_end)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+        });
+        let mut cur = indicator_end;
+        while cur < body_end {
+            let header: [u8; 5] = cur
+                .checked_add(5)
+                .filter(|&end| end <= body_end)
+                .and_then(|end| self.buf.get(cur..end))
+                .and_then(|bytes| <[u8; 5]>::try_from(bytes).ok())
+                .ok_or_else(|| format!("GRIB2: truncated section header at offset {cur}"))?;
+            let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+            let number = header[4];
+            let section_end = usize::try_from(length)
+                .ok()
+                .filter(|&len| len >= 5)
+                .and_then(|len| cur.checked_add(len))
+                .filter(|&end| end <= body_end)
+                .ok_or_else(|| {
+                    format!(
+                        "GRIB2: section {number} at offset {cur} has invalid length {length} (the message body ends at offset {body_end})"
+                    )
+                })?;
+            let section_type = match number {
+                1 => GribSectionType::Identification,
+                2 => GribSectionType::LocalUse,
+                3 => GribSectionType::GridDefinitionSection,
+                4 => GribSectionType::ProductDefinition,
+                5 => GribSectionType::DataRepresentationSection,
+                6 => GribSectionType::Bitmap,
+                7 => GribSectionType::Data,
+                other => {
+                    return Err(format!(
+                        "GRIB2: unknown section number {other} at offset {cur}"
+                    ));
+                }
+            };
+            self.sections.push(GribSection {
+                section_type,
+                length,
+                payload: self
+                    .buf
+                    .get(cur + 5..section_end)
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default(),
+            });
+            cur = section_end;
+        }
+        self.sections.push(GribSection {
+            section_type: GribSectionType::End,
+            length: GRIB_END_LEN as u32,
+            payload: b"7777".to_vec(),
+        });
+        Ok(())
+    }
+    /// Return the parsed sections from the most recent message that was
+    /// split by [`next_message`](Self::next_message).
+    pub fn sections(&self) -> &[GribSection] {
+        &self.sections
+    }
+}
+/// Wind information decoded from a METAR string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetarWind {
+    /// Direction in degrees true north (0 = calm/VRB).
+    pub direction: u16,
+    /// Sustained speed in knots.
+    pub speed: u16,
+    /// Gust speed in knots (0 if no gust).
+    pub gust: u16,
+    /// Whether direction is variable.
+    pub variable: bool,
+}
+/// CF time axis utilities.
+#[derive(Debug, Clone)]
+pub struct CfTimeAxis {
+    /// Reference date as "days since YYYY-MM-DD".
+    pub units: String,
+    /// Calendar type.
+    pub calendar: String,
+    /// Time coordinate values in the native unit.
+    pub values: Vec<f64>,
+}
+impl CfTimeAxis {
+    /// Create a new CF time axis.
+    pub fn new(units: &str, calendar: &str, values: Vec<f64>) -> Self {
+        Self {
+            units: units.to_string(),
+            calendar: calendar.to_string(),
+            values,
+        }
+    }
+    /// Parse the base date from the units string.
+    ///
+    /// Expects format `"`unit` since YYYY-MM-DD"`.
+    pub fn base_date(&self) -> Option<(i32, u32, u32)> {
+        let since_pos = self.units.find("since ")?;
+        let date_str = self.units[since_pos + 6..].trim();
+        let parts: Vec<&str> = date_str.split('-').collect();
+        if parts.len() >= 3 {
+            let year: i32 = parts[0].parse().ok()?;
+            let month: u32 = parts[1].parse().ok()?;
+            let day: u32 = parts[2].split_whitespace().next()?.parse().ok()?;
+            Some((year, month, day))
+        } else {
+            None
+        }
+    }
+    /// Return the time unit multiplier (seconds per unit).
+    pub fn seconds_per_unit(&self) -> f64 {
+        if self.units.starts_with("seconds") {
+            1.0
+        } else if self.units.starts_with("minutes") {
+            60.0
+        } else if self.units.starts_with("hours") {
+            3600.0
+        } else if self.units.starts_with("days") {
+            86400.0
+        } else {
+            1.0
+        }
+    }
+    /// Convert time values to seconds since the base date.
+    pub fn to_seconds(&self) -> Vec<f64> {
+        let mult = self.seconds_per_unit();
+        self.values.iter().map(|&v| v * mult).collect()
+    }
+    /// Number of time steps.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+    /// Whether the axis is empty.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}

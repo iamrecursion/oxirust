@@ -1,0 +1,101 @@
+[package]
+name = "scirs2-interpolate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Interpolation module for SciRS2 (scirs2-interpolate)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["interpolation", "spline", "scientific", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["simd", "parallel", "random", "array"] }
+scirs2-linalg = { workspace = true }
+scirs2-spatial = { workspace = true }
+thiserror = { workspace = true }
+num_cpus = { workspace = true }
+ordered-float = { workspace = true }
+statrs = { workspace = true }
+
+# Optional dependencies for features
+pyo3 = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }
+oxicuda-blas = { workspace = true, optional = true }
+oxicuda-solver = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+plotters = { workspace = true, default-features = false }
+
+[features]
+# Default features
+default = []
+
+# Enable this feature for linear algebra operations via OxiBLAS (pure Rust)
+# Provides faster matrix operations, SVD, eigendecompositions, etc.
+# No system dependencies required (uses OxiBLAS instead of OpenBLAS)
+# linalg = ["ndarray-linalg"]  # Commented out since dependency is removed
+# Adding linalg as empty feature to support existing cfg conditions
+linalg = []
+
+# Enable SIMD optimizations for performance-critical operations
+# Provides 2-4x speedup for B-spline evaluation and distance calculations
+simd = ["scirs2-core/simd"]
+
+# Enable parallel processing features
+parallel = ["scirs2-core/parallel"]
+
+# Enable scipy comparison benchmarks (requires Python with scipy/numpy)
+scipy-comparison = ["pyo3"]
+
+# Enable GPU-accelerated k-d tree queries via wgpu linear-scan backend
+gpu_kdtree = []
+
+# Enable real wgpu RBF kernel-matrix + evaluation dispatch.
+# Requires a wgpu-compatible GPU adapter at runtime; falls back to CPU when absent.
+wgpu = ["dep:wgpu", "dep:pollster"]
+
+# Enable optional, off-by-default, NVIDIA-only CUDA acceleration for the dense
+# linear algebra in RBF interpolation (kernel-system solve + eval GEMM) via the
+# pure-Rust oxicuda library crates. Compiles everywhere; the runtime probe
+# returns false when no NVIDIA device is present (e.g. macOS).
+cuda = ["dep:oxicuda-driver", "dep:oxicuda-memory", "dep:oxicuda-blas", "dep:oxicuda-solver"]
+
+# Enable serialization support for data structures
+serde = []
+
+[[bench]]
+name = "basic_interpolation"
+harness = false
+
+[[bench]]
+name = "advanced_methods"
+harness = false
+
+[[bench]]
+name = "bspline_benchmarks"
+harness = false
+
+[[bench]]
+name = "v020_production_validation"
+harness = false
+
+# scipy_comparison benchmark disabled (Python/PyO3 linking issues on macOS)
+# [[bench]]
+# name = "scipy_comparison"
+# harness = false
+# required-features = ["scipy-comparison"]

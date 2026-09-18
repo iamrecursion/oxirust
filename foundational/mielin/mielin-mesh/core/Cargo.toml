@@ -1,0 +1,44 @@
+[package]
+name = "mielin-mesh-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Distributed hash table and routing implementation with Kademlia-based DHT and geographic awareness"
+keywords = ["distributed", "dht", "kademlia", "p2p", "networking"]
+categories = ["network-programming", "algorithms", "asynchronous"]
+readme = "README.md"
+documentation = "https://docs.rs/mielin-mesh-core"
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# DHT and routing
+lru.workspace = true
+
+# Node discovery
+mdns-sd.workspace = true
+
+# Distributed tracing
+hex.workspace = true
+rand.workspace = true
+
+# Cryptography & Security
+oxicrypto-rand.workspace = true
+oxicrypto-aead.workspace = true
+oxicrypto-sig.workspace = true
+oxicrypto-kex.workspace = true
+oxicrypto-kdf.workspace = true
+oxicrypto-core.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+proptest.workspace = true

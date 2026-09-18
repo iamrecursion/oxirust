@@ -1,0 +1,68 @@
+[package]
+name = "oximedia-batch"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Comprehensive batch processing engine for OxiMedia"
+keywords = ["batch", "workflow", "processing", "multimedia", "pipeline"]
+categories = ["multimedia", "algorithms"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+scripting = ["mlua"]
+sqlite = ["oxisql-core", "oxisql-sqlite-compat"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-transcode = { workspace = true }
+oximedia-qc = { workspace = true }
+oximedia-workflow = { workspace = true }
+oximedia-monitor = { workspace = true }
+oximedia-metadata = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+regex.workspace = true
+glob = "0.3"
+prometheus = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxiarc-archive = { workspace = true }
+walkdir.workspace = true
+memmap2 = { workspace = true }
+sha2 = { workspace = true }
+hex.workspace = true
+num_cpus = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oximedia-farm = { workspace = true }
+hostname.workspace = true
+tokio = { workspace = true, features = ["full"] }
+oxisql-core = { workspace = true, optional = true }
+oxisql-sqlite-compat = { workspace = true, optional = true }
+notify = { workspace = true }
+mlua = { workspace = true, optional = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile.workspace = true

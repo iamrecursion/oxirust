@@ -1,0 +1,1100 @@
+//! Auto-generated module
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+
+use super::functions::*;
+use super::functions::{D2Q9_CX, D2Q9_CY, D2Q9_OPP, D2Q9_Q, D2Q9_W};
+use std::f64::consts::PI;
+
+/// A full FLIP/PIC fluid simulation (CPU mock of GPU dispatch).
+#[derive(Debug, Clone)]
+pub struct FluidSimulation {
+    /// Simulation configuration.
+    pub config: FluidSimConfig,
+    /// MAC grid.
+    pub grid: MacGrid,
+    /// Grid velocities right after the particle-to-grid transfer (before body
+    /// forces, boundary conditions and the pressure projection): the reference
+    /// for the FLIP velocity delta `grid - grid_prev`.
+    pub grid_prev: MacGrid,
+    /// FLIP particles.
+    pub particles: Vec<FlipParticle>,
+    /// Level-set function (negative = fluid).
+    pub phi: Vec<f64>,
+    /// Simulation time.
+    pub time: f64,
+    /// Step count.
+    pub step_count: u64,
+}
+impl FluidSimulation {
+    /// Create a new fluid simulation.
+    pub fn new(config: FluidSimConfig) -> Self {
+        let [nx, ny, nz] = config.grid_size;
+        let dx = config.dx;
+        let grid = MacGrid::new(nx, ny, nz, dx);
+        let grid_prev = MacGrid::new(nx, ny, nz, dx);
+        let phi = vec![1.0f64; nx * ny * nz];
+        Self {
+            config,
+            grid,
+            grid_prev,
+            particles: Vec::new(),
+            phi,
+            time: 0.0,
+            step_count: 0,
+        }
+    }
+    /// Add particles in a rectangular region.
+    pub fn add_fluid_block(&mut self, min: [f64; 3], max: [f64; 3], count: usize) {
+        let dx = (max[0] - min[0]) / (count as f64).cbrt().ceil();
+        let dy = (max[1] - min[1]) / (count as f64).cbrt().ceil();
+        let dz = (max[2] - min[2]) / (count as f64).cbrt().ceil();
+        let steps = (count as f64).cbrt().ceil() as usize;
+        let mut added = 0;
+        'outer: for k in 0..steps {
+            for j in 0..steps {
+                for i in 0..steps {
+                    if added >= count {
+                        break 'outer;
+                    }
+                    let pos = [
+                        min[0] + (i as f64 + 0.5) * dx,
+                        min[1] + (j as f64 + 0.5) * dy,
+                        min[2] + (k as f64 + 0.5) * dz,
+                    ];
+                    self.particles.push(FlipParticle::new(pos));
+                    added += 1;
+                }
+            }
+        }
+    }
+    /// Advance the simulation by one time step.
+    ///
+    /// 1. mark the fluid cells from the particle positions and splat the
+    ///    particle velocities onto the MAC grid (P2G);
+    /// 2. save the splatted velocities as the FLIP reference
+    ///    [`grid_prev`](Self::grid_prev);
+    /// 3. add the gravity acceleration on all three axes and enforce
+    ///    no-penetration at the domain walls and solid cells;
+    /// 4. solve the pressure Poisson equation (air cells are `p = 0`) and
+    ///    project the velocity field;
+    /// 5. apply vorticity confinement;
+    /// 6. blend the PIC and FLIP velocities back onto the particles on all
+    ///    three axes and advect them by `dt` (G2P).
+    pub fn step(&mut self) {
+        let dt = self.config.dt;
+        self.grid.mark_fluid_cells(&self.particles);
+        p2g_transfer(&self.particles, &mut self.grid);
+        if !self.grid_prev.copy_velocities_from(&self.grid) {
+            self.grid_prev = self.grid.clone();
+        }
+        self.grid.add_body_acceleration(self.config.gravity, dt);
+        self.grid.enforce_solid_boundaries();
+        self.grid
+            .jacobi_pressure_solve(self.config.density, dt, self.config.pressure_iters);
+        self.grid.pressure_project(self.config.density, dt);
+        let vorticity = compute_vorticity(&self.grid);
+        vorticity_confinement(&mut self.grid, &vorticity, self.config.vorticity_eps, dt);
+        g2p_transfer(
+            &mut self.particles,
+            &self.grid,
+            &self.grid_prev,
+            self.config.flip_ratio,
+            dt,
+        );
+        self.time += dt;
+        self.step_count += 1;
+    }
+    /// Return total kinetic energy of the particle system.
+    pub fn kinetic_energy(&self) -> f64 {
+        let m = 1.0;
+        self.particles
+            .iter()
+            .map(|p| {
+                let v2 = p.velocity[0] * p.velocity[0]
+                    + p.velocity[1] * p.velocity[1]
+                    + p.velocity[2] * p.velocity[2];
+                0.5 * m * v2
+            })
+            .sum()
+    }
+}
+/// Multi-GPU domain decomposition along the X axis.
+///
+/// Splits the particle set evenly across `n_devices` by X coordinate.
+/// In a production system each sub-domain is transferred to a separate device
+/// memory and processed by its own command queue.
+pub struct MultiGpuDomain;
+impl MultiGpuDomain {
+    /// Decompose particle positions across `n_devices` by X coordinate.
+    pub fn decompose_x(positions: &[[f64; 3]], n_devices: usize) -> Vec<GpuSubDomain> {
+        if n_devices == 0 || positions.is_empty() {
+            return Vec::new();
+        }
+        let x_min = positions.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+        let x_max = positions
+            .iter()
+            .map(|p| p[0])
+            .fold(f64::NEG_INFINITY, f64::max);
+        let range = (x_max - x_min).max(1e-30);
+        let slice = range / n_devices as f64;
+        let mut domains: Vec<GpuSubDomain> = (0..n_devices)
+            .map(|dev| GpuSubDomain {
+                device_id: dev,
+                x_range: [x_min + dev as f64 * slice, x_min + (dev + 1) as f64 * slice],
+                particle_indices: Vec::new(),
+            })
+            .collect();
+        for (idx, pos) in positions.iter().enumerate() {
+            let dev = (((pos[0] - x_min) / slice) as usize).min(n_devices - 1);
+            domains[dev].particle_indices.push(idx);
+        }
+        domains
+    }
+}
+/// An SPH fluid particle.
+#[derive(Debug, Clone)]
+pub struct SphParticle {
+    /// Position in world space.
+    pub position: [f64; 3],
+    /// Velocity.
+    pub velocity: [f64; 3],
+    /// Mass.
+    pub mass: f64,
+    /// Computed density.
+    pub density: f64,
+    /// Computed pressure.
+    pub pressure: f64,
+    /// Accumulated force.
+    pub force: [f64; 3],
+}
+impl SphParticle {
+    /// Create a new SPH particle.
+    pub fn new(position: [f64; 3], mass: f64) -> Self {
+        Self {
+            position,
+            velocity: [0.0; 3],
+            mass,
+            density: 0.0,
+            pressure: 0.0,
+            force: [0.0; 3],
+        }
+    }
+}
+/// Configuration for the GPU-accelerated fluid simulation.
+#[derive(Debug, Clone)]
+pub struct FluidSimConfig {
+    /// Grid cell count on each axis.
+    pub grid_size: [usize; 3],
+    /// Grid cell size (m).
+    pub dx: f64,
+    /// Simulation time step (s).
+    pub dt: f64,
+    /// Fluid density (kg/m³).
+    pub density: f64,
+    /// Gravity vector.
+    pub gravity: [f64; 3],
+    /// Number of pressure solver iterations.
+    pub pressure_iters: usize,
+    /// Vorticity confinement strength.
+    pub vorticity_eps: f64,
+    /// Surface tension coefficient `σ` (N/m).  Not read by
+    /// [`FluidSimulation::step`], which evaluates no surface-tension force: it
+    /// does not influence the FLIP simulation.  Pass it to
+    /// [`surface_tension_csf`] to obtain a continuum-surface-force field.
+    pub surface_tension: f64,
+    /// FLIP/PIC blending ratio.
+    pub flip_ratio: f64,
+}
+/// A spatial hash / uniform grid neighbour list built on a simulated GPU.
+///
+/// In a real GPU implementation the binning is done in a single prefix-sum
+/// pass; here we use a `HashMap` to keep the mock dependency-free.
+#[derive(Debug, Clone)]
+pub struct GpuNeighborList {
+    /// Smoothing radius used when building the list.
+    pub h: f64,
+    /// Domain size in each axis.
+    pub domain: [f64; 3],
+    /// Number of grid cells in each axis.
+    pub grid_dims: [usize; 3],
+    /// Cell edge length.
+    pub cell_size: f64,
+    /// Neighbour indices for every particle (indexed by particle id).
+    pub neighbor_data: Vec<Vec<usize>>,
+}
+impl GpuNeighborList {
+    /// Build the neighbour list from a slice of particle positions.
+    pub fn build(positions: &[[f64; 3]], h: f64, domain: [f64; 3]) -> Self {
+        let cell_size = h;
+        let grid_dims = [
+            ((domain[0] / cell_size).ceil() as usize).max(1),
+            ((domain[1] / cell_size).ceil() as usize).max(1),
+            ((domain[2] / cell_size).ceil() as usize).max(1),
+        ];
+        let n = positions.len();
+        let mut cells: std::collections::HashMap<(usize, usize, usize), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (idx, &pos) in positions.iter().enumerate() {
+            let ci = ((pos[0] / cell_size) as usize).min(grid_dims[0].saturating_sub(1));
+            let cj = ((pos[1] / cell_size) as usize).min(grid_dims[1].saturating_sub(1));
+            let ck = ((pos[2] / cell_size) as usize).min(grid_dims[2].saturating_sub(1));
+            cells.entry((ci, cj, ck)).or_default().push(idx);
+        }
+        let mut neighbor_data: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (idx, &pos_i) in positions.iter().enumerate() {
+            let ci = ((pos_i[0] / cell_size) as isize).max(0) as usize;
+            let cj = ((pos_i[1] / cell_size) as isize).max(0) as usize;
+            let ck = ((pos_i[2] / cell_size) as isize).max(0) as usize;
+            for dz in 0usize..3 {
+                for dy in 0usize..3 {
+                    for dx in 0usize..3 {
+                        let ni = (ci + dx).wrapping_sub(1);
+                        let nj = (cj + dy).wrapping_sub(1);
+                        let nk = (ck + dz).wrapping_sub(1);
+                        if ni >= grid_dims[0] || nj >= grid_dims[1] || nk >= grid_dims[2] {
+                            continue;
+                        }
+                        if let Some(bucket) = cells.get(&(ni, nj, nk)) {
+                            for &jdx in bucket {
+                                if jdx == idx {
+                                    continue;
+                                }
+                                let r = length3(sub3(pos_i, positions[jdx]));
+                                if r <= h {
+                                    neighbor_data[idx].push(jdx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            h,
+            domain,
+            grid_dims,
+            cell_size,
+            neighbor_data,
+        }
+    }
+    /// Return the neighbour indices of particle `idx`.
+    pub fn neighbors_of(&self, idx: usize) -> &[usize] {
+        &self.neighbor_data[idx]
+    }
+}
+/// LBM cell type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LbmCellType {
+    /// Fluid cell.
+    Fluid,
+    /// Solid wall (no-slip bounce-back).
+    Solid,
+    /// Inlet velocity boundary.
+    Inlet,
+    /// Outlet pressure boundary.
+    Outlet,
+}
+/// LBM D2Q9 simulation on a 2D grid.
+///
+/// Streaming is periodic.  Open boundaries are imposed after every streaming
+/// step with the Zou-He conditions: [`LbmCellType::Inlet`] cells on the left wall
+/// take the velocity set by [`set_inlet_velocity`](Self::set_inlet_velocity) and
+/// [`LbmCellType::Outlet`] cells on the right wall the density set by
+/// [`set_outlet_pressure`](Self::set_outlet_pressure), see
+/// [`apply_open_boundaries`](Self::apply_open_boundaries).
+#[derive(Debug, Clone)]
+pub struct LbmD2Q9 {
+    /// Grid width.
+    pub nx: usize,
+    /// Grid height.
+    pub ny: usize,
+    /// Distribution functions f\[y * nx * Q + x * Q + q\].
+    pub f: Vec<f64>,
+    /// Temporary buffer for streaming.
+    pub f_tmp: Vec<f64>,
+    /// Cell types.
+    pub cell_type: Vec<LbmCellType>,
+    /// Relaxation parameter τ (0 < τ < 2, τ=1 → ν=1/6).
+    pub tau: f64,
+    /// Inverse τ (precomputed).
+    pub inv_tau: f64,
+    /// Velocity `[ux, uy]` (lattice units) imposed on the [`LbmCellType::Inlet`]
+    /// cells after every streaming step; `None` leaves them to the streaming.
+    pub inlet_velocity: Option<[f64; 2]>,
+    /// Density imposed on the [`LbmCellType::Outlet`] cells after every streaming
+    /// step; `None` leaves them to the streaming.
+    pub outlet_density: Option<f64>,
+}
+impl LbmD2Q9 {
+    /// Create a new D2Q9 LBM simulation.
+    pub fn new(nx: usize, ny: usize, tau: f64) -> Self {
+        let n = nx * ny * D2Q9_Q;
+        let mut f = vec![0.0f64; n];
+        for y in 0..ny {
+            for x in 0..nx {
+                for q in 0..D2Q9_Q {
+                    f[(y * nx + x) * D2Q9_Q + q] = D2Q9_W[q];
+                }
+            }
+        }
+        let f_tmp = f.clone();
+        let cell_type = vec![LbmCellType::Fluid; nx * ny];
+        Self {
+            nx,
+            ny,
+            f,
+            f_tmp,
+            cell_type,
+            tau,
+            inv_tau: 1.0 / tau,
+            inlet_velocity: None,
+            outlet_density: None,
+        }
+    }
+    /// Get distribution function f at cell (x, y), direction q.
+    pub fn get_f(&self, x: usize, y: usize, q: usize) -> f64 {
+        self.f[(y * self.nx + x) * D2Q9_Q + q]
+    }
+    /// Set distribution function.
+    pub fn set_f(&mut self, x: usize, y: usize, q: usize, val: f64) {
+        self.f[(y * self.nx + x) * D2Q9_Q + q] = val;
+    }
+    /// Compute macroscopic density ρ at cell (x, y).
+    pub fn density(&self, x: usize, y: usize) -> f64 {
+        (0..D2Q9_Q).map(|q| self.get_f(x, y, q)).sum()
+    }
+    /// Compute macroscopic velocity (ux, uy) at cell (x, y).
+    pub fn velocity(&self, x: usize, y: usize) -> [f64; 2] {
+        let rho = self.density(x, y);
+        if rho < 1e-15 {
+            return [0.0, 0.0];
+        }
+        let ux: f64 = (0..D2Q9_Q)
+            .map(|q| self.get_f(x, y, q) * D2Q9_CX[q] as f64)
+            .sum::<f64>()
+            / rho;
+        let uy: f64 = (0..D2Q9_Q)
+            .map(|q| self.get_f(x, y, q) * D2Q9_CY[q] as f64)
+            .sum::<f64>()
+            / rho;
+        [ux, uy]
+    }
+    /// Compute equilibrium distribution f_eq.
+    pub fn f_equilibrium(rho: f64, ux: f64, uy: f64, q: usize) -> f64 {
+        let cx = D2Q9_CX[q] as f64;
+        let cy = D2Q9_CY[q] as f64;
+        let cu = cx * ux + cy * uy;
+        let u2 = ux * ux + uy * uy;
+        D2Q9_W[q] * rho * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * u2)
+    }
+    /// BGK collision step: f_i → f_i - (1/τ)(f_i - f_i^eq).
+    pub fn collide(&mut self) {
+        for y in 0..self.ny {
+            for x in 0..self.nx {
+                if self.cell_type[y * self.nx + x] == LbmCellType::Solid {
+                    continue;
+                }
+                let rho = self.density(x, y);
+                let [ux, uy] = self.velocity(x, y);
+                for q in 0..D2Q9_Q {
+                    let f_eq = Self::f_equilibrium(rho, ux, uy, q);
+                    let f_old = self.get_f(x, y, q);
+                    let f_new = f_old - self.inv_tau * (f_old - f_eq);
+                    self.set_f(x, y, q, f_new);
+                }
+            }
+        }
+    }
+    /// Streaming step: propagate f to neighboring cells.
+    pub fn stream(&mut self) {
+        let nx = self.nx;
+        let ny = self.ny;
+        self.f_tmp.copy_from_slice(&self.f);
+        for y in 0..ny {
+            for x in 0..nx {
+                for q in 0..D2Q9_Q {
+                    let nx_cell = (x as i32 + D2Q9_CX[q]).rem_euclid(nx as i32) as usize;
+                    let ny_cell = (y as i32 + D2Q9_CY[q]).rem_euclid(ny as i32) as usize;
+                    let src = self.f_tmp[(y * nx + x) * D2Q9_Q + q];
+                    self.f[(ny_cell * nx + nx_cell) * D2Q9_Q + q] = src;
+                }
+            }
+        }
+    }
+    /// Bounce-back boundary conditions for solid cells.
+    pub fn apply_bounce_back(&mut self) {
+        let nx = self.nx;
+        let ny = self.ny;
+        let mut updates = Vec::new();
+        for y in 0..ny {
+            for x in 0..nx {
+                if self.cell_type[y * nx + x] != LbmCellType::Solid {
+                    continue;
+                }
+                for (q, &opp) in D2Q9_OPP.iter().enumerate().take(D2Q9_Q) {
+                    let val = self.get_f(x, y, q);
+                    updates.push((x, y, opp, val));
+                }
+            }
+        }
+        for (x, y, q, val) in updates {
+            self.set_f(x, y, q, val);
+        }
+    }
+    /// Zou-He boundary conditions of the open boundaries, applied after streaming.
+    ///
+    /// The periodic streaming step refills the populations that point into the
+    /// domain at the left and right wall with whatever leaves through the opposite
+    /// wall, so the open boundaries must be re-imposed after every step.  The
+    /// unknown populations are reconstructed from the known ones and the imposed
+    /// macroscopic state (Zou and He 1997), with the lattice velocities of
+    /// [`D2Q9_CX`] / [`D2Q9_CY`]:
+    ///
+    /// * every [`LbmCellType::Inlet`] cell, when [`inlet_velocity`](Self::inlet_velocity)
+    ///   is `Some([ux, uy])`, gets `ρ = (f₀ + f₂ + f₄ + 2(f₃ + f₆ + f₇)) / (1 − ux)`,
+    ///   `f₁ = f₃ + ⅔ρux`, `f₅ = f₇ − ½(f₂ − f₄) + ⅙ρux + ½ρuy` and
+    ///   `f₈ = f₆ + ½(f₂ − f₄) + ⅙ρux − ½ρuy`, so its velocity is `(ux, uy)`;
+    /// * every [`LbmCellType::Outlet`] cell, when
+    ///   [`outlet_density`](Self::outlet_density) is `Some(ρ)`, gets
+    ///   `ux = −1 + (f₀ + f₂ + f₄ + 2(f₁ + f₅ + f₈)) / ρ` (with `uy = 0`),
+    ///   `f₃ = f₁ − ⅔ρux`, `f₆ = f₈ − ½(f₂ − f₄) − ⅙ρux` and
+    ///   `f₇ = f₅ + ½(f₂ − f₄) − ⅙ρux`, so its density is `ρ`.
+    ///
+    /// The formulas are those of a flow entering through the left wall and leaving
+    /// through the right wall, which is where the two setters put the cells.  An
+    /// imposed `ux` with `|1 − ux|` below `1e-12` and a non-positive outlet
+    /// density are ignored.
+    pub fn apply_open_boundaries(&mut self) {
+        let nx = self.nx;
+        for y in 0..self.ny {
+            for x in 0..nx {
+                match self.cell_type[y * nx + x] {
+                    LbmCellType::Inlet => {
+                        if let Some([ux, uy]) = self.inlet_velocity {
+                            self.zou_he_velocity_inlet(x, y, ux, uy);
+                        }
+                    }
+                    LbmCellType::Outlet => {
+                        if let Some(rho_out) = self.outlet_density {
+                            self.zou_he_pressure_outlet(x, y, rho_out);
+                        }
+                    }
+                    LbmCellType::Fluid | LbmCellType::Solid => {}
+                }
+            }
+        }
+    }
+    /// Zou-He velocity inlet on the left wall: the populations `f₁, f₅, f₈` that
+    /// point into the domain are rebuilt for the imposed velocity `(ux, uy)`.
+    fn zou_he_velocity_inlet(&mut self, x: usize, y: usize, ux: f64, uy: f64) {
+        let denominator = 1.0 - ux;
+        if denominator.abs() < 1e-12 {
+            return;
+        }
+        let f = |q: usize| self.get_f(x, y, q);
+        let rho = (f(0) + f(2) + f(4) + 2.0 * (f(3) + f(6) + f(7))) / denominator;
+        let shear = 0.5 * (f(2) - f(4));
+        let f1 = f(3) + 2.0 / 3.0 * rho * ux;
+        let f5 = f(7) - shear + rho * ux / 6.0 + 0.5 * rho * uy;
+        let f8 = f(6) + shear + rho * ux / 6.0 - 0.5 * rho * uy;
+        self.set_f(x, y, 1, f1);
+        self.set_f(x, y, 5, f5);
+        self.set_f(x, y, 8, f8);
+    }
+    /// Zou-He pressure outlet on the right wall: the populations `f₃, f₆, f₇` that
+    /// point into the domain are rebuilt for the imposed density `rho_out` and
+    /// zero transverse velocity.
+    fn zou_he_pressure_outlet(&mut self, x: usize, y: usize, rho_out: f64) {
+        if !(rho_out.is_finite() && rho_out > 0.0) {
+            return;
+        }
+        let f = |q: usize| self.get_f(x, y, q);
+        let ux = -1.0 + (f(0) + f(2) + f(4) + 2.0 * (f(1) + f(5) + f(8))) / rho_out;
+        let shear = 0.5 * (f(2) - f(4));
+        let f3 = f(1) - 2.0 / 3.0 * rho_out * ux;
+        let f6 = f(8) - shear - rho_out * ux / 6.0;
+        let f7 = f(5) + shear - rho_out * ux / 6.0;
+        self.set_f(x, y, 3, f3);
+        self.set_f(x, y, 6, f6);
+        self.set_f(x, y, 7, f7);
+    }
+    /// Full LBM step: collide → stream → bounce-back → open boundaries.
+    ///
+    /// The Zou-He inlet and outlet conditions are re-imposed after the streaming
+    /// (see [`apply_open_boundaries`](Self::apply_open_boundaries)), so they hold
+    /// at the end of every step instead of only at the setup.
+    pub fn step(&mut self) {
+        self.collide();
+        self.stream();
+        self.apply_bounce_back();
+        self.apply_open_boundaries();
+    }
+    /// Set inlet velocity boundary condition on left wall.
+    ///
+    /// Marks the left column as [`LbmCellType::Inlet`], initialises it to the
+    /// equilibrium of density 1 and velocity `(ux_in, uy_in)`, and records the
+    /// velocity in [`inlet_velocity`](Self::inlet_velocity) so that every
+    /// [`step`](Self::step) re-imposes it (Zou-He).  `ux_in` must stay well below
+    /// the lattice speed of sound (`≈ 0.577`); typical values are `0.01 – 0.1`.
+    pub fn set_inlet_velocity(&mut self, ux_in: f64, uy_in: f64) {
+        self.inlet_velocity = Some([ux_in, uy_in]);
+        for y in 0..self.ny {
+            self.cell_type[y * self.nx] = LbmCellType::Inlet;
+            let rho = 1.0;
+            for q in 0..D2Q9_Q {
+                let f_eq = Self::f_equilibrium(rho, ux_in, uy_in, q);
+                self.set_f(0, y, q, f_eq);
+            }
+        }
+    }
+    /// Set outlet pressure boundary (right wall, ρ = ρ_out).
+    ///
+    /// Marks the right column as [`LbmCellType::Outlet`], initialises it to the
+    /// equilibrium of density `rho_out` at the local velocity, and records the
+    /// density in [`outlet_density`](Self::outlet_density) so that every
+    /// [`step`](Self::step) re-imposes it (Zou-He, zero transverse velocity).
+    pub fn set_outlet_pressure(&mut self, rho_out: f64) {
+        self.outlet_density = Some(rho_out);
+        let nx = self.nx;
+        for y in 0..self.ny {
+            self.cell_type[y * nx + nx - 1] = LbmCellType::Outlet;
+            let [ux, uy] = self.velocity(nx - 1, y);
+            for q in 0..D2Q9_Q {
+                let f_eq = Self::f_equilibrium(rho_out, ux, uy, q);
+                self.set_f(nx - 1, y, q, f_eq);
+            }
+        }
+    }
+}
+/// SPH smoothing kernels (Müller et al. 2003).
+pub struct SphKernels;
+impl SphKernels {
+    /// Poly6 kernel for density estimation.
+    ///
+    /// W_poly6(r, h) = (315 / (64πh^9)) * (h² - r²)³  for r ≤ h
+    pub fn poly6(r: f64, h: f64) -> f64 {
+        if r > h || r < 0.0 {
+            return 0.0;
+        }
+        let h2 = h * h;
+        let r2 = r * r;
+        let diff = h2 - r2;
+        (315.0 / (64.0 * PI * h.powi(9))) * diff * diff * diff
+    }
+    /// Gradient of Poly6 kernel.
+    pub fn poly6_grad(r_vec: [f64; 3], r: f64, h: f64) -> [f64; 3] {
+        if r > h || r < 1e-15 {
+            return [0.0; 3];
+        }
+        let h2 = h * h;
+        let r2 = r * r;
+        let coeff = -6.0 * (315.0 / (64.0 * PI * h.powi(9))) * (h2 - r2) * (h2 - r2);
+        scale3(r_vec, coeff)
+    }
+    /// Spiky kernel gradient for pressure forces.
+    ///
+    /// ∇W_spiky(r, h) = -(45 / (πh^6)) * (h - r)² * r̂  for r ≤ h
+    pub fn spiky_grad(r_vec: [f64; 3], r: f64, h: f64) -> [f64; 3] {
+        if r > h || r < 1e-15 {
+            return [0.0; 3];
+        }
+        let diff = h - r;
+        let coeff = -(45.0 / (PI * h.powi(6))) * diff * diff / r;
+        scale3(r_vec, coeff)
+    }
+    /// Viscosity kernel Laplacian.
+    ///
+    /// ∇²W_visc(r, h) = (45 / (πh^6)) * (h - r)  for r ≤ h
+    pub fn viscosity_laplacian(r: f64, h: f64) -> f64 {
+        if r > h {
+            return 0.0;
+        }
+        (45.0 / (PI * h.powi(6))) * (h - r)
+    }
+    /// Cohesion spline `C(r)` of Akinci et al. (2013).
+    ///
+    /// ```text
+    ///            32 / (π h⁹) · (h − r)³ r³                  for h/2 < r ≤ h
+    /// C(r, h) =  32 / (π h⁹) · (2 (h − r)³ r³ − h⁶/64)      for 0 < r ≤ h/2
+    ///            0                                           otherwise
+    /// ```
+    ///
+    /// It is continuous at `r = h/2` and `r = h`, attractive (`C > 0`) from
+    /// about `0.27 h` to `h`, and negative at very short range, which keeps
+    /// the particles from collapsing onto each other.
+    pub fn cohesion(r: f64, h: f64) -> f64 {
+        if r <= 0.0 || r > h {
+            return 0.0;
+        }
+        let norm = 32.0 / (PI * h.powi(9));
+        let shell = (h - r).powi(3) * r.powi(3);
+        if 2.0 * r > h {
+            norm * shell
+        } else {
+            norm * (2.0 * shell - h.powi(6) / 64.0)
+        }
+    }
+}
+/// A FLIP/PIC particle.
+#[derive(Debug, Clone)]
+pub struct FlipParticle {
+    /// Particle position.
+    pub position: [f64; 3],
+    /// Particle velocity.
+    pub velocity: [f64; 3],
+    /// Accumulated grid velocity (for FLIP update).
+    pub velocity_grid: [f64; 3],
+}
+impl FlipParticle {
+    /// Create a new FLIP particle at rest.
+    pub fn new(position: [f64; 3]) -> Self {
+        Self {
+            position,
+            velocity: [0.0; 3],
+            velocity_grid: [0.0; 3],
+        }
+    }
+}
+/// Axis-aligned bounding box for GPU boundary enforcement.
+#[derive(Debug, Clone)]
+pub struct GpuBoundaryBox {
+    /// Minimum corner of the box.
+    pub min: [f64; 3],
+    /// Maximum corner of the box.
+    pub max: [f64; 3],
+    /// Coefficient of restitution (0 = inelastic, 1 = elastic).
+    pub restitution: f64,
+}
+/// A single GPU sub-domain in a multi-GPU decomposition.
+#[derive(Debug, Clone)]
+pub struct GpuSubDomain {
+    /// GPU device index (logical).
+    pub device_id: usize,
+    /// X-axis boundary \[x_min, x_max\].
+    pub x_range: [f64; 2],
+    /// Particle indices assigned to this device.
+    pub particle_indices: Vec<usize>,
+}
+/// Cell flag: air, a free-surface Dirichlet cell (`p = 0`).
+pub const CELL_AIR: u8 = 0;
+/// Cell flag: fluid, a cell whose pressure is solved for.
+pub const CELL_FLUID: u8 = 1;
+/// Cell flag: solid, a Neumann (no-flux) cell.
+pub const CELL_SOLID: u8 = 2;
+/// Offsets of the six face neighbours of a cell.
+const NEIGHBOR_OFFSETS: [(isize, isize, isize); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
+/// Marker-and-Cell (MAC) staggered grid for incompressible fluid.
+///
+/// u-velocity is stored at cell face centers on the X axis (i+½, j, k).
+/// v-velocity is at (i, j+½, k).
+/// w-velocity is at (i, j, k+½).
+/// Pressure is at cell centers (i, j, k).
+#[derive(Debug, Clone)]
+pub struct MacGrid {
+    /// Grid dimensions (cells).
+    pub nx: usize,
+    /// Grid dimensions (cells).
+    pub ny: usize,
+    /// Grid dimensions (cells).
+    pub nz: usize,
+    /// Cell size.
+    pub dx: f64,
+    /// u-velocity: (nx+1) × ny × nz.
+    pub u: Vec<f64>,
+    /// v-velocity: nx × (ny+1) × nz.
+    pub v: Vec<f64>,
+    /// w-velocity: nx × ny × (nz+1).
+    pub w: Vec<f64>,
+    /// Pressure: nx × ny × nz.
+    pub p: Vec<f64>,
+    /// Divergence of velocity field.
+    pub div: Vec<f64>,
+    /// Cell flags (0=air, 1=fluid, 2=solid).
+    pub flags: Vec<u8>,
+}
+impl MacGrid {
+    /// Create a new MAC grid.
+    pub fn new(nx: usize, ny: usize, nz: usize, dx: f64) -> Self {
+        Self {
+            nx,
+            ny,
+            nz,
+            dx,
+            u: vec![0.0; (nx + 1) * ny * nz],
+            v: vec![0.0; nx * (ny + 1) * nz],
+            w: vec![0.0; nx * ny * (nz + 1)],
+            p: vec![0.0; nx * ny * nz],
+            div: vec![0.0; nx * ny * nz],
+            flags: vec![0u8; nx * ny * nz],
+        }
+    }
+    fn cell_idx(&self, i: usize, j: usize, k: usize) -> usize {
+        k * self.nx * self.ny + j * self.nx + i
+    }
+    /// Get u-velocity at face (i+½, j, k).
+    pub fn get_u(&self, i: usize, j: usize, k: usize) -> f64 {
+        self.u[k * (self.nx + 1) * self.ny + j * (self.nx + 1) + i]
+    }
+    /// Set u-velocity.
+    pub fn set_u(&mut self, i: usize, j: usize, k: usize, val: f64) {
+        self.u[k * (self.nx + 1) * self.ny + j * (self.nx + 1) + i] = val;
+    }
+    /// Get v-velocity at face (i, j+½, k).
+    pub fn get_v(&self, i: usize, j: usize, k: usize) -> f64 {
+        self.v[k * self.nx * (self.ny + 1) + j * self.nx + i]
+    }
+    /// Set v-velocity.
+    pub fn set_v(&mut self, i: usize, j: usize, k: usize, val: f64) {
+        self.v[k * self.nx * (self.ny + 1) + j * self.nx + i] = val;
+    }
+    /// Get w-velocity at face (i, j, k+½).
+    pub fn get_w(&self, i: usize, j: usize, k: usize) -> f64 {
+        self.w[(k) * self.nx * self.ny + j * self.nx + i]
+    }
+    /// Set w-velocity.
+    pub fn set_w(&mut self, i: usize, j: usize, k: usize, val: f64) {
+        self.w[(k) * self.nx * self.ny + j * self.nx + i] = val;
+    }
+    /// Flag of cell `(i, j, k)`; cells outside the grid count as solid, so the
+    /// domain walls are no-flux (Neumann) boundaries.
+    fn flag_at(&self, i: isize, j: isize, k: isize) -> u8 {
+        if i < 0
+            || j < 0
+            || k < 0
+            || i >= self.nx as isize
+            || j >= self.ny as isize
+            || k >= self.nz as isize
+        {
+            return CELL_SOLID;
+        }
+        self.flags
+            .get(self.cell_idx(i as usize, j as usize, k as usize))
+            .copied()
+            .unwrap_or(CELL_SOLID)
+    }
+    /// Mark the fluid cells from the particle positions.
+    ///
+    /// Every non-solid cell is reset to [`CELL_AIR`]; each cell containing at
+    /// least one particle (`floor(position / dx)`, clamped to the grid)
+    /// becomes [`CELL_FLUID`].  Pressure outside the fluid is zeroed, so the
+    /// free surface is a clean Dirichlet condition `p = 0` for the Jacobi
+    /// solve.  Solid cells keep their flag.
+    pub fn mark_fluid_cells(&mut self, particles: &[FlipParticle]) {
+        for flag in self.flags.iter_mut() {
+            if *flag != CELL_SOLID {
+                *flag = CELL_AIR;
+            }
+        }
+        if self.nx == 0 || self.ny == 0 || self.nz == 0 {
+            return;
+        }
+        let inv_dx = 1.0 / self.dx;
+        let cell_of = |x: f64, n: usize| -> usize {
+            // NaN positions saturate to cell 0.
+            ((x * inv_dx).floor() as isize).clamp(0, n as isize - 1) as usize
+        };
+        for p in particles {
+            let idx = self.cell_idx(
+                cell_of(p.position[0], self.nx),
+                cell_of(p.position[1], self.ny),
+                cell_of(p.position[2], self.nz),
+            );
+            if let Some(flag) = self.flags.get_mut(idx)
+                && *flag != CELL_SOLID
+            {
+                *flag = CELL_FLUID;
+            }
+        }
+        for (pressure, &flag) in self.p.iter_mut().zip(self.flags.iter()) {
+            if flag != CELL_FLUID {
+                *pressure = 0.0;
+            }
+        }
+    }
+    /// Copy the face velocities (`u`, `v`, `w`) of `other`.
+    ///
+    /// Returns `false` and leaves `self` untouched when the grids differ in
+    /// size.
+    pub fn copy_velocities_from(&mut self, other: &MacGrid) -> bool {
+        if self.u.len() != other.u.len()
+            || self.v.len() != other.v.len()
+            || self.w.len() != other.w.len()
+        {
+            return false;
+        }
+        self.u.copy_from_slice(&other.u);
+        self.v.copy_from_slice(&other.v);
+        self.w.copy_from_slice(&other.w);
+        true
+    }
+    /// Add the body acceleration `acceleration * dt` to every face velocity
+    /// (u, v and w alike).
+    pub fn add_body_acceleration(&mut self, acceleration: [f64; 3], dt: f64) {
+        for u in self.u.iter_mut() {
+            *u += acceleration[0] * dt;
+        }
+        for v in self.v.iter_mut() {
+            *v += acceleration[1] * dt;
+        }
+        for w in self.w.iter_mut() {
+            *w += acceleration[2] * dt;
+        }
+    }
+    /// Enforce no-penetration: the normal velocity is zero on the six domain
+    /// faces and on every face adjacent to a solid cell.
+    pub fn enforce_solid_boundaries(&mut self) {
+        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..=nx {
+                    let (ii, jj, kk) = (i as isize, j as isize, k as isize);
+                    if self.flag_at(ii - 1, jj, kk) == CELL_SOLID
+                        || self.flag_at(ii, jj, kk) == CELL_SOLID
+                    {
+                        self.set_u(i, j, k, 0.0);
+                    }
+                }
+            }
+        }
+        for k in 0..nz {
+            for j in 0..=ny {
+                for i in 0..nx {
+                    let (ii, jj, kk) = (i as isize, j as isize, k as isize);
+                    if self.flag_at(ii, jj - 1, kk) == CELL_SOLID
+                        || self.flag_at(ii, jj, kk) == CELL_SOLID
+                    {
+                        self.set_v(i, j, k, 0.0);
+                    }
+                }
+            }
+        }
+        for k in 0..=nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let (ii, jj, kk) = (i as isize, j as isize, k as isize);
+                    if self.flag_at(ii, jj, kk - 1) == CELL_SOLID
+                        || self.flag_at(ii, jj, kk) == CELL_SOLID
+                    {
+                        self.set_w(i, j, k, 0.0);
+                    }
+                }
+            }
+        }
+    }
+    /// Compute velocity divergence at each cell.
+    pub fn compute_divergence(&mut self) {
+        let inv_dx = 1.0 / self.dx;
+        for k in 0..self.nz {
+            for j in 0..self.ny {
+                for i in 0..self.nx {
+                    let du = self.get_u(i + 1, j, k) - self.get_u(i, j, k);
+                    let dv = self.get_v(i, j + 1, k) - self.get_v(i, j, k);
+                    let dw = self.get_w(i, j, k + 1) - self.get_w(i, j, k);
+                    let idx = self.cell_idx(i, j, k);
+                    self.div[idx] = (du + dv + dw) * inv_dx;
+                }
+            }
+        }
+    }
+    /// Jacobi pressure solve: solve ∇²p = ρ/dt * ∇·u.
+    ///
+    /// Runs `iterations` Jacobi sweeps over the fluid cells ([`CELL_FLUID`]).
+    /// Air cells are Dirichlet (`p = 0`; pressure outside the fluid is zeroed
+    /// before the first sweep and counts as a neighbour with zero pressure),
+    /// solid cells and the domain walls are Neumann (the neighbour is dropped
+    /// from the stencil).
+    pub fn jacobi_pressure_solve(&mut self, rho: f64, dt: f64, iterations: usize) {
+        self.compute_divergence();
+        let scale = rho * self.dx * self.dx / dt;
+        let nx = self.nx;
+        let ny = self.ny;
+        let nz = self.nz;
+        for (pressure, &flag) in self.p.iter_mut().zip(self.flags.iter()) {
+            if flag != CELL_FLUID {
+                *pressure = 0.0;
+            }
+        }
+        let mut p_new = self.p.clone();
+        for _ in 0..iterations {
+            for k in 0..nz {
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let (ii, jj, kk) = (i as isize, j as isize, k as isize);
+                        if self.flag_at(ii, jj, kk) != CELL_FLUID {
+                            continue;
+                        }
+                        let mut neighbor_sum = 0.0;
+                        let mut n_count = 0u32;
+                        for (di, dj, dk) in NEIGHBOR_OFFSETS {
+                            let (ni, nj, nk) = (ii + di, jj + dj, kk + dk);
+                            match self.flag_at(ni, nj, nk) {
+                                CELL_SOLID => {}
+                                CELL_FLUID => {
+                                    neighbor_sum += self.p
+                                        [self.cell_idx(ni as usize, nj as usize, nk as usize)];
+                                    n_count += 1;
+                                }
+                                _ => n_count += 1,
+                            }
+                        }
+                        if n_count > 0 {
+                            let idx = self.cell_idx(i, j, k);
+                            p_new[idx] = (neighbor_sum - scale * self.div[idx]) / n_count as f64;
+                        }
+                    }
+                }
+            }
+            self.p.copy_from_slice(&p_new);
+        }
+    }
+    /// Apply pressure gradient to velocities (project step).
+    ///
+    /// Faces adjacent to a solid cell are left untouched (their normal
+    /// velocity is imposed by [`enforce_solid_boundaries`](Self::enforce_solid_boundaries)).
+    pub fn pressure_project(&mut self, rho: f64, dt: f64) {
+        let scale = dt / (rho * self.dx);
+        let nx = self.nx;
+        let ny = self.ny;
+        let nz = self.nz;
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 1..nx {
+                    let (ii, jj, kk) = (i as isize, j as isize, k as isize);
+                    if self.flag_at(ii - 1, jj, kk) == CELL_SOLID
+                        || self.flag_at(ii, jj, kk) == CELL_SOLID
+                    {
+                        continue;
+                    }
+                    let p_r = self.p[self.cell_idx(i, j, k)];
+                    let p_l = self.p[self.cell_idx(i - 1, j, k)];
+                    let u_old = self.get_u(i, j, k);
+                    self.set_u(i, j, k, u_old - scale * (p_r - p_l));
+                }
+            }
+        }
+        for k in 0..nz {
+            for j in 1..ny {
+                for i in 0..nx {
+                    let (ii, jj, kk) = (i as isize, j as isize, k as isize);
+                    if self.flag_at(ii, jj - 1, kk) == CELL_SOLID
+                        || self.flag_at(ii, jj, kk) == CELL_SOLID
+                    {
+                        continue;
+                    }
+                    let p_t = self.p[self.cell_idx(i, j, k)];
+                    let p_b = self.p[self.cell_idx(i, j - 1, k)];
+                    let v_old = self.get_v(i, j, k);
+                    self.set_v(i, j, k, v_old - scale * (p_t - p_b));
+                }
+            }
+        }
+        for k in 1..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let (ii, jj, kk) = (i as isize, j as isize, k as isize);
+                    if self.flag_at(ii, jj, kk - 1) == CELL_SOLID
+                        || self.flag_at(ii, jj, kk) == CELL_SOLID
+                    {
+                        continue;
+                    }
+                    let p_f = self.p[self.cell_idx(i, j, k)];
+                    let p_bk = self.p[self.cell_idx(i, j, k - 1)];
+                    let w_old = self.get_w(i, j, k);
+                    self.set_w(i, j, k, w_old - scale * (p_f - p_bk));
+                }
+            }
+        }
+    }
+    /// Trilinear interpolation of u-velocity at world position (x, y, z).
+    ///
+    /// `u(i, j, k)` lives at `(i dx, (j + ½) dx, (k + ½) dx)`.
+    pub fn interp_u(&self, x: f64, y: f64, z: f64) -> f64 {
+        let inv_dx = 1.0 / self.dx;
+        Self::trilerp(
+            &self.u,
+            [self.nx + 1, self.ny, self.nz],
+            [x * inv_dx, y * inv_dx - 0.5, z * inv_dx - 0.5],
+        )
+    }
+    /// Trilinear interpolation of v-velocity at world position (x, y, z).
+    ///
+    /// `v(i, j, k)` lives at `((i + ½) dx, j dx, (k + ½) dx)`.
+    pub fn interp_v(&self, x: f64, y: f64, z: f64) -> f64 {
+        let inv_dx = 1.0 / self.dx;
+        Self::trilerp(
+            &self.v,
+            [self.nx, self.ny + 1, self.nz],
+            [x * inv_dx - 0.5, y * inv_dx, z * inv_dx - 0.5],
+        )
+    }
+    /// Trilinear interpolation of w-velocity at world position (x, y, z).
+    ///
+    /// `w(i, j, k)` lives at `((i + ½) dx, (j + ½) dx, k dx)`.
+    pub fn interp_w(&self, x: f64, y: f64, z: f64) -> f64 {
+        let inv_dx = 1.0 / self.dx;
+        Self::trilerp(
+            &self.w,
+            [self.nx, self.ny, self.nz + 1],
+            [x * inv_dx - 0.5, y * inv_dx - 0.5, z * inv_dx],
+        )
+    }
+    /// Trilinear interpolation of a staggered component.
+    ///
+    /// `data` holds `dims[0] * dims[1] * dims[2]` samples (x fastest) and
+    /// `pos` is the query point in sample-index units.  Indices are clamped to
+    /// the sample range (constant extrapolation).
+    fn trilerp(data: &[f64], dims: [usize; 3], pos: [f64; 3]) -> f64 {
+        if dims.contains(&0) {
+            return 0.0;
+        }
+        let floor = pos.map(f64::floor);
+        let frac = [pos[0] - floor[0], pos[1] - floor[1], pos[2] - floor[2]];
+        let base = floor.map(|b| b as isize);
+        let sample = |di: isize, dj: isize, dk: isize| -> f64 {
+            let i = (base[0] + di).clamp(0, dims[0] as isize - 1) as usize;
+            let j = (base[1] + dj).clamp(0, dims[1] as isize - 1) as usize;
+            let k = (base[2] + dk).clamp(0, dims[2] as isize - 1) as usize;
+            data.get((k * dims[1] + j) * dims[0] + i)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let lerp = |a: f64, b: f64, t: f64| a + t * (b - a);
+        let x00 = lerp(sample(0, 0, 0), sample(1, 0, 0), frac[0]);
+        let x10 = lerp(sample(0, 1, 0), sample(1, 1, 0), frac[0]);
+        let x01 = lerp(sample(0, 0, 1), sample(1, 0, 1), frac[0]);
+        let x11 = lerp(sample(0, 1, 1), sample(1, 1, 1), frac[0]);
+        let y0 = lerp(x00, x10, frac[1]);
+        let y1 = lerp(x01, x11, frac[1]);
+        lerp(y0, y1, frac[2])
+    }
+}
+/// SPH simulation configuration.
+#[derive(Debug, Clone)]
+pub struct SphConfig {
+    /// Smoothing radius.
+    pub h: f64,
+    /// Rest density (kg/m³).
+    pub rest_density: f64,
+    /// Pressure stiffness.
+    pub pressure_k: f64,
+    /// Viscosity coefficient.
+    pub viscosity: f64,
+    /// Surface-tension coefficient `γ` of the Akinci et al. (2013) model
+    /// (cohesion between neighbours plus curvature minimisation, see
+    /// [`sph_compute_forces`]).  It is a tuning coefficient of that model, not
+    /// a physical surface tension in N/m; values `<= 0` switch the surface
+    /// tension off.
+    pub surface_tension: f64,
+    /// Gravity.
+    pub gravity: [f64; 3],
+    /// Time step.
+    pub dt: f64,
+}

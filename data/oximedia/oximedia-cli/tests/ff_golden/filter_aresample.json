@@ -1,0 +1,9 @@
+{
+  "name": "filter_aresample",
+  "args": ["-i", "in.mkv", "-af", "aresample=48000", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "audio_filters": 1
+  }
+}

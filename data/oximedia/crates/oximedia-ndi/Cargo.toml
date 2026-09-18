@@ -1,0 +1,33 @@
+[package]
+name = "oximedia-ndi"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "NDI (Network Device Interface) support for OxiMedia"
+keywords = ["ndi", "network", "video", "ip-video", "multimedia"]
+categories = ["multimedia", "network-programming"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-codec = { workspace = true, default-features = true }
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+mdns-sd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rayon = { workspace = true }

@@ -1,0 +1,70 @@
+[package]
+name = "oximedia-packager"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Adaptive streaming packaging (HLS/DASH) for OxiMedia"
+keywords = ["streaming", "multimedia", "network", "video", "hls"]
+categories = ["multimedia", "network-programming"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = ["hls", "dash"]
+hls = []
+dash = []
+encryption = ["aes", "cbc", "block-padding"]
+s3 = ["aws-sdk-s3", "aws-config"]
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-io.workspace = true
+oximedia-codec = { workspace = true, default-features = true }
+oximedia-container.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["full"] }
+async-trait.workspace = true
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# XML for DASH MPD
+quick-xml = { workspace = true, features = ["serialize"] }
+
+# Time handling
+chrono = { workspace = true }
+
+# Crypto for encryption
+aes = { version = "0.9", optional = true }
+cbc = { workspace = true, optional = true }
+block-padding = { workspace = true, optional = true }
+hex.workspace = true
+base64 = { workspace = true }
+
+# CSPRNG for key/IV generation and PBKDF2 for passphrase-derived keys
+rand = { workspace = true }
+sha2 = { workspace = true }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+
+# Cloud storage
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+
+# Path handling
+camino = "1"
+
+# Parallel processing
+rayon.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true

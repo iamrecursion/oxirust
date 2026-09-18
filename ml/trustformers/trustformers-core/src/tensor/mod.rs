@@ -1,0 +1,520 @@
+//! Core tensor abstraction for TrustformeRS.
+//!
+//! This module provides the fundamental `Tensor` type that serves as the backbone
+//! for all numerical computations in TrustformeRS. It offers a unified interface
+//! over different backend implementations (ndarray on the CPU, Metal on Apple
+//! GPUs) while maintaining high performance through SIMD optimizations.
+//!
+//! # Overview
+//!
+//! The `Tensor` enum provides:
+//! - Multi-backend support (CPU via ndarray, GPU via Metal on macOS)
+//! - Common tensor operations (matmul, add, softmax, etc.)
+//! - Broadcasting and shape manipulation
+//! - Gradient-related operations for training
+//! - Serialization support for model persistence
+//!
+//! # Example
+//!
+//! ```no_run
+//! use trustformers_core::tensor::Tensor;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create tensors
+//! let a = Tensor::randn(&[2, 3])?;
+//! let b = Tensor::randn(&[3, 4])?;
+//!
+//! // Perform operations
+//! let c = a.matmul(&b)?;  // Matrix multiplication
+//! let d = c.relu()?;       // ReLU activation
+//! let e = d.softmax(-1)?;  // Softmax along last dimension
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Performance Notes
+//!
+//! - SIMD operations are used where available for better performance
+//! - Tensor operations are optimized for common transformer patterns
+//! - GPU operations are available when compiled with appropriate features
+
+mod activations;
+mod complex;
+pub mod constructors;
+mod conversions;
+mod expression;
+mod math_ops;
+mod sparse;
+pub mod transformations;
+mod utils;
+
+#[cfg(test)]
+mod complex_tests;
+#[cfg(test)]
+mod constructors_tests;
+#[cfg(test)]
+mod property_tests;
+#[cfg(test)]
+mod transformations_tests;
+
+use crate::errors::Result;
+use scirs2_core::ndarray::{ArrayBase, ArrayD, Dim, IxDynImpl, OwnedRepr};
+use scirs2_core::Complex;
+use scirs2_core::{Complex32, Complex64};
+use serde::{Deserialize, Serialize};
+
+/// Data types supported by tensors
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DType {
+    /// 32-bit floating point
+    F32,
+    /// 16-bit floating point
+    F16,
+    /// Brain floating point 16
+    BF16,
+    /// 64-bit floating point
+    F64,
+    /// 32-bit complex number (two 32-bit floats)
+    C32,
+    /// 64-bit complex number (two 64-bit floats)
+    C64,
+    /// 16-bit complex number (two 16-bit floats)
+    CF16,
+    /// Brain floating point 16 complex number (two BF16 floats)
+    CBF16,
+    /// 8-bit unsigned integer
+    U8,
+    /// 16-bit unsigned integer
+    U16,
+    /// 32-bit unsigned integer
+    U32,
+    /// 64-bit unsigned integer
+    U64,
+    /// 8-bit signed integer
+    I8,
+    /// 16-bit signed integer
+    I16,
+    /// 32-bit signed integer
+    I32,
+    /// 64-bit signed integer
+    I64,
+    /// Boolean
+    Bool,
+}
+
+impl DType {
+    /// Returns the size in bytes of an element of this data type
+    pub fn size_in_bytes(&self) -> usize {
+        match self {
+            DType::F32 => 4,
+            DType::F16 => 2,
+            DType::BF16 => 2,
+            DType::F64 => 8,
+            DType::C32 => 8,   // Two 32-bit floats
+            DType::C64 => 16,  // Two 64-bit floats
+            DType::CF16 => 4,  // Two 16-bit floats
+            DType::CBF16 => 4, // Two BF16 floats
+            DType::U8 => 1,
+            DType::U16 => 2,
+            DType::U32 => 4,
+            DType::U64 => 8,
+            DType::I8 => 1,
+            DType::I16 => 2,
+            DType::I32 => 4,
+            DType::I64 => 8,
+            DType::Bool => 1,
+        }
+    }
+}
+
+/// Multi-backend tensor representation.
+///
+/// The `Tensor` enum provides a unified interface over different tensor backends,
+/// allowing seamless switching between CPU and GPU computations based on availability
+/// and requirements.
+///
+/// # Variants
+///
+/// - `F32`: 32-bit floating point tensors (most common for neural networks)
+/// - `F64`: 64-bit floating point tensors (for high precision requirements)
+/// - `I64`: 64-bit integer tensors (for indices and discrete values)
+/// - `Metal`: GPU-resident tensor on Apple silicon (requires the `metal`
+///   feature on macOS)
+///
+/// # Backend Selection
+///
+/// The default backend is ndarray (CPU), which provides good performance for
+/// small to medium models. GPU acceleration comes from the `metal` feature on
+/// macOS and from the `hardware_acceleration` module elsewhere.
+///
+/// # Example
+///
+/// ```no_run
+/// use trustformers_core::tensor::Tensor;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create a tensor with default backend
+/// let tensor = Tensor::zeros(&[2, 3, 4])?;
+/// assert_eq!(tensor.shape(), vec![2, 3, 4]);
+/// # Ok(())
+/// # }
+/// ```
+/// Metal GPU buffer wrapper for GPU-resident tensors.
+///
+/// Holds a reference-counted [`MetalBufferHandle`](crate::gpu_ops::metal::MetalBufferHandle)
+/// rather than a raw buffer id, mirroring [`CudaTensorData`]: cloning shares the same GPU
+/// allocation (refcount increment only), and when the last clone drops the buffer is removed
+/// from the backend's cache and the `MTLBuffer` freed. A bare `BufferId` here previously left
+/// every GPU-resident tensor's buffer parked in the cache until `clear_buffer_cache` or process
+/// exit - see the module docs on `gpu_ops::metal::types` for the full history.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Debug, Clone)]
+pub struct MetalTensorData {
+    /// Lifecycle-managed reference to the GPU-resident buffer.
+    pub buffer: crate::gpu_ops::metal::MetalBufferHandle,
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl MetalTensorData {
+    /// Wrap a freshly minted buffer id into a lifecycle-managed Metal tensor payload.
+    ///
+    /// Takes a reference on `buffer_id` through
+    /// [`MetalBackend::retain_buffer`](crate::gpu_ops::metal::MetalBackend::retain_buffer),
+    /// which exempts the entry from LRU eviction and frees it when the last clone of the
+    /// returned value drops. Each raw id must be wrapped at most once; all sharing then
+    /// goes through `clone()`.
+    pub fn new(
+        backend: &crate::gpu_ops::metal::MetalBackend,
+        buffer_id: crate::gpu_ops::metal::BufferId,
+        shape: Vec<usize>,
+        dtype: DType,
+    ) -> Result<Self> {
+        Ok(Self {
+            buffer: backend.retain_buffer(&buffer_id)?,
+            shape,
+            dtype,
+        })
+    }
+
+    /// The resident buffer id backing this tensor.
+    #[inline]
+    pub fn buffer_id(&self) -> crate::gpu_ops::metal::BufferId {
+        self.buffer.id()
+    }
+}
+
+/// CUDA GPU buffer wrapper for GPU-resident tensors.
+///
+/// Holds a reference-counted [`BufferHandle`](crate::gpu_ops::cuda::BufferHandle) rather
+/// than a raw buffer id: cloning shares the same device allocation (refcount increment
+/// only), and when the last clone drops the buffer is removed from the backend cache and
+/// its device memory freed. The handle also carries the CUDA device ordinal the buffer
+/// lives on, so downstream ops address the correct device on multi-GPU machines.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub struct CudaTensorData {
+    /// Lifecycle-managed reference to the GPU-resident buffer (id + device ordinal).
+    pub buffer: crate::gpu_ops::cuda::BufferHandle,
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaTensorData {
+    /// Wrap a freshly minted resident buffer id (owned by the backend for `device_id`)
+    /// into a lifecycle-managed CUDA tensor payload. Each raw id must be wrapped at most
+    /// once; all sharing then goes through `clone()`.
+    pub fn new(
+        buffer_id: crate::gpu_ops::cuda::BufferId,
+        device_id: usize,
+        shape: Vec<usize>,
+        dtype: DType,
+    ) -> Self {
+        Self {
+            buffer: crate::gpu_ops::cuda::BufferHandle::new(buffer_id, device_id),
+            shape,
+            dtype,
+        }
+    }
+
+    /// Build from an existing handle (test seam for mocked release callbacks).
+    #[cfg(test)]
+    pub(crate) fn from_handle(
+        buffer: crate::gpu_ops::cuda::BufferHandle,
+        shape: Vec<usize>,
+        dtype: DType,
+    ) -> Self {
+        Self {
+            buffer,
+            shape,
+            dtype,
+        }
+    }
+
+    /// The resident buffer id backing this tensor.
+    #[inline]
+    pub fn buffer_id(&self) -> crate::gpu_ops::cuda::BufferId {
+        self.buffer.id()
+    }
+
+    /// The CUDA device ordinal this tensor's buffer lives on.
+    #[inline]
+    pub fn device_id(&self) -> usize {
+        self.buffer.device_id()
+    }
+}
+
+pub enum Tensor {
+    // Standard ndarray types
+    F32(ArrayD<f32>),
+    F64(ArrayD<f64>),
+    F16(ArrayD<half::f16>),
+    BF16(ArrayD<half::bf16>),
+    I64(ArrayD<i64>),
+    // Complex number types
+    C32(ArrayD<Complex32>),
+    C64(ArrayD<Complex64>),
+    CF16(ArrayD<Complex<half::f16>>),
+    CBF16(ArrayD<Complex<half::bf16>>),
+    // Sparse tensor variant
+    Sparse(crate::sparse_tensor::SparseTensor),
+    // GPU support available via hardware acceleration module (CUDA, ROCm, Intel OneAPI, Vulkan, Metal)
+    // Metal GPU-resident tensor (data lives on GPU)
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    Metal(MetalTensorData),
+    // CUDA GPU-resident tensor (data lives on GPU)
+    #[cfg(feature = "cuda")]
+    CUDA(CudaTensorData),
+}
+
+// Manual Clone implementation because some backend tensor types require custom clone semantics
+impl Clone for Tensor {
+    fn clone(&self) -> Self {
+        match self {
+            Tensor::F32(arr) => Tensor::F32(arr.clone()),
+            Tensor::F64(arr) => Tensor::F64(arr.clone()),
+            Tensor::F16(arr) => Tensor::F16(arr.clone()),
+            Tensor::BF16(arr) => Tensor::BF16(arr.clone()),
+            Tensor::I64(arr) => Tensor::I64(arr.clone()),
+            Tensor::C32(arr) => Tensor::C32(arr.clone()),
+            Tensor::C64(arr) => Tensor::C64(arr.clone()),
+            Tensor::CF16(arr) => Tensor::CF16(arr.clone()),
+            Tensor::CBF16(arr) => Tensor::CBF16(arr.clone()),
+            Tensor::Sparse(s) => Tensor::Sparse(s.clone()),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Tensor::Metal(data) => Tensor::Metal(data.clone()),
+            #[cfg(feature = "cuda")]
+            Tensor::CUDA(data) => Tensor::CUDA(data.clone()),
+        }
+    }
+}
+
+// Manual Debug implementation for Tensor
+impl std::fmt::Debug for Tensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tensor::F32(_) => write!(f, "Tensor::F32(shape: {:?}, dtype: F32)", self.shape()),
+            Tensor::F64(_) => write!(f, "Tensor::F64(shape: {:?}, dtype: F64)", self.shape()),
+            Tensor::F16(_) => write!(f, "Tensor::F16(shape: {:?}, dtype: F16)", self.shape()),
+            Tensor::BF16(_) => write!(f, "Tensor::BF16(shape: {:?}, dtype: BF16)", self.shape()),
+            Tensor::I64(_) => write!(f, "Tensor::I64(shape: {:?}, dtype: I64)", self.shape()),
+            Tensor::C32(_) => write!(f, "Tensor::C32(shape: {:?}, dtype: C32)", self.shape()),
+            Tensor::C64(_) => write!(f, "Tensor::C64(shape: {:?}, dtype: C64)", self.shape()),
+            Tensor::CF16(_) => write!(f, "Tensor::CF16(shape: {:?}, dtype: CF16)", self.shape()),
+            Tensor::CBF16(_) => write!(f, "Tensor::CBF16(shape: {:?}, dtype: CBF16)", self.shape()),
+            Tensor::Sparse(s) => write!(f, "Tensor::Sparse({:?})", s),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            Tensor::Metal(data) => write!(
+                f,
+                "Tensor::Metal(shape: {:?}, dtype: {:?}, buffer: {:?})",
+                data.shape, data.dtype, data.buffer
+            ),
+            #[cfg(feature = "cuda")]
+            Tensor::CUDA(data) => write!(
+                f,
+                "Tensor::CUDA(shape: {:?}, dtype: {:?}, buffer: {:?})",
+                data.shape, data.dtype, data.buffer
+            ),
+        }
+    }
+}
+
+// The implementations are in separate modules but the methods are part of the Tensor impl blocks
+
+impl From<ArrayBase<OwnedRepr<f32>, Dim<IxDynImpl>>> for Tensor {
+    fn from(arr: ArrayD<f32>) -> Self {
+        Tensor::F32(arr)
+    }
+}
+
+impl From<ArrayBase<OwnedRepr<f64>, Dim<IxDynImpl>>> for Tensor {
+    fn from(arr: ArrayD<f64>) -> Self {
+        Tensor::F64(arr)
+    }
+}
+
+// Additional math operations for trait compatibility
+impl std::ops::Add for Tensor {
+    type Output = Result<Tensor>;
+
+    fn add(self, other: Tensor) -> Self::Output {
+        Tensor::add(&self, &other)
+    }
+}
+
+impl std::ops::Add for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn add(self, other: &Tensor) -> Self::Output {
+        Tensor::add(self, other)
+    }
+}
+
+impl std::ops::Add<&&Tensor> for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn add(self, other: &&Tensor) -> Self::Output {
+        Tensor::add(self, other)
+    }
+}
+
+impl std::ops::Add<&Tensor> for &&Tensor {
+    type Output = Result<Tensor>;
+
+    fn add(self, other: &Tensor) -> Self::Output {
+        Tensor::add(self, other)
+    }
+}
+
+impl std::ops::Sub for Tensor {
+    type Output = Result<Tensor>;
+
+    fn sub(self, other: Tensor) -> Self::Output {
+        Tensor::sub(&self, &other)
+    }
+}
+
+// Scalar multiplication operators
+impl std::ops::Mul<f32> for Tensor {
+    type Output = Result<Tensor>;
+
+    fn mul(self, scalar: f32) -> Self::Output {
+        self.scalar_mul(scalar)
+    }
+}
+
+impl std::ops::Mul<f32> for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn mul(self, scalar: f32) -> Self::Output {
+        self.scalar_mul(scalar)
+    }
+}
+
+impl std::ops::Mul<f64> for Tensor {
+    type Output = Result<Tensor>;
+
+    fn mul(self, scalar: f64) -> Self::Output {
+        self.scalar_mul(scalar as f32)
+    }
+}
+
+impl std::ops::Mul<f64> for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn mul(self, scalar: f64) -> Self::Output {
+        self.scalar_mul(scalar as f32)
+    }
+}
+
+// Element-wise multiplication with another tensor
+impl std::ops::Mul<&Tensor> for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn mul(self, other: &Tensor) -> Self::Output {
+        Tensor::mul(self, other)
+    }
+}
+
+impl std::ops::Mul<Tensor> for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn mul(self, other: Tensor) -> Self::Output {
+        Tensor::mul(self, &other)
+    }
+}
+
+impl std::ops::Mul<&Tensor> for Tensor {
+    type Output = Result<Tensor>;
+
+    fn mul(self, other: &Tensor) -> Self::Output {
+        Tensor::mul(&self, other)
+    }
+}
+
+// Scalar division operators
+impl std::ops::Div<f32> for Tensor {
+    type Output = Result<Tensor>;
+
+    fn div(self, scalar: f32) -> Self::Output {
+        self.scalar_div(scalar)
+    }
+}
+
+impl std::ops::Div<f32> for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn div(self, scalar: f32) -> Self::Output {
+        self.scalar_div(scalar)
+    }
+}
+
+impl std::ops::Div<f64> for Tensor {
+    type Output = Result<Tensor>;
+
+    fn div(self, scalar: f64) -> Self::Output {
+        self.scalar_div(scalar as f32)
+    }
+}
+
+impl std::ops::Div<f64> for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn div(self, scalar: f64) -> Self::Output {
+        self.scalar_div(scalar as f32)
+    }
+}
+
+impl std::ops::Div<f64> for &&Tensor {
+    type Output = Result<Tensor>;
+
+    fn div(self, scalar: f64) -> Self::Output {
+        (*self).scalar_div(scalar as f32)
+    }
+}
+
+// Tensor subtraction operators
+impl std::ops::Sub for &Tensor {
+    type Output = Result<Tensor>;
+
+    fn sub(self, other: &Tensor) -> Self::Output {
+        Tensor::sub(self, other)
+    }
+}
+
+// Type alias for backward compatibility
+pub type TensorType = DType;
+
+// Re-export expression template types
+pub use expression::{EvalContext, ExprNode, OpType, OptimizationHints, TensorExpr};
+
+// Re-export gradient tracking utilities
+pub use utils::{clear_gradients, disable_grad, enable_grad, is_grad_enabled};
+
+// Numerical-stability predicates and clamps used by the tensor math kernels.
+pub use math_ops::{
+    is_stable_f32, is_stable_f64, stabilize_f32, stabilize_f64, MAX_SAFE_VALUE_F32,
+    MAX_SAFE_VALUE_F64, STABILITY_EPSILON_F32, STABILITY_EPSILON_F64,
+};

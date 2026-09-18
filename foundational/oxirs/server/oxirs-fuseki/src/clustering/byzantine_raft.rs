@@ -1,0 +1,886 @@
+//! Byzantine Fault Tolerant Raft (BFT-Raft) implementation
+//!
+//! This module enhances the standard Raft consensus algorithm with Byzantine fault tolerance
+//! capabilities to handle malicious or arbitrarily faulty nodes. It implements cryptographic
+//! signatures, message verification, and Byzantine behavior detection.
+//!
+//! Key BFT features:
+//! - Cryptographic authentication of all messages
+//! - Byzantine behavior detection and node blacklisting
+//! - Enhanced quorum requirements (2f+1 for f Byzantine nodes)
+//! - Message integrity verification and replay attack prevention
+//! - Secure leader election with proof-of-work challenges
+//! - Distributed key management for node authentication
+
+use crate::clustering::raft::{AppendEntriesRequest, RequestVoteRequest, RpcMessage};
+use crate::error::{FusekiError, FusekiResult};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use oxicrypto_hash::Sha256;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::{Duration, Instant},
+};
+use tracing::{info, warn};
+
+/// Compute a SHA-256 digest over the concatenation of the given byte segments.
+///
+/// The previous `ring::digest::Context` API accumulated multiple `update()`
+/// calls; concatenating the same segments and hashing once yields an identical
+/// digest. Uses the Pure-Rust `oxicrypto-hash` SHA-256.
+fn sha256_segments(segments: &[&[u8]]) -> [u8; 32] {
+    let total: usize = segments.iter().map(|s| s.len()).sum();
+    let mut buf = Vec::with_capacity(total);
+    for segment in segments {
+        buf.extend_from_slice(segment);
+    }
+    Sha256.hash_fixed(&buf)
+}
+
+/// Maximum number of Byzantine nodes the system can tolerate
+const MAX_BYZANTINE_NODES: usize = 10;
+
+/// Proof-of-work difficulty for leader election
+const POW_DIFFICULTY: u32 = 4;
+
+/// Message signature expiry time (5 minutes)
+const MESSAGE_TTL: Duration = Duration::from_secs(300);
+
+/// Byzantine node detection threshold
+const BYZANTINE_THRESHOLD: u32 = 3;
+
+/// BFT-enhanced RPC message with cryptographic authentication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BftMessage {
+    /// Original Raft message
+    pub inner: RpcMessage,
+    /// Cryptographic signature
+    pub signature: Vec<u8>,
+    /// Sender's public key identifier
+    pub sender_key_id: String,
+    /// Message timestamp (for replay protection)
+    pub timestamp: DateTime<Utc>,
+    /// Nonce for uniqueness
+    pub nonce: Vec<u8>,
+    /// Proof-of-work (for leader election)
+    pub proof_of_work: Option<ProofOfWork>,
+}
+
+/// A generic Ed25519-signed, replay-protected envelope around an arbitrary
+/// pre-serialized payload.
+///
+/// [`BftMessage`] is hard-typed to [`RpcMessage`] (the in-process,
+/// non-networked `raft.rs` RPC enum). Real inter-node traffic instead flows
+/// through [`crate::clustering::node::TcpNodeCommunication`], whose
+/// `NodeMessage` enum has a different shape (`Heartbeat`/`JoinRequest`/
+/// `LeaderElection`/...). `SignedPayload` carries the same cryptographic
+/// authentication (Ed25519 signature over a SHA-256 digest of the payload +
+/// timestamp + nonce) and the same replay/expiry protection as `BftMessage`,
+/// but over an opaque byte payload so it can wrap any serializable message
+/// type. See [`BftNodeState::sign_payload`] / [`BftNodeState::verify_payload`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedPayload {
+    /// The serialized message being authenticated (opaque to this layer).
+    pub payload: Vec<u8>,
+    /// Cryptographic signature over the payload/timestamp/nonce digest.
+    pub signature: Vec<u8>,
+    /// Sender's public key identifier (matches `BftNodeState::identity.node_id`).
+    pub sender_key_id: String,
+    /// Message timestamp (for replay protection).
+    pub timestamp: DateTime<Utc>,
+    /// Nonce for uniqueness.
+    pub nonce: Vec<u8>,
+}
+
+/// Proof-of-work for Byzantine-resistant leader election
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofOfWork {
+    /// Nonce that produces the required hash
+    pub nonce: u64,
+    /// Target hash with required number of leading zeros
+    pub hash: Vec<u8>,
+    /// Difficulty level achieved
+    pub difficulty: u32,
+    /// Computation time (for fairness verification)
+    pub compute_time_ms: u64,
+}
+
+/// Node's cryptographic identity
+#[derive(Debug)]
+pub struct NodeIdentity {
+    /// Node's unique identifier
+    pub node_id: String,
+    /// Ed25519 signing key (Pure-Rust `ed25519-dalek`)
+    pub key_pair: SigningKey,
+    /// Raw 32-byte Ed25519 public key bytes
+    pub public_key: Vec<u8>,
+    /// HMAC key bytes for message authentication (reserved for future use)
+    pub hmac_key: [u8; 32],
+}
+
+/// Byzantine behavior evidence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ByzantineEvidence {
+    /// Node that exhibited Byzantine behavior
+    pub node_id: String,
+    /// Type of Byzantine behavior detected
+    pub behavior_type: ByzantineBehavior,
+    /// Evidence timestamp
+    pub detected_at: DateTime<Utc>,
+    /// Additional evidence data
+    pub evidence_data: Vec<u8>,
+    /// Witness nodes that can verify this evidence
+    pub witnesses: Vec<String>,
+}
+
+/// Types of Byzantine behavior
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ByzantineBehavior {
+    /// Double voting in the same term
+    DoubleVoting,
+    /// Sending conflicting append entries
+    ConflictingAppendEntries,
+    /// Invalid message signature
+    InvalidSignature,
+    /// Replay attack detected
+    ReplayAttack,
+    /// Invalid proof-of-work
+    InvalidProofOfWork,
+    /// Term manipulation
+    TermManipulation,
+    /// Log inconsistency attack
+    LogInconsistency,
+}
+
+/// BFT node state management
+#[derive(Debug)]
+pub struct BftNodeState {
+    /// Node's cryptographic identity
+    pub identity: NodeIdentity,
+    /// Known public keys of other nodes
+    pub known_public_keys: HashMap<String, Vec<u8>>,
+    /// Byzantine nodes detection
+    pub suspected_byzantine: HashMap<String, ByzantineEvidence>,
+    /// Message deduplication (prevents replay attacks)
+    pub seen_messages: HashMap<String, DateTime<Utc>>,
+    /// Byzantine behavior evidence
+    pub byzantine_evidence: Vec<ByzantineEvidence>,
+    /// Blacklisted nodes
+    pub blacklisted_nodes: HashSet<String>,
+    /// Vote tracking for Byzantine detection
+    pub vote_tracking: HashMap<u64, HashMap<String, RequestVoteRequest>>,
+    /// Append entries tracking
+    pub append_entries_tracking: HashMap<String, VecDeque<AppendEntriesRequest>>,
+}
+
+impl BftNodeState {
+    /// Create new BFT node state
+    pub fn new(node_id: String) -> FusekiResult<Self> {
+        // Generate an Ed25519 signing key from a fresh 32-byte CSPRNG seed
+        // (Pure-Rust `oxicrypto-rand` + `ed25519-dalek`).
+        let seed = oxicrypto_rand::random_nonce::<32>()
+            .map_err(|e| FusekiError::internal(format!("Failed to generate key seed: {e:?}")))?;
+        let key_pair = SigningKey::from_bytes(&seed);
+
+        let public_key = key_pair.verifying_key().to_bytes().to_vec();
+
+        // Generate HMAC key bytes (stored for potential future use).
+        let hmac_key = oxicrypto_rand::random_nonce::<32>()
+            .map_err(|e| FusekiError::internal(format!("Failed to generate HMAC key: {e:?}")))?;
+
+        let identity = NodeIdentity {
+            node_id: node_id.clone(),
+            key_pair,
+            public_key,
+            hmac_key,
+        };
+
+        Ok(Self {
+            identity,
+            known_public_keys: HashMap::new(),
+            suspected_byzantine: HashMap::new(),
+            seen_messages: HashMap::new(),
+            byzantine_evidence: Vec::new(),
+            blacklisted_nodes: HashSet::new(),
+            vote_tracking: HashMap::new(),
+            append_entries_tracking: HashMap::new(),
+        })
+    }
+
+    /// Sign a message with cryptographic signature
+    pub fn sign_message(&self, message: &RpcMessage) -> FusekiResult<BftMessage> {
+        let timestamp = Utc::now();
+
+        // Generate nonce for uniqueness (Pure-Rust CSPRNG)
+        let nonce = oxicrypto_rand::random_nonce::<16>()
+            .map_err(|e| FusekiError::internal(format!("Failed to generate nonce: {e:?}")))?;
+
+        // Serialize message for signing
+        let message_bytes = oxicode::serde::encode_to_vec(message, oxicode::config::standard())
+            .map_err(|e| FusekiError::internal(format!("Failed to serialize message: {e}")))?;
+
+        // Create message hash including timestamp and nonce
+        let timestamp_bytes = timestamp.timestamp().to_le_bytes();
+        let message_digest = sha256_segments(&[&message_bytes, &timestamp_bytes, &nonce]);
+
+        // Sign the hash
+        let signature = self.identity.key_pair.sign(&message_digest);
+
+        Ok(BftMessage {
+            inner: message.clone(),
+            signature: signature.to_bytes().to_vec(),
+            sender_key_id: self.identity.node_id.clone(),
+            timestamp,
+            nonce: nonce.to_vec(),
+            proof_of_work: None,
+        })
+    }
+
+    /// Verify message signature and detect Byzantine behavior
+    pub fn verify_message(&mut self, bft_message: &BftMessage) -> FusekiResult<bool> {
+        // Check if message is too old (replay attack protection)
+        let age = Utc::now() - bft_message.timestamp;
+        if age
+            > chrono::Duration::from_std(MESSAGE_TTL).expect("MESSAGE_TTL should be valid duration")
+        {
+            self.record_byzantine_behavior(
+                &bft_message.sender_key_id,
+                ByzantineBehavior::ReplayAttack,
+                format!("Message too old: {} seconds", age.num_seconds()).into_bytes(),
+            );
+            return Ok(false);
+        }
+
+        // Check for message replay
+        let message_id = self.compute_message_id(bft_message)?;
+        if let Some(&_seen_time) = self.seen_messages.get(&message_id) {
+            self.record_byzantine_behavior(
+                &bft_message.sender_key_id,
+                ByzantineBehavior::ReplayAttack,
+                format!("Duplicate message: {message_id}").into_bytes(),
+            );
+            return Ok(false);
+        }
+
+        // Get sender's public key
+        let public_key_bytes = self
+            .known_public_keys
+            .get(&bft_message.sender_key_id)
+            .ok_or_else(|| FusekiError::authentication("Unknown sender"))?;
+
+        // Parse the raw 32-byte Ed25519 public key.
+        let public_key = match <[u8; 32]>::try_from(public_key_bytes.as_slice())
+            .ok()
+            .and_then(|pk| VerifyingKey::from_bytes(&pk).ok())
+        {
+            Some(pk) => pk,
+            None => {
+                self.record_byzantine_behavior(
+                    &bft_message.sender_key_id,
+                    ByzantineBehavior::InvalidSignature,
+                    b"Invalid sender public key".to_vec(),
+                );
+                return Ok(false);
+            }
+        };
+
+        // Parse the 64-byte Ed25519 signature.
+        let signature = match <[u8; 64]>::try_from(bft_message.signature.as_slice()) {
+            Ok(sig_bytes) => ed25519_dalek::Signature::from_bytes(&sig_bytes),
+            Err(_) => {
+                self.record_byzantine_behavior(
+                    &bft_message.sender_key_id,
+                    ByzantineBehavior::InvalidSignature,
+                    b"Malformed signature".to_vec(),
+                );
+                return Ok(false);
+            }
+        };
+
+        // Recreate message hash
+        let message_bytes =
+            oxicode::serde::encode_to_vec(&bft_message.inner, oxicode::config::standard())
+                .map_err(|e| FusekiError::internal(format!("Failed to serialize message: {e}")))?;
+
+        let timestamp_bytes = bft_message.timestamp.timestamp().to_le_bytes();
+        let message_digest =
+            sha256_segments(&[&message_bytes, &timestamp_bytes, &bft_message.nonce]);
+
+        // Verify signature
+        match public_key.verify(&message_digest, &signature) {
+            Ok(()) => {
+                // Record message as seen
+                self.seen_messages.insert(message_id, bft_message.timestamp);
+
+                // Check for Byzantine behavior patterns
+                self.detect_byzantine_patterns(bft_message)?;
+
+                Ok(true)
+            }
+            Err(_) => {
+                self.record_byzantine_behavior(
+                    &bft_message.sender_key_id,
+                    ByzantineBehavior::InvalidSignature,
+                    b"Signature verification failed".to_vec(),
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// This node's raw 32-byte Ed25519 public key, for distributing to peers
+    /// (e.g. at cluster join time) so they can [`add_public_key`](Self::add_public_key)
+    /// and subsequently [`verify_payload`](Self::verify_payload) messages from
+    /// this node.
+    pub fn public_key(&self) -> &[u8] {
+        &self.identity.public_key
+    }
+
+    /// Sign an arbitrary pre-serialized payload, producing a [`SignedPayload`]
+    /// with the same Ed25519-over-SHA256(payload‖timestamp‖nonce) scheme as
+    /// [`sign_message`](Self::sign_message), for use by transports (e.g.
+    /// [`crate::clustering::node::TcpNodeCommunication`]) whose message type
+    /// is not [`RpcMessage`].
+    pub fn sign_payload(&self, payload: &[u8]) -> FusekiResult<SignedPayload> {
+        let timestamp = Utc::now();
+
+        let nonce = oxicrypto_rand::random_nonce::<16>()
+            .map_err(|e| FusekiError::internal(format!("Failed to generate nonce: {e:?}")))?;
+
+        let timestamp_bytes = timestamp.timestamp().to_le_bytes();
+        let digest = sha256_segments(&[payload, &timestamp_bytes, &nonce]);
+        let signature = self.identity.key_pair.sign(&digest);
+
+        Ok(SignedPayload {
+            payload: payload.to_vec(),
+            signature: signature.to_bytes().to_vec(),
+            sender_key_id: self.identity.node_id.clone(),
+            timestamp,
+            nonce: nonce.to_vec(),
+        })
+    }
+
+    /// Verify a [`SignedPayload`]: rejects expired (replay-window), replayed
+    /// (duplicate nonce/signature), unknown-sender, or badly-signed payloads,
+    /// recording Byzantine evidence (and blacklisting on repeated offenses)
+    /// exactly like [`verify_message`](Self::verify_message). Returns
+    /// `Ok(true)` only when the payload is freshly signed by a known,
+    /// non-blacklisted peer.
+    pub fn verify_payload(&mut self, signed: &SignedPayload) -> FusekiResult<bool> {
+        if self.blacklisted_nodes.contains(&signed.sender_key_id) {
+            return Ok(false);
+        }
+
+        let age = Utc::now() - signed.timestamp;
+        if age
+            > chrono::Duration::from_std(MESSAGE_TTL).expect("MESSAGE_TTL should be valid duration")
+        {
+            self.record_byzantine_behavior(
+                &signed.sender_key_id,
+                ByzantineBehavior::ReplayAttack,
+                format!("Signed payload too old: {} seconds", age.num_seconds()).into_bytes(),
+            );
+            return Ok(false);
+        }
+
+        let message_id = hex::encode(sha256_segments(&[
+            &signed.signature,
+            signed.sender_key_id.as_bytes(),
+            &signed.timestamp.timestamp().to_le_bytes(),
+            &signed.nonce,
+        ]));
+        if self.seen_messages.contains_key(&message_id) {
+            self.record_byzantine_behavior(
+                &signed.sender_key_id,
+                ByzantineBehavior::ReplayAttack,
+                format!("Duplicate signed payload: {message_id}").into_bytes(),
+            );
+            return Ok(false);
+        }
+
+        let Some(public_key_bytes) = self.known_public_keys.get(&signed.sender_key_id) else {
+            return Err(FusekiError::authentication(format!(
+                "Unknown sender: {}",
+                signed.sender_key_id
+            )));
+        };
+
+        let public_key = match <[u8; 32]>::try_from(public_key_bytes.as_slice())
+            .ok()
+            .and_then(|pk| VerifyingKey::from_bytes(&pk).ok())
+        {
+            Some(pk) => pk,
+            None => {
+                self.record_byzantine_behavior(
+                    &signed.sender_key_id,
+                    ByzantineBehavior::InvalidSignature,
+                    b"Invalid sender public key".to_vec(),
+                );
+                return Ok(false);
+            }
+        };
+
+        let signature = match <[u8; 64]>::try_from(signed.signature.as_slice()) {
+            Ok(sig_bytes) => ed25519_dalek::Signature::from_bytes(&sig_bytes),
+            Err(_) => {
+                self.record_byzantine_behavior(
+                    &signed.sender_key_id,
+                    ByzantineBehavior::InvalidSignature,
+                    b"Malformed signature".to_vec(),
+                );
+                return Ok(false);
+            }
+        };
+
+        let timestamp_bytes = signed.timestamp.timestamp().to_le_bytes();
+        let digest = sha256_segments(&[&signed.payload, &timestamp_bytes, &signed.nonce]);
+
+        match public_key.verify(&digest, &signature) {
+            Ok(()) => {
+                self.seen_messages.insert(message_id, signed.timestamp);
+                Ok(true)
+            }
+            Err(_) => {
+                self.record_byzantine_behavior(
+                    &signed.sender_key_id,
+                    ByzantineBehavior::InvalidSignature,
+                    b"Signature verification failed".to_vec(),
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Detect Byzantine behavior patterns
+    fn detect_byzantine_patterns(&mut self, bft_message: &BftMessage) -> FusekiResult<()> {
+        match &bft_message.inner {
+            RpcMessage::RequestVote(vote_req) => {
+                self.check_double_voting(vote_req)?;
+            }
+            RpcMessage::AppendEntries(append_req) => {
+                self.check_conflicting_append_entries(append_req)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Check for double voting (Byzantine behavior)
+    fn check_double_voting(&mut self, vote_req: &RequestVoteRequest) -> FusekiResult<()> {
+        // Check if this node has already voted for a different candidate in this term
+        let previous_candidate_id = {
+            let term_votes = self.vote_tracking.entry(vote_req.term).or_default();
+
+            // Use this node's ID as key to track its votes
+            let node_id = &self.identity.node_id;
+
+            if let Some(previous_vote) = term_votes.get(node_id) {
+                if previous_vote.candidate_id != vote_req.candidate_id {
+                    Some(previous_vote.candidate_id.clone())
+                } else {
+                    None
+                }
+            } else {
+                term_votes.insert(node_id.clone(), vote_req.clone());
+                None
+            }
+        };
+
+        // Now record byzantine behavior if detected (after borrow is dropped)
+        if let Some(prev_candidate) = previous_candidate_id {
+            let node_id = self.identity.node_id.clone();
+            self.record_byzantine_behavior(
+                &node_id,
+                ByzantineBehavior::DoubleVoting,
+                format!(
+                    "Double vote in term {}: {} vs {}",
+                    vote_req.term, prev_candidate, vote_req.candidate_id
+                )
+                .into_bytes(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Check for conflicting append entries
+    fn check_conflicting_append_entries(
+        &mut self,
+        append_req: &AppendEntriesRequest,
+    ) -> FusekiResult<()> {
+        // First, check for conflicts and collect information
+        let conflict_detected = {
+            let entries = self
+                .append_entries_tracking
+                .entry(append_req.leader_id.clone())
+                .or_default();
+
+            // Keep only recent entries
+            while entries.len() > 100 {
+                entries.pop_front();
+            }
+
+            // Check for conflicts
+            let has_conflict = entries.iter().any(|previous_req| {
+                previous_req.term == append_req.term
+                    && previous_req.prev_log_index == append_req.prev_log_index
+                    && previous_req.entries.len() != append_req.entries.len()
+            });
+
+            entries.push_back(append_req.clone());
+            has_conflict
+        };
+
+        // Record byzantine behavior if conflict detected (after borrow is dropped)
+        if conflict_detected {
+            self.record_byzantine_behavior(
+                &append_req.leader_id,
+                ByzantineBehavior::ConflictingAppendEntries,
+                format!(
+                    "Conflicting append entries at term {} index {}",
+                    append_req.term, append_req.prev_log_index
+                )
+                .into_bytes(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Record Byzantine behavior evidence
+    fn record_byzantine_behavior(
+        &mut self,
+        node_id: &str,
+        behavior: ByzantineBehavior,
+        evidence: Vec<u8>,
+    ) {
+        let evidence = ByzantineEvidence {
+            node_id: node_id.to_string(),
+            behavior_type: behavior,
+            detected_at: Utc::now(),
+            evidence_data: evidence,
+            witnesses: vec![self.identity.node_id.clone()],
+        };
+
+        info!("Byzantine behavior detected: {:?}", evidence);
+
+        // Track repeated offenses
+        if let Some(existing) = self.suspected_byzantine.get_mut(node_id) {
+            existing.witnesses.push(self.identity.node_id.clone());
+            existing.witnesses.dedup();
+        } else {
+            self.suspected_byzantine
+                .insert(node_id.to_string(), evidence.clone());
+        }
+
+        self.byzantine_evidence.push(evidence);
+
+        // Blacklist node if sufficient evidence
+        let evidence_count = self
+            .byzantine_evidence
+            .iter()
+            .filter(|e| e.node_id == node_id)
+            .count() as u32;
+
+        if evidence_count >= BYZANTINE_THRESHOLD {
+            warn!("Blacklisting Byzantine node: {}", node_id);
+            self.blacklisted_nodes.insert(node_id.to_string());
+        }
+    }
+
+    /// Compute unique message identifier
+    fn compute_message_id(&self, bft_message: &BftMessage) -> FusekiResult<String> {
+        let timestamp_bytes = bft_message.timestamp.timestamp().to_le_bytes();
+        let hash = sha256_segments(&[
+            &bft_message.signature,
+            bft_message.sender_key_id.as_bytes(),
+            &timestamp_bytes,
+            &bft_message.nonce,
+        ]);
+        Ok(hex::encode(hash))
+    }
+
+    /// Add a known public key for a node
+    pub fn add_public_key(&mut self, node_id: String, public_key: Vec<u8>) {
+        self.known_public_keys.insert(node_id, public_key);
+    }
+
+    /// Check if a node is blacklisted
+    pub fn is_blacklisted(&self, node_id: &str) -> bool {
+        self.blacklisted_nodes.contains(node_id)
+    }
+
+    /// Get Byzantine evidence for a node
+    pub fn get_byzantine_evidence(&self, node_id: &str) -> Option<&ByzantineEvidence> {
+        self.suspected_byzantine.get(node_id)
+    }
+
+    /// Clean up old messages and evidence
+    pub fn cleanup_old_data(&mut self) {
+        let cutoff = Utc::now() - chrono::Duration::hours(1);
+
+        // Clean up seen messages
+        self.seen_messages
+            .retain(|_, &mut timestamp| timestamp > cutoff);
+
+        // Clean up old vote tracking
+        self.vote_tracking.clear(); // Simple cleanup - in production, be more selective
+
+        // Clean up old append entries
+        for entries in self.append_entries_tracking.values_mut() {
+            while entries.len() > 50 {
+                entries.pop_front();
+            }
+        }
+    }
+
+    /// Generate proof-of-work for leader election
+    pub fn generate_proof_of_work(&self, term: u64, candidate: &str) -> FusekiResult<ProofOfWork> {
+        let start_time = Instant::now();
+        let mut nonce = 0u64;
+
+        loop {
+            // Create hash input
+            let term_bytes = term.to_le_bytes();
+            let nonce_bytes = nonce.to_le_bytes();
+            let hash_bytes = sha256_segments(&[
+                &term_bytes,
+                candidate.as_bytes(),
+                &nonce_bytes,
+                self.identity.node_id.as_bytes(),
+            ]);
+
+            let difficulty = count_leading_zeros(&hash_bytes);
+
+            if difficulty >= POW_DIFFICULTY {
+                let compute_time = start_time.elapsed().as_millis() as u64;
+                return Ok(ProofOfWork {
+                    nonce,
+                    hash: hash_bytes.to_vec(),
+                    difficulty,
+                    compute_time_ms: compute_time,
+                });
+            }
+
+            nonce += 1;
+
+            // Prevent infinite loops in tests
+            if nonce > 1_000_000 {
+                return Err(FusekiError::internal(
+                    "Proof of work computation took too long",
+                ));
+            }
+        }
+    }
+
+    /// Verify proof-of-work
+    pub fn verify_proof_of_work(&self, pow: &ProofOfWork, term: u64, candidate: &str) -> bool {
+        // Recreate hash
+        let term_bytes = term.to_le_bytes();
+        let nonce_bytes = pow.nonce.to_le_bytes();
+        let hash_bytes = sha256_segments(&[
+            &term_bytes,
+            candidate.as_bytes(),
+            &nonce_bytes,
+            self.identity.node_id.as_bytes(),
+        ]);
+
+        // Verify hash matches
+        if hash_bytes.as_slice() != pow.hash.as_slice() {
+            return false;
+        }
+
+        // Verify difficulty
+        let actual_difficulty = count_leading_zeros(&hash_bytes);
+        actual_difficulty >= POW_DIFFICULTY && actual_difficulty == pow.difficulty
+    }
+}
+
+/// Count leading zeros in a hash (for proof-of-work)
+fn count_leading_zeros(hash: &[u8]) -> u32 {
+    let mut count = 0;
+    for &byte in hash {
+        if byte == 0 {
+            count += 8;
+        } else {
+            count += byte.leading_zeros();
+            break;
+        }
+    }
+    count
+}
+
+/// BFT-enhanced Raft consensus trait
+#[async_trait]
+pub trait ByzantineFaultTolerantRaft {
+    /// Enhanced quorum size calculation for Byzantine fault tolerance
+    /// Requires 2f+1 nodes for f Byzantine nodes
+    fn bft_quorum_size(&self, total_nodes: usize) -> usize {
+        let max_byzantine = std::cmp::min(total_nodes / 3, MAX_BYZANTINE_NODES);
+        2 * max_byzantine + 1
+    }
+
+    /// Verify that enough honest nodes participated in consensus
+    fn verify_bft_quorum(&self, responses: usize, total_nodes: usize) -> bool {
+        responses >= self.bft_quorum_size(total_nodes)
+    }
+
+    /// Send BFT-authenticated message
+    async fn send_bft_message(&self, node_id: &str, message: BftMessage) -> FusekiResult<()>;
+
+    /// Handle incoming BFT message with verification
+    async fn handle_bft_message(&mut self, message: BftMessage) -> FusekiResult<()>;
+
+    /// Broadcast Byzantine evidence to all nodes
+    async fn broadcast_byzantine_evidence(&self, evidence: ByzantineEvidence) -> FusekiResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_bft_node_creation() {
+        let node = BftNodeState::new("test_node".to_string()).unwrap();
+        assert_eq!(node.identity.node_id, "test_node");
+        assert!(!node.identity.public_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_message_signing_and_verification() {
+        let mut node1 = BftNodeState::new("node1".to_string()).unwrap();
+        let mut node2 = BftNodeState::new("node2".to_string()).unwrap();
+
+        // Share public keys
+        node2.add_public_key("node1".to_string(), node1.identity.public_key.clone());
+        node1.add_public_key("node2".to_string(), node2.identity.public_key.clone());
+
+        // Create and sign a message
+        let message = RpcMessage::RequestVote(RequestVoteRequest {
+            term: 1,
+            candidate_id: "node1".to_string(),
+            last_log_index: 0,
+            last_log_term: 0,
+        });
+
+        let signed_message = node1.sign_message(&message).unwrap();
+
+        // Verify the message
+        assert!(node2.verify_message(&signed_message).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_byzantine_detection() {
+        let mut node = BftNodeState::new("test_node".to_string()).unwrap();
+
+        // Simulate double voting
+        let vote1 = RequestVoteRequest {
+            term: 1,
+            candidate_id: "candidate1".to_string(),
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+
+        let vote2 = RequestVoteRequest {
+            term: 1,
+            candidate_id: "candidate2".to_string(), // Different candidate, same term
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+
+        node.check_double_voting(&vote1).unwrap();
+        node.check_double_voting(&vote2).unwrap();
+
+        // Should detect Byzantine behavior
+        assert!(!node.byzantine_evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_proof_of_work() {
+        let node = BftNodeState::new("test_node".to_string()).unwrap();
+
+        let pow = node.generate_proof_of_work(1, "candidate").unwrap();
+        assert!(pow.difficulty >= POW_DIFFICULTY);
+        assert!(node.verify_proof_of_work(&pow, 1, "candidate"));
+    }
+
+    #[test]
+    fn test_leading_zeros_count() {
+        assert_eq!(count_leading_zeros(&[0, 0, 0xFF]), 16); // Two zero bytes = 16 zeros
+        assert_eq!(count_leading_zeros(&[0x80, 0xFF]), 0); // 0x80 = 10000000 = 0 leading zeros
+        assert_eq!(count_leading_zeros(&[0x40, 0xFF]), 1); // 0x40 = 01000000 = 1 leading zero
+        assert_eq!(count_leading_zeros(&[0x20, 0xFF]), 2); // 0x20 = 00100000 = 2 leading zeros
+    }
+
+    /// Regression test for the "BFT layer never wired to any RPC path"
+    /// finding: `sign_payload`/`verify_payload` (the generic envelope used by
+    /// `TcpNodeCommunication`) must authenticate arbitrary payloads with the
+    /// same guarantees as the `RpcMessage`-specific `sign_message`/
+    /// `verify_message` pair.
+    #[tokio::test]
+    async fn regression_sign_and_verify_payload_roundtrip() {
+        let node1 = BftNodeState::new("node1".to_string()).unwrap();
+        let mut node2 = BftNodeState::new("node2".to_string()).unwrap();
+        node2.add_public_key("node1".to_string(), node1.public_key().to_vec());
+
+        let payload = b"arbitrary NodeMessage bytes".to_vec();
+        let signed = node1.sign_payload(&payload).unwrap();
+        assert_eq!(signed.payload, payload);
+        assert_eq!(signed.sender_key_id, "node1");
+
+        assert!(node2.verify_payload(&signed).unwrap());
+    }
+
+    /// A payload signed by an unknown sender (no registered public key) must
+    /// fail loud (`Err`), not silently pass or silently fail.
+    #[tokio::test]
+    async fn regression_verify_payload_unknown_sender_fails_loud() {
+        let node1 = BftNodeState::new("node1".to_string()).unwrap();
+        let mut node2 = BftNodeState::new("node2".to_string()).unwrap();
+        // node2 never learns node1's public key.
+
+        let signed = node1.sign_payload(b"hello").unwrap();
+        assert!(node2.verify_payload(&signed).is_err());
+    }
+
+    /// A tampered payload (signature no longer matches) must be rejected.
+    #[tokio::test]
+    async fn regression_verify_payload_tampered_rejected() {
+        let node1 = BftNodeState::new("node1".to_string()).unwrap();
+        let mut node2 = BftNodeState::new("node2".to_string()).unwrap();
+        node2.add_public_key("node1".to_string(), node1.public_key().to_vec());
+
+        let mut signed = node1.sign_payload(b"original payload").unwrap();
+        signed.payload = b"tampered payload".to_vec();
+
+        assert!(!node2.verify_payload(&signed).unwrap());
+    }
+
+    /// A replayed (identical) signed payload must be rejected the second time.
+    #[tokio::test]
+    async fn regression_verify_payload_replay_rejected() {
+        let node1 = BftNodeState::new("node1".to_string()).unwrap();
+        let mut node2 = BftNodeState::new("node2".to_string()).unwrap();
+        node2.add_public_key("node1".to_string(), node1.public_key().to_vec());
+
+        let signed = node1.sign_payload(b"do the thing once").unwrap();
+        assert!(node2.verify_payload(&signed).unwrap());
+        // Replaying the exact same signed envelope must now be rejected.
+        assert!(!node2.verify_payload(&signed).unwrap());
+    }
+
+    /// Once a node is blacklisted, its signed payloads are rejected outright
+    /// even if the signature itself would otherwise verify.
+    #[tokio::test]
+    async fn regression_verify_payload_blacklisted_sender_rejected() {
+        let node1 = BftNodeState::new("node1".to_string()).unwrap();
+        let mut node2 = BftNodeState::new("node2".to_string()).unwrap();
+        node2.add_public_key("node1".to_string(), node1.public_key().to_vec());
+        node2.blacklisted_nodes.insert("node1".to_string());
+
+        let signed = node1.sign_payload(b"hello").unwrap();
+        assert!(!node2.verify_payload(&signed).unwrap());
+    }
+}

@@ -1,0 +1,300 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "circuit",
+    "sim",
+    "anneal",
+    "device",
+    "ml",
+    "tytan",
+    "py",
+    "examples",
+    "quantrs2-symengine-pure",
+    "quantrs2",
+]
+# Exclude Python bindings from default builds (use maturin for py crate)
+default-members = [
+    "core",
+    "circuit",
+    "sim",
+    "anneal",
+    "device",
+    "ml",
+    "tytan",
+    "examples",
+    "quantrs2-symengine-pure",
+    "quantrs2",
+]
+exclude = [
+    "symengine-fork",
+    "quantrs2-symengine-sys",
+    "quantrs2-symengine",
+]
+
+# Exclude the Python bindings when publishing to crates.io
+[workspace.metadata.cargo-released]
+exclude-members = ["py", "examples"]
+
+
+[workspace.lints.rust]
+nonstandard_style = { level = "warn", priority = -1 }
+missing_debug_implementations = "allow"
+missing_docs = "allow"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_imports = "allow"
+dead_code = "allow"
+unused_variables = "allow"
+unused_assignments = "allow"
+unused_mut = "allow"
+deprecated = "allow"
+ambiguous_glob_reexports = "allow"
+private_bounds = "allow"
+elided_lifetimes_in_paths = "allow"
+unpredictable_function_pointer_comparisons = "allow"  # Renamed from fn_address_comparisons
+private_interfaces = "allow"
+
+[workspace.lints.clippy]
+# Enable pedantic and nursery lints but with scientific computing exceptions
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Critical warnings - keep enabled
+enum_glob_use = "warn"
+dbg_macro = "warn"
+
+# Acceptable for scientific/quantum computing code - suppress to reduce noise
+# Variable naming - math code naturally uses similar/single-char names (x, y, z, i, j, k)
+similar_names = "allow"
+many_single_char_names = "allow"
+# Code complexity - quantum algorithms can be complex
+too_many_lines = "allow"
+too_many_arguments = "allow"
+struct_excessive_bools = "allow"
+# Numeric operations - precision loss acceptable with proper context
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+# Float comparisons - sometimes necessary in quantum computing
+float_cmp = "allow"
+# Documentation - allow for now, will add incrementally
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+missing_docs_in_private_items = "allow"
+doc_markdown = "allow"
+# Code style - allow for clarity
+module_name_repetitions = "allow"
+wildcard_imports = "allow"
+# Must use attributes - allow for now
+must_use_candidate = "allow"
+# Other pedantic lints that are acceptable
+needless_pass_by_value = "allow"
+redundant_closure_for_method_calls = "allow"
+items_after_statements = "allow"
+# Unwrap - warn but don't error (will fix incrementally)
+unwrap_used = "allow"
+# Pointer operations
+ptr_eq = "allow"
+
+[workspace.package]
+version = "0.2.2"
+authors = ["COOLJAPAN OU"]
+edition = "2021"
+rust-version = "1.86.0"
+repository = "https://github.com/cool-japan/quantrs"
+license = "Apache-2.0"
+keywords = ["quantum", "computing", "simulator", "annealing", "gate"]
+categories = ["science::quantum-computing", "simulation"]
+
+[workspace.dependencies]
+# Core quantum computing dependencies
+quantrs2-core = { path = "core", version = "0.2.2" }
+quantrs2-circuit = { path = "circuit", version = "0.2.2" }
+quantrs2-sim = { path = "sim", version = "0.2.2" }
+quantrs2-anneal = { path = "anneal", version = "0.2.2" }
+quantrs2-device = { path = "device", version = "0.2.2", default-features = false }
+quantrs2-ml = { path = "ml", version = "0.2.2" }
+quantrs2-tytan = { path = "tytan", version = "0.2.2" }
+
+# Symbolic computation - Pure Rust only (SciRS2 POLICY: No C/C++ dependencies)
+# quantrs2-symengine and quantrs2-symengine-sys removed - use pure Rust implementation
+quantrs2-symengine-pure = { path = "quantrs2-symengine-pure", version = "0.2.2" }
+
+# Pure Rust symbolic math dependencies (MIT licensed)
+egg = "0.11"
+num-bigint = "0.4"
+num-rational = "0.4"
+ordered-float = "5.3"
+
+# Common math and linear algebra dependencies
+# num-complex = "0.4.6"         # REMOVED: Use scirs2_core::complex (SciRS2 POLICY)
+# ndarray = { version = "0.16.1", features = ["rayon", "serde"] }  # REMOVED: Use scirs2_core::ndarray (SciRS2 POLICY)
+nalgebra = "0.35.0"            # Used in sim/src/scirs2_integration/types.rs CG solver (advanced_math feature)
+# ndarray-linalg = { version = "0.17", default-features = false, features = ["openblas-system"] }  # REMOVED: Use scirs2_core (SciRS2 POLICY)
+# ndarray-rand = "0.15"          # REMOVED: Use scirs2_core::ndarray (SciRS2 POLICY)
+# ndarray-stats = "0.6"          # REMOVED: Use scirs2_core::ndarray (SciRS2 POLICY)
+# num-traits = "0.2"             # REMOVED: Use scirs2_core::numeric (SciRS2 POLICY)
+# num-bigint = "0.4"             # REMOVED: Unused dependency (SciRS2 POLICY CLEANUP)
+# num-integer = "0.1"            # REMOVED: Use scirs2_core::numeric (SciRS2 POLICY)
+# num = "0.4"                    # REMOVED: Use scirs2_core::Complex64 (SciRS2 POLICY)
+approx = "0.5"                   # Test-only usage, acceptable
+# wide = "0.7.33"                # REMOVED: Unused dependency (SciRS2 POLICY CLEANUP)
+
+# Essential SciRS2 dependencies for QuantRS2 - COMPREHENSIVE INTEGRATION
+# Status: Production Ready with SciRS2 foundation
+# Using scirs2 0.4.0 from crates.io
+scirs2-core = { version = "0.6.5", default-features = false, features = [
+    "serialization",  # Complex<T> serde support
+    "linalg",         # ndarray-linalg integration (solve, svd, eigh)
+    "simd",           # SIMD acceleration
+    "parallel",       # Parallel operations
+    "cache",          # Caching support
+    "profiling",      # Performance profiling
+    "memory_management",  # Memory management
+    "random",         # Random number generation
+    "array",          # Array operations
+] }
+
+# HIGHLY LIKELY REQUIRED SciRS2 crates
+scirs2-autograd = { version = "0.6.5", default-features = false }  # Primary source for ndarray types
+scirs2-linalg = { version = "0.6.5", default-features = false }
+scirs2-optimize = { version = "0.6.5", default-features = false }
+scirs2-special = { version = "0.6.5", default-features = false }
+scirs2-sparse = { version = "0.6.5", default-features = false }
+scirs2-fft = { version = "0.6.5", default-features = false, features = ["oxifft"] }
+
+# CONDITIONALLY REQUIRED SciRS2 crates
+scirs2-neural = { version = "0.6.5", default-features = false }
+scirs2-metrics = { version = "0.6.5", default-features = false }
+scirs2-stats = { version = "0.6.5", default-features = false }
+scirs2-cluster = { version = "0.6.5", default-features = false }
+scirs2-graph = { version = "0.6.5", default-features = false }
+
+# OptiRS integration for advanced optimization (VQE, QAOA) 
+optirs-core = { version = "0.3.2", default-features = false }
+
+# Performance and parallel computing
+# rayon = "1.10.0"               # REMOVED: Use scirs2_core::parallel_ops (SciRS2 POLICY)
+smallvec = { version = "1.15", features = ["const_generics"] }
+rustc-hash = "2.1"
+fastrand = "2.4.1"
+num_cpus = "1.17.0"
+dashmap = "6.2"
+half = { version = "2.7", features = ["num-traits"] }
+
+# Error handling
+thiserror = "2.0.18"
+
+# Random number generation
+# rand = "0.9.2"         # REMOVED: Use scirs2_core::random (SciRS2 POLICY)
+# rand_chacha = "0.9.0"  # REMOVED: Use scirs2_core::random (SciRS2 POLICY)
+# rand_distr = "0.5"     # REMOVED: Use scirs2_core::random (SciRS2 POLICY)
+# rand_xoshiro = "0.7"   # REMOVED: Use scirs2_core::random (SciRS2 POLICY)
+
+# Serialization and data formats
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+oxicode = { version = "0.2.6", features = ["std", "derive", "serde"] }
+oxiarc-deflate = "0.4.2"   # Pure Rust DEFLATE/zlib (COOLJAPAN Policy: replaces flate2)
+oxiarc-lz4 = "0.4.2"      # Pure Rust LZ4 (COOLJAPAN Policy: replaces lz4 crate)
+# zstd = "0.13"  # REMOVED: Not used in code (COOLJAPAN Pure Rust Policy)
+# flate2 = "1.1"  # REMOVED: Replaced by oxiarc-deflate (COOLJAPAN Pure Rust Policy)
+md5 = "0.8"
+
+# GPU computing support
+wgpu = { version = "30.0.0" }
+bytemuck = { version = "1.25.0", features = ["derive"] }
+ocl = "0.19.7"
+# OxiCUDA: Pure Rust CUDA replacement (COOLJAPAN). Driver path loads libcuda.so at
+# runtime (no CUDA Toolkit needed at build time); webgpu adds a wgpu/WGSL backend, but
+# oxicuda-webgpu 0.5.5 still requires wgpu 29.x, so 29.x and 30.0.0 coexist until it bumps.
+oxicuda = { version = "0.5.5", default-features = false, features = ["driver", "memory", "launch", "ptx", "webgpu"] }
+
+# Minimal block_on executor for synchronous wgpu adapter/device queries
+pollster = "0.4.0"
+
+# Async and networking
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "blocking", "rustls"] }
+tokio = { version = "1.52.3", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Python bindings and FFI
+# NOTE: `extension-module` must NEVER be enabled here (nor in any member manifest).
+# `--all-features` would then activate it for every workspace member, pyo3 would stop
+# linking libpython, and every `cargo test` binary would fail to link (undefined
+# _PyExc_*/_Py_* symbols). Maturin enables it for the wheel build instead, via
+# `[tool.maturin] features = ["pyo3/extension-module"]` in py/pyproject.toml.
+pyo3 = { version = "0.29.0", default-features = false }
+scirs2-numpy = { version = "0.6.5", default-features = false }  # SciRS2-compatible numpy bindings
+
+# Utility libraries
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.12.4"
+colored = "3.1"
+petgraph = "0.8"
+pest = "2.8"
+pest_derive = "2.8"
+
+# Cryptographic functions
+hmac = "0.13.0"
+sha2 = "0.11.0"
+hex = "0.4.3"
+
+
+# Advanced math libraries
+# ndrustfft = "0.6"  # REMOVED: Replaced by scirs2-fft (COOLJAPAN Pure Rust Policy)
+sprs = "0.11"
+# nalgebra-sparse removed: replaced by scirs2-sparse (COOLJAPAN Pure Rust Policy)
+
+# Visualization and plotting (default-features = false to avoid font-kit/pathfinder_simd on nightly ARM)
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "svg_backend", "ab_glyph", "all_series", "all_elements", "full_palette", "colormaps"] }
+
+# System information
+sysinfo = "0.39"
+
+# Additional dependencies for workspace members
+libc = "0.2"
+bindgen = "0.72"
+cc = "1.2"
+pkg-config = "0.3"
+serde_test = "1.0"
+broadcast = "0.1"
+url = { version = "2.5.8", features = ["serde"] }
+aes-gcm = "0.11.0"
+x25519-dalek = "2.0.1"
+tokio-test = "0.4"
+memmap2 = "0.9"
+
+# Development and testing
+criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support", "rayon"] }
+tempfile = "3.27"
+
+# NumRS2 ecosystem dependencies
+numrs2 = "0.4.1"
+pandrs = "0.4.1"  # Latest available on crates.io
+
+[profile.dev]
+incremental = true
+debug = 1              # debug = 2 → 1 (reduce debug information)
+split-debuginfo = "packed"  # Separate debug information
+
+[profile.dev.package."*"]
+debug = 0              # Disable debug information for dependency crates
+
+# Build script optimization for CUDA and other heavy build dependencies
+[profile.dev.build-override]
+opt-level = 0
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+
+# Patch crates.io dependencies with git versions (currently none needed)
+# [patch.crates-io]

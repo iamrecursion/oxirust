@@ -1,0 +1,668 @@
+[package]
+name = "scirs2-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Core utilities and common functionality for SciRS2 (scirs2-core)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/cool-japan/scirs"
+documentation = "https://docs.rs/scirs2-core"
+keywords = ["scientific", "mathematics", "science", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[build-dependencies]
+cc = { workspace = true, optional = true }
+
+[dependencies]
+# Core dependencies
+ndarray = { workspace = true }  # ndarray 0.17.1 - REQUIRED (not optional)
+num-traits = { workspace = true, default-features = false }
+num-complex = { workspace = true, default-features = false }
+num-integer = { workspace = true, default-features = false }
+thiserror = { workspace = true }
+once_cell.workspace = true
+parking_lot.workspace = true
+cached = { workspace = true, optional = true }  # Memoization and caching
+chrono = { workspace = true, features = ["serde"] }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+rand_chacha = { workspace = true }
+ndarray-rand = { workspace = true, optional = true }
+ndarray-stats = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }  # Serialization
+serde_json = { workspace = true, optional = true }  # JSON serialization
+uuid = { workspace = true, features = ["serde"] }  # Used for unique identifiers
+tempfile = { workspace = true, optional = true }  # For temporary files in memory_efficient
+oxicode = { workspace = true, optional = true }  # For serialization in memory_efficient (SIMD-optimized)
+memmap2 = { workspace = true, optional = true }  # For memory-mapped arrays
+regex = { workspace = true, optional = true }  # For string pattern validation
+
+# Feature-gated dependencies  
+log = { workspace = true, optional = true }  # Logging support
+wide = { workspace = true, optional = true }  # SIMD acceleration
+rayon = { workspace = true, optional = true }  # Parallel processing
+crossbeam = { workspace = true, optional = true }  # Used in parallel scheduler for channels
+crossbeam-utils = { workspace = true, optional = true }  # Used in parallel scheduler
+crossbeam-deque = { workspace = true, optional = true }  # Used in parallel scheduler
+num_cpus = { workspace = true, optional = true }  # CPU count detection
+
+# Compression libraries (Pure Rust - COOLJAPAN Policy)
+oxiarc-snappy = { workspace = true, optional = true }   # Pure Rust Snappy compression (COOLJAPAN Policy)
+bytemuck = { workspace = true, optional = true }  # Zero-copy type casting
+crc32fast = { workspace = true }  # CRC32 checksum (used in serialization)
+oxiarc-lz4 = { workspace = true, optional = true }  # Pure Rust LZ4 compression
+oxiarc-zstd = { workspace = true, optional = true }  # Pure Rust Zstandard compression
+oxiarc-deflate = { workspace = true, optional = true }  # Pure Rust DEFLATE/GZIP compression
+
+# System monitoring for resource-aware prefetching
+libc = { workspace = true, optional = true }  # System calls for resource monitoring
+sysinfo = { workspace = true, optional = true }  # System information gathering
+
+# Platform-specific dependencies for cross-platform validation are handled through feature gates
+
+# OxiBLAS - Pure Rust BLAS/LAPACK implementation (replaces OpenBLAS)
+# OxiBLAS v0.1.2+ supports Complex<f64> operations (SVD, Eigh, Solve)
+oxiblas-ndarray = { workspace = true, optional = true }
+oxiblas-blas = { workspace = true, optional = true }
+oxiblas-lapack = { workspace = true, optional = true }
+# NOTE: All OpenBLAS/system BLAS dependencies removed - using pure Rust OxiBLAS
+
+
+# Async runtime for async error handling
+tokio = { workspace = true, optional = true }  # Async runtime for async error handling
+async-trait = { workspace = true, optional = true }  # For object-safe async traits
+
+# GPU backend dependencies
+# Note: metal and objc2-metal-performance-shaders are macOS-specific, moved to target-specific section
+# Note: CUDA was retired from scirs2-core in 0.6.x — CUDA acceleration now lives in the per-crate oxicuda-* backends (no cudarc here)
+wgpu = { workspace = true, optional = true }  # WebGPU runtime
+pollster = { workspace = true, optional = true }  # Async runtime for WebGPU
+
+# Production-level feature dependencies
+reqwest = { workspace = true, optional = true }  # HTTP client for tracing export
+# Pure-Rust rustls CryptoProvider (OxiTLS, `oxitls-rustcrypto-provider` resolved under the
+# `rustls-rustcrypto` name -- see the "PURE RUST BLOCKER (reqwest)" note in the workspace root
+# Cargo.toml). Installed as the process-default provider by observability's
+# ensure_default_tls_provider() right before every eager reqwest client construction, unless
+# the application already installed a provider of its own.
+rustls = { workspace = true, optional = true }
+rustls-rustcrypto = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }  # Cryptographic hash functions
+
+# Tracing and observability dependencies
+tracing = { workspace = true, optional = true }  # Structured logging and tracing
+tracing-subscriber = { workspace = true, optional = true }  # Tracing subscriber implementation
+tracing-appender = { workspace = true, optional = true }  # File appender for tracing
+
+# OpenTelemetry dependencies
+opentelemetry = { workspace = true, optional = true }  # OpenTelemetry API
+opentelemetry_sdk = { workspace = true, optional = true }  # OpenTelemetry SDK
+opentelemetry-otlp = { workspace = true, optional = true }  # OTLP exporter
+
+# Prometheus metrics
+prometheus = { workspace = true, optional = true }  # Prometheus metrics
+
+# Memory profiling uses Pure Rust OS APIs (libc on Unix, windows-sys on Windows)
+
+# Testing and validation dependencies
+statrs = { workspace = true, optional = true }  # Statistical functions for validation
+quickcheck = { workspace = true, optional = true }  # Property-based testing
+
+# Arbitrary precision dependencies
+num-bigint = { workspace = true, optional = true }  # Arbitrary precision integers
+# oxinum-* Pure Rust arbitrary precision (GMP/MPFR-free); replaces rug entirely.
+oxinum-core     = { workspace = true, optional = true }
+oxinum-int      = { workspace = true, optional = true }
+oxinum-float    = { workspace = true, optional = true }
+oxinum-rational = { workspace = true, optional = true }
+oxinum-complex  = { workspace = true, optional = true }
+
+# Python integration dependencies (PyO3)
+pyo3 = { workspace = true, optional = true }  # Python bindings
+scirs2-numpy = { workspace = true, optional = true }  # NumPy integration for Python (SciRS2 fork with ndarray 0.17)
+
+# Arrow interoperability (v0.3.0) - zero-copy Arrow format support
+arrow = { workspace = true, optional = true }  # Apache Arrow columnar format
+
+# Embedded systems support (v0.2.0) - no_std compatibility
+libm = { workspace = true, optional = true }  # Math functions for no_std
+fixed = { workspace = true, optional = true }  # Fixed-point arithmetic
+
+# WASM support - getrandom needs wasm_js feature, uuid needs js feature for wasm32 targets
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true }
+getrandom_03 = { workspace = true }
+uuid = { workspace = true, features = ["serde", "js"] }
+
+# Platform-specific BLAS backend configuration
+# macOS: Use Accelerate framework ONLY (system BLAS, no source build)
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS uses Accelerate framework - NO openblas-src dependency
+libloading = { workspace = true }  # Runtime OpenCL ICD loader for the opencl feature (detection/dispatch only; no build-time OpenCL library)
+# Metal GPU dependencies (macOS only)
+metal = { workspace = true, optional = true }  # Metal GPU backend for macOS
+objc2 = { workspace = true, optional = true }  # Objective-C runtime for Metal
+objc2-foundation = { workspace = true, optional = true }  # Foundation framework for Metal
+objc2-metal = { workspace = true, optional = true }  # Metal bindings for objc2
+objc2-metal-performance-shaders = { workspace = true, optional = true }  # MPS integration for Metal
+objc2-metal-performance-shaders-graph = { workspace = true, optional = true }  # MPSGraph for high-performance operations
+
+# NOTE: Platform-specific BLAS dependencies removed - using pure Rust OxiBLAS
+
+# Linux-specific profiling and system dependencies
+[target.'cfg(target_os = "linux")'.dependencies]
+perf-event = { workspace = true, optional = true }  # Linux perf integration
+libloading = { workspace = true }  # Runtime CUDA driver probe for PlatformCapabilities (detection only; compute lives in oxicuda-*)
+
+# Windows-specific dependencies
+[target.'cfg(target_os = "windows")'.dependencies]
+# GlobalMemoryStatusEx requires both Win32_System_SystemInformation and Win32_Foundation features
+windows-sys = { workspace = true, features = ["Win32_System_SystemInformation", "Win32_Foundation"] }  # Windows system APIs for memory detection
+libloading = { workspace = true }  # Runtime CUDA driver probe for PlatformCapabilities (detection only; compute lives in oxicuda-*)
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+# Enable auto-initialize for tests only (not for production builds)
+pyo3 = { workspace = true, features = ["macros", "auto-initialize"] }
+
+[features]
+default = ["std", "array", "serialization"]  # Enable std and array module by default
+# Core embedded support features (v0.2.0)
+std = []  # Standard library support (default, required for most features)
+alloc = []  # Heap allocation support (requires global allocator in no_std)
+embedded = ["libm"]  # Basic embedded support (no_std + no heap)
+embedded-alloc = ["alloc", "embedded"]  # Embedded with heap allocator
+fixed-point = ["embedded", "dep:fixed"]  # Fixed-point arithmetic
+ffi = ["std"]  # C ABI FFI for calling SciRS2 from C, Julia, and other languages (requires std)
+simd = ["wide"]  # SIMD operations (works in no_std with alloc)
+parallel = ["std", "rayon", "crossbeam", "crossbeam-utils", "crossbeam-deque", "num_cpus"]  # Parallel processing with rayon (requires std)
+cache = ["std", "cached"]  # Caching and memoization functionality (requires std)
+validation = ["std", "regex", "statrs"]  # Validation utilities (requires std)
+cross_platform = ["std", "libc", "sysinfo"]  # Cross-platform validation and compatibility (requires std)
+logging = ["log"]  # Structured logging and diagnostics (works with no_std)
+async = ["std", "tokio", "async-trait"]  # Async error handling and recovery mechanisms (requires std)
+gpu = ["std"]  # GPU acceleration abstractions (requires std)
+opencl = ["std", "gpu"]  # OpenCL-specific GPU acceleration via the in-repo pure-Rust runtime loader (no build-time OpenCL library) (requires std)
+metal = ["std", "gpu", "dep:metal", "dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:objc2-metal-performance-shaders"]  # Metal-specific GPU acceleration (Apple) (requires std)
+mpsgraph = ["std", "metal", "dep:objc2-metal-performance-shaders-graph", "dep:cc"]  # MPSGraph high-performance operations (Apple, requires metal + cc for ObjC wrapper) (requires std)
+c-opt = ["dep:cc"]  # Enable C/Objective-C compiler for optional native extensions (mpsgraph Obj-C wrapper)
+wgpu = ["std", "gpu", "dep:wgpu", "dep:pollster"]  # WebGPU-specific GPU acceleration (requires std)
+rocm = ["std", "gpu"]  # ROCm-specific GPU acceleration (AMD) (requires std)
+# NOTE: the `cuda` feature was removed from scirs2-core in 0.6.x — CUDA now lives in the per-crate oxicuda-* backends (see SCIRS2_POLICY.md)
+memory_management = ["std", "oxicode", "dep:tempfile", "serialization"]  # Advanced memory management (oxicode for SIMD optimization) (requires std)
+mmap = ["std", "memmap2", "bytemuck", "memory_management", "dep:tempfile"]  # Memory-mapped array wrapper with COW semantics (requires std)
+memory_efficient = ["std", "dep:tempfile", "oxicode", "memmap2", "rayon", "serialization"]  # Memory-efficient operations (oxicode for SIMD) (requires std)
+memory_efficient_all_types = ["memory_efficient", "float32", "float64", "all_ints"]  # Full type support for memory-efficient operations (requires std)
+float32 = []  # Support for f32 in zero-copy operations
+float64 = []  # Support for f64 in zero-copy operations
+int32 = []    # Support for i32 in zero-copy operations
+int64 = []    # Support for i64 in zero-copy operations
+uint32 = []   # Support for u32 in zero-copy operations
+uint64 = []   # Support for u64 in zero-copy operations
+all_ints = [] # Support for all integer types in zero-copy operations
+memory_compression = ["memory_efficient", "dep:oxiarc-lz4", "dep:oxiarc-zstd", "dep:oxiarc-deflate", "dep:oxiarc-snappy", "bytemuck", "serde", "serde_json", "libc", "num_cpus"]  # Compressed memory-mapped arrays (SIMD-optimized)
+memory_metrics = ["memory_management", "serde", "serde_json"]  # Enhanced memory metrics tracking
+sysinfo = ["dep:sysinfo"]  # System information gathering
+serialization = ["std", "serde", "serde_json", "num-complex/serde", "dep:oxiarc-lz4", "dep:oxiarc-zstd"]  # Serialization support (includes Complex<T> serde, pure-Rust LZ4/Zstd) (requires std)
+array = ["std", "ndarray-rand"]  # Basic ndarray with random support (minimal dependencies) (requires std)
+array_stats = ["std", "array", "ndarray-stats"]  # Statistics operations on arrays (requires std)
+array_io = ["std", "array"]  # Array I/O (save/load .npy files) (requires std) - ndarray-npy removed to eliminate zip crate
+memory_visualization = ["memory_metrics"]  # Memory usage visualization
+memory_call_stack = ["memory_metrics"]  # Capture call stacks for memory events
+profiling = ["std", "num_cpus", "serialization"]  # Performance profiling tools (basic, includes serialization for JSON export) (requires std)
+profiling_advanced = ["std", "profiling", "tracing", "tracing-subscriber", "tracing-appender"]  # Advanced profiling with structured logging (requires std)
+profiling_flame = ["std", "profiling_advanced"]  # Flame graph generation (requires std)
+profiling_chrome = ["std", "profiling_advanced"]  # Chrome DevTools profiling (requires std)
+profiling_opentelemetry = ["std", "profiling_advanced", "opentelemetry", "opentelemetry_sdk"]  # OpenTelemetry integration (requires std)
+profiling_prometheus = ["std", "profiling", "prometheus"]  # Prometheus metrics export (requires std)
+profiling_otlp = ["std", "profiling_opentelemetry", "opentelemetry-otlp"]  # OTLP exporter for distributed tracing (requires std)
+profiling_memory = ["std", "profiling", "libc"]  # Memory profiling with Pure Rust OS APIs (requires std)
+profiling_perf = ["std", "profiling", "perf-event"]  # Linux perf integration (platform-specific) (requires std)
+profiling_all = ["std", "profiling_advanced", "profiling_flame", "profiling_chrome", "profiling_opentelemetry", "profiling_prometheus", "profiling_otlp", "profiling_memory"]  # All profiling features (requires std)
+tracy = ["std", "profiling"]  # Tracy-API-compatible profiling: Pure Rust Chrome/Perfetto trace-event JSON exporter (no C++ Tracy client, no new deps, feature-gated, NOT in `all`); pulls `profiling` because the tracy module lives inside the profiling module and is otherwise never compiled (requires std)
+libnuma = []  # DEPRECATED no-op (kept for backward-compat with downstream `features = ["libnuma"]`): libnuma C dependency removed per COOLJAPAN Pure Rust Policy; NUMA sysfs discovery is now unconditional on Linux
+instrumentation = ["std", "profiling_advanced"]  # Instrumentation framework (requires std)
+random = ["std", "array"]  # Random number generation utilities with ndarray support (requires std)
+types = []  # Type conversion utilities (works in no_std)
+ufuncs = []  # Universal Functions (ufuncs) system (works in no_std)
+testing = ["std", "dep:tempfile", "serde", "serde_json", "quickcheck"]  # Testing framework for production systems (requires std)
+benchmarking = ["std", "testing", "serde", "serde_json"]  # Comprehensive benchmarking system (requires std)
+linalg = ["std", "array", "oxiblas-ndarray", "oxiblas-blas", "oxiblas-lapack"]  # Linear algebra with OxiBLAS (pure Rust) with Complex support (v0.1.2+) (requires std)
+# NOTE: OpenBLAS/Netlib/Accelerate features removed - using pure Rust OxiBLAS for all platforms
+array_protocol = []  # Array Protocol for third-party array implementations
+array_protocol_jit = ["std", "array_protocol"]  # JIT compilation for Array Protocol (requires std)
+array_protocol_gpu = ["array_protocol", "gpu"]  # GPU support for Array Protocol
+array_protocol_opencl = ["array_protocol_gpu", "opencl"]  # OpenCL support for Array Protocol
+array_protocol_metal = ["array_protocol_gpu", "metal"]  # Metal support for Array Protocol
+array_protocol_wgpu = ["array_protocol_gpu", "wgpu"]  # WebGPU support for Array Protocol
+array_protocol_rocm = ["array_protocol_gpu", "rocm"]  # ROCm support for Array Protocol
+array_protocol_distributed = ["array_protocol", "parallel"]  # Distributed computing for Array Protocol
+array_protocol_all = ["array_protocol", "array_protocol_jit", "array_protocol_distributed"]  # All Array Protocol features
+# Production-level features for enterprise deployments
+observability = ["std", "serde", "serde_json"]  # Observability infrastructure (tracing, audit logging) (requires std)
+reqwest = ["dep:reqwest", "dep:rustls", "dep:rustls-rustcrypto"]  # HTTP client + auto-installed pure-Rust OxiTLS CryptoProvider (process default unless the app installed one)
+observability_http = ["std", "observability", "reqwest"]  # HTTP export for observability (requires std)
+versioning = ["std", "serde", "serde_json"]  # API versioning and compatibility management (requires std)
+leak_detection = ["std", "memory_management", "serde", "serde_json"]  # Memory leak detection system (requires std)
+data_validation = ["std", "validation", "serde", "serde_json", "regex"]  # Comprehensive data validation (requires std)
+s3 = ["std"]  # S3 integration for remote storage (requires std)
+crypto = []  # Cryptographic features (placeholder) (may work in no_std)
+compression = ["std", "dep:oxiarc-deflate"]  # Compression support (requires std)
+database = ["std"]  # Database integration features (requires std)
+cloud = ["std"]  # Cloud storage integration (S3, GCS, Azure) (requires std)
+arrow = ["std", "dep:arrow", "memmap2"]  # Arrow columnar format interoperability for zero-copy data exchange (requires std)
+jit = ["std"]  # Just-in-time compilation (requires std)
+ml_pipeline = ["std"]  # ML pipeline integration and real-time processing (requires std)
+production = ["std", "observability", "versioning", "leak_detection", "data_validation"]  # All production features (requires std)
+arbitrary-precision = ["std", "num-bigint", "oxinum-core", "oxinum-int", "oxinum-float", "oxinum-rational", "oxinum-complex"]  # Arbitrary precision arithmetic (Pure Rust oxinum-* for Int/Float/Rational/Complex; rug fully removed)
+python = ["std", "dep:pyo3", "dep:scirs2-numpy", "serialization"]  # Python bindings with NumPy integration (uses scirs2-numpy with ndarray 0.17) (requires std)
+all = [
+    "simd", "parallel", "cache", "validation", "logging",
+    "gpu", "memory_management", "memory_efficient", "memory_compression",
+    "array", "array_stats", "array_io", "linalg", "profiling", "random", "types", "ufuncs", "testing", "benchmarking",
+    "array_protocol_all", "production", "arbitrary-precision"
+    # Note: "python" can now be used with all other features (uses scirs2-numpy with ndarray 0.17)
+]  # Enable all features except mutually exclusive BLAS backends (openblas, netlib)
+
+[[example]]
+name = "gpu_example"
+path = "examples/gpu_example.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "mpsgraph_operations_example"
+path = "examples/mpsgraph_operations_example.rs"
+required-features = ["mpsgraph"]
+
+[[example]]
+name = "gpu_kernel_library"
+path = "examples/gpu_kernel_library.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_foundation_example"
+path = "examples/gpu_foundation_example.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_detection_example"
+path = "examples/gpu_detection_example.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "memory_management"
+path = "examples/memory_management.rs"
+required-features = ["memory_management"]
+
+[[example]]
+name = "logging_example"
+path = "examples/logging_example.rs"
+required-features = ["logging"]
+
+[[example]]
+name = "random_example"
+path = "examples/random_example.rs"
+required-features = ["random"]
+
+[[example]]
+name = "profiling_example"
+path = "examples/profiling_example.rs"
+required-features = ["profiling"]
+
+[[example]]
+name = "type_conversion_example"
+path = "examples/type_conversion_example.rs"
+required-features = ["types"]
+
+[[example]]
+name = "integrated_features"
+path = "examples/integrated_features.rs"
+required-features = ["logging", "profiling", "random", "memory_management", "types"]
+
+[[example]]
+name = "memory_metrics_example"
+path = "examples/memory_metrics_example.rs"
+required-features = ["memory_management"]
+
+[[example]]
+name = "memory_metrics_bufferpool"
+path = "examples/memory_metrics_bufferpool.rs"
+required-features = ["memory_management"]
+
+[[example]]
+name = "memory_metrics_chunking"
+path = "examples/memory_metrics_chunking.rs"
+required-features = ["memory_management"]
+
+[[example]]
+name = "memory_metrics_gpu"
+path = "examples/memory_metrics_gpu.rs"
+required-features = ["memory_management", "memory_metrics", "gpu"]
+
+[[example]]
+name = "memory_metrics_snapshots"
+path = "examples/memory_metrics_snapshots.rs"
+required-features = ["memory_management", "memory_metrics"]
+
+[[example]]
+name = "memory_mapped_array"
+path = "examples/memory_mapped_array.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "memory_mapped_adaptive"
+path = "examples/memory_mapped_adaptive.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "memory_mapped_chunks"
+path = "examples/memory_mapped_chunks.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "memory_mapped_compressed"
+path = "examples/memory_mapped_compressed.rs"
+required-features = ["memory_compression"]
+
+[[example]]
+name = "memory_mapped_mutation"
+path = "examples/memory_mapped_mutation.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "memory_mapped_parallel"
+path = "examples/memory_mapped_parallel.rs"
+required-features = ["memory_efficient", "parallel"]
+
+[[example]]
+name = "memory_mapped_running_stats"
+path = "examples/memory_mapped_running_stats.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "memory_mapped_simple"
+path = "examples/memory_mapped_simple.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "memory_mapped_slicing"
+path = "examples/memory_mapped_slicing.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "memory_mapped_zerocopy"
+path = "examples/memory_mapped_zerocopy.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "memory_mapped_zerocopy_serialization"
+path = "examples/memory_mapped_zerocopy_serialization.rs"
+required-features = ["memory_efficient", "serialization", "float32", "float64", "all_ints"]
+
+[[example]]
+name = "scientific_arrays_example"
+path = "examples/scientific_arrays_example.rs"
+required-features = ["array"]
+
+[[example]]
+name = "core_large_dataset_processing"
+path = "examples/core_large_dataset_processing.rs"
+required-features = ["memory_efficient", "array", "random"]
+
+[[example]]
+name = "ndarray_ufuncs_example"
+path = "examples/ndarray_ufuncs_example.rs"
+required-features = ["ufuncs"]
+
+[[example]]
+name = "advanced_indexing_example"
+path = "examples/advanced_indexing_example.rs"
+
+[[example]]
+name = "advanced_ndarray_example"
+path = "examples/advanced_ndarray_example.rs"
+required-features = ["ufuncs"]
+
+[[example]]
+name = "ndarray_advanced_operations"
+path = "examples/ndarray_advanced_operations.rs"
+
+[[example]]
+name = "ndarray_statistical_operations"
+path = "examples/ndarray_statistical_operations.rs"
+required-features = ["random"]
+
+[[example]]
+name = "ndarray_correlation_binning"
+path = "examples/ndarray_correlation_binning.rs"
+
+[[example]]
+name = "memory_mapped_prefetching"
+path = "examples/memory_mapped_prefetching.rs"
+required-features = ["memory_compression"]
+
+[[example]]
+name = "advanced_prefetching_example"
+path = "examples/advanced_prefetching_example.rs"
+required-features = ["memory_compression"]
+
+[[example]]
+name = "array_protocol_operations"
+path = "examples/array_protocol_operations.rs"
+required-features = ["array_protocol"]
+
+[[example]]
+name = "array_protocol_advanced"
+path = "examples/array_protocol_advanced.rs"
+required-features = ["array_protocol"]
+
+[[example]]
+name = "array_protocol_backpropagation"
+path = "examples/array_protocol_backpropagation.rs"
+required-features = ["array_protocol", "random"]
+
+[[example]]
+name = "array_protocol_distributed_training"
+path = "examples/array_protocol_distributed_training.rs"
+required-features = ["array_protocol_distributed"]
+
+[[example]]
+name = "distributed_training_example"
+path = "examples/distributed_training_example.rs"
+required-features = ["array_protocol_distributed", "serialization"]
+
+[[example]]
+name = "array_protocol_gpu"
+path = "examples/array_protocol_gpu.rs"
+required-features = ["array_protocol_gpu"]
+
+[[example]]
+name = "custom_array_protocol"
+path = "examples/custom_array_protocol.rs"
+required-features = ["array_protocol"]
+
+[[example]]
+name = "progress_visualization_example"
+path = "examples/progress_visualization_example.rs"
+required-features = ["logging"]
+
+[[example]]
+name = "gpu_kernel_comprehensive_example"
+path = "examples/gpu_kernel_comprehensive_example.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "batch_conversions_example"
+path = "examples/batch_conversions_example.rs"
+required-features = ["types"]
+
+[[example]]
+name = "enhanced_memory_metrics_example"
+path = "examples/enhanced_memory_metrics_example.rs"
+required-features = ["memory_management"]
+
+[[example]]
+name = "core_memory_efficient_example"
+path = "examples/core_memory_efficient_example.rs"
+required-features = ["memory_efficient"]
+
+[[example]]
+name = "advanced_error_handling"
+path = "examples/advanced_error_handling.rs"
+required-features = ["random"]
+
+[[example]]
+name = "leak_detection_demo"
+path = "examples/leak_detection_demo.rs"
+required-features = ["leak_detection"]
+
+[[example]]
+name = "adaptive_optimization_test"
+path = "examples/adaptive_optimization_test.rs"
+required-features = ["profiling"]
+
+[[example]]
+name = "coverage_analysis_demo"
+path = "examples/coverage_analysis_demo.rs"
+required-features = ["profiling"]
+
+[[example]]
+name = "production_profiling_demo"
+path = "examples/production_profiling_demo.rs"
+required-features = ["profiling"]
+
+[[example]]
+name = "adaptive_optimization_demo"
+path = "examples/adaptive_optimization_demo.rs"
+required-features = ["profiling", "random"]
+
+[[example]]
+name = "performance_dashboards_demo"
+path = "examples/performance_dashboards_demo.rs"
+required-features = ["profiling"]
+
+[[example]]
+name = "advanced_profiling_demo"
+path = "examples/advanced_profiling_demo.rs"
+required-features = ["profiling_all"]
+
+[[example]]
+name = "pattern_recognition_example"
+path = "examples/pattern_recognition_example.rs"
+required-features = ["memory_efficient"]
+
+
+[[bench]]
+name = "array_protocol_bench"
+harness = false
+
+[[bench]]
+name = "validation_bench"
+harness = false
+
+[[bench]]
+name = "pattern_recognition_bench"
+harness = false
+required-features = ["memory_efficient"]
+
+[[bench]]
+name = "numpy_scipy_comparison_bench"
+harness = false
+required-features = ["random"]
+
+[[bench]]
+name = "mobile_neon_bench"
+harness = false
+required-features = ["simd"]
+
+[[bench]]
+name = "simple_array_bench"
+harness = false
+required-features = ["random"]
+
+[[bench]]
+name = "random_performance_bench"
+harness = false
+required-features = ["random"]
+
+[[bench]]
+name = "mpsgraph_operations"
+harness = false
+required-features = ["mpsgraph"]
+
+[[bench]]
+name = "simd_matmul"
+harness = false
+required-features = ["simd"]
+
+[[bench]]
+name = "v020_performance_validation"
+harness = false
+required-features = ["simd"]
+
+[[example]]
+name = "parallel_ops_example"
+path = "examples/parallel_ops_example.rs"
+required-features = ["parallel"]
+
+[[example]]
+name = "arbitrary_precision_example"
+path = "examples/arbitrary_precision_example.rs"
+required-features = ["arbitrary-precision"]
+
+[[example]]
+name = "advanced_parallel_processing"
+path = "examples/advanced_parallel_processing.rs"
+required-features = ["parallel"]
+
+[[example]]
+name = "ecosystem_integration_demo"
+path = "examples/ecosystem_integration_demo.rs"
+required-features = ["testing", "parallel", "random"]
+
+[[example]]
+name = "security_test_verification"
+path = "examples/security_test_verification.rs"
+required-features = ["testing"]
+
+[[example]]
+name = "rng_patterns"
+path = "examples/rng_patterns.rs"
+required-features = ["random"]
+
+[[example]]
+name = "simd_ml_operations_demo"
+path = "examples/simd_ml_operations_demo.rs"
+required-features = ["simd"]
+
+[[example]]
+name = "simd_perf_comparison"
+path = "examples/simd_perf_comparison.rs"
+required-features = ["simd"]
+
+[[example]]
+name = "simd_ultra_benchmark"
+path = "examples/simd_ultra_benchmark.rs"
+required-features = ["simd"]
+
+[[example]]
+name = "simd_ultra_benchmark_csv"
+path = "examples/simd_ultra_benchmark_csv.rs"
+required-features = ["simd"]
+
+[[example]]
+name = "norm_l2_comparison"
+path = "examples/norm_l2_comparison.rs"
+required-features = ["random", "simd"]

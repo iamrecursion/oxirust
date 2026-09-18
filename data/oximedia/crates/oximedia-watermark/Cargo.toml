@@ -1,0 +1,29 @@
+[package]
+name = "oximedia-watermark"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional audio watermarking and steganography for OxiMedia"
+keywords = ["watermark", "steganography", "audio", "multimedia", "media"]
+categories = ["multimedia", "algorithms"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-audio.workspace = true
+thiserror.workspace = true
+oxifft = { workspace = true }
+scirs2-core = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

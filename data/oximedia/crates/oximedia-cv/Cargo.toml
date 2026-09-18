@@ -1,0 +1,47 @@
+[package]
+name = "oximedia-cv"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Computer vision for OxiMedia"
+keywords = ["computer-vision", "video", "tracking", "multimedia", "image"]
+categories = ["multimedia::images", "science"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+onnx = ["dep:oxionnx"]
+cuda = ["onnx", "oxionnx/cuda"]
+rocm = ["onnx"]
+tensorrt = ["onnx"]
+webgpu = ["onnx", "oxionnx/gpu"]
+directml = ["onnx", "oxionnx/directml"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+# Only `VideoFrame` / `Plane` are used here, both unconditional. Leaving the default features off
+# keeps the `image-io` PNG/JPEG decoders -- and with them `flate2`/`miniz_oxide` -- out of the tree.
+oximedia-codec = { workspace = true, default-features = false }
+thiserror = { workspace = true }
+oxionnx = { workspace = true, optional = true }
+ndarray = { workspace = true }
+bytes = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+oxifft = { workspace = true }
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

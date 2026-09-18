@@ -1,0 +1,42 @@
+[package]
+name = "oximedia-shots"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Advanced shot detection and classification engine for OxiMedia"
+keywords = ["shot-detection", "scene", "video", "multimedia", "analysis"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+## Opt-in ML-assisted shot boundary detection via the Pure-Rust
+## `oximedia-ml` pipeline. Enabling `onnx` pulls in `oximedia-ml` with its
+## `shot-boundary` + `onnx` features so callers can actually run
+## inference against a TransNet V2-compatible ONNX model.
+onnx = [
+    "dep:oximedia-ml",
+    "oximedia-ml/shot-boundary",
+    "oximedia-ml/onnx",
+]
+## Enable CUDA dispatch for the ML-assisted shot boundary detector.
+cuda = ["onnx", "oximedia-ml/cuda"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-cv = { workspace = true }
+oximedia-scene = { workspace = true }
+oximedia-edl = { workspace = true }
+oximedia-timecode = { workspace = true }
+oximedia-ml = { workspace = true, optional = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rayon = { workspace = true }

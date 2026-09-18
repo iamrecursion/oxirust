@@ -1,0 +1,597 @@
+//! Auto-generated module
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+
+use super::functions::vec3_normalize;
+use super::functions::*;
+use super::functions::{Face, Vertex};
+use super::types::{AnisotropicSizeField, BooleanResult, ProcessMesh};
+
+/// Boolean intersection `A ∩ B` of two closed, outward-oriented meshes.
+///
+/// Faces are split along the intersection curves and re-triangulated, so the
+/// result is the closed boundary of the intersection (see
+/// [`crate::mesh_boolean::mesh_boolean`]).
+pub fn mesh_intersection(a: &ProcessMesh, b: &ProcessMesh) -> BooleanResult {
+    process_mesh_boolean(a, b, crate::mesh_boolean::MeshBooleanOp::Intersection)
+}
+/// Boolean difference `A \ B` of two closed, outward-oriented meshes.
+///
+/// Faces are split along the intersection curves; the part of `B`'s surface
+/// inside `A` is kept with reversed orientation to bound the carved cavity
+/// (see [`crate::mesh_boolean::mesh_boolean`]).
+pub fn mesh_difference(a: &ProcessMesh, b: &ProcessMesh) -> BooleanResult {
+    process_mesh_boolean(a, b, crate::mesh_boolean::MeshBooleanOp::Difference)
+}
+/// Build a simple unit tetrahedron mesh.
+pub fn make_tetrahedron() -> ProcessMesh {
+    let verts = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.5, (3.0_f64).sqrt() / 2.0, 0.0],
+        [0.5, (3.0_f64).sqrt() / 6.0, (6.0_f64).sqrt() / 3.0],
+    ];
+    let faces = vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]];
+    ProcessMesh::new(verts, faces)
+}
+/// Build a flat square mesh (two triangles).
+pub fn make_quad() -> ProcessMesh {
+    let verts = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ];
+    let faces = vec![[0, 1, 2], [0, 2, 3]];
+    ProcessMesh::new(verts, faces)
+}
+/// Build an icosphere with `subdivisions` subdivision rounds.
+pub fn make_icosphere(subdivisions: usize) -> ProcessMesh {
+    let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
+    let verts: Vec<Vertex> = vec![
+        vec3_normalize([-1.0, phi, 0.0]),
+        vec3_normalize([1.0, phi, 0.0]),
+        vec3_normalize([-1.0, -phi, 0.0]),
+        vec3_normalize([1.0, -phi, 0.0]),
+        vec3_normalize([0.0, -1.0, phi]),
+        vec3_normalize([0.0, 1.0, phi]),
+        vec3_normalize([0.0, -1.0, -phi]),
+        vec3_normalize([0.0, 1.0, -phi]),
+        vec3_normalize([phi, 0.0, -1.0]),
+        vec3_normalize([phi, 0.0, 1.0]),
+        vec3_normalize([-phi, 0.0, -1.0]),
+        vec3_normalize([-phi, 0.0, 1.0]),
+    ];
+    let faces: Vec<Face> = vec![
+        [0, 11, 5],
+        [0, 5, 1],
+        [0, 1, 7],
+        [0, 7, 10],
+        [0, 10, 11],
+        [1, 5, 9],
+        [5, 11, 4],
+        [11, 10, 2],
+        [10, 7, 6],
+        [7, 1, 8],
+        [3, 9, 4],
+        [3, 4, 2],
+        [3, 2, 6],
+        [3, 6, 8],
+        [3, 8, 9],
+        [4, 9, 5],
+        [2, 4, 11],
+        [6, 2, 10],
+        [8, 6, 7],
+        [9, 8, 1],
+    ];
+    let mut mesh = ProcessMesh::new(verts, faces);
+    for _ in 0..subdivisions {
+        mesh = midpoint_subdivide(&mesh);
+        for v in &mut mesh.verts {
+            *v = vec3_normalize(*v);
+        }
+    }
+    mesh
+}
+/// Build a uniform anisotropic size field (same size everywhere).
+pub fn uniform_anisotropic_field(mesh: &ProcessMesh, len: f64) -> AnisotropicSizeField {
+    let nv = mesh.verts.len();
+    AnisotropicSizeField {
+        k_min_dir: vec![[1.0, 0.0, 0.0]; nv],
+        k_max_dir: vec![[0.0, 1.0, 0.0]; nv],
+        len_min: vec![len; nv],
+        len_max: vec![len; nv],
+    }
+}
+/// Anisotropic remeshing guided by a size field.
+///
+/// Splits edges that exceed `len_max` at either endpoint and collapses edges
+/// shorter than `len_min` at either endpoint.
+pub fn anisotropic_remesh(
+    mesh: &ProcessMesh,
+    field: &AnisotropicSizeField,
+    iters: usize,
+) -> ProcessMesh {
+    let mut out = mesh.clone();
+    for _ in 0..iters {
+        let avg_max: f64 =
+            field.len_max.iter().copied().sum::<f64>() / field.len_max.len().max(1) as f64;
+        let avg_min: f64 =
+            field.len_min.iter().copied().sum::<f64>() / field.len_min.len().max(1) as f64;
+        out = split_long_edges(&out, avg_max);
+        out = collapse_short_edges(&out, avg_min * 0.6);
+        out = laplacian_smooth(&out, 0.3, 1);
+    }
+    out
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh_processing::Quadric;
+    fn tet() -> ProcessMesh {
+        make_tetrahedron()
+    }
+    fn quad() -> ProcessMesh {
+        make_quad()
+    }
+    fn ico1() -> ProcessMesh {
+        make_icosphere(1)
+    }
+    #[test]
+    fn test_mesh_num_verts() {
+        let m = tet();
+        assert_eq!(m.num_verts(), 4);
+    }
+    #[test]
+    fn test_mesh_num_faces() {
+        let m = tet();
+        assert_eq!(m.num_faces(), 4);
+    }
+    #[test]
+    fn test_mesh_compute_normals() {
+        let mut m = tet();
+        m.compute_normals();
+        let normals = m.normals.as_ref().unwrap();
+        assert_eq!(normals.len(), 4);
+        for &n in normals {
+            let l = vec3_len(n);
+            assert!(l < 1.01, "normal too long: {l}");
+        }
+    }
+    #[test]
+    fn test_build_adjacency_tetrahedron() {
+        let m = tet();
+        let adj = m.build_adjacency();
+        assert_eq!(adj.len(), 4);
+        for (i, nbrs) in adj.iter().enumerate() {
+            assert_eq!(nbrs.len(), 3, "vertex {i} should have 3 neighbours");
+        }
+    }
+    #[test]
+    fn test_laplacian_smooth_zero_iter() {
+        let m = tet();
+        let s = laplacian_smooth(&m, 0.5, 0);
+        for i in 0..4 {
+            assert_eq!(s.verts[i], m.verts[i]);
+        }
+    }
+    #[test]
+    fn test_laplacian_smooth_moves_vertices() {
+        let m = ico1();
+        let s = laplacian_smooth(&m, 0.5, 3);
+        let changed = m
+            .verts
+            .iter()
+            .zip(s.verts.iter())
+            .any(|(a, b)| vec3_len(vec3_sub(*a, *b)) > 1e-12);
+        assert!(changed);
+    }
+    #[test]
+    fn test_taubin_smooth_preserves_face_count() {
+        let m = ico1();
+        let s = taubin_smooth(&m, 0.5, -0.53, 3);
+        assert_eq!(s.num_faces(), m.num_faces());
+    }
+    #[test]
+    fn test_taubin_lambda_mu_signs() {
+        let m = ico1();
+        let _s = taubin_smooth(&m, 0.5, -0.53, 5);
+    }
+    #[test]
+    fn test_midpoint_subdivide_face_count() {
+        let m = tet();
+        let s = midpoint_subdivide(&m);
+        assert_eq!(s.num_faces(), m.num_faces() * 4);
+    }
+    #[test]
+    fn test_midpoint_subdivide_vertex_count_increases() {
+        let m = tet();
+        let s = midpoint_subdivide(&m);
+        assert!(s.num_verts() > m.num_verts());
+    }
+    #[test]
+    fn test_loop_subdivide_face_count() {
+        let m = tet();
+        let s = loop_subdivide(&m);
+        assert_eq!(s.num_faces(), m.num_faces() * 4);
+    }
+    #[test]
+    fn test_catmull_clark_subdivide_more_faces() {
+        let m = tet();
+        let s = catmull_clark_subdivide(&m);
+        assert!(s.num_faces() > m.num_faces());
+    }
+    #[test]
+    fn test_double_midpoint_subdivide() {
+        let m = tet();
+        let s1 = midpoint_subdivide(&m);
+        let s2 = midpoint_subdivide(&s1);
+        assert_eq!(s2.num_faces(), m.num_faces() * 16);
+    }
+    #[test]
+    fn test_quadric_zero() {
+        let q = Quadric::zero();
+        assert_eq!(q.evaluate([1.0, 2.0, 3.0]), 0.0);
+    }
+    #[test]
+    fn test_quadric_plane() {
+        let q = Quadric::from_plane(0.0, 0.0, 1.0, 0.0);
+        assert!(q.evaluate([1.0, 2.0, 0.0]).abs() < 1e-12);
+        assert!(q.evaluate([1.0, 2.0, 1.0]) > 0.0);
+    }
+    #[test]
+    fn test_qem_decimate_reduces_faces() {
+        let m = make_icosphere(2);
+        let target = 200;
+        let dec = qem_decimate(&m, target);
+        assert!(
+            dec.num_faces() < m.num_faces(),
+            "decimation should reduce faces; got={}",
+            dec.num_faces()
+        );
+        assert!(dec.num_faces() <= target + 5, "faces={}", dec.num_faces());
+    }
+    #[test]
+    fn test_qem_decimate_no_op_when_under_target() {
+        let m = tet();
+        let dec = qem_decimate(&m, 100);
+        assert_eq!(dec.num_faces(), m.num_faces());
+    }
+    #[test]
+    fn test_triangle_quality_equilateral() {
+        let va = [0.0, 0.0, 0.0];
+        let vb = [1.0, 0.0, 0.0];
+        let vc = [0.5, (3.0_f64).sqrt() / 2.0, 0.0];
+        let q = triangle_quality(va, vb, vc);
+        assert!((q.aspect_ratio - 1.0).abs() < 0.01, "ar={}", q.aspect_ratio);
+        assert!((q.area_quality - 1.0).abs() < 0.01, "aq={}", q.area_quality);
+    }
+    #[test]
+    fn test_triangle_quality_right_angle() {
+        let va = [0.0, 0.0, 0.0];
+        let vb = [1.0, 0.0, 0.0];
+        let vc = [0.0, 1.0, 0.0];
+        let q = triangle_quality(va, vb, vc);
+        assert!(q.min_angle > 0.0);
+        assert!(q.max_angle < std::f64::consts::PI);
+    }
+    #[test]
+    fn test_mesh_quality_stats_tetrahedron() {
+        let m = tet();
+        let stats = mesh_quality_stats(&m);
+        assert!(
+            stats.mean_aspect_ratio >= 1.0 - 1e-9,
+            "mean_aspect_ratio={}",
+            stats.mean_aspect_ratio
+        );
+        assert!(stats.min_angle_deg > 0.0);
+    }
+    #[test]
+    fn test_mesh_quality_empty_mesh() {
+        let m = ProcessMesh::new(vec![], vec![]);
+        let stats = mesh_quality_stats(&m);
+        assert_eq!(stats.mean_aspect_ratio, 0.0);
+    }
+    #[test]
+    fn test_detect_boundary_loops_closed_mesh() {
+        let m = tet();
+        let loops = detect_boundary_loops(&m);
+        assert!(loops.is_empty(), "tetrahedron should have no boundary");
+    }
+    #[test]
+    fn test_detect_boundary_loops_open_mesh() {
+        let m = quad();
+        let loops = detect_boundary_loops(&m);
+        assert!(!loops.is_empty());
+    }
+    #[test]
+    fn test_fill_hole_fan_single_triangle() {
+        let m = quad();
+        let loops = detect_boundary_loops(&m);
+        let mut verts = m.verts.clone();
+        let mut total_faces = m.faces.clone();
+        for lp in &loops {
+            let nf = fill_hole_fan(&mut verts, lp);
+            total_faces.extend(nf);
+        }
+        assert!(total_faces.len() > m.num_faces());
+    }
+    #[test]
+    fn test_fill_all_holes_closes_boundary() {
+        let m = quad();
+        let repaired = fill_all_holes(&m);
+        let loops = detect_boundary_loops(&repaired);
+        assert!(loops.is_empty(), "boundary should be closed after repair");
+    }
+    #[test]
+    fn test_feature_edges_tetrahedron_sharp() {
+        let m = tet();
+        let edges = detect_feature_edges(&m, 0.0);
+        assert!(!edges.is_empty());
+    }
+    #[test]
+    fn test_feature_edges_high_threshold() {
+        let m = tet();
+        let edges = detect_feature_edges(&m, 180.0);
+        assert!(edges.is_empty());
+    }
+    #[test]
+    fn test_split_long_edges_increases_verts() {
+        let m = make_icosphere(0);
+        let split = split_long_edges(&m, 0.5);
+        assert!(split.num_verts() >= m.num_verts());
+    }
+    #[test]
+    fn test_collapse_short_edges_reduces_verts() {
+        let m = make_icosphere(2);
+        let collapsed = collapse_short_edges(&m, 0.5);
+        assert!(collapsed.num_verts() <= m.num_verts());
+    }
+    #[test]
+    fn test_isotropic_remesh_smoke() {
+        let m = make_icosphere(1);
+        let rm = isotropic_remesh(&m, 0.4, 2);
+        assert!(rm.num_verts() > 0);
+        assert!(rm.num_faces() > 0);
+    }
+    #[test]
+    fn test_tutte_parameterize_uv_count() {
+        let m = make_icosphere(1);
+        let param = tutte_parameterize(&m, 50);
+        assert_eq!(param.uvs.len(), m.num_verts());
+    }
+    #[test]
+    fn test_tutte_parameterize_uv_range() {
+        let m = make_icosphere(1);
+        let param = tutte_parameterize(&m, 50);
+        for &[u, v] in &param.uvs {
+            assert!(u.is_finite(), "u not finite");
+            assert!(v.is_finite(), "v not finite");
+        }
+    }
+    #[test]
+    fn test_lscm_parameterize_returns_uvs() {
+        let m = make_icosphere(1);
+        let param = lscm_parameterize(&m);
+        assert_eq!(param.uvs.len(), m.num_verts());
+    }
+    #[test]
+    fn test_generate_texture_atlas_nonempty() {
+        let m = make_icosphere(1);
+        let atlas = generate_texture_atlas(&m, 512);
+        assert!(!atlas.is_empty());
+    }
+    #[test]
+    fn test_generate_texture_atlas_bounds_valid() {
+        let m = make_icosphere(1);
+        let atlas = generate_texture_atlas(&m, 512);
+        for patch in &atlas {
+            let [umin, vmin, umax, vmax] = patch.bounds;
+            assert!(umin <= umax, "umin > umax");
+            assert!(vmin <= vmax, "vmin > vmax");
+        }
+    }
+    #[test]
+    fn test_point_in_mesh_inside() {
+        let m = make_icosphere(2);
+        assert!(point_in_mesh([0.0, 0.0, 0.0], &m));
+    }
+    #[test]
+    fn test_point_in_mesh_outside() {
+        let m = make_icosphere(2);
+        assert!(!point_in_mesh([10.0, 0.0, 0.0], &m));
+    }
+    /// Enclosed volume of a closed mesh (divergence theorem).
+    fn enclosed_volume(m: &ProcessMesh) -> f64 {
+        m.faces
+            .iter()
+            .map(|&[a, b, c]| {
+                let (p, q, r) = (m.verts[a], m.verts[b], m.verts[c]);
+                p[0] * (q[1] * r[2] - q[2] * r[1]) - p[1] * (q[0] * r[2] - q[2] * r[0])
+                    + p[2] * (q[0] * r[1] - q[1] * r[0])
+            })
+            .sum::<f64>()
+            / 6.0
+    }
+    /// Axis-aligned box `[lo, hi]` as a closed, outward-oriented mesh.
+    fn make_box(lo: [f64; 3], hi: [f64; 3]) -> ProcessMesh {
+        let verts = (0..8)
+            .map(|i| {
+                [
+                    if i & 1 == 0 { lo[0] } else { hi[0] },
+                    if i & 2 == 0 { lo[1] } else { hi[1] },
+                    if i & 4 == 0 { lo[2] } else { hi[2] },
+                ]
+            })
+            .collect();
+        let faces = vec![
+            [0, 2, 1],
+            [1, 2, 3],
+            [4, 5, 6],
+            [5, 7, 6],
+            [0, 1, 4],
+            [1, 5, 4],
+            [2, 6, 3],
+            [3, 6, 7],
+            [0, 4, 2],
+            [2, 4, 6],
+            [1, 3, 5],
+            [3, 7, 5],
+        ];
+        ProcessMesh::new(verts, faces)
+    }
+    #[test]
+    fn test_mesh_booleans_of_offset_boxes_are_exact() {
+        // A = [0,1]^3, B = A + (0.5, 0.25, 0): every face of the overlap is
+        // cut mid-triangle, so whole-face selection cannot get these right.
+        let a = make_box([0.0; 3], [1.0; 3]);
+        let b = make_box([0.5, 0.25, 0.0], [1.5, 1.25, 1.0]);
+        assert!((enclosed_volume(&a) - 1.0).abs() < 1e-12);
+        let overlap = 0.5 * 0.75;
+        for (result, want, what) in [
+            (mesh_union(&a, &b), 2.0 - overlap, "union"),
+            (mesh_intersection(&a, &b), overlap, "intersection"),
+            (mesh_difference(&a, &b), 1.0 - overlap, "difference"),
+        ] {
+            assert!(result.is_exact, "{what}: result is not a closed manifold");
+            let v = enclosed_volume(&result.mesh);
+            assert!(
+                (v - want).abs() < 1e-9,
+                "{what}: volume {v}, expected {want}"
+            );
+        }
+    }
+    #[test]
+    fn test_mesh_union_of_icospheres_is_closed_and_larger() {
+        let a = make_icosphere(1);
+        let mut b = make_icosphere(1);
+        for v in &mut b.verts {
+            v[0] += 0.5;
+        }
+        let (va, vb) = (enclosed_volume(&a), enclosed_volume(&b));
+        let union = mesh_union(&a, &b);
+        let inter = mesh_intersection(&a, &b);
+        let diff = mesh_difference(&a, &b);
+        for (r, what) in [
+            (&union, "union"),
+            (&inter, "intersection"),
+            (&diff, "difference"),
+        ] {
+            assert!(r.is_exact, "{what}: result is not a closed manifold");
+        }
+        let (vu, vi, vd) = (
+            enclosed_volume(&union.mesh),
+            enclosed_volume(&inter.mesh),
+            enclosed_volume(&diff.mesh),
+        );
+        assert!(vi > 0.0 && vi < va && vu > va);
+        assert!((vu + vi - (va + vb)).abs() < 1e-9, "∪ {vu} ∩ {vi}");
+        assert!((vd - (va - vi)).abs() < 1e-9, "\\ {vd} ∩ {vi}");
+    }
+    #[test]
+    fn test_mesh_difference_of_identical_meshes_is_empty() {
+        let a = make_icosphere(1);
+        let result = mesh_difference(&a, &a);
+        assert_eq!(result.mesh.num_faces(), 0);
+        assert!(!result.is_exact);
+    }
+    #[test]
+    fn test_anisotropic_remesh_smoke() {
+        let m = make_icosphere(1);
+        let field = uniform_anisotropic_field(&m, 0.5);
+        let rm = anisotropic_remesh(&m, &field, 2);
+        assert!(rm.num_verts() > 0);
+    }
+    #[test]
+    fn test_uniform_anisotropic_field_dimensions() {
+        let m = tet();
+        let field = uniform_anisotropic_field(&m, 1.0);
+        assert_eq!(field.len_min.len(), m.num_verts());
+        assert_eq!(field.len_max.len(), m.num_verts());
+    }
+    #[test]
+    fn test_make_icosphere_vertices_on_unit_sphere() {
+        let m = make_icosphere(0);
+        for v in &m.verts {
+            let r = vec3_len(*v);
+            assert!((r - 1.0).abs() < 1e-10, "radius={r}");
+        }
+    }
+    #[test]
+    fn test_make_icosphere_subdivision_grows_mesh() {
+        let m0 = make_icosphere(0);
+        let m1 = make_icosphere(1);
+        assert!(m1.num_faces() > m0.num_faces());
+    }
+    #[test]
+    fn test_vec3_cross_perpendicular() {
+        let a = [1.0, 0.0, 0.0];
+        let b = [0.0, 1.0, 0.0];
+        let c = vec3_cross(a, b);
+        assert!((c[0]).abs() < 1e-12);
+        assert!((c[1]).abs() < 1e-12);
+        assert!((c[2] - 1.0).abs() < 1e-12);
+    }
+    #[test]
+    fn test_vec3_normalize_unit() {
+        let v = [3.0, 4.0, 0.0];
+        let n = vec3_normalize(v);
+        assert!((vec3_len(n) - 1.0).abs() < 1e-12);
+    }
+    #[test]
+    fn test_vec3_lerp_midpoint() {
+        let a = [0.0, 0.0, 0.0];
+        let b = [2.0, 2.0, 2.0];
+        let m = vec3_lerp(a, b, 0.5);
+        assert!((m[0] - 1.0).abs() < 1e-12);
+    }
+
+    // ── LSCM UV parameterization ──────────────────────────────────────────────
+
+    #[test]
+    fn test_lscm_flat_square_uv_in_range() {
+        let mesh = make_quad();
+        let param = lscm_parameterize(&mesh);
+        assert_eq!(param.uvs.len(), mesh.verts.len());
+        for &[u, v] in &param.uvs {
+            assert!(
+                u.is_finite() && v.is_finite(),
+                "UV must be finite: ({u}, {v})"
+            );
+            assert!((0.0..=1.0).contains(&u), "u={u} must be in [0,1]");
+            assert!((0.0..=1.0).contains(&v), "v={v} must be in [0,1]");
+        }
+    }
+
+    #[test]
+    fn test_lscm_flat_square_pin_vertices() {
+        // Vertex 0 must map to (0,0) and vertex 1 to (1,0)
+        let mesh = make_quad();
+        let param = lscm_parameterize(&mesh);
+        let uv0 = param.uvs[0];
+        let uv1 = param.uvs[1];
+        assert!(
+            (uv0[0]).abs() < 1e-6 && (uv0[1]).abs() < 1e-6,
+            "vertex 0 must be pinned to (0,0): got {:?}",
+            uv0
+        );
+        assert!(
+            (uv1[0] - 1.0).abs() < 1e-6 && (uv1[1]).abs() < 1e-6,
+            "vertex 1 must be pinned to (1,0): got {:?}",
+            uv1
+        );
+    }
+
+    #[test]
+    fn test_lscm_icosphere_all_finite() {
+        let mesh = make_icosphere(2);
+        let param = lscm_parameterize(&mesh);
+        assert_eq!(param.uvs.len(), mesh.verts.len());
+        for (i, &[u, v]) in param.uvs.iter().enumerate() {
+            assert!(
+                u.is_finite() && v.is_finite(),
+                "vertex {i} UV ({u}, {v}) must be finite"
+            );
+        }
+    }
+}

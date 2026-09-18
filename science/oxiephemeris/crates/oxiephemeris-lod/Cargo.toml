@@ -1,0 +1,28 @@
+[package]
+name = "oxiephemeris-lod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: SPARQL store and HTTP endpoint (oxieph-sparqld) for the astrological Linked Open Data layer"
+keywords = ["sparql", "rdf", "linked-data", "endpoint", "astrology"]
+categories = ["database-implementations", "science"]
+
+[[bin]]
+name = "oxieph-sparqld"
+path = "src/bin/sparqld.rs"
+
+[dependencies]
+oxiephemeris-rdf.workspace = true
+oxigraph.workspace = true
+oxhttp.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

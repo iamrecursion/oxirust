@@ -1,0 +1,27 @@
+[package]
+name = "oxiephemeris-chart"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: the UI-free chart-computation facade (natal, synastry, transit, progression, composite) shared by the CLI, Python, and WASM bindings"
+keywords = ["astrology", "ephemeris", "chart", "natal", "synastry"]
+categories = ["science"]
+
+[dependencies]
+oxiephemeris-core = { workspace = true, features = ["std"] }
+oxiephemeris-de = { workspace = true, features = ["std"] }
+oxiephemeris-bodies = { workspace = true, features = ["std"] }
+oxiephemeris-astro = { workspace = true, features = ["std"] }
+oxiephemeris-rdf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

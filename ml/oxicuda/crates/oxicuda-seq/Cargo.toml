@@ -1,0 +1,31 @@
+[package]
+name = "oxicuda-seq"
+description = "OxiCUDA: Sequence Models & Structured Prediction (HMM/CRF/Kalman/MRF/alignment)"
+categories = ["algorithms", "science", "text-processing"]
+keywords = ["hmm", "crf", "kalman-filter", "sequence-alignment", "gpu"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[features]
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "seq_ops"
+harness = false

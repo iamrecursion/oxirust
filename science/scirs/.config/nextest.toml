@@ -1,0 +1,143 @@
+# cargo-nextest configuration for SciRS2
+# https://nexte.st/book/configuration.html
+
+# All `*_or_skip` tests under `gpu_cuda` modules (scirs2-datasets, -fft, -graph,
+# -interpolate, -linalg, -optimize, -special, -stats, -symbolic, -vision) probe a
+# real NVIDIA device via `oxicuda-driver` and build a CUDA primary context. nextest
+# runs each test in its own OS process, so the in-source `Mutex` those modules use
+# only serializes threads within a process — it does nothing across the concurrent
+# processes nextest spawns. Two such tests running at once race on CUDA context
+# creation/execution on the single physical GPU and corrupt each other's results
+# (observed: FFT roundtrip silently returning zeros). `max-threads = 1` makes this
+# group a global mutex across processes.
+[test-groups.cuda-gpu]
+max-threads = 1
+
+# Each trybuild harness shells out to its own nested `cargo build` against a
+# sandbox crate under `target/tests/trybuild/`. Two of them exist
+# (`compile_fail_tests` in scirs2-stability-tests and `compile_fail_doc` in the
+# scirs2 facade), and nextest is free to schedule them at the same time — two
+# concurrent cargo invocations contending for the same `target/` lock, each
+# reporting a build failure as a stderr mismatch. Serializing the group removes
+# the interaction; both harnesses pass standalone.
+[test-groups.trybuild]
+max-threads = 1
+
+[store]
+# Directory where nextest stores its metadata
+dir = "target/.nextest"
+
+[profile.default]
+# Default test execution settings
+retries = 0
+fail-fast = false
+failure-output = "immediate"
+success-output = "never"
+status-level = "all"
+
+# Test execution
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.ci]
+# CI-specific settings for faster feedback
+retries = 1
+fail-fast = false
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "all"
+
+# More lenient timeouts for CI runners
+slow-timeout = { period = "120s", terminate-after = 3 }
+test-threads = 4
+
+# JUnit output for CI integration
+final-status-level = "all"
+
+[profile.default.junit]
+path = "target/nextest/junit.xml"
+store-success-output = true
+store-failure-output = true
+
+[profile.ci.junit]
+path = "target/nextest/ci-junit.xml"
+store-success-output = false
+store-failure-output = true
+
+# Override settings for specific tests
+[[profile.default.overrides]]
+# Long-running integration tests
+filter = 'test(integration)'
+slow-timeout = { period = "300s" }
+threads-required = 1
+
+[[profile.default.overrides]]
+# GPU tests (when available)
+filter = 'test(gpu)'
+slow-timeout = { period = "180s" }
+threads-required = 1
+
+[[profile.default.overrides]]
+# Real-device CUDA tests (`*_or_skip` under `gpu_cuda` / `blas_accelerated` modules)
+# must run one-at-a-time across the whole workspace; see the `cuda-gpu` test-group
+# comment above for why the intra-process Mutex in those test modules isn't enough.
+filter = 'test(/_or_skip$/)'
+slow-timeout = { period = "180s" }
+test-group = 'cuda-gpu'
+
+[[profile.default.overrides]]
+# Large dataset tests
+filter = 'test(large_dataset)'
+slow-timeout = { period = "600s" }
+threads-required = 2
+
+[[profile.default.overrides]]
+# Property-based tests (quickcheck/proptest suites). `test(property_)` did
+# NOT match the tests this override exists for: `test()` matches against
+# test *names*, and the real quickcheck/proptest functions in
+# `tests/property_based_tests.rs` (scirs2-stats, scirs2-metrics) are named
+# things like `descriptive_stats_properties::mean_bounds_property` — no
+# `property_` substring anywhere. The old filter instead accidentally
+# matched unrelated `property_tests::*` modules in other crates (e.g.
+# scirs2-linalg/scirs2-cluster) that happen to contain that substring in
+# their module name. Verified against `cargo nextest list --run-ignored
+# all`: the real suites are auto-discovered as binaries named
+# `property_based_tests`, so this is a `binary()` filter, not `test()`.
+filter = 'binary(property_based_tests)'
+slow-timeout = { period = "300s" }
+
+[[profile.default.overrides]]
+# Stress tests
+filter = 'test(stress_)'
+slow-timeout = { period = "600s" }
+threads-required = 2
+
+[[profile.default.overrides]]
+# Wall-clock scaling assertions (test_performance_scaling compares timings
+# across four data sizes with a linear-scaling tolerance). Sub-millisecond
+# measurements are noise-sensitive when many other nextest test processes are
+# scheduled concurrently on the same cores; reserving extra slots reduces
+# (does not require avoiding entirely — see the in-test tolerance) that
+# contention. See scirs2-integration-tests/tests/integration/performance.rs.
+filter = 'test(test_performance_scaling)'
+threads-required = 2
+
+[[profile.default.overrides]]
+# Both trybuild compile-fail harnesses spawn their own `cargo` build, which can
+# take minutes to compile the sandbox crate's deps:
+#   - `compile_fail_tests`  (scirs2-stability-tests)
+#   - `compile_fail_doc` / `compile_fail_harness`  (scirs2 facade)
+# The default 60s SLOW + 2 cycles (=120s) is too short and was killing
+# `compile_fail_harness` (~145s: 50s build + 95s trybuild). Allow up to
+# 600s × 3 cycles (30 min) and reserve threads.
+filter = 'binary(compile_fail_tests) | binary(compile_fail_doc)'
+slow-timeout = { period = "600s", terminate-after = 3 }
+threads-required = 4
+test-group = 'trybuild'
+
+[[profile.default.overrides]]
+# 4D hypercube Voronoi tests (Bowyer-Watson 16-point triangulation) are slow;
+# ignored by default — run with --run-ignored. Give them extra time when invoked.
+filter = 'test(test_4d_hypercube)'
+slow-timeout = { period = "300s", terminate-after = 2 }
+threads-required = 1

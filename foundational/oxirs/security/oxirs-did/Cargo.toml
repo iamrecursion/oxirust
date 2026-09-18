@@ -1,0 +1,122 @@
+[package]
+name = "oxirs-did"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "W3C DID and Verifiable Credentials implementation with Signed RDF Graphs for OxiRS"
+keywords = ["did", "vc", "w3c", "rdf", "cryptography"]
+categories = ["cryptography", "authentication", "web-programming"]
+readme = "README.md"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal OxiRS crates
+oxirs-core.workspace = true
+
+# SciRS2 for cryptographic operations
+scirs2-core.workspace = true
+
+# Cryptography
+ed25519-dalek.workspace = true
+# curve25519-dalek is a mandatory dependency: it backs the real X25519 key
+# agreement (key_agreement.rs) and the Ristretto255 Pedersen/Schnorr
+# proof-of-knowledge used by the ZKP selective-disclosure path. Pure Rust.
+curve25519-dalek.workspace = true
+# NOTE (cargo-upgrade sweep, 2026-07-02): PINNED to sha2 0.10 + hmac 0.12 (digest
+# 0.10 generation). sha2 0.11 / hmac 0.13 implement the digest 0.11 traits, but this
+# crate's bls12_381_plus 0.8.18 (via elliptic-curve 0.13.8's ExpandMsgXmd in
+# signatures/bbs_plus.rs) and rsa 0.9.10 (signatures/rs256.rs SigningKey<Sha256>)
+# BOTH still require the digest 0.10 traits (BlockSizeUser/FixedOutput/HashMarker) on
+# Sha256 — a genuinely incompatible-Sha256-type diamond. No stable upstream escape
+# exists: bls12_381_plus 0.8.18 is the latest, and rsa's only digest-0.11 release is
+# the pre-release 0.10.0-rc.18 (not shippable for RSA signing). Sha256 is also paired
+# with hmac in kms/mod.rs (`Hmac<Sha256>`), so hmac must stay on the same (0.12)
+# digest generation. Reverted DIRECT (not workspace) so the other 13 workspace crates
+# keep sha2 0.11. sha3 stays workspace 0.12 (used standalone as Keccak256 in
+# did/methods/did_ethr.rs — not entangled with the digest-0.10 consumers). Re-eval
+# 2026-08-02 (when rsa 0.10 goes stable + bls12_381_plus adopts elliptic-curve 0.14).
+sha2 = "0.10"
+sha3.workspace = true
+hmac = "0.12"
+base64.workspace = true
+hex.workspace = true
+p256.workspace = true
+# OS CSPRNG (ChaCha20 seeded from getrandom) — used for key/seed/blinding
+# generation now that rand_core 0.9 (via p256 0.14) dropped `OsRng`.
+oxicrypto-rand.workspace = true
+bls12_381_plus.workspace = true
+# rsa provides the pure-Rust RS256 (RSASSA-PKCS1-v1_5) signing and verification
+# path (replaces the former `ring` dependency). Key generation lives behind the
+# `keygen` feature, but the crate itself is always required for sign/verify.
+rsa.workspace = true
+
+# Multiformat encoding
+bs58.workspace = true
+
+# Compression (Pure Rust, COOLJAPAN OxiARC) — GZIP for the spec-mandated
+# StatusList2021 `encodedList` on-wire format (RFC 1952 gzip + base64url).
+oxiarc-deflate.workspace = true
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+
+# HTTP client (for did:web resolution)
+reqwest = { workspace = true, optional = true }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Utilities
+uuid.workspace = true
+chrono.workspace = true
+lru.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[features]
+default = ["did-key", "vc-data-model-2", "did-ethr", "did-ion", "bbs-plus", "zkp"]
+# fips: marker feature for FIPS 140-2 validated cryptographic operations.
+# NOT included in default — must be explicitly enabled.
+# When this flag is set, application code in the FIPS boundary (DID key
+# generation, signature verification, VC signing) must only invoke primitives
+# that are FIPS 140-2 validated (AES-GCM, ECDSA P-256/P-384, RSA, HMAC-SHA-2,
+# SHA-2). See docs/policies/fips-boundary.md (RFC-003).
+fips = []
+# keygen: enables RSA key-pair generation. Signing/verification use the `rsa`
+# crate unconditionally; this flag only gates the (slow) keygen helpers.
+keygen = []
+did-key = []
+did-web = ["reqwest"]
+did-ebsi = ["reqwest"]
+did-ethr = []
+did-ion = []
+vc-data-model-2 = []
+signed-graphs = []
+key-management = []
+bbs-plus = []
+zkp = []
+# zkp-ristretto: compiles the standalone `zkp::pedersen::ristretto` helper module.
+# curve25519-dalek is now a mandatory dependency (the default Pedersen/Schnorr
+# path is Ristretto255-backed regardless of this flag), so this is just a marker.
+zkp-ristretto = []
+# insecure-mock-kms: opt-in gate for the deterministic, NON-SECURE in-memory KMS
+# backends (InsecureMockAwsKms/Gcp/Azure). They derive signing keys from the
+# public key_id and MUST NOT be used in production. Enabled only for tests/dev.
+insecure-mock-kms = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

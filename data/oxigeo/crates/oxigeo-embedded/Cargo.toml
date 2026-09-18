@@ -1,0 +1,63 @@
+[package]
+name = "oxigeo-embedded"
+description = "Embedded systems support for OxiGeo - no_std compatible geospatial processing for ARM, RISC-V, and ESP32"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigeo-embedded"
+readme = "README.md"
+keywords = ["gdal", "science", "embedded", "no-std", "arm"]
+categories = ["science::geo", "embedded", "no-std"]
+
+[features]
+default = ["alloc"]
+std = ["thiserror/std", "serde/std", "oxigeo-core/std"]
+alloc = ["serde/alloc", "oxigeo-core/alloc"]
+
+# Target-specific features
+arm = []
+riscv = []
+esp32 = []
+
+# Power management features
+low-power = []
+sleep-modes = ["low-power"]
+
+# Real-time features
+realtime = []
+static-pool = ["alloc"]
+
+# Minimal footprint
+minimal = []
+
+[dependencies]
+oxigeo-core = { workspace = true, default-features = false, features = ["alloc"] }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+# Embedded-specific dependencies
+# The `critical-section` feature lets portable-atomic emulate 64-bit atomics
+# (used by `sync::AtomicCounter` and `realtime`) on 32-bit bare-metal targets
+# that have no native 64-bit CAS. The downstream firmware supplies the actual
+# `critical-section` implementation (e.g. via `cortex-m`/`riscv` runtime crates).
+portable-atomic = { workspace = true, features = ["critical-section"] }
+heapless = { workspace = true }
+libm = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+# Use workspace lints
+[lints]
+workspace = true
+
+# NOTE: ESP32 cfg conditions (esp32, esp32s2, etc.) are declared in build.rs
+# to avoid conflicts with workspace lints
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

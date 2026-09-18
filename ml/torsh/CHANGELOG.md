@@ -1,0 +1,289 @@
+# Changelog
+
+All notable changes to ToRSh will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.2.1] - Unreleased
+
+## [0.2.0] - 2026-08-14
+
+This release combines the Python-bindings & correctness work with a broad
+**production-hardening campaign** that replaced fabricated "success" paths with
+real implementations (or honest `Err` returns), completed autograd backward
+coverage, consolidated the CUDA backend onto the pure-Rust oxicuda stack, and
+tightened security. Highlights are grouped below.
+
+### Added
+- `rstorch.optim.lr_scheduler` submodule (torsh-python): 6 PyTorch-compatible learning rate schedulers — `StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `LinearLR`, `ReduceLROnPlateau`
+- Real `state_dict()` / `load_state_dict()` on the Python `SGD`, `Adam`, `AdamW`, `Adagrad`, and `RMSprop` optimizer bindings — checkpoints now carry the actual per-parameter buffers (momentum, `exp_avg`, `exp_avg_sq`, step count, ...) instead of an empty placeholder, so training can be resumed from a saved checkpoint
+- Tensor operator overloads on the Python bindings: `__add__`, `__sub__`, `__mul__`, `__truediv__`, `__matmul__`, `__neg__`, so `a + b`, `a @ b`, `-a`, etc. work directly on `Tensor` objects
+- `Tensor::norm_lp(p, dims, keepdim)` (torsh-tensor): general Lp-norm (L0/L1/L2/max/min/arbitrary finite `p`) with per-dimension reduction and `keepdim`, matching `torch.norm` semantics; backs the Python `Tensor.norm()` binding
+- Full NumPy / pandas / SciPy interop bridge in `torsh-ffi` (previously all placeholder stubs returning "not implemented" errors): tensor <-> NumPy array conversion (contiguous and strided), pandas DataFrame/Series <-> tensor conversion plus DataFrame merge/pivot/time-series helpers, and SciPy `solve`/`eig`/`svd`/`minimize`/`fft`/statistical-test/`interpolate`/sparse-matrix-conversion/benchmark integration
+- `FloatElement` trait implementation for `f16` and `bf16` (torsh-core), enabling `epsilon()`/`infinity()`/`nan()`/`is_finite()` and other float operations on half-precision tensors
+- Real TCP distributed backend (torsh-distributed): a working socket-based collective backend replaces the previous mock, so single-host multi-process flows no longer silently corrupt or drop gradients
+- Completed autograd backward coverage (torsh-autograd): real gradients for `mul`, `div`, `matmul`, `cat`, `stack`, `narrow`, and `log_softmax` (paths that previously returned zero or were unimplemented)
+- Real signal-processing numerics (torsh-signal): FIR/IIR filter design, eigenvalue (`eig`) and SVD paths now compute real results instead of placeholders
+
+### Changed
+- **Dependency truth-up** (versions corrected to what is actually built): scirs2 ecosystem → **0.6.5**, `oxicuda-*` → **0.5.4**, `oxifft` → **0.4.2**, `oxiarc-*` → **0.4.1**, `oxicode` → **0.2.6**, `oxionnx` → **0.1.6**, `wgpu` → **30.0.0**
+- **CUDA backend consolidation** — GPU compute is now provided exclusively by the pure-Rust **oxicuda** stack (`torsh-tensor`'s runtime-loaded `GpuDispatch`, no CUDA SDK at build time). `torsh-backend`'s `cuda` feature is now an honest pure-Rust fallback (ops return an error or route to CPU); the duplicated legacy CUDA C-FFI backend was removed (see **Removed**)
+- scirs2 ecosystem (`scirs2-core` and related `scirs2-*` crates) updated 0.5.1 → 0.6.5
+- `oxicuda-backend`/`oxicuda-driver`/`oxicuda-launch`/`oxicuda-ptx` updated 0.3 → 0.5.4
+- `pyo3` updated 0.28.3 → 0.29.0 (with `numpy` 0.28 → 0.29, `scirs2-numpy` 0.5.1 → 0.6.0, `pyo3-build-config` 0.28 → 0.29); see **Fixed** for a default-argument regression this exposed across `torsh-python`
+- `wgpu` updated 29.0.3 → 30.0.0; WebGPU buffer mapping now handles the new fallible `get_mapped_range`/`get_mapped_range_mut` API, and adapter requests set the new `apply_limit_buckets` option
+- `rand` updated 0.10.1 → 0.10.2; `humantime` (torsh-cli) updated 2.3 → 2.4
+- `TensorParallel::parallel_all_gather` (torsh-distributed) now takes an explicit `shard_dim` parameter (breaking change) — see **Fixed**
+
+### Fixed
+- torsh-python: 31 tensor-creation and reduction methods (`tensor`/`zeros`/`ones`/`randn`/`rand`/`empty`/`full`/`eye`/`arange`/`linspace` and their `*_like` variants, the `Tensor()` constructor, and `std`/`var`/`sum`/`mean`/`max`/`min`/`squeeze`/`flatten`/`clamp`/`argmax`/`argmin`/`uniform_`/`normal_`/`diag`) previously required every optional argument to be passed explicitly, or raised a `TypeError` when a trailing argument was omitted (a pyo3 0.29 signature-annotation gap); optional arguments now actually default as documented
+- torsh-python: `Tensor.norm()` now honors the `p`, `dim`, and `keepdim` arguments (previously always returned the whole-tensor L2 norm no matter what was passed)
+- torsh-python: `set_lr()` on `Adam`/`AdamW`/`Adagrad`/`RMSprop` now propagates the new rate to the wrapped optimizer (previously updated only a Python-side field, so `step()` silently kept using the original learning rate)
+- torsh-backend: WebGPU `copy_buffer`/`copy_to_device`/`copy_from_device` now perform real GPU buffer copies (previously silently returned success without moving any data; the old buffer lookup also cast an opaque handle id to a raw `wgpu::Buffer` pointer, which was undefined behavior)
+- torsh-autograd: `HyperparameterOptimizer` now computes real first-order gradients via central finite differences (previously unconditionally returned zero, so gradient-based hyperparameter search never moved a hyperparameter toward its optimum)
+- torsh-signal: Wavelet Packet Transform (`wpt`/`iwpt`) and lifting-scheme DWT/IDWT now run the real recursive-packet and Sweldens-lifting transforms (previously returned all-zero tensors of the correct shape); `cone_of_influence` now computes the real Torrence & Compo e-folding-time formula per wavelet/scale instead of a placeholder linear approximation
+- torsh-distributed: `parallel_all_gather` now concatenates every gathered shard via `Tensor::cat` instead of silently discarding all but one; MPI `barrier()` now invokes the real collective instead of being a no-op, and the MPI `Universe` handle is now held for the backend's lifetime (it was previously dropped right after construction, which finalizes MPI and made every later MPI call — including `barrier()` — fail)
+- torsh-tensor: fixed an alignment-UB bug in `lazy_loading.rs` where file bytes were reinterpreted as typed elements through a raw pointer cast on an unaligned `Vec<u8>` buffer (found via Miri); fixed a mutex-poisoning cascade in `memory_pool.rs` where one intentional test panic poisoned the global memory-pool lock and cascaded failures into unrelated tests — pool-lock acquisition now recovers from a poisoned lock instead of treating it as fatal
+- torsh-cli: `info`/`info --detailed` no longer inflate memory readings by 1024x (a KB-vs-bytes unit mismatch after a `sysinfo` API change); `completions <shell>` no longer leaks a log line onto stdout, which was breaking the `source <(torsh completions bash)` shell-integration pattern
+- Removed a stray `crates/torsh-ffi/java.d` file that hardcoded a different machine's absolute path (including a mounted backup-drive path) and leaked a username; `.gitignore` now excludes `*.d` files
+- Real RNG seeding: fixed a bug where a fixed seed (e.g. seed 42) did not actually make sampling deterministic; seeded generators now reproduce their sequence
+- torsh-python: import-time fixes so `import rstorch` and its submodules load correctly against pyo3 0.29; the regression suite (`python/tests/`) passes under a maturin-built wheel
+- Numerous crates: fabricated "success" return paths replaced with real computation or an honest `Err` — the framework no longer returns plausible-looking but fake results where an operation is unimplemented or unavailable
+
+### Security
+- Archive extraction (torsh-hub / torsh-package) hardened against **path-traversal (tar-slip / zip-slip)**: entry paths are now validated and rejected if they escape the destination directory
+- **Integrity checks** on downloaded / unpacked artifacts to detect tampering or truncation
+- **Ed25519** package signing / verification wired through the pure-Rust `ed25519-dalek` path (no C/asm crypto)
+
+### Removed
+- Legacy CUDA C-FFI backend and its dead dependencies (`cust`, `cuda-sys`, `cudnn-sys`) — zero remaining use sites after the oxicuda consolidation; the CUDA C-FFI tree was deleted. Real GPU compute now goes through the pure-Rust oxicuda stack in `torsh-tensor`
+- `OptiRS` dependency (zero use sites in `torsh-optim/src`), which also dropped a duplicate SciRS2 0.4.4 stack, `ndarray` 0.15, and `oxiarc` 0.2.8 from the tree
+
+## [0.1.3] - 2026-06-30
+
+### Added
+
+#### GPU Backend (oxicuda)
+- `torsh-tensor`: new `CudaBackend` struct implementing `oxicuda_backend::ComputeBackend` trait — thin adapter over `oxicuda-driver` / `oxicuda-launch` / `oxicuda-ptx` leaf crates; no CUDA SDK required at build time (runtime driver load via libloading)
+- `ptx_ops` module: PTX-backed unary / binary / reduce kernel dispatch; `gemm` / `conv2d_forward` / `attention` return `BackendError::Unsupported` pending upstream addition
+- `gpu_dispatch.rs`: GPU dispatch layer routing tensor operations through the `ComputeBackend` trait
+- `gpu = ["torsh-backend", "dep:oxicuda-backend"]` and `cuda = ["gpu", ...]` feature flags in torsh-tensor wiring the new backend
+- `oxicuda-backend`, `oxicuda-driver`, `oxicuda-launch`, `oxicuda-ptx` added to workspace dependencies (replaces the removed `scirs2-core/gpu` feature path)
+
+#### CUDA
+- Re-enabled 4 CUDA performance modules (`high_performance_kernels`, `intelligent_task_scheduler`, `kernel_fusion_optimizer`, `performance_optimization_coordinator`) that were blocked by an upstream compilation cascade
+- Re-enabled `cuda/memory/manager.rs` with canonical `MemoryPressureLevel` enum (Normal/Low/Medium/High/Critical), `OnceLock`-based global manager, and real memory-pool wiring (`allocate_from_device_pool` / `return_to_device_pool` via `cust::cuda_malloc`/free)
+- Fully wired `get_memory_manager`, `get_memory_statistics`, `get_performance_metrics`, `optimize_memory_layout`, and `configure_predictive_allocation` through the live `CudaMemoryManagerCoordinator`; fallbacks return `Default::default()` before init so tests pass without a real GPU
+- Real CUDA allocators wired: `cudaMalloc`, `cudaMallocManaged` (unified memory), and `cudaHostAlloc` (pinned host memory)
+- Real fragmentation analysis via `calculate_fragmentation_level` replacing the previous stub
+
+#### Distributed / Multi-GPU
+- `ReducibleElement` type-safe dispatch trait for `f32`/`f64`, replacing all `unsafe { mem::transmute }` calls in `multi_gpu.rs`
+- Ring all-reduce algorithm (bandwidth-optimal `2(N-1)/N × buffer_size`), replacing the naive gather+broadcast approach; all `ReduceOp` variants (Sum, Product, Min, Max, Average, Mean)
+- 14 new tests (`tests_p3`) covering ring all-reduce correctness and edge cases
+
+#### Python Bindings (`torsh-python`)
+- Re-enabled `torsh-data`, `torsh-autograd`, and `torsh-distributed` dependencies (previously disabled with stale comments)
+- Migrated `distributed.rs` to PyO3 0.28 API: `#[pyfunction]` + `wrap_pyfunction!`, `Bound<'_, PyModule>` signatures throughout
+- Added `src/data.rs` with `PyDataset`, `PyDataLoader`, and `PyDataLoaderIter` wrapping the real `torsh-data` API
+- All 3 Python submodules (autograd, distributed, data) now registered in the `rstorch` pymodule
+
+#### Performance
+- Phase 4 chunking helpers: `ChunkingUtils::matrix_blocks`, `chunked_elementwise`, `chunked_sum`, `chunked_mean` — delivers 15-30% automatic throughput improvement on large tensors
+- SIMD-accelerated forward pass in `tensor_parallel.rs`: `simd_optimized_forward` calls `scirs2_core::simd_ops::simd_matrix_multiply_f32` for F32×F32 matmul inputs; falls back to `standard_forward` for N-D / non-f32 cases
+- Distributed `communication_scheduler.rs` wired to `SimdUnifiedOps`: `simd_sum` for mean/variance, `simd_div` for scheduling scores, `simd_clip` + `simd_scalar_mul` for compression, linear-regression slope via `simd_sum` + `simd_mul` for trend analysis (gated `#[cfg(feature = "scirs2-simd")]`)
+- Cross-platform SIMD validation benchmark added to `crates/torsh-benches`
+
+#### Node.js N-API (`torsh-ffi`)
+- 9 N-API handler modules: `activations` (sigmoid / tanh / softmax), `creation`, `ops`, `nn`, `optim` (optimizer step/zero-grad), `reductions`, `clone_detach`, `helpers`, `utils_js` — completing the Node.js JavaScript binding layer
+- TypeScript type definitions (`nodejs/src/index.ts`) and Jest test suite (`nodejs/__tests__/tensor.test.js`)
+
+#### Time Series (`torsh-series`)
+- `NaturalCubicSpline` struct: fits and evaluates natural cubic splines; `TimeSeriesImputer::spline_interpolation` now uses cubic splines, falling back to linear interpolation when fewer than 4 valid points are available
+- `SsaModel` (Singular Spectrum Analysis): `fit` / `forecast` with power-iteration eigenvector computation
+- MSTL (Multiple Seasonal-Trend decomposition using Loess): `fit` returning `MSTLResult`
+- LSTM, Transformer, and CNN-based forecasters in `torsh-series::forecast::deep`
+- Statistical tests enhanced: `augmented_dickey_fuller_test`, `kpss_test`, `phillips_perron_test` now compute proper p-values via chi-squared survival function approximation; edge cases handled
+
+#### Other
+- `DifferentialFlamegraph::compare()` implementation in `torsh-autograd`: produces `FlamegraphComparison` with per-frame `FrameDelta` (self/total-time delta, appeared/disappeared sets); previously was a TODO stub
+- `FrameDelta` and `FlamegraphComparison` public types exported from `torsh-autograd::flamegraph`
+- `torsh-vision`: `ImageRegistrar::apply_transformation` (scaling / rotation / translation), `FramePreprocessor` with resize / normalize / grayscale; 3D visualization utilities (bounding box, grid creation)
+- `torsh-functional::attention`: flash attention with causal and non-causal modes, improved block processing with tests against naive reference implementation
+- `torsh-models`: diversity calculation methods for model performance metrics in `ensembling_advanced`
+
+### Changed
+- `cuda/memory/optimization/parameters.rs` refactored: 2183 → 1901 lines; placeholder support block extracted to `parameters_support.rs` via `#[path]` + `pub use *` to comply with the 2000-line policy
+- `cuda/memory/optimization/objectives.rs` refactored: 2228 → 1470 lines; ~770 lines of placeholder structs/configs/traits extracted to `objectives_support.rs`
+- `scirs2_integration.rs` parallel paths updated: matmul uses `matrix_blocks(m,n,k,4)` for row-strip blocking; 4 SIMD parallel paths (add/mul elementwise + scalar) use `WorkloadType::Elementwise` rounded to SIMD-lane multiples; sum path uses `WorkloadType::Reduction`
+- All scirs2 dependencies bumped 0.4.2 → 0.5.1 (`scirs2-core`, `scirs2-autograd`, `scirs2-special`, `scirs2-sparse`, `scirs2-optimize`, `scirs2-signal`, `scirs2-fft`, `scirs2-cluster`, `scirs2-datasets`, `scirs2-graph`, `scirs2-metrics`, `scirs2-series`, `scirs2-spatial`, `scirs2-stats`, `scirs2-text`, `scirs2-vision`, `scirs2-linalg`, `scirs2-neural`, `scirs2-numpy`)
+- `oxiarc-archive` / `oxiarc-core` bumped 0.2.7 → 0.3.3; `oxiarc-deflate` / `oxiarc-zstd` bumped 0.2 → 0.3.3
+- `oxifft` updated to 0.3.2
+- `oxionnx` updated to 0.1.4 (with `ndarray` feature enabled)
+- `oxicode` updated to 0.2.4
+- `redis` updated to use `connection-manager` feature
+- `gpu` feature in `torsh-autograd` is now empty (GPU backward dispatch deferred to oxicuda; removes the broken `scirs2-core/gpu` dependency)
+- `BernoulliDistribution` sampling fixed to generate binary outputs from probabilities (was previously incorrect)
+- `torsh-models`: `majority_vote` / `weighted_vote` now return errors for empty ensembles; argmax calculation and output tensor creation improved
+
+### Fixed
+- 2 root compilation errors unblocking 1100+ downstream optimization-module errors: missing `use std::fmt;` in `configversion_traits.rs` and `use scirs2_core::random::{rng, RngExt};` in `multi_objective/types.rs`
+- All optimization submodules (`adaptive_controller`, `ml_engine`, `multi_objective`, `execution_engine`) now compile cleanly with zero warnings
+- README: removed unvalidated "2-3x faster than PyTorch" performance claim; replaced with an accurate description of SIMD dispatch and pool-reuse behaviour
+- `ring` (C/asm) replaced by pure-Rust RustCrypto AEAD in `torsh-package::security`: `aes-gcm` 0.11.0-rc.4, `chacha20poly1305` 0.11.0-rc.3, `pbkdf2` 0.13, `hmac` 0.13 (COOLJAPAN Pure Rust Policy — removes the only C/asm dependency)
+- `torsh-distributed`: eradicated silent fabrications in cluster state — `be725015`
+- `QuadraticProgrammingLayer::backward`: fixed shape mismatch by using full adjoint vector for gradient calculations
+
+## [0.1.2] - 2026-04-26
+
+### Added
+- `simd_ops_f32` module: zero-allocation SIMD f32 arithmetic helpers (`add_into_f32`, `sub_into_f32`, `mul_into_f32`, `div_into_f32`, `add_assign_f32`, `sub_assign_f32`, `mul_assign_f32`, `div_assign_f32`) backed by `scirs2_core::simd_ops::SimdUnifiedOps` (AVX2/NEON with scalar fallback)
+- In-place activation SIMD helpers (`relu_assign_f32`, `leaky_relu_assign_f32`, `clamp_assign_f32`) with PyTorch-compatible NaN passthrough semantics
+- `BinaryF32Op` enum with `dispatch_into`/`dispatch_inplace` for zero-branch op selection
+- `GlobalMemoryPool::acquire_uninit<T>` / `global_acquire_uninit<T>` API: returns the actual pooled allocation via `ReusedBuffer<T>` RAII type (zero-copy on pool hit, replacing the copy-on-hit bug)
+- `ReusedBuffer<T>`: RAII pooled buffer with `as_uninit_slice_mut`, `into_vec`, `release_to_pool`; auto-returns to pool on drop
+- Performance regression framework: criterion benchmarks in `benches/regression_baselines.rs` and CI threshold script `scripts/check_perf_regression.sh`
+- `dhat` allocation-tracking benchmark (`benches/alloc_tracking.rs`) proving `GlobalMemoryPool` achieves 100% reduction in heap blocks on hot loops (10,000 alloc blocks → 0 with pooling)
+
+### Changed
+- `Tensor::add` / `sub` / `mul` / `div` for f32 tensors ≥ 1024 elements: dispatch to real SIMD via `simd_ops_f32` (replaces fake `par_iter` branch that was gated behind `cfg(feature = "simd")`)
+- `Tensor::add_` / `sub_` / `mul_` / `div_` for f32 ≥ 1024 elements: zero-allocation SIMD in-place arithmetic
+- `Tensor::relu_` / `leaky_relu_` / `clamp_` for f32 ≥ 1024 elements: SIMD-dispatched in-place activations
+- Default features now include `simd` and `parallel` (`default = ["std", "simd", "parallel"]`)
+- `simd` feature now enables `scirs2-core/simd` so scirs2 SIMD intrinsics activate automatically
+- `math_ops.rs` split into `math_ops.rs` (1917 lines) + `math_ops_tests.rs` (563 lines) to enforce < 2000 line policy
+- `GlobalMemoryPool::allocate<T>` deprecated (kept for compatibility); callers should use `global_acquire_uninit`
+- Upgraded wgpu 28.0.0 → 29.0.1 with full API migration (Instance::new value arg, BindGroupLayout Option wrapping, u64 limits, PollType::Wait, BufferViewMut streaming API)
+- Upgraded sha2 0.10 → 0.11; hash output now via `hex::encode()`
+- Upgraded cranelift 0.130 → 0.131
+- Upgraded prometheus 0.13 → 0.14, quickcheck 1.0 → 1.1, unicode-segmentation 1.12 → 1.13, imageproc 0.25 → 0.26
+- `torsh-hub`: replaced `Vec<u8>` buffer workaround with `TarStreamReader` streaming extraction — O(512 B) memory vs O(archive size) for `.tar.gz` archives
+- All local `oxiarc-*` path deps replaced with published registry versions (0.2.7)
+- Python bindings version bumped to 0.1.2
+
+### Fixed
+- `GlobalMemoryPool` pool hits no longer copy into a new `Vec` — the actual pooled allocation is returned
+- 5 doctests in `torsh-distributed` fixed: missing `.await` on async calls in `nccl_ops`, `alerting`, `prometheus_exporter`, `three_d_parallelism`, and `zero_3_cpu_offload` doc examples
+
+## [0.1.1] - 2026-03-17
+
+### Changed
+- Version bump to 0.1.1
+- Updated all workspace crate versions
+
+### Fixed
+- Dependency version updates
+
+## [0.1.0] - 2026-02-19
+
+### Initial Release
+
+ToRSh (Tensor Operations in Rust with Sharding) is a PyTorch-compatible deep learning framework built entirely in Rust. It provides a comprehensive set of tensor operations, automatic differentiation, neural network layers, and scientific computing integration through the SciRS2 ecosystem.
+
+### Features
+
+#### Core Components
+
+- **Tensor Operations**: ~400 PyTorch-compatible operations
+  - Arithmetic, matrix, and reduction operations
+  - Advanced indexing, broadcasting, and shape manipulation
+  - FFT, complex numbers, sorting, and histograms
+  - 13 in-place operations (`add_`, `mul_`, `sub_`, `div_`, `relu_`, `sigmoid_`, `tanh_`, `gelu_`, `leaky_relu_`, `clamp_`, etc.) with method chaining and autograd safety
+  - 11 manipulation operations (`stack`, `chunk`, `split`, `flip`, `fliplr`, `flipud`, `roll`, `rot90`, `tile`, `repeat_interleave`, `unflatten`)
+  - 6 dimension manipulation operations (`movedim`, `moveaxis`, `swapaxes`, `swapdims`, `broadcast_to`, `expand_as`)
+  - 5 advanced reduction operations (`argmax`, `argmin`, `cumsum`, `cumprod`, `prod`)
+  - 4 statistical operations (`median`, `median_dim`, `mode`, `mode_dim`) with keepdim support
+  - 5 NaN/Inf detection operations (`isnan`, `isinf`, `isfinite`, `allclose`, `isclose`)
+  - 3 masked operations (`masked_fill`, `masked_fill_`, `nonzero`)
+  - 3 triangular and diagonal operations (`tril`, `triu`, `diagonal`)
+  - 3 index operations (`index_add`, `index_copy`, `index_fill`)
+  - 9 scatter operations (`scatter`, `scatter_add`, `scatter_reduce`, `diagonal_scatter`, `select_scatter`, `slice_scatter`, `masked_scatter`, `index_put`, `put_`)
+  - 2 repeating operations (`repeat`, `repeat_interleave`)
+  - 2 utility operations (`unflatten`, `take_along_dim`)
+  - Complete PyTorch scatter family coverage
+- **Automatic Differentiation**: Complete reverse-mode AD with gradient computation
+  - Computation graph tracking
+  - Higher-order derivatives
+  - Gradient checkpointing
+- **Neural Network Layers**: All essential layers
+  - Linear, Conv1d/2d/3d, ConvTranspose
+  - BatchNorm, LayerNorm, GroupNorm, InstanceNorm
+  - RNN, LSTM, GRU, Transformer, MultiheadAttention
+  - All common activation functions (ReLU, GELU, SiLU, etc.)
+  - Comprehensive pooling operations
+- **Optimizers**: 70+ optimizers
+  - SGD, Adam, AdamW, AdaGrad, RMSprop, LBFGS
+  - Learning rate schedulers (CosineAnnealing, OneCycle, etc.)
+  - Advanced optimizers from OptiRS
+- **Data Loading**: Parallel data processing
+  - Multi-worker DataLoader with csv-based tabular loading
+  - Dataset abstractions (TensorDataset, ConcatDataset, etc.)
+  - Sampling strategies (Random, Weighted, Distributed, etc.)
+
+#### Scientific Computing (SciRS2 Integration)
+
+- **18 SciRS2 Crates**: Complete scientific ecosystem
+  - scirs2-core stable with OxiBLAS
+  - scipy.linalg compatibility (35 functions: svd, eig, qr, lu, cholesky, etc.)
+  - Graph Neural Networks (GCN, GAT, GraphSAGE)
+  - Time Series Analysis (STL, SSA, Kalman filters)
+  - Computer Vision operations
+  - Sparse tensors (COO, CSR formats)
+  - Special functions (Gamma, Bessel, error functions)
+
+#### Advanced Features
+
+- **JIT Compilation**: Cranelift-based compilation with kernel fusion
+- **Quantization**: INT8 quantization, QAT, post-training quantization
+- **Model Hub**: PyTorch model import, versioning, ONNX compatibility
+- **Distributed Training**: DDP, FSDP, collective operations
+- **Profiling**: Advanced profiling with metrics collection
+- **Multiple Backends**: CPU, CUDA, Metal support
+
+### Technical Architecture
+
+- **29 Workspace Crates**: Modular architecture for flexibility
+- **100% Pure Rust** by default (zero C/Fortran dependencies in default features)
+- **SciRS2 Policy Compliance**: All numerical operations through scirs2-core
+- **Parallel Operations**: Uses `scirs2_core::parallel_ops` for concurrent computation
+- **No-warnings Policy**: Strict code quality standards
+- **Comprehensive Testing**: Unit tests, integration tests, benchmarks
+- System information via `sysinfo` crate (pure Rust)
+- Linear algebra via OxiBLAS backend through scirs2-linalg
+
+### Quality Metrics
+
+- **Tests**: 9,000+ tests passing across all crates
+- **Zero Warnings**: Clean build across all 29 workspace crates
+- **Zero Errors**: All workspace packages compile successfully
+- **Stable Dependencies**: All from crates.io (no local patches)
+
+### Dependencies
+
+Built on stable, production-ready dependencies:
+- **SciRS2**: Scientific computing platform
+- **OxiBLAS**: Optimized BLAS/LAPACK operations
+- **OxiCode**: Modern binary serialization
+- **OptiRS**: Advanced ML optimization algorithms
+
+### Known Limitations
+
+- **f16/bf16**: Half-precision floating point support coming in a future release
+- **Distributed Training**: API stabilization ongoing
+- **API Coverage**: Targeting 95%+ PyTorch API coverage for 1.0
+- **CUDA**: Requires local CUDA toolkit installation
+
+### Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+torsh = "0.1.1"
+torsh-nn = "0.1.1"      # Neural networks
+torsh-vision = "0.1.1"  # Computer vision
+```
+
+[0.2.0]: https://github.com/cool-japan/torsh/releases/tag/v0.2.0
+[0.1.3]: https://github.com/cool-japan/torsh/releases/tag/v0.1.3

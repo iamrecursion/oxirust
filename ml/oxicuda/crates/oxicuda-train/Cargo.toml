@@ -1,0 +1,44 @@
+[package]
+name = "oxicuda-train"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GPU-accelerated training engine: fused optimizer update kernels, gradient checkpointing, LR schedulers, and ZeRO optimizer state sharding"
+readme = "README.md"
+keywords = ["gpu", "training", "neural-network", "cuda", "deep-learning"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+oxicuda-driver  = { workspace = true }
+oxicuda-memory  = { workspace = true }
+oxicuda-launch  = { workspace = true }
+oxicuda-ptx     = { workspace = true }
+thiserror       = { workspace = true }
+num-traits      = { workspace = true }
+serde           = { workspace = true, features = ["derive"], optional = true }
+
+[features]
+default = []
+serialize = ["serde"]
+# On-device GPU validation harness (`src/gpu_tests.rs`). The driver / memory /
+# launch infra crates are already normal dependencies, so no extra dev-deps are
+# needed; this flag only gates the test module.
+gpu-tests = []
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "train_ops"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

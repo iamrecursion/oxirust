@@ -1,0 +1,40 @@
+[package]
+name = "mielin-cells"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent SDK providing agent lifecycle management, policy execution, and inter-agent communication"
+keywords = ["agent", "sdk", "distributed", "messaging", "lifecycle"]
+categories = ["os", "asynchronous", "wasm", "network-programming"]
+readme = "README.md"
+documentation = "https://docs.rs/mielin-cells"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+oxicode.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+oxiarc-lz4.workspace = true
+oxiarc-zstd.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+oxicrypto-hash.workspace = true
+oxicrypto-rand.workspace = true
+oxicrypto-aead.workspace = true
+oxicrypto-sig.workspace = true
+oxicrypto-core.workspace = true
+
+mielin-mesh-core.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+criterion.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "migration"
+harness = false

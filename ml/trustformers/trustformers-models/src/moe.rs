@@ -1,0 +1,673 @@
+/// Mixture of Experts (MoE) infrastructure for efficient scaling
+///
+/// This module provides reusable MoE components that can be integrated into
+/// various transformer architectures like Mixtral, GLaM, Switch Transformer, etc.
+use crate::common::ActivationType;
+use std::collections::HashMap;
+use trustformers_core::{
+    errors::{tensor_op_error, Result},
+    layers::Linear,
+    tensor::Tensor,
+    traits::Layer,
+};
+
+/// Configuration for MoE layers
+#[derive(Debug, Clone)]
+pub struct MoEConfig {
+    pub hidden_size: usize,
+    pub num_experts: usize,
+    pub num_experts_per_token: usize,
+    pub expert_capacity: Option<usize>, // For capacity-based routing
+    pub load_balancing_loss_coeff: f32,
+    pub router_z_loss_coeff: f32,
+    pub use_auxiliary_loss: bool,
+    pub jitter_noise: f32, // Noise for load balancing
+}
+
+impl Default for MoEConfig {
+    fn default() -> Self {
+        Self {
+            hidden_size: 4096,
+            num_experts: 8,
+            num_experts_per_token: 2,
+            expert_capacity: None,
+            load_balancing_loss_coeff: 0.01,
+            router_z_loss_coeff: 0.001,
+            use_auxiliary_loss: true,
+            jitter_noise: 1e-2,
+        }
+    }
+}
+
+/// Expert routing statistics for load balancing
+#[derive(Debug, Clone)]
+pub struct RoutingStats {
+    pub expert_counts: Vec<f32>,
+    pub expert_weights: Vec<f32>,
+    pub load_balancing_loss: f32,
+    pub router_z_loss: f32,
+}
+
+/// Generic expert trait that can wrap different layer types
+pub trait Expert: Layer<Input = Tensor, Output = Tensor> + Send + Sync {
+    fn expert_id(&self) -> usize;
+    fn capacity(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Basic MLP expert implementation
+pub struct MLPExpert {
+    id: usize,
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+    activation: ActivationType,
+}
+
+impl MLPExpert {
+    pub fn new(
+        id: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        activation: String,
+    ) -> Result<Self> {
+        let gate_proj = Linear::new(hidden_size, intermediate_size, false);
+        let up_proj = Linear::new(hidden_size, intermediate_size, false);
+        let down_proj = Linear::new(intermediate_size, hidden_size, false);
+
+        // Parse the activation string once at construction. Any unsupported
+        // identifier falls back to the identity (matching the previous
+        // `_ => Ok(x.clone())` default arm).
+        let activation = ActivationType::from_config_str_or(&activation, ActivationType::Identity);
+
+        Ok(Self {
+            id,
+            gate_proj,
+            up_proj,
+            down_proj,
+            activation,
+        })
+    }
+
+    fn apply_activation(&self, x: &Tensor) -> Result<Tensor> {
+        self.activation.apply(x)
+    }
+}
+
+impl Layer for MLPExpert {
+    type Input = Tensor;
+    type Output = Tensor;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output> {
+        let gate = self.gate_proj.forward(input.clone())?;
+        let gate_activated = self.apply_activation(&gate)?;
+
+        let up = self.up_proj.forward(input)?;
+        let gated = gate_activated.mul(&up)?;
+
+        self.down_proj.forward(gated)
+    }
+}
+
+impl Expert for MLPExpert {
+    fn expert_id(&self) -> usize {
+        self.id
+    }
+}
+
+/// Top-K router for expert selection
+pub struct TopKRouter {
+    gate: Linear,
+    config: MoEConfig,
+}
+
+impl TopKRouter {
+    pub fn new(config: MoEConfig) -> Result<Self> {
+        let gate = Linear::new(config.hidden_size, config.num_experts, false);
+        Ok(Self { gate, config })
+    }
+
+    /// Route tokens to top-k experts
+    pub fn route(&self, hidden_states: &Tensor) -> Result<RouterOutput> {
+        let batch_size = hidden_states.shape()[0];
+        let seq_len = hidden_states.shape()[1];
+        let hidden_size = hidden_states.shape()[2];
+
+        // Flatten for per-token routing
+        let flattened = hidden_states.reshape(&[batch_size * seq_len, hidden_size])?;
+
+        // Compute router logits
+        let router_logits = self.gate.forward(flattened)?;
+
+        // Add jitter noise for load balancing during training
+        let router_logits = if self.config.jitter_noise > 0.0 {
+            let noise = Tensor::randn_like(&router_logits)?.mul_scalar(self.config.jitter_noise)?;
+            router_logits.add(&noise)?
+        } else {
+            router_logits
+        };
+
+        // Apply softmax to get probabilities
+        let router_probs = router_logits.softmax(-1)?;
+
+        // Select top-k experts
+        let (top_k_weights, top_k_indices) = self.select_top_k(&router_probs)?;
+
+        // Compute auxiliary losses
+        let stats = self.compute_routing_stats(&router_probs, &top_k_weights, &top_k_indices)?;
+
+        Ok(RouterOutput {
+            top_k_weights,
+            top_k_indices,
+            router_probs,
+            stats,
+        })
+    }
+
+    fn select_top_k(&self, router_probs: &Tensor) -> Result<(Tensor, Tensor)> {
+        let num_tokens = router_probs.shape()[0];
+        let num_experts = router_probs.shape()[1];
+
+        let mut all_weights = Vec::new();
+        let mut all_indices = Vec::new();
+
+        for token_idx in 0..num_tokens {
+            // Get probabilities for this token
+            let mut expert_probs: Vec<(f32, usize)> = Vec::new();
+            for expert_idx in 0..num_experts {
+                let prob = router_probs.get_scalar(&[token_idx, expert_idx])?;
+                expert_probs.push((prob, expert_idx));
+            }
+
+            // Sort and select top-k
+            expert_probs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            expert_probs.truncate(self.config.num_experts_per_token);
+
+            // Renormalize selected probabilities
+            let sum: f32 = expert_probs.iter().map(|(p, _)| p).sum();
+            let norm_factor = if sum > 0.0 { 1.0 / sum } else { 1.0 };
+
+            for (prob, expert_idx) in expert_probs {
+                all_weights.push(prob * norm_factor);
+                all_indices.push(expert_idx as f32);
+            }
+        }
+
+        let weights_tensor = Tensor::from_vec(
+            all_weights,
+            &[num_tokens, self.config.num_experts_per_token],
+        )?;
+        let indices_tensor = Tensor::from_vec(
+            all_indices,
+            &[num_tokens, self.config.num_experts_per_token],
+        )?;
+
+        Ok((weights_tensor, indices_tensor))
+    }
+
+    fn compute_routing_stats(
+        &self,
+        router_probs: &Tensor,
+        top_k_weights: &Tensor,
+        top_k_indices: &Tensor,
+    ) -> Result<RoutingStats> {
+        let num_tokens = router_probs.shape()[0];
+        let num_experts = self.config.num_experts;
+
+        // Count tokens routed to each expert
+        let mut expert_counts = vec![0.0; num_experts];
+        let mut expert_weights = vec![0.0; num_experts];
+
+        for token_idx in 0..num_tokens {
+            for k in 0..self.config.num_experts_per_token {
+                let expert_idx = top_k_indices.get_scalar(&[token_idx, k])? as usize;
+                let weight = top_k_weights.get_scalar(&[token_idx, k])?;
+
+                expert_counts[expert_idx] += 1.0;
+                expert_weights[expert_idx] += weight;
+            }
+        }
+
+        // Normalize counts and weights
+        let total_tokens = num_tokens as f32;
+        expert_counts.iter_mut().for_each(|c| *c /= total_tokens);
+        expert_weights.iter_mut().for_each(|w| *w /= total_tokens);
+
+        // Compute load balancing loss (encourages uniform expert usage)
+        let _mean_count = 1.0 / num_experts as f32;
+        let load_balancing_loss: f32 = expert_counts
+            .iter()
+            .zip(expert_weights.iter())
+            .map(|(count, weight)| count * weight)
+            .sum::<f32>()
+            * num_experts as f32
+            - 1.0;
+
+        // Compute router z-loss (encourages sparsity)
+        let router_z_loss = router_probs
+            .pow(2.0)?
+            .sum(Some(vec![router_probs.shape().len() - 1]), false)?
+            .mean()?
+            .get_scalar(&[])?;
+
+        Ok(RoutingStats {
+            expert_counts,
+            expert_weights,
+            load_balancing_loss,
+            router_z_loss,
+        })
+    }
+}
+
+/// Output from the router
+pub struct RouterOutput {
+    pub top_k_weights: Tensor,
+    pub top_k_indices: Tensor,
+    pub router_probs: Tensor,
+    pub stats: RoutingStats,
+}
+
+/// Sparse Mixture of Experts layer
+pub struct SparseMoE<E: Expert> {
+    experts: Vec<E>,
+    router: TopKRouter,
+    config: MoEConfig,
+}
+
+impl<E: Expert> SparseMoE<E> {
+    pub fn new(experts: Vec<E>, config: MoEConfig) -> Result<Self> {
+        let router = TopKRouter::new(config.clone())?;
+        Ok(Self {
+            experts,
+            router,
+            config,
+        })
+    }
+
+    /// Get the number of experts
+    pub fn num_experts(&self) -> usize {
+        self.experts.len()
+    }
+
+    /// Get routing statistics from the last forward pass
+    pub fn last_routing_stats(&self) -> Option<&RoutingStats> {
+        // This would need to be stored from the last forward pass
+        None
+    }
+}
+
+impl<E: Expert> Layer for SparseMoE<E> {
+    type Input = Tensor;
+    type Output = Tensor;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output> {
+        let batch_size = input.shape()[0];
+        let seq_len = input.shape()[1];
+        let hidden_size = input.shape()[2];
+
+        // Route tokens to experts
+        let router_output = self.router.route(&input)?;
+
+        // Flatten input for processing
+        let flattened_input = input.reshape(&[batch_size * seq_len, hidden_size])?;
+        let num_tokens = flattened_input.shape()[0];
+
+        // Accumulate directly into a flat buffer.
+        //
+        // A previous revision rebuilt the *whole* output tensor on every token:
+        // it sliced the rows before the current one, the row itself and the rows
+        // after it, then `concat`-ed the three back together. That copies
+        // `O(num_tokens)` rows per token and therefore `O(num_tokens²)` in
+        // total, so a 2048-token sequence performed about four million row
+        // copies to write two thousand rows — with three temporary tensor
+        // allocations per token on top. Writing into a `Vec<f32>` at a known
+        // offset is the same computation in `O(num_tokens)`.
+        let mut output = vec![0.0f32; num_tokens * hidden_size];
+
+        // Process each token
+        for token_idx in 0..num_tokens {
+            // Proper tensor slicing: select single token input
+            let token_input =
+                flattened_input.slice_multi(&[(token_idx, token_idx + 1), (0, hidden_size)])?;
+
+            // Combine outputs from selected experts
+            let row = &mut output[token_idx * hidden_size..(token_idx + 1) * hidden_size];
+            for k in 0..self.config.num_experts_per_token {
+                let expert_idx = router_output.top_k_indices.get_scalar(&[token_idx, k])? as usize;
+                if expert_idx >= self.experts.len() {
+                    return Err(tensor_op_error(
+                        "SparseMoE::forward",
+                        format!(
+                            "router selected expert {expert_idx} but only {} exist",
+                            self.experts.len()
+                        ),
+                    ));
+                }
+                let weight = router_output.top_k_weights.get_scalar(&[token_idx, k])?;
+
+                // Get expert output and accumulate it, weighted by the router.
+                let expert_output = self.experts[expert_idx].forward(token_input.clone())?;
+                let values = expert_output.data().map_err(|e| {
+                    tensor_op_error(
+                        "SparseMoE::forward",
+                        format!("failed to read expert {expert_idx} output: {e}"),
+                    )
+                })?;
+                if values.len() != hidden_size {
+                    return Err(tensor_op_error(
+                        "SparseMoE::forward",
+                        format!(
+                            "expert {expert_idx} produced {} value(s) for a hidden size of \
+                             {hidden_size}",
+                            values.len()
+                        ),
+                    ));
+                }
+                for (slot, value) in row.iter_mut().zip(values.iter()) {
+                    *slot += weight * value;
+                }
+            }
+        }
+
+        // Reshape back to original dimensions
+        Tensor::from_vec(output, &[batch_size, seq_len, hidden_size])
+    }
+}
+
+/// Switch Transformer style MoE (uses only top-1 expert per token)
+pub type SwitchMoE<E> = SparseMoE<E>;
+
+/// Helper function to create Switch Transformer configuration
+pub fn switch_config(hidden_size: usize, num_experts: usize) -> MoEConfig {
+    MoEConfig {
+        hidden_size,
+        num_experts,
+        num_experts_per_token: 1, // Switch uses top-1
+        ..Default::default()
+    }
+}
+
+/// Helper function to create GLaM-style configuration
+pub fn glam_config(hidden_size: usize, num_experts: usize) -> MoEConfig {
+    MoEConfig {
+        hidden_size,
+        num_experts,
+        num_experts_per_token: 2, // GLaM uses top-2
+        ..Default::default()
+    }
+}
+
+/// Expert parallel processing for distributed training
+pub struct ExpertParallel<E: Expert> {
+    local_experts: Vec<E>,
+    expert_mapping: HashMap<usize, usize>, // global_id -> local_id
+    #[allow(dead_code)]
+    rank: usize,
+    #[allow(dead_code)]
+    world_size: usize,
+}
+
+impl<E: Expert> ExpertParallel<E> {
+    pub fn new(experts: Vec<E>, rank: usize, world_size: usize) -> Self {
+        let mut expert_mapping = HashMap::new();
+        for (local_id, expert) in experts.iter().enumerate() {
+            expert_mapping.insert(expert.expert_id(), local_id);
+        }
+
+        Self {
+            local_experts: experts,
+            expert_mapping,
+            rank,
+            world_size,
+        }
+    }
+
+    /// Check if an expert is available locally
+    pub fn has_expert(&self, expert_id: usize) -> bool {
+        self.expert_mapping.contains_key(&expert_id)
+    }
+
+    /// Forward pass for local experts only
+    pub fn forward_local(&self, expert_id: usize, input: &Tensor) -> Result<Option<Tensor>> {
+        if let Some(&local_id) = self.expert_mapping.get(&expert_id) {
+            let output = self.local_experts[local_id].forward(input.clone())?;
+            Ok(Some(output))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── MoEConfig ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_moe_config_default_values() {
+        let cfg = MoEConfig::default();
+        assert_eq!(cfg.hidden_size, 4096);
+        assert_eq!(cfg.num_experts, 8);
+        assert_eq!(cfg.num_experts_per_token, 2);
+        assert!(cfg.expert_capacity.is_none());
+        assert!((cfg.load_balancing_loss_coeff - 0.01).abs() < 1e-7);
+        assert!((cfg.router_z_loss_coeff - 0.001).abs() < 1e-7);
+        assert!(cfg.use_auxiliary_loss);
+        assert!((cfg.jitter_noise - 1e-2).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_moe_config_clone() {
+        let cfg = MoEConfig::default();
+        let c = cfg.clone();
+        assert_eq!(c.num_experts, cfg.num_experts);
+        assert_eq!(c.hidden_size, cfg.hidden_size);
+    }
+
+    #[test]
+    fn test_moe_config_custom() {
+        let cfg = MoEConfig {
+            hidden_size: 512,
+            num_experts: 16,
+            num_experts_per_token: 4,
+            expert_capacity: Some(32),
+            load_balancing_loss_coeff: 0.05,
+            router_z_loss_coeff: 0.005,
+            use_auxiliary_loss: false,
+            jitter_noise: 0.0,
+        };
+        assert_eq!(cfg.hidden_size, 512);
+        assert_eq!(cfg.num_experts, 16);
+        assert_eq!(cfg.expert_capacity, Some(32));
+        assert!(!cfg.use_auxiliary_loss);
+    }
+
+    // ── switch_config / glam_config helper functions ───────────────────────
+
+    #[test]
+    fn test_switch_config_top1() {
+        let cfg = switch_config(256, 4);
+        assert_eq!(cfg.hidden_size, 256);
+        assert_eq!(cfg.num_experts, 4);
+        assert_eq!(cfg.num_experts_per_token, 1, "Switch uses top-1");
+    }
+
+    #[test]
+    fn test_glam_config_top2() {
+        let cfg = glam_config(512, 8);
+        assert_eq!(cfg.hidden_size, 512);
+        assert_eq!(cfg.num_experts, 8);
+        assert_eq!(cfg.num_experts_per_token, 2, "GLaM uses top-2");
+    }
+
+    // ── RoutingStats ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_routing_stats_construction() {
+        let stats = RoutingStats {
+            expert_counts: vec![10.0, 15.0, 8.0, 12.0],
+            expert_weights: vec![0.3, 0.35, 0.15, 0.2],
+            load_balancing_loss: 0.002,
+            router_z_loss: 0.0005,
+        };
+        assert_eq!(stats.expert_counts.len(), 4);
+        assert!((stats.load_balancing_loss - 0.002).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_routing_stats_clone() {
+        let stats = RoutingStats {
+            expert_counts: vec![1.0, 2.0],
+            expert_weights: vec![0.5, 0.5],
+            load_balancing_loss: 0.01,
+            router_z_loss: 0.001,
+        };
+        let c = stats.clone();
+        assert_eq!(c.expert_counts, stats.expert_counts);
+    }
+
+    // ── MLPExpert ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mlp_expert_construction_id() {
+        let expert = MLPExpert::new(3, 64, 128, "silu".to_string())
+            .expect("MLPExpert creation should succeed");
+        assert_eq!(expert.expert_id(), 3);
+    }
+
+    #[test]
+    fn test_mlp_expert_id_zero() {
+        let expert = MLPExpert::new(0, 32, 64, "gelu".to_string())
+            .expect("MLPExpert creation should succeed");
+        assert_eq!(expert.expert_id(), 0);
+    }
+
+    #[test]
+    fn test_mlp_expert_capacity_default_none() {
+        let expert = MLPExpert::new(1, 64, 128, "relu".to_string())
+            .expect("MLPExpert creation should succeed");
+        assert!(expert.capacity().is_none());
+    }
+
+    #[test]
+    fn test_mlp_expert_forward_output_shape() {
+        let expert = MLPExpert::new(0, 8, 16, "silu".to_string())
+            .expect("MLPExpert creation should succeed");
+        let input = Tensor::zeros(&[4, 8]).expect("tensor creation should succeed");
+        let out = expert.forward(input).expect("expert forward should succeed");
+        assert_eq!(
+            out.shape(),
+            &[4, 8],
+            "output shape should match hidden_size"
+        );
+    }
+
+    #[test]
+    fn test_mlp_expert_forward_gelu() {
+        let expert = MLPExpert::new(2, 8, 16, "gelu".to_string())
+            .expect("MLPExpert creation should succeed");
+        let input = Tensor::zeros(&[2, 8]).expect("tensor creation should succeed");
+        let out = expert.forward(input).expect("gelu expert forward should succeed");
+        assert_eq!(out.shape(), &[2, 8]);
+    }
+
+    #[test]
+    fn test_mlp_expert_forward_relu() {
+        let expert =
+            MLPExpert::new(0, 4, 8, "relu".to_string()).expect("MLPExpert creation should succeed");
+        let input = Tensor::zeros(&[1, 4]).expect("tensor creation should succeed");
+        let out = expert.forward(input).expect("relu expert forward should succeed");
+        assert_eq!(out.shape(), &[1, 4]);
+    }
+
+    #[test]
+    fn test_mlp_expert_forward_unknown_activation() {
+        // unknown activation falls through to identity (no activation)
+        let expert = MLPExpert::new(0, 4, 8, "unknown_act".to_string())
+            .expect("MLPExpert creation should succeed");
+        let input = Tensor::zeros(&[1, 4]).expect("tensor creation should succeed");
+        let out = expert.forward(input).expect("expert with unknown act should succeed");
+        assert_eq!(out.shape(), &[1, 4]);
+    }
+
+    // ── TopKRouter ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_top_k_router_construction() {
+        let cfg = MoEConfig {
+            hidden_size: 16,
+            num_experts: 4,
+            num_experts_per_token: 2,
+            expert_capacity: None,
+            load_balancing_loss_coeff: 0.01,
+            router_z_loss_coeff: 0.001,
+            use_auxiliary_loss: true,
+            jitter_noise: 0.0,
+        };
+        let _router = TopKRouter::new(cfg).expect("TopKRouter construction should succeed");
+    }
+
+    // ── ExpertParallel ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expert_parallel_has_expert() {
+        let experts: Vec<MLPExpert> = (0..4)
+            .map(|i| {
+                MLPExpert::new(i, 8, 16, "silu".to_string())
+                    .expect("expert creation should succeed")
+            })
+            .collect();
+        let ep = ExpertParallel::new(experts, 0, 2);
+        assert!(ep.has_expert(0));
+        assert!(ep.has_expert(1));
+        assert!(ep.has_expert(2));
+        assert!(ep.has_expert(3));
+        assert!(!ep.has_expert(4));
+    }
+
+    #[test]
+    fn test_expert_parallel_forward_local_present() {
+        let experts: Vec<MLPExpert> = (0..2)
+            .map(|i| {
+                MLPExpert::new(i, 8, 16, "silu".to_string())
+                    .expect("expert creation should succeed")
+            })
+            .collect();
+        let ep = ExpertParallel::new(experts, 0, 1);
+        let input = Tensor::zeros(&[1, 8]).expect("tensor creation should succeed");
+        let out = ep.forward_local(0, &input).expect("forward_local should succeed");
+        assert!(out.is_some(), "expert 0 should be local");
+    }
+
+    #[test]
+    fn test_expert_parallel_forward_local_absent() {
+        let experts: Vec<MLPExpert> = (0..2)
+            .map(|i| {
+                MLPExpert::new(i, 8, 16, "silu".to_string())
+                    .expect("expert creation should succeed")
+            })
+            .collect();
+        let ep = ExpertParallel::new(experts, 0, 2);
+        let input = Tensor::zeros(&[1, 8]).expect("tensor creation should succeed");
+        let out = ep.forward_local(99, &input).expect("forward_local for absent should succeed");
+        assert!(out.is_none(), "expert 99 should not be local");
+    }
+
+    #[test]
+    fn test_expert_parallel_world_size_mapping() {
+        // Shard 4 experts across 2 workers
+        let all_experts: Vec<MLPExpert> = (0..4)
+            .map(|i| {
+                MLPExpert::new(i, 8, 16, "silu".to_string())
+                    .expect("expert creation should succeed")
+            })
+            .collect();
+        let ep = ExpertParallel::new(all_experts, 1, 2);
+        // All 4 experts are stored locally (ExpertParallel holds all it's given)
+        for i in 0..4usize {
+            assert!(ep.has_expert(i), "expert {} should exist", i);
+        }
+    }
+}

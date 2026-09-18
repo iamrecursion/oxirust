@@ -1,0 +1,42 @@
+[package]
+name = "oxixml-turtle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "N-Triples/N-Quads/Turtle/TriG/N3 parsers and serializers (replaces oxttl)."
+keywords = ["n-triples", "n-quads", "turtle", "trig", "rdf"]
+categories = ["parser-implementations", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+rdf-12 = ["oxixml-model/rdf-12"]
+
+## Enables asynchronous parsing and serialization on top of `tokio`'s
+## `AsyncRead` / `AsyncWrite`, mirroring `oxttl`'s `async-tokio` feature:
+## `*Parser::for_tokio_async_reader` and `*Serializer::for_tokio_async_writer`.
+## Off by default, so the crate stays third-party-free in its default
+## configuration.
+async-tokio = ["dep:tokio"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-model = { workspace = true }
+oxixml-iri = { workspace = true }
+oxixml-langtag = { workspace = true }
+oxixml-xsd = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[lints]
+workspace = true

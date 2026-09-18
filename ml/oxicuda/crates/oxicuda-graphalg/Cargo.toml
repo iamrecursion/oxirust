@@ -1,0 +1,33 @@
+[package]
+name = "oxicuda-graphalg"
+description = "OxiCUDA: Classical graph algorithms (BFS/DFS, shortest paths, MST, max-flow, matching, SCC, centrality, community, TSP, coloring, isomorphism)"
+categories = ["algorithms", "science", "mathematics"]
+keywords = ["graph-algorithms", "shortest-path", "max-flow", "spanning-tree", "gpu"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+thiserror.workspace = true
+
+[features]
+# On-device GPU validation harness for the hand-written PTX kernels.
+# Enable with `--features gpu-tests` on a machine with a CUDA device.
+gpu-tests = []
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "graphalg_ops"
+harness = false

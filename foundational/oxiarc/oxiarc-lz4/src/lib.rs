@@ -1,0 +1,143 @@
+//! Pure Rust LZ4 compression implementation.
+//!
+//! LZ4 is a lossless compression algorithm focusing on compression and
+//! decompression speed. It provides very fast decompression while offering
+//! reasonable compression ratios.
+//!
+//! # Features
+//!
+//! - Block compression/decompression (raw LZ4 blocks)
+//! - Official LZ4 frame format with XXHash32 checksums
+//! - Frame descriptor options (block size, checksums, content size)
+//! - Compatible with lz4 reference implementation
+//!
+//! # Example
+//!
+//! ```
+//! use oxiarc_lz4::{compress, decompress};
+//!
+//! let data = b"Hello, World! Hello, World!";
+//! let compressed = compress(data).unwrap();
+//! let decompressed = decompress(&compressed, data.len() * 2).unwrap();
+//! assert_eq!(decompressed, data);
+//! ```
+//!
+//! ## Sizing decompression output
+//!
+//! Unlike some codecs, [`decompress`] (and [`decompress_bytes`]) require an
+//! explicit `max_output` size hint rather than discovering the output size
+//! from the stream itself: raw LZ4 blocks carry no uncompressed-length
+//! trailer, so the caller must supply an upper bound (e.g. from an external
+//! header, or the LZ4 frame's content-size field via
+//! [`get_frame_dict_id`]-adjacent frame APIs). Passing too small a value
+//! yields an error rather than silent truncation; passing a generous
+//! over-estimate is always safe and only costs a larger scratch allocation.
+
+#![warn(missing_docs)]
+
+pub mod block;
+pub mod dict;
+mod frame;
+pub mod hc;
+pub mod xxhash;
+
+pub use block::{
+    compress_block, compress_block_hc, compress_block_with_accel, compress_block_with_dict,
+    decompress_block, decompress_block_dict,
+};
+pub use frame::{
+    BlockMaxSize, FrameDescriptor, LZ4_FRAME_MAGIC, Lz4Compressor, Lz4Decompressor,
+    Lz4DictCompressor, Lz4DictDecompressor, Lz4DictFrameDecoder, Lz4DictFrameEncoder,
+    Lz4FrameReader, Lz4FrameWriter, compress, compress_frame_with_dict,
+    compress_frame_with_dict_options, compress_with_options, decompress,
+    decompress_frame_with_dict, get_frame_dict_id,
+};
+pub use hc::{HcEncoder, HcLevel, compress_hc, compress_hc_level, compress_hc_with_dict};
+
+// Re-export dictionary types for convenience
+pub use dict::{
+    DictBuilder, DictFrameDescriptor, DictLevel, Lz4Dict, Lz4DictBlockDecoder, Lz4DictBlockEncoder,
+    compress_with_dict, compress_with_dict_accel, compress_with_dict_hc, compress_with_dict_level,
+    decompress_with_dict,
+};
+
+#[cfg(feature = "parallel")]
+pub use frame::{compress_parallel, compress_with_options_parallel};
+
+use oxiarc_core::error::Result;
+
+/// LZ4 compression level.
+///
+/// Marked `#[non_exhaustive]` so additional levels (e.g. a future `HighCompression`
+/// tier mapping to a specific LZ4-HC clevel) can be added without a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Lz4Level {
+    /// Fast compression (default).
+    #[default]
+    Fast,
+    /// High compression (slower but better ratio).
+    High,
+}
+
+/// Compress data using LZ4 block format.
+pub fn compress_bytes(data: &[u8]) -> Result<Vec<u8>> {
+    compress_block(data)
+}
+
+/// Decompress LZ4 block data.
+pub fn decompress_bytes(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
+    decompress_block(data, max_output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_roundtrip_empty() {
+        let data: &[u8] = b"";
+        let compressed = compress(data).expect("lz4 compress empty");
+        let decompressed = decompress(&compressed, 0).expect("lz4 decompress empty");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_roundtrip_hello() {
+        let data = b"Hello, World!";
+        let compressed = compress(data).expect("lz4 compress hello");
+        let decompressed = decompress(&compressed, data.len()).expect("lz4 decompress hello");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_roundtrip_repeated() {
+        let data = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let compressed = compress(data).expect("lz4 compress repeated");
+        // Repeated data should compress well
+        assert!(compressed.len() < data.len());
+        let decompressed = decompress(&compressed, data.len()).expect("lz4 decompress repeated");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_roundtrip_pattern() {
+        let data = b"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+        let compressed = compress(data).expect("lz4 compress pattern");
+        let decompressed = decompress(&compressed, data.len()).expect("lz4 decompress pattern");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_block_roundtrip() {
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let compressed = compress_block(data).expect("lz4 block compress");
+        let decompressed = decompress_block(&compressed, data.len()).expect("lz4 block decompress");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_level() {
+        assert_eq!(Lz4Level::default(), Lz4Level::Fast);
+    }
+}

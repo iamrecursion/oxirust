@@ -1,0 +1,1132 @@
+//! SciRS2 integration layer for quantum machine learning
+//!
+//! This module provides integration with the SciRS2 scientific computing framework,
+//! enabling quantum ML models to leverage SciRS2's optimized tensor operations,
+//! distributed training capabilities, and serialization formats.
+
+use crate::error::{MLError, Result};
+use scirs2_core::ndarray::{
+    Array, Array1, Array2, Array3, ArrayD, ArrayViewD, Axis, Dimension, Ix2, IxDyn,
+};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Trait for tensor operations compatible with SciRS2
+pub trait SciRS2Tensor {
+    /// Get tensor shape
+    fn shape(&self) -> &[usize];
+
+    /// Get tensor data as ArrayViewD
+    fn view(&self) -> ArrayViewD<f64>;
+
+    /// Convert to SciRS2 format (placeholder)
+    fn to_scirs2(&self) -> Result<SciRS2Array>;
+
+    /// Perform tensor operations using SciRS2 backend
+    fn matmul(&self, other: &dyn SciRS2Tensor) -> Result<SciRS2Array>;
+
+    /// Element-wise operations
+    fn add(&self, other: &dyn SciRS2Tensor) -> Result<SciRS2Array>;
+    fn mul(&self, other: &dyn SciRS2Tensor) -> Result<SciRS2Array>;
+    fn sub(&self, other: &dyn SciRS2Tensor) -> Result<SciRS2Array>;
+
+    /// Reduction operations
+    fn sum(&self, axis: Option<usize>) -> Result<SciRS2Array>;
+    fn mean(&self, axis: Option<usize>) -> Result<SciRS2Array>;
+    fn max(&self, axis: Option<usize>) -> Result<SciRS2Array>;
+    fn min(&self, axis: Option<usize>) -> Result<SciRS2Array>;
+}
+
+/// SciRS2 array wrapper for quantum ML operations
+pub struct SciRS2Array {
+    /// Array data
+    pub data: ArrayD<f64>,
+    /// Whether gradients are required
+    pub requires_grad: bool,
+    /// Gradient accumulator. Wrapped in `Arc<Mutex<_>>` (rather than a bare
+    /// `ArrayD<f64>`) so that a `GradFunction` created for a downstream op
+    /// can hold a *shared handle* to this same accumulator and actually
+    /// write the real backpropagated gradient into it from `backward()`,
+    /// instead of only ever seeing a disconnected clone of the data with no
+    /// way back to the original leaf tensor. `Arc<Mutex<_>>` (rather than
+    /// `Rc<RefCell<_>>`) is used so that `GradFunction: Send + Sync`
+    /// remains satisfiable.
+    pub grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+    /// Operation history for backpropagation
+    pub grad_fn: Option<Box<dyn GradFunction>>,
+}
+
+impl std::fmt::Debug for SciRS2Array {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SciRS2Array")
+            .field("data", &self.data)
+            .field("requires_grad", &self.requires_grad)
+            .field("grad", &self.grad)
+            .field("grad_fn", &"<gradient_function>")
+            .finish()
+    }
+}
+
+impl Clone for SciRS2Array {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            requires_grad: self.requires_grad,
+            grad: self.grad.clone(),
+            grad_fn: None, // Cannot clone trait objects
+        }
+    }
+}
+
+impl SciRS2Array {
+    /// Create a new SciRS2Array
+    pub fn new(data: ArrayD<f64>, requires_grad: bool) -> Self {
+        let grad = if requires_grad {
+            Some(Arc::new(Mutex::new(ArrayD::zeros(data.raw_dim()))))
+        } else {
+            None
+        };
+        Self {
+            data,
+            requires_grad,
+            grad,
+            grad_fn: None,
+        }
+    }
+
+    /// Create from ndarray
+    pub fn from_array<D: Dimension>(arr: Array<f64, D>) -> Self {
+        let data = arr.into_dyn();
+        Self::new(data, false)
+    }
+
+    /// Create with gradient tracking
+    pub fn with_grad<D: Dimension>(arr: Array<f64, D>) -> Self {
+        let data = arr.into_dyn();
+        Self::new(data, true)
+    }
+
+    /// Zero gradients
+    pub fn zero_grad(&mut self) {
+        if let Some(ref grad) = self.grad {
+            lock_grad(grad).fill(0.0);
+        }
+    }
+
+    /// Set the seed gradient w.r.t. this array (typically all-ones for a
+    /// scalar loss) before calling [`Self::backward`].
+    pub fn set_grad(&mut self, grad: ArrayD<f64>) {
+        match &self.grad {
+            Some(cell) => *lock_grad(cell) = grad,
+            None => self.grad = Some(Arc::new(Mutex::new(grad))),
+        }
+    }
+
+    /// Backward pass: propagates `self.grad` one step upstream through
+    /// `self.grad_fn`, accumulating real gradients into the operands' own
+    /// (shared) gradient cells.
+    pub fn backward(&mut self) -> Result<()> {
+        // Extract grad_fn to avoid borrow conflicts
+        if let Some(grad_fn) = self.grad_fn.take() {
+            grad_fn.backward(self)?;
+            self.grad_fn = Some(grad_fn);
+        }
+        Ok(())
+    }
+
+    /// Matrix multiplication using SciRS2 backend
+    pub fn matmul(&self, other: &SciRS2Array) -> Result<SciRS2Array> {
+        let result_data = if self.data.ndim() == 2 && other.data.ndim() == 2 {
+            let self_2d = self
+                .data
+                .view()
+                .into_dimensionality::<Ix2>()
+                .map_err(|e| MLError::ComputationError(format!("Shape error: {}", e)))?;
+            let other_2d = other
+                .data
+                .view()
+                .into_dimensionality::<Ix2>()
+                .map_err(|e| MLError::ComputationError(format!("Shape error: {}", e)))?;
+            self_2d.dot(&other_2d).into_dyn()
+        } else {
+            return Err(MLError::InvalidConfiguration(
+                "Matrix multiplication requires 2D arrays".to_string(),
+            ));
+        };
+
+        let requires_grad = self.requires_grad || other.requires_grad;
+        let mut result = SciRS2Array::new(result_data, requires_grad);
+
+        if requires_grad {
+            result.grad_fn = Some(Box::new(MatmulGradFn {
+                left_grad: self.grad.clone(),
+                right_grad: other.grad.clone(),
+                left_data: self.data.clone(),
+                right_data: other.data.clone(),
+            }));
+        }
+
+        Ok(result)
+    }
+
+    /// Element-wise addition
+    pub fn add(&self, other: &SciRS2Array) -> Result<SciRS2Array> {
+        let result_data = &self.data + &other.data;
+        let requires_grad = self.requires_grad || other.requires_grad;
+        let mut result = SciRS2Array::new(result_data, requires_grad);
+
+        if requires_grad {
+            result.grad_fn = Some(Box::new(AddGradFn {
+                left_grad: self.grad.clone(),
+                right_grad: other.grad.clone(),
+            }));
+        }
+
+        Ok(result)
+    }
+
+    /// Element-wise multiplication
+    pub fn mul(&self, other: &SciRS2Array) -> Result<SciRS2Array> {
+        let result_data = &self.data * &other.data;
+        let requires_grad = self.requires_grad || other.requires_grad;
+        let mut result = SciRS2Array::new(result_data, requires_grad);
+
+        if requires_grad {
+            result.grad_fn = Some(Box::new(MulGradFn {
+                left_grad: self.grad.clone(),
+                right_grad: other.grad.clone(),
+                left_data: self.data.clone(),
+                right_data: other.data.clone(),
+            }));
+        }
+
+        Ok(result)
+    }
+
+    /// Reduction sum
+    pub fn sum(&self, axis: Option<usize>) -> Result<SciRS2Array> {
+        let result_data = match axis {
+            Some(ax) => self
+                .data
+                .sum_axis(scirs2_core::ndarray::Axis(ax))
+                .into_dyn(),
+            None => {
+                let sum_val = self.data.sum();
+                ArrayD::from_elem(IxDyn(&[]), sum_val)
+            }
+        };
+
+        let mut result = SciRS2Array::new(result_data, self.requires_grad);
+
+        if self.requires_grad {
+            result.grad_fn = Some(Box::new(SumGradFn {
+                axis,
+                input_shape: self.data.raw_dim(),
+                input_grad: self.grad.clone(),
+            }));
+        }
+
+        Ok(result)
+    }
+}
+
+impl SciRS2Tensor for SciRS2Array {
+    fn shape(&self) -> &[usize] {
+        self.data.shape()
+    }
+
+    fn view(&self) -> ArrayViewD<f64> {
+        self.data.view()
+    }
+
+    fn to_scirs2(&self) -> Result<SciRS2Array> {
+        Ok(self.clone())
+    }
+
+    fn matmul(&self, other: &dyn SciRS2Tensor) -> Result<SciRS2Array> {
+        // Convert other to SciRS2Array for computation
+        let other_array = other.to_scirs2()?;
+        self.matmul(&other_array)
+    }
+
+    fn add(&self, other: &dyn SciRS2Tensor) -> Result<SciRS2Array> {
+        let other_array = other.to_scirs2()?;
+        self.add(&other_array)
+    }
+
+    fn mul(&self, other: &dyn SciRS2Tensor) -> Result<SciRS2Array> {
+        let other_array = other.to_scirs2()?;
+        self.mul(&other_array)
+    }
+
+    fn sub(&self, other: &dyn SciRS2Tensor) -> Result<SciRS2Array> {
+        let other_array = other.to_scirs2()?;
+        let result_data = &self.data - &other_array.data;
+        let requires_grad = self.requires_grad || other_array.requires_grad;
+        let mut result = SciRS2Array::new(result_data, requires_grad);
+
+        if requires_grad {
+            result.grad_fn = Some(Box::new(SubGradFn {
+                left_grad: self.grad.clone(),
+                right_grad: other_array.grad.clone(),
+            }));
+        }
+
+        Ok(result)
+    }
+
+    fn sum(&self, axis: Option<usize>) -> Result<SciRS2Array> {
+        self.sum(axis)
+    }
+
+    fn mean(&self, axis: Option<usize>) -> Result<SciRS2Array> {
+        let result_data = match axis {
+            Some(ax) => self
+                .data
+                .mean_axis(scirs2_core::ndarray::Axis(ax))
+                .ok_or_else(|| {
+                    MLError::ComputationError("Empty axis for mean computation".to_string())
+                })?
+                .into_dyn(),
+            None => {
+                let mean_val = self.data.mean().ok_or_else(|| {
+                    MLError::ComputationError("Empty array for mean computation".to_string())
+                })?;
+                ArrayD::from_elem(IxDyn(&[]), mean_val)
+            }
+        };
+        Ok(SciRS2Array::new(result_data, self.requires_grad))
+    }
+
+    fn max(&self, axis: Option<usize>) -> Result<SciRS2Array> {
+        let result_data = match axis {
+            Some(ax) => self
+                .data
+                .map_axis(scirs2_core::ndarray::Axis(ax), |view| {
+                    *view
+                        .iter()
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .expect("map_axis guarantees non-empty view for valid axis")
+                })
+                .into_dyn(),
+            None => {
+                let max_val = *self
+                    .data
+                    .iter()
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .ok_or_else(|| {
+                        MLError::ComputationError("Empty array for max computation".to_string())
+                    })?;
+                ArrayD::from_elem(IxDyn(&[]), max_val)
+            }
+        };
+        Ok(SciRS2Array::new(result_data, self.requires_grad))
+    }
+
+    fn min(&self, axis: Option<usize>) -> Result<SciRS2Array> {
+        let result_data = match axis {
+            Some(ax) => self
+                .data
+                .map_axis(scirs2_core::ndarray::Axis(ax), |view| {
+                    *view
+                        .iter()
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .expect("map_axis guarantees non-empty view for valid axis")
+                })
+                .into_dyn(),
+            None => {
+                let min_val = *self
+                    .data
+                    .iter()
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .ok_or_else(|| {
+                        MLError::ComputationError("Empty array for min computation".to_string())
+                    })?;
+                ArrayD::from_elem(IxDyn(&[]), min_val)
+            }
+        };
+        Ok(SciRS2Array::new(result_data, self.requires_grad))
+    }
+}
+
+/// Lock a shared gradient cell, recovering the inner data even if a prior
+/// panic poisoned the mutex (a plain `.lock().unwrap()` would instead panic
+/// again here, which production code must avoid).
+fn lock_grad(cell: &Arc<Mutex<ArrayD<f64>>>) -> std::sync::MutexGuard<'_, ArrayD<f64>> {
+    cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Reads the seed gradient stored in `output.grad`, defaulting to an
+/// all-ones array (the standard implicit seed for a scalar loss) the first
+/// time `backward()` is called on a node whose gradient was never
+/// explicitly set via [`SciRS2Array::set_grad`].
+fn output_grad_or_ones(output: &SciRS2Array) -> ArrayD<f64> {
+    match &output.grad {
+        Some(cell) => lock_grad(cell).clone(),
+        None => ArrayD::ones(output.data.raw_dim()),
+    }
+}
+
+/// Accumulate `contribution` into a (possibly absent) shared gradient cell.
+fn accumulate_grad(cell: &Option<Arc<Mutex<ArrayD<f64>>>>, contribution: &ArrayD<f64>) {
+    if let Some(cell) = cell {
+        let mut guard = lock_grad(cell);
+        *guard = &*guard + contribution;
+    }
+}
+
+/// Trait for gradient functions
+pub trait GradFunction: Send + Sync {
+    fn backward(&self, output: &mut SciRS2Array) -> Result<()>;
+}
+
+/// Gradient function for matrix multiplication: for `C = A @ B`,
+/// `dL/dA = dL/dC @ B^T` and `dL/dB = A^T @ dL/dC`.
+#[derive(Debug)]
+struct MatmulGradFn {
+    left_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+    right_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+    left_data: ArrayD<f64>,
+    right_data: ArrayD<f64>,
+}
+
+impl GradFunction for MatmulGradFn {
+    fn backward(&self, output: &mut SciRS2Array) -> Result<()> {
+        let output_grad = output_grad_or_ones(output);
+        let grad_2d = output_grad
+            .view()
+            .into_dimensionality::<Ix2>()
+            .map_err(|e| MLError::ComputationError(format!("Shape error: {}", e)))?;
+
+        if self.left_grad.is_some() {
+            let right_2d = self
+                .right_data
+                .view()
+                .into_dimensionality::<Ix2>()
+                .map_err(|e| MLError::ComputationError(format!("Shape error: {}", e)))?;
+            let grad_left = grad_2d.dot(&right_2d.t()).into_dyn();
+            accumulate_grad(&self.left_grad, &grad_left);
+        }
+
+        if self.right_grad.is_some() {
+            let left_2d = self
+                .left_data
+                .view()
+                .into_dimensionality::<Ix2>()
+                .map_err(|e| MLError::ComputationError(format!("Shape error: {}", e)))?;
+            let grad_right = left_2d.t().dot(&grad_2d).into_dyn();
+            accumulate_grad(&self.right_grad, &grad_right);
+        }
+
+        Ok(())
+    }
+}
+
+/// Gradient function for addition: `d(A+B)/dA = d(A+B)/dB = 1`, so the
+/// output gradient flows through unchanged (but must still be *copied* into
+/// both operands' accumulators, unlike the previous no-op).
+#[derive(Debug)]
+struct AddGradFn {
+    left_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+    right_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+}
+
+impl GradFunction for AddGradFn {
+    fn backward(&self, output: &mut SciRS2Array) -> Result<()> {
+        let output_grad = output_grad_or_ones(output);
+        accumulate_grad(&self.left_grad, &output_grad);
+        accumulate_grad(&self.right_grad, &output_grad);
+        Ok(())
+    }
+}
+
+/// Gradient function for element-wise subtraction: `d(A-B)/dA = 1`,
+/// `d(A-B)/dB = -1`.
+#[derive(Debug)]
+struct SubGradFn {
+    left_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+    right_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+}
+
+impl GradFunction for SubGradFn {
+    fn backward(&self, output: &mut SciRS2Array) -> Result<()> {
+        let output_grad = output_grad_or_ones(output);
+        accumulate_grad(&self.left_grad, &output_grad);
+        let negated = output_grad.mapv(|x| -x);
+        accumulate_grad(&self.right_grad, &negated);
+        Ok(())
+    }
+}
+
+/// Gradient function for element-wise multiplication:
+/// `d(A*B)/dA = B`, `d(A*B)/dB = A` (Hadamard product with the output
+/// gradient).
+#[derive(Debug)]
+struct MulGradFn {
+    left_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+    right_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+    left_data: ArrayD<f64>,
+    right_data: ArrayD<f64>,
+}
+
+impl GradFunction for MulGradFn {
+    fn backward(&self, output: &mut SciRS2Array) -> Result<()> {
+        let output_grad = output_grad_or_ones(output);
+        let grad_left = &output_grad * &self.right_data;
+        let grad_right = &output_grad * &self.left_data;
+        accumulate_grad(&self.left_grad, &grad_left);
+        accumulate_grad(&self.right_grad, &grad_right);
+        Ok(())
+    }
+}
+
+/// Gradient function for sum reduction: broadcasts the (scalar or
+/// reduced-axis) output gradient back across the reduced axis/axes to the
+/// original input shape.
+#[derive(Debug)]
+struct SumGradFn {
+    axis: Option<usize>,
+    input_shape: IxDyn,
+    input_grad: Option<Arc<Mutex<ArrayD<f64>>>>,
+}
+
+impl GradFunction for SumGradFn {
+    fn backward(&self, output: &mut SciRS2Array) -> Result<()> {
+        let output_grad = output_grad_or_ones(output);
+
+        let broadcasted = match self.axis {
+            None => {
+                let scalar = output_grad.iter().next().copied().unwrap_or(0.0);
+                ArrayD::from_elem(self.input_shape.clone(), scalar)
+            }
+            Some(ax) => {
+                let expanded = output_grad.insert_axis(Axis(ax));
+                expanded
+                    .broadcast(self.input_shape.clone())
+                    .ok_or_else(|| {
+                        MLError::ComputationError(
+                            "Failed to broadcast sum gradient back to input shape".to_string(),
+                        )
+                    })?
+                    .to_owned()
+            }
+        };
+
+        accumulate_grad(&self.input_grad, &broadcasted);
+        Ok(())
+    }
+}
+
+/// SciRS2 optimization interface
+pub struct SciRS2Optimizer {
+    /// Optimizer type
+    pub optimizer_type: String,
+    /// Configuration parameters
+    pub config: HashMap<String, f64>,
+    /// Parameter state (for stateful optimizers like Adam)
+    pub state: HashMap<String, ArrayD<f64>>,
+}
+
+impl SciRS2Optimizer {
+    /// Create a new SciRS2 optimizer
+    pub fn new(optimizer_type: impl Into<String>) -> Self {
+        Self {
+            optimizer_type: optimizer_type.into(),
+            config: HashMap::new(),
+            state: HashMap::new(),
+        }
+    }
+
+    /// Set optimizer configuration
+    pub fn with_config(mut self, key: impl Into<String>, value: f64) -> Self {
+        self.config.insert(key.into(), value);
+        self
+    }
+
+    /// Update parameters using computed gradients
+    pub fn step(&mut self, params: &mut HashMap<String, SciRS2Array>) -> Result<()> {
+        match self.optimizer_type.as_str() {
+            "adam" => self.adam_step(params),
+            "sgd" => self.sgd_step(params),
+            "lbfgs" => self.lbfgs_step(params),
+            _ => Err(MLError::InvalidConfiguration(format!(
+                "Unknown optimizer type: {}",
+                self.optimizer_type
+            ))),
+        }
+    }
+
+    /// Adam optimizer step
+    fn adam_step(&mut self, params: &mut HashMap<String, SciRS2Array>) -> Result<()> {
+        let learning_rate = self.config.get("learning_rate").unwrap_or(&0.001);
+        let beta1 = self.config.get("beta1").unwrap_or(&0.9);
+        let beta2 = self.config.get("beta2").unwrap_or(&0.999);
+        let epsilon = self.config.get("epsilon").unwrap_or(&1e-8);
+
+        for (name, param) in params.iter_mut() {
+            let grad_cell = match &param.grad {
+                Some(cell) => cell.clone(),
+                None => continue,
+            };
+            let grad = lock_grad(&grad_cell).clone();
+            {
+                // Initialize momentum and velocity if not present
+                let m_key = format!("{}_m", name);
+                let v_key = format!("{}_v", name);
+
+                if !self.state.contains_key(&m_key) {
+                    self.state
+                        .insert(m_key.clone(), ArrayD::zeros(grad.raw_dim()));
+                    self.state
+                        .insert(v_key.clone(), ArrayD::zeros(grad.raw_dim()));
+                }
+
+                // Update first moment estimate
+                {
+                    let m = self
+                        .state
+                        .get_mut(&m_key)
+                        .expect("m_key was just inserted if not present");
+                    *m = *beta1 * &*m + (1.0 - *beta1) * &grad;
+                }
+
+                // Update second moment estimate
+                {
+                    let v = self
+                        .state
+                        .get_mut(&v_key)
+                        .expect("v_key was just inserted if not present");
+                    *v = *beta2 * &*v + (1.0 - *beta2) * &grad * &grad;
+                }
+
+                // Get references for bias correction
+                let m_hat = self
+                    .state
+                    .get(&m_key)
+                    .expect("m_key exists after update")
+                    .clone();
+                let v_hat = self
+                    .state
+                    .get(&v_key)
+                    .expect("v_key exists after update")
+                    .clone();
+
+                // Update parameters
+                param.data =
+                    &param.data - *learning_rate * &m_hat / (v_hat.mapv(|x| x.sqrt()) + *epsilon);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// SGD optimizer step
+    fn sgd_step(&mut self, params: &mut HashMap<String, SciRS2Array>) -> Result<()> {
+        let learning_rate = self.config.get("learning_rate").unwrap_or(&0.01);
+        let momentum = self.config.get("momentum").unwrap_or(&0.0);
+
+        for (name, param) in params.iter_mut() {
+            let grad_cell = match &param.grad {
+                Some(cell) => cell.clone(),
+                None => continue,
+            };
+            let grad = lock_grad(&grad_cell).clone();
+            {
+                if *momentum > 0.0 {
+                    let v_key = format!("{}_v", name);
+                    if !self.state.contains_key(&v_key) {
+                        self.state
+                            .insert(v_key.clone(), ArrayD::zeros(grad.raw_dim()));
+                    }
+
+                    let v = self
+                        .state
+                        .get_mut(&v_key)
+                        .expect("v_key was just inserted if not present");
+                    *v = *momentum * &*v + *learning_rate * &grad;
+                    param.data = &param.data - &*v;
+                } else {
+                    param.data = &param.data - *learning_rate * &grad;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// L-BFGS optimizer step (placeholder)
+    fn lbfgs_step(&mut self, _params: &mut HashMap<String, SciRS2Array>) -> Result<()> {
+        // Placeholder - would implement L-BFGS using SciRS2
+        Ok(())
+    }
+}
+
+/// SciRS2 distributed training support
+pub struct SciRS2DistributedTrainer {
+    /// World size (number of processes)
+    pub world_size: usize,
+    /// Local rank
+    pub rank: usize,
+    /// Backend for communication
+    pub backend: String,
+}
+
+impl SciRS2DistributedTrainer {
+    /// Create a new distributed trainer
+    pub fn new(world_size: usize, rank: usize) -> Self {
+        Self {
+            world_size,
+            rank,
+            backend: "nccl".to_string(),
+        }
+    }
+
+    /// All-reduce operation for gradient synchronization
+    pub fn all_reduce(&self, tensor: &mut SciRS2Array) -> Result<()> {
+        // Placeholder - would use SciRS2 distributed operations
+        Ok(())
+    }
+
+    /// All-reduce scalar operation for metrics synchronization
+    pub fn all_reduce_scalar(&self, value: f64) -> Result<f64> {
+        // Placeholder - would use SciRS2 distributed operations
+        // For now, just return the value unchanged (single process behavior)
+        Ok(value)
+    }
+
+    /// Broadcast operation
+    pub fn broadcast(&self, tensor: &mut SciRS2Array, root: usize) -> Result<()> {
+        // Placeholder - would use SciRS2 distributed operations
+        Ok(())
+    }
+
+    /// All-gather operation
+    pub fn all_gather(&self, tensor: &SciRS2Array) -> Result<Vec<SciRS2Array>> {
+        // Placeholder - would use SciRS2 distributed operations
+        Ok(vec![tensor.clone(); self.world_size])
+    }
+
+    /// Wrap a model for distributed training
+    pub fn wrap_model<T>(&self, model: T) -> Result<T> {
+        // Placeholder - would wrap the model with distributed training capabilities
+        // For now, just return the model unchanged
+        Ok(model)
+    }
+}
+
+/// SciRS2 model serialization interface
+pub struct SciRS2Serializer;
+
+impl SciRS2Serializer {
+    /// Serialize model parameters to SciRS2 format
+    pub fn save_model(params: &HashMap<String, SciRS2Array>, path: &str) -> Result<()> {
+        // Placeholder - would use SciRS2 serialization
+        Ok(())
+    }
+
+    /// Load model parameters from SciRS2 format
+    pub fn load_model(path: &str) -> Result<HashMap<String, SciRS2Array>> {
+        // Placeholder - would use SciRS2 deserialization
+        Ok(HashMap::new())
+    }
+
+    /// Save checkpoint with optimizer state
+    pub fn save_checkpoint(
+        params: &HashMap<String, SciRS2Array>,
+        optimizer: &SciRS2Optimizer,
+        epoch: usize,
+        path: &str,
+    ) -> Result<()> {
+        // Placeholder - would use SciRS2 checkpoint format
+        Ok(())
+    }
+
+    /// Load checkpoint with optimizer state
+    pub fn load_checkpoint(
+        path: &str,
+    ) -> Result<(HashMap<String, SciRS2Array>, SciRS2Optimizer, usize)> {
+        // Placeholder - would use SciRS2 checkpoint format
+        Ok((HashMap::new(), SciRS2Optimizer::new("adam"), 0))
+    }
+}
+
+/// SciRS2 Dataset wrapper for quantum ML
+pub struct SciRS2Dataset {
+    /// Training data
+    pub data: ArrayD<f64>,
+    /// Labels
+    pub labels: ArrayD<f64>,
+    /// Dataset size
+    pub size: usize,
+}
+
+impl SciRS2Dataset {
+    /// Create a new dataset
+    pub fn new(data: ArrayD<f64>, labels: ArrayD<f64>) -> Result<Self> {
+        let size = data.shape()[0];
+        if labels.shape()[0] != size {
+            return Err(MLError::InvalidConfiguration(
+                "Data and labels must have same number of samples".to_string(),
+            ));
+        }
+
+        Ok(Self { data, labels, size })
+    }
+}
+
+/// SciRS2 DataLoader for batch processing
+pub struct SciRS2DataLoader {
+    /// Dataset reference
+    pub dataset: SciRS2Dataset,
+    /// Batch size
+    pub batch_size: usize,
+    /// Current index
+    pub current_index: usize,
+}
+
+impl SciRS2DataLoader {
+    /// Create a new data loader
+    pub fn new(dataset: SciRS2Dataset, batch_size: usize) -> Self {
+        Self {
+            dataset,
+            batch_size,
+            current_index: 0,
+        }
+    }
+
+    /// Iterator-like enumeration support
+    pub fn enumerate(&mut self) -> DataLoaderIterator {
+        DataLoaderIterator {
+            loader: self,
+            batch_idx: 0,
+        }
+    }
+}
+
+/// Iterator for DataLoader
+pub struct DataLoaderIterator<'a> {
+    loader: &'a mut SciRS2DataLoader,
+    batch_idx: usize,
+}
+
+impl<'a> Iterator for DataLoaderIterator<'a> {
+    type Item = (usize, (SciRS2Array, SciRS2Array));
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.loader.current_index >= self.loader.dataset.size {
+            return None;
+        }
+
+        let start = self.loader.current_index;
+        let end = (start + self.loader.batch_size).min(self.loader.dataset.size);
+
+        // Extract batch data and labels
+        let batch_data = self
+            .loader
+            .dataset
+            .data
+            .slice(scirs2_core::ndarray::s![start..end, ..])
+            .to_owned();
+        let batch_labels = self
+            .loader
+            .dataset
+            .labels
+            .slice(scirs2_core::ndarray::s![start..end, ..])
+            .to_owned();
+
+        let data_array = SciRS2Array::from_array(batch_data);
+        let label_array = SciRS2Array::from_array(batch_labels);
+
+        self.loader.current_index = end;
+        let batch_idx = self.batch_idx;
+        self.batch_idx += 1;
+
+        Some((batch_idx, (data_array, label_array)))
+    }
+}
+
+/// SciRS2 Device enumeration
+#[derive(Debug, Clone, Copy)]
+pub enum SciRS2Device {
+    CPU,
+    GPU,
+    Quantum,
+}
+
+/// Additional SciRS2Array methods for compatibility
+impl SciRS2Array {
+    /// Create array with specified device
+    pub fn randn(shape: Vec<usize>, device: SciRS2Device) -> Result<Self> {
+        use scirs2_core::random::prelude::*;
+        let total_size = shape.iter().product();
+        let mut rng = thread_rng();
+        let data: Vec<f64> = (0..total_size)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .map_err(|e| MLError::ComputationError(format!("Shape error: {}", e)))?;
+        Ok(Self::new(array, false))
+    }
+
+    /// Create ones_like array
+    pub fn ones_like(&self) -> Result<Self> {
+        let ones = ArrayD::ones(self.data.raw_dim());
+        Ok(Self::new(ones, false))
+    }
+
+    /// Create random integers
+    pub fn randint(low: i32, high: i32, shape: Vec<usize>, device: SciRS2Device) -> Result<Self> {
+        use scirs2_core::random::prelude::*;
+        let total_size = shape.iter().product();
+        let mut rng = thread_rng();
+        let data: Vec<f64> = (0..total_size)
+            .map(|_| rng.random_range(low..high) as f64)
+            .collect();
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .map_err(|e| MLError::ComputationError(format!("Shape error: {}", e)))?;
+        Ok(Self::new(array, false))
+    }
+
+    /// Create quantum observable
+    pub fn quantum_observable(name: &str, num_qubits: usize) -> Result<Self> {
+        match name {
+            "pauli_z_all" => {
+                let size = 1 << num_qubits;
+                let mut data = ArrayD::zeros(IxDyn(&[size, size]));
+                for i in 0..size {
+                    let parity = i.count_ones() % 2;
+                    data[[i, i]] = if parity == 0 { 1.0 } else { -1.0 };
+                }
+                Ok(Self::new(data, false))
+            }
+            _ => Err(MLError::InvalidConfiguration(format!(
+                "Unknown observable: {}",
+                name
+            ))),
+        }
+    }
+}
+
+/// Integration helper functions
+pub mod integration {
+    use super::*;
+
+    /// Convert ndarray to SciRS2Array
+    pub fn from_ndarray<D: Dimension>(arr: Array<f64, D>) -> SciRS2Array {
+        SciRS2Array::from_array(arr)
+    }
+
+    /// Convert SciRS2Array to ndarray
+    pub fn to_ndarray<D: Dimension>(arr: &SciRS2Array) -> Result<Array<f64, D>> {
+        arr.data
+            .view()
+            .into_dimensionality::<D>()
+            .map(|v| v.to_owned())
+            .map_err(|e| MLError::ComputationError(format!("Dimension error: {}", e)))
+    }
+
+    /// Create SciRS2 optimizer from configuration
+    pub fn create_optimizer(optimizer_type: &str, config: HashMap<String, f64>) -> SciRS2Optimizer {
+        let mut optimizer = SciRS2Optimizer::new(optimizer_type);
+        for (key, value) in config {
+            optimizer = optimizer.with_config(key, value);
+        }
+        optimizer
+    }
+
+    /// Setup distributed training
+    pub fn setup_distributed(world_size: usize, rank: usize) -> SciRS2DistributedTrainer {
+        SciRS2DistributedTrainer::new(world_size, rank)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scirs2_core::ndarray::Array2;
+
+    #[test]
+    fn test_scirs2_array_creation() {
+        let arr = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0])
+            .expect("valid shape for 2x2 array");
+        let scirs2_arr = SciRS2Array::from_array(arr);
+
+        assert_eq!(scirs2_arr.data.shape(), &[2, 2]);
+        assert!(!scirs2_arr.requires_grad);
+    }
+
+    #[test]
+    fn test_scirs2_array_with_grad() {
+        let arr = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0])
+            .expect("valid shape for 2x2 array");
+        let scirs2_arr = SciRS2Array::with_grad(arr);
+
+        assert!(scirs2_arr.requires_grad);
+        assert!(scirs2_arr.grad.is_some());
+    }
+
+    #[test]
+    fn test_scirs2_matmul() {
+        let arr1 = Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .expect("valid shape for 2x3 array");
+        let arr2 = Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .expect("valid shape for 3x2 array");
+
+        let scirs2_arr1 = SciRS2Array::from_array(arr1);
+        let scirs2_arr2 = SciRS2Array::from_array(arr2);
+
+        let result = scirs2_arr1
+            .matmul(&scirs2_arr2)
+            .expect("matmul should succeed for compatible shapes");
+        assert_eq!(result.data.shape(), &[2, 2]);
+    }
+
+    #[test]
+    fn test_scirs2_optimizer() {
+        let mut optimizer = SciRS2Optimizer::new("adam")
+            .with_config("learning_rate", 0.001)
+            .with_config("beta1", 0.9);
+
+        let mut params = HashMap::new();
+        let param_arr = SciRS2Array::with_grad(Array1::from_vec(vec![1.0, 2.0, 3.0]));
+        params.insert("weight".to_string(), param_arr);
+
+        let result = optimizer.step(&mut params);
+        assert!(result.is_ok());
+    }
+
+    /// Regression test for the fabricated-autograd bug: `MatmulGradFn`,
+    /// `MulGradFn`, and `SumGradFn`'s `backward()` used to be a bare `Ok(())`
+    /// no-op, and `SciRS2Array` had no way to reach back to the input nodes
+    /// that produced an output, so gradients could never propagate through
+    /// matmul/mul/sum. This checks the exact analytic gradients:
+    /// `d(A@B)/dA = grad@B^T`, `d(A@B)/dB = A^T@grad`,
+    /// `d(A*B)/dA = grad*B`, `d(A*B)/dB = grad*A`, and that `sum()`
+    /// broadcasts its scalar seed gradient back across every input element.
+    #[test]
+    fn test_matmul_mul_sum_backward_are_real() {
+        // matmul: A (2x2) @ B (2x2) -> C; seed dL/dC with a known,
+        // non-uniform gradient and check dL/dA, dL/dB analytically.
+        let a_arr = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0])
+            .expect("valid shape for 2x2 array");
+        let b_arr = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0])
+            .expect("valid shape for 2x2 array");
+        let a = SciRS2Array::with_grad(a_arr.clone());
+        let b = SciRS2Array::with_grad(b_arr.clone());
+
+        let mut c = a.matmul(&b).expect("matmul should succeed");
+        let seed = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0])
+            .expect("valid shape for 2x2 array")
+            .into_dyn();
+        c.set_grad(seed.clone());
+        c.backward().expect("matmul backward should succeed");
+
+        // dL/dA = seed @ B^T, dL/dB = A^T @ seed (both computed independently
+        // here via plain ndarray ops, not by re-using the code under test).
+        let seed_2d = seed.into_dimensionality::<Ix2>().expect("2d seed");
+        let expected_grad_a = seed_2d.dot(&b_arr.t());
+        let expected_grad_b = a_arr.t().dot(&seed_2d);
+
+        let grad_a = a
+            .grad
+            .as_ref()
+            .expect("a should have a grad cell")
+            .lock()
+            .expect("grad lock should not be poisoned")
+            .clone();
+        let grad_b = b
+            .grad
+            .as_ref()
+            .expect("b should have a grad cell")
+            .lock()
+            .expect("grad lock should not be poisoned")
+            .clone();
+
+        for ((i, j), &expected) in expected_grad_a.indexed_iter() {
+            assert!(
+                (grad_a[[i, j]] - expected).abs() < 1e-9,
+                "matmul dL/dA mismatch at ({i},{j}): got {}, expected {expected}",
+                grad_a[[i, j]]
+            );
+        }
+        for ((i, j), &expected) in expected_grad_b.indexed_iter() {
+            assert!(
+                (grad_b[[i, j]] - expected).abs() < 1e-9,
+                "matmul dL/dB mismatch at ({i},{j}): got {}, expected {expected}",
+                grad_b[[i, j]]
+            );
+        }
+
+        // mul: element-wise x * y; dL/dx = seed * y, dL/dy = seed * x.
+        let x_arr = Array1::from_vec(vec![2.0, 3.0, 4.0]);
+        let y_arr = Array1::from_vec(vec![10.0, 20.0, 30.0]);
+        let x = SciRS2Array::with_grad(x_arr.clone());
+        let y = SciRS2Array::with_grad(y_arr.clone());
+
+        let mut z = x.mul(&y).expect("mul should succeed");
+        z.set_grad(ArrayD::from_elem(IxDyn(&[3]), 2.0));
+        z.backward().expect("mul backward should succeed");
+
+        let grad_x = x
+            .grad
+            .as_ref()
+            .expect("x should have a grad cell")
+            .lock()
+            .expect("grad lock should not be poisoned")
+            .clone();
+        let grad_y = y
+            .grad
+            .as_ref()
+            .expect("y should have a grad cell")
+            .lock()
+            .expect("grad lock should not be poisoned")
+            .clone();
+
+        for (i, (&gx, &yv)) in grad_x.iter().zip(y_arr.iter()).enumerate() {
+            assert!(
+                (gx - 2.0 * yv).abs() < 1e-9,
+                "mul dL/dx mismatch at {i}: got {gx}, expected {}",
+                2.0 * yv
+            );
+        }
+        for (i, (&gy, &xv)) in grad_y.iter().zip(x_arr.iter()).enumerate() {
+            assert!(
+                (gy - 2.0 * xv).abs() < 1e-9,
+                "mul dL/dy mismatch at {i}: got {gy}, expected {}",
+                2.0 * xv
+            );
+        }
+
+        // sum (full reduction): dL/d(input[i]) = seed for every element.
+        let s_arr = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+        let s = SciRS2Array::with_grad(s_arr);
+        let mut total = s.sum(None).expect("sum should succeed");
+        total.set_grad(ArrayD::from_elem(IxDyn(&[]), 3.5));
+        total.backward().expect("sum backward should succeed");
+
+        let grad_s = s
+            .grad
+            .as_ref()
+            .expect("s should have a grad cell")
+            .lock()
+            .expect("grad lock should not be poisoned")
+            .clone();
+        for &g in grad_s.iter() {
+            assert!(
+                (g - 3.5).abs() < 1e-9,
+                "sum backward did not broadcast the seed gradient: got {g}, expected 3.5"
+            );
+        }
+    }
+
+    #[test]
+    fn test_integration_helpers() {
+        let arr = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0])
+            .expect("valid shape for 2x2 array");
+        let scirs2_arr = integration::from_ndarray(arr.clone());
+
+        let back_to_ndarray: Array2<f64> = integration::to_ndarray(&scirs2_arr)
+            .expect("conversion back to ndarray should succeed");
+        assert_eq!(arr, back_to_ndarray);
+    }
+}

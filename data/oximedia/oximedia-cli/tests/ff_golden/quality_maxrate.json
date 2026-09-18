@@ -1,0 +1,9 @@
+{
+  "name": "quality_maxrate",
+  "args": ["-i", "in.mkv", "-maxrate", "5M", "out.webm"],
+  "expect": {
+    "contains_diagnostic_kinds": ["UnknownOptionIgnored"],
+    "contains_diagnostic_messages": ["maxrate"],
+    "jobs": 1
+  }
+}

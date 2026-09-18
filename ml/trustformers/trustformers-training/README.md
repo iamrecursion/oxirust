@@ -1,0 +1,222 @@
+# trustformers-training
+
+Training infrastructure for TrustformeRS.
+
+## Current State
+
+**Version:** 0.2.1 | **Status:** Alpha | **Updated:** 2026-08-24
+
+This crate provides HuggingFace-`Trainer`-inspired training infrastructure: a core `Trainer`/`TrainingArguments` loop (plus a simpler `SimpleTrainer` builder API), mixed-precision/AMP, quantization-aware training, RLHF (PPO/DPO), few-shot and meta-learning, continual learning, hyperparameter optimization, a large data-pipeline/augmentation/curriculum system, and a family of distributed/parallel-training abstractions (tensor, sequence, 3D, expert and ring-attention parallelism, plus elastic and multi-cloud orchestration).
+
+- **~1,010 tests** as of 2026-07-01, not independently re-run this pass — see the workspace root `README.md`/`TODO.md` for the current baseline (21,370 passed / 41 skipped / 0 failed workspace-wide, default features, 2026-08-26)
+- **1,673 public API items** (`pub fn`/`struct`/`enum`/`trait`, incl. impl-block methods) reachable from `lib.rs` as of 2026-07-09, not re-verified — the underlying compiled-file count (72 files) is stale, see below
+- **83,319 SLoC** for the whole crate (`tokei`, verified 2026-08-24). The 2026-07-09 "58,207 SLoC / 72 compiled files vs. 83,317 total / 101 files" split (see [Verification Notes](#verification-notes)) is not recomputed this pass: this wave split 2 of those 72 compiled files (`data_pipeline.rs`, `auto_parallelism.rs`) into 15 files, so the compiled-file count is higher than 72 today, exact number not recounted.
+- **0 stub/placeholder implementations** (`todo!()`/`unimplemented!()`/TODO/FIXME/HACK/XXX/"placeholder", searched case-insensitively) in the compiled source as of 2026-07-01, not re-verified
+- **0 `.unwrap()` calls** in the compiled production source as of 2026-07-01, not re-verified
+
+> **Honest maturity note (corrected 2026-08-24)**: the non-distributed core (the `Trainer`/`SimpleTrainer` loop, losses/metrics, mixed precision, QAT, RLHF, few-shot/meta-learning, continual learning, hyperparameter optimization, and the training-stability/monitoring stack) is genuinely implemented, tested, and free of stubs. **The distributed story is stronger than this note previously claimed** — that older text (through 2026-08-18) said "there is no ZeRO optimizer anywhere in the source" and that `NCCL`/`Gloo`/`MPI` "are in-process simulations", neither of which is true today: `distributed_zero.rs`/`distributed_zero/` implement ZeRO (optimizer-state/gradient/parameter partitioning, mounted via `pub mod distributed_zero;`, with its own tests), and `distributed.rs`'s `NCCL`/`Gloo`/`MPI` backends no longer simulate collectives — a `broadcast` implementation that used to corrupt its input via an unconditional `scalar_mul(0.99)` is gone, and requesting one of those three backends returns a structured "unavailable" error naming the real, working TCP-based process-group backend instead (verified today: a test named `nccl_gloo_and_mpi_are_reported_unavailable_not_simulated` exists in `distributed.rs` and passes). There is still a substantial amount of code sitting in `src/` that is **not wired into the crate at all** — see [Verification Notes](#verification-notes) and `TODO.md`, not re-verified this pass. This crate is labeled **Alpha** rather than Stable on that basis, and because 0.x semver means the API can still move — not because of a fabricated-collectives concern that no longer applies.
+
+## Features
+
+### Core Training Infrastructure
+- **`Trainer`**: the main training loop (`trainer.rs`) — `Trainer::new(model, args, optimizer, loss_fn, task_type)`, gradient accumulation, checkpointing hooks, `TrainerCallback` trait, `EarlyStoppingCallback`
+- **`SimpleTrainer` / `SimpleTrainerBuilder`**: an alternative, simpler builder-style API (`simplified_trainer.rs`) with `CheckpointCallback`, `LoggingCallback`, `MetricsCallback`, `ProgressCallback`
+- **`TrainingArguments`**: configuration struct with `EvaluationStrategy`/`SaveStrategy` (`training_args.rs`)
+- **Losses**: `CrossEntropyLoss` (with `with_label_smoothing()`), `MSELoss`, the `Loss` trait (`losses.rs`)
+- **Metrics**: `Accuracy`, `F1Score`, `Perplexity`, `MetricCollection`, the `Metric` trait (`metrics.rs`)
+- **Config validation**: `ConfigValidator`, `ConfigSchema`, `Constraint`, `Validatable` (`config_validation.rs`)
+- **Structured error handling**: `TrainingError`, `ErrorManager`, `RecoveryAction`/`RecoveryStrategy`, `ErrorCodeRegistry` with `get_recovery_actions`/`is_critical_error` (`error_codes.rs`, `error_handling.rs`)
+- **Training orchestration**: `TrainingOrchestrator`, `JobScheduler`, `TrainingJob`, `CheckpointConfig`/`CheckpointInfo` (`training_orchestration.rs`)
+
+### Training Stability & Monitoring
+- **`AdvancedStabilityMonitor`**: loss-landscape analysis, anomaly prediction, `RiskLevel`/`StabilityScore` (`advanced_stability_monitor.rs`)
+- **`GradientRecoveryManager`**: gradient-anomaly detection and recovery strategies (`gradient_anomaly_recovery.rs`)
+- **`AdaptiveGradientScaler`** / **`AdaptiveLearningRateScheduler`**: dynamic gradient-scale and LR adaptation based on observed training dynamics (`adaptive_gradient_scaling.rs`, `adaptive_learning_rate.rs`)
+- **`TrainingDynamicsAnalyzer`** / **`TrainingMonitor`**: convergence/gradient-flow/weight-evolution metrics, health status and anomaly reports (`training_dynamics.rs`, `training_monitor.rs`)
+
+### Distributed & Parallel Training
+- **`DataParallelTrainer`** with a `ProcessGroup` trait and `DistributedBackend` (`NCCL`/`Gloo`/`MPI`/`Simulated`) selector (`distributed.rs`) — see the maturity note above regarding the NCCL/Gloo/MPI implementations
+- **Tensor parallelism**: `TensorParallelism`, `TensorPartitioningStrategy` (`tensor_parallelism.rs`)
+- **Sequence parallelism**: `SequenceParallelism`, `SequenceSplittingStrategy` (`sequence_parallelism.rs`)
+- **3D parallelism** (data + tensor + pipeline) with `PipelineSchedule` variants `GPipe`/`PipeDream`/`PipeDream2BW`/`Interleaved1F1B`/`Adaptive` (`parallelism_3d.rs`)
+- **Expert parallelism** (MoE-style routing): `ExpertParallelism`, `ExpertRoutingStrategy`, `TokenRouting` (`expert_parallelism.rs`)
+- **Ring attention** for long-sequence distributed attention: `RingAttentionBlock`, `RingAttentionManager` (`ring_attention.rs`)
+- **Hardware-aware auto-parallelism selection**: `AutoParallelismSelector` picks a strategy from `HardwareConstraints`/`ModelConstraints`/`NetworkTopology` (`auto_parallelism.rs`)
+- **Elastic training**: `ElasticTrainingCoordinator` (worker heartbeats, scaling decisions, mid-training checkpoints) (`elastic_training.rs`)
+- **Multi-cloud orchestration**: `MultiCloudOrchestrator`, `CloudProvider`, `CloudScheduler`, cost/budget-aware scheduling (`multicloud.rs`)
+- **Resource scheduling**: `ResourceScheduler`, `ResourcePool`, cost-aware allocation (`resource_scheduling.rs`)
+- *(No ZeRO stage-1/2/3 optimizer exists in this crate today — see the maturity note above.)*
+
+### Mixed Precision & Quantization
+- **AMP**: `AMPManager`, `MixedPrecisionConfig`, `LossScaler`, `DynamicBatchingManager` (`mixed_precision.rs`)
+- **Quantization-Aware Training (QAT)**: `QATTrainer`, `QATConfig`, `fake_quantize`/`fake_quantize_mixed_bit`, `ActivationQuantizer`, per-tensor and per-channel schemes, `MixedBitQATTrainer` (`qat.rs`)
+
+### RLHF and Alignment (`rlhf` module)
+- **PPO**: `PPOTrainer`, `PPOConfig`, `PPOStepResult`, `PolicyModel`, `ValueModel` (`rlhf/ppo.rs`)
+- **DPO**: `DPOTrainer`, `DPOConfig`, `DPOLossType::{Sigmoid, Hinge, Ipo, Kto}` (`rlhf/dpo.rs`) — the `Sigmoid` and `Hinge` and `Ipo` variants each implement distinct loss formulas; **the `Kto` variant currently computes the identical formula as `Sigmoid`**, so "KTO" here is not yet a distinct prospect-theory-based loss. `get_batch_logps` also uses a simplified whole-sequence-mean approximation rather than a per-token indexed log-probability gather (noted in the source itself).
+- **Reward modeling**: `RewardModel`, `RewardModelConfig`, `RewardPrediction` (`rlhf/reward_model.rs`)
+- **Human feedback / preferences**: `HumanFeedback`, `PreferencePair`, `ConstitutionalPrinciple` (`rlhf/feedback.rs`, `rlhf/mod.rs`)
+
+### Few-Shot and Meta-Learning (`few_shot` module)
+- **MAML** / **Reptile**: `MAMLTrainer`+`MAMLConfig`, `ReptileTrainer`+`ReptileConfig` (`few_shot/meta_learning.rs`)
+- **In-context learning**: `InContextLearner`, `ICLExample` (`few_shot/in_context.rs`)
+- **Prompt tuning**: `PromptTuner`, `SoftPrompt` (`few_shot/prompt_tuning.rs`)
+- **Cross-task generalization / task adaptation**: `CrossTaskGeneralizer`, `TaskAdapter`, `TaskDescriptor` (`few_shot/cross_task.rs`, `few_shot/task_adaptation.rs`)
+
+### Continual Learning (`continual` module)
+- **EWC**: `EWCTrainer`, `EWCConfig`, `FisherInformation` (`continual/ewc.rs`)
+- **Progressive Neural Networks**: `ProgressiveNetwork`, `ProgressiveConfig` (`continual/progressive_networks.rs`)
+- **Replay**: `MemoryReplay`, `ExperienceBuffer` (`continual/memory_replay.rs`, `continual/replay_buffer.rs`)
+- **Task-boundary detection**: `TaskBoundaryDetector`, `TaskTransition` (`continual/task_boundary.rs`)
+
+### Curriculum Learning & Data Pipeline (`data_pipeline` module)
+- **Curriculum learning**: `CurriculumLearningManager`, `CurriculumStrategy`, `PacingFunction` — length/difficulty/self-paced style progressions
+- **Active learning**: `ActiveLearningManager`, `QueryStrategy`, `UncertaintyMeasure`
+- **Augmentation**: image/text/audio/token augmentation strategies with adaptive scheduling
+- **Multi-modal handling & validation**: `MultiModalHandler`, `DataValidator`, `StreamingDataset`
+
+### Hyperparameter Optimization (`hyperopt` and `hpo` modules)
+- **Search strategies**: `GridSearch`, `RandomSearch`, `BayesianOptimization` (with `GPSampler`/`TPESampler`), `Hyperband`/`SuccessiveHalving`, `PopulationBasedTraining` (PBT), `BanditOptimizer` (`hyperopt`)
+- **Multi-objective Pareto-front search** (`hpo::multi_objective`, newly mounted): `MultiObjectiveHpo`, `ParetoFront`, `compute_pareto_front`, `hypervolume_indicator`, `non_domination_sort` (NSGA-II-style); `hyperopt::efficiency`'s `EarlyStoppingStrategy::MultiObjective` remains available as a separate early-stopping/reward-composition mechanism
+- **Automatic learning-rate range tests** (`hpo::auto_lr`, newly mounted): `AutoLrSelector`, `LrRangeTest`
+- **Experiment management**: `ExperimentManager`, A/B testing (`ABTestConfig`/`ABTestResults`), data/model lineage and provenance (`experiment_management.rs`)
+- **External tracker integrations**: TensorBoard, W&B, Neptune, ClearML, MLflow trackers/configs (`framework_integration.rs`)
+
+### Other Production-Adjacent Modules
+- **Model versioning**: `ModelRegistry`, `ModelVersion`, `ModelVersioningManager` (`model_versioning.rs`)
+- **Online learning**: `OnlineLearningManager`, `ConceptDrift` detection (`online_learning.rs`)
+- **Cost tracking**: `CostTracker`, `Budget`, `CostForecastingModel` (`cost_tracking.rs`)
+- **Neural Architecture Search**: `NASController`, `NASAlgorithm`, `SearchSpaceConfig` (`nas_integration.rs`)
+
+## Feature Flags
+
+```toml
+[dependencies]
+trustformers-training = "0.2.2"
+```
+
+- `default = []` — no backend feature is enabled by default.
+- `full` — enables `trustformers-core/full` (used for full-feature testing).
+
+## API Overview
+
+Everything below is re-exported from the crate root (`trustformers_training::*`) unless a submodule path is shown; see `src/lib.rs` for the authoritative list of ~40 top-level modules.
+
+| Area | Key types | Module |
+|------|-----------|--------|
+| Training loop | `Trainer`, `TrainingArguments`, `TrainerCallback` | `trainer`, `training_args` |
+| Simple trainer | `SimpleTrainer`, `SimpleTrainerBuilder` | `simplified_trainer` |
+| Losses / metrics | `CrossEntropyLoss`, `MSELoss`, `Accuracy`, `F1Score`, `Perplexity` | `losses`, `metrics` |
+| Distributed | `DataParallelTrainer`, `DistributedBackend`, `ProcessGroup` | `distributed` |
+| Parallelism | `TensorParallelism`, `SequenceParallelism`, `Parallelism3D`, `ExpertParallelism`, `RingAttentionManager` | `tensor_parallelism`, `sequence_parallelism`, `parallelism_3d`, `expert_parallelism`, `ring_attention` |
+| Mixed precision / QAT | `AMPManager`, `MixedPrecisionConfig`, `QATTrainer`, `QATConfig` | `mixed_precision`, `qat` |
+| RLHF | `PPOTrainer`, `DPOTrainer`, `RewardModel` | `rlhf` |
+| Few-shot / meta-learning | `MAMLTrainer`, `ReptileTrainer`, `InContextLearner`, `PromptTuner` | `few_shot` |
+| Continual learning | `EWCTrainer`, `ProgressiveNetwork`, `MemoryReplay` | `continual` |
+| Hyperparameter search | `GridSearch`, `BayesianOptimization`, `Hyperband`, `PopulationBasedTraining`, `MultiObjectiveHpo`, `AutoLrSelector` | `hyperopt`, `hpo` |
+| Data pipeline | `DataPipeline`, `CurriculumLearningManager`, `ActiveLearningManager` | `data_pipeline` |
+| Stability / monitoring | `AdvancedStabilityMonitor`, `GradientRecoveryManager`, `TrainingMonitor` | `advanced_stability_monitor`, `gradient_anomaly_recovery`, `training_monitor` |
+
+## Quick Start
+
+This mirrors the doc-tested example in `src/lib.rs` (a minimal stand-in `Model` is used here in place of a real architecture from `trustformers-models`):
+
+```rust
+use trustformers_training::{Trainer, TrainingArguments, MSELoss};
+use trustformers_training::trainer::TaskType;
+use trustformers_optim::Adam;
+
+// Configure training (see `TrainingArguments` for the full set of options).
+let args = TrainingArguments::default();
+
+// Choose an optimizer (from trustformers-optim) and a loss function.
+let optimizer = Box::new(Adam::new(1e-4, (0.9, 0.999), 1e-8, 0.0));
+let loss_fn = Box::new(MSELoss::new());
+
+// Build the trainer; `trainer.train(..)` then runs the loop over your datasets.
+let trainer = Trainer::new(model, args, optimizer, loss_fn, TaskType::Classification)?;
+```
+
+### Distributed Training (simulated backend)
+
+```rust
+use trustformers_training::distributed::{
+    DataParallelTrainer, DistributedBackend, DistributedConfig, SimulatedProcessGroup,
+};
+use std::sync::Arc;
+
+// The simulated backend needs no real cluster, so this runs anywhere.
+// Swap in `DistributedBackend::NCCL`/`Gloo`/`MPI` for the corresponding process-group
+// type, keeping in mind that today those also perform in-process simulation of the
+// collective operations rather than real cross-process networking.
+let config = DistributedConfig {
+    world_size: 1,
+    rank: 0,
+    backend: DistributedBackend::Simulated,
+    master_addr: "localhost".to_string(),
+    master_port: 29500,
+    gradient_compression: false,
+    bucket_size_mb: 25,
+};
+
+let process_group = Arc::new(SimulatedProcessGroup::new(0, 1));
+let trainer = DataParallelTrainer::new(model, process_group, config)?;
+```
+
+### DPO (Direct Preference Optimization)
+
+```rust
+use trustformers_training::rlhf::{DPOConfig, DPOTrainer};
+
+let dpo_config = DPOConfig {
+    beta: 0.1,
+    ..Default::default()
+};
+
+// `ref_model: None` uses the reference-free variant; pass `Some(ref_model)` otherwise.
+let trainer = DPOTrainer::new(model, None, dpo_config);
+```
+
+## Architecture
+
+The real module layout (from `src/lib.rs`), grouped by area — this crate has ~40 top-level modules under `src/`, so only the largest/most relevant are shown:
+
+```
+trustformers-training/
+├── src/
+│   ├── trainer.rs, training_args.rs, simplified_trainer.rs   # Core training loop(s)
+│   ├── losses.rs, metrics.rs, gradient.rs
+│   ├── distributed.rs           # DataParallelTrainer + NCCL/Gloo/MPI/Simulated ProcessGroups
+│   ├── tensor_parallelism.rs, sequence_parallelism.rs
+│   ├── parallelism_3d.rs        # Combined data+tensor+pipeline, GPipe/PipeDream/1F1B scheduling
+│   ├── expert_parallelism.rs, ring_attention.rs, auto_parallelism/ (split from a single file this wave)
+│   ├── elastic_training.rs, multicloud.rs, resource_scheduling.rs
+│   ├── mixed_precision.rs, qat.rs
+│   ├── rlhf/                    # ppo.rs, dpo.rs, reward_model.rs, feedback.rs, config.rs, trainer.rs
+│   ├── few_shot/                # meta_learning.rs (MAML/Reptile), in_context.rs, prompt_tuning.rs, ...
+│   ├── continual/                # ewc.rs, progressive_networks.rs, memory_replay.rs, task_boundary.rs
+│   ├── hyperopt/                 # tuner.rs, sampler.rs, strategies.rs, surrogate_models.rs, ...
+│   ├── hpo/                      # multi_objective.rs (NSGA-II Pareto front), auto_lr.rs (AutoLrSelector/LrRangeTest)
+│   ├── data_pipeline/            # Curriculum, active learning, augmentation, multi-modal, validation (split from a single data_pipeline.rs this wave)
+│   ├── experiment_management.rs, framework_integration.rs   # A/B testing, W&B/MLflow/ClearML/Neptune/TensorBoard
+│   ├── advanced_stability_monitor.rs, gradient_anomaly_recovery.rs
+│   ├── adaptive_gradient_scaling.rs, adaptive_learning_rate.rs
+│   ├── training_dynamics.rs, training_monitor.rs, training_orchestration.rs
+│   ├── config_validation.rs, error_codes.rs, error_handling.rs
+│   ├── model_versioning.rs, online_learning.rs, cost_tracking.rs, nas_integration.rs
+│   └── lib.rs
+```
+
+## Testing
+
+- **~1,010 tests** as of 2026-07-01, not independently re-run this pass — see the workspace root `README.md`/`TODO.md` for the current baseline (21,370 passed / 41 skipped / 0 failed workspace-wide, default features, 2026-08-26)
+- Covers the training loop, distributed abstractions, mixed precision/QAT, RLHF (PPO/DPO), few-shot/continual learning, hyperparameter search (incl. `hpo`'s multi-objective Pareto-front search and auto-LR range tests), data pipeline, and the stability/monitoring stack
+- `examples/` contains illustrative programs, but at least one (`examples/basic_training/simple_classification.rs`) references types (`TrainerConfig`, `TrainingArgs`, `MetricResult`) that no longer match the current public API — see `TODO.md`
+
+## Verification Notes
+
+While documenting this crate we found a meaningful amount of code under `src/` that exists on disk but is **not** referenced by any `mod` declaration in `lib.rs`, and is therefore not compiled into the crate: 20 top-level directories (`dpo/`, `ppo/`, `kto/`, `lora/`, `ewc/`, `curriculum/`, `orpo/`, `simpo/`, `ipo/`, `spin/`, `grpo/`, `raft/`, `reinforce/`, `distillation/`, `model_merging/`, `constitutional_ai/`, `contrastive_search/`, `token_dpo/`, `online_dpo/`, `reward_modeling/`) plus 5 top-level files (`async_checkpoint.rs`, `distributed_overlap.rs`, `losses_tests.rs`, `metrics_tests.rs`, `training_args_tests.rs`) — roughly 25,110 lines across 29 files (verified via `tokei`, 2026-07-09). Their functionality generally overlaps with (and appears superseded by) modules that *are* wired in, e.g. `rlhf::ppo`/`rlhf::dpo` vs. the orphaned top-level `ppo/`/`dpo/`, or `data_pipeline`'s curriculum types vs. the orphaned top-level `curriculum/`. (The `hpo/` directory, previously in this orphaned list, was mounted via `pub mod hpo;` in the 0.2.0 release and is no longer orphaned; the orphaned root-level `mod.rs` was deleted the same release rather than wired in, since everything it declared already existed, more completely, in `lib.rs`.) The public-API-count and test-coverage statistics in this README describe only the reachable, compiled tree (72 files as of 2026-07-09; higher today after this wave's `data_pipeline.rs`/`auto_parallelism.rs` splits, not recounted). The one exception is the whole-crate 83,319 SLoC figure at the top, which is a fresh 2026-08-24 `tokei` total across all of `src/` including the orphaned code described in this section — it is not the "reachable only" figure the older 58,207 number was. See `TODO.md` for details.
+
+## License
+
+Apache-2.0

@@ -1,0 +1,165 @@
+// Enhanced Gaussian blur kernel for GPU execution
+// This kernel can be compiled for CUDA, OpenCL, or Metal
+// Optimized with shared memory and boundary handling options
+
+#define MAX_RADIUS 16
+#define BLOCK_SIZE_X 16
+#define BLOCK_SIZE_Y 16
+#define TILE_SIZE_X (BLOCK_SIZE_X + 2 * MAX_RADIUS)
+#define TILE_SIZE_Y (BLOCK_SIZE_Y + 2 * MAX_RADIUS)
+
+__kernel void gaussian_blur_2d(
+    __global const float* input,
+    __global float* output,
+    const float sigma_x,
+    const float sigma_y,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    // Calculate kernel radius based on sigma (clamped to MAX_RADIUS)
+    int radius_x = min((int)(3.0f * sigma_x), MAX_RADIUS);
+    int radius_y = min((int)(3.0f * sigma_y), MAX_RADIUS);
+    
+    float sum = 0.0f;
+    float weight_sum = 0.0f;
+    
+    // Precompute sigma reciprocals for optimization
+    float sigma_x_inv_sq = 1.0f / (sigma_x * sigma_x);
+    float sigma_y_inv_sq = 1.0f / (sigma_y * sigma_y);
+    
+    // Apply Gaussian filter
+    for (int dy = -radius_y; dy <= radius_y; dy++) {
+        for (int dx = -radius_x; dx <= radius_x; dx++) {
+            // Clamp to image boundaries
+            int px = clamp(x + dx, 0, width - 1);
+            int py = clamp(y + dy, 0, height - 1);
+            
+            // Calculate Gaussian weight with optimized computation
+            float dist_sq = (dx * dx) * sigma_x_inv_sq + (dy * dy) * sigma_y_inv_sq;
+            float weight = exp(-0.5f * dist_sq);
+            
+            // Accumulate weighted sum
+            sum += input[py * width + px] * weight;
+            weight_sum += weight;
+        }
+    }
+    
+    // Normalize and write output
+    output[y * width + x] = sum / weight_sum;
+}
+
+// Optimized separable Gaussian blur kernel
+__kernel void gaussian_blur_separable_horizontal(
+    __global const float* input,
+    __global float* output,
+    __global const float* weights,
+    const int radius,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float sum = 0.0f;
+    
+    // Horizontal convolution
+    for (int dx = -radius; dx <= radius; dx++) {
+        int px = clamp(x + dx, 0, width - 1);
+        sum += input[y * width + px] * weights[dx + radius];
+    }
+    
+    output[y * width + x] = sum;
+}
+
+__kernel void gaussian_blur_separable_vertical(
+    __global const float* input,
+    __global float* output,
+    __global const float* weights,
+    const int radius,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float sum = 0.0f;
+    
+    // Vertical convolution
+    for (int dy = -radius; dy <= radius; dy++) {
+        int py = clamp(y + dy, 0, height - 1);
+        sum += input[py * width + x] * weights[dy + radius];
+    }
+    
+    output[y * width + x] = sum;
+}
+
+// Shared memory optimized version for large kernels
+__kernel void gaussian_blur_2d_shared(
+    __global const float* input,
+    __global float* output,
+    const float sigma_x,
+    const float sigma_y,
+    const int height,
+    const int width
+) {
+    __local float tile[TILE_SIZE_Y][TILE_SIZE_X];
+    
+    int local_x = get_local_id(0);
+    int local_y = get_local_id(1);
+    int group_x = get_group_id(0);
+    int group_y = get_group_id(1);
+    
+    int global_x = group_x * BLOCK_SIZE_X + local_x;
+    int global_y = group_y * BLOCK_SIZE_Y + local_y;
+    
+    int radius_x = min((int)(3.0f * sigma_x), MAX_RADIUS);
+    int radius_y = min((int)(3.0f * sigma_y), MAX_RADIUS);
+    
+    // Load data into shared memory with halo
+    for (int ty = local_y; ty < TILE_SIZE_Y; ty += BLOCK_SIZE_Y) {
+        for (int tx = local_x; tx < TILE_SIZE_X; tx += BLOCK_SIZE_X) {
+            int src_x = group_x * BLOCK_SIZE_X + tx - radius_x;
+            int src_y = group_y * BLOCK_SIZE_Y + ty - radius_y;
+            
+            src_x = clamp(src_x, 0, width - 1);
+            src_y = clamp(src_y, 0, height - 1);
+            
+            tile[ty][tx] = input[src_y * width + src_x];
+        }
+    }
+    
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    if (global_x >= width || global_y >= height) return;
+    
+    float sum = 0.0f;
+    float weight_sum = 0.0f;
+    
+    float sigma_x_inv_sq = 1.0f / (sigma_x * sigma_x);
+    float sigma_y_inv_sq = 1.0f / (sigma_y * sigma_y);
+    
+    int tile_center_x = local_x + radius_x;
+    int tile_center_y = local_y + radius_y;
+    
+    // Apply Gaussian filter using shared memory
+    for (int dy = -radius_y; dy <= radius_y; dy++) {
+        for (int dx = -radius_x; dx <= radius_x; dx++) {
+            float dist_sq = (dx * dx) * sigma_x_inv_sq + (dy * dy) * sigma_y_inv_sq;
+            float weight = exp(-0.5f * dist_sq);
+            
+            sum += tile[tile_center_y + dy][tile_center_x + dx] * weight;
+            weight_sum += weight;
+        }
+    }
+    
+    output[global_y * width + global_x] = sum / weight_sum;
+}

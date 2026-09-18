@@ -1,0 +1,514 @@
+//! Convert command implementation.
+
+use crate::commands::create::{CompressionLevel, OutputFormat};
+use crate::style::Styler;
+use crate::utils::{ExtractedEntry, create_file, open_file, write_file};
+use oxiarc_archive::{
+    ArchiveFormat, BrotliReader, BrotliWriter, Bzip2Reader, Bzip2Writer, CabReader, Lz4Reader,
+    Lz4Writer, LzhCompressionLevel, LzhWriter, SevenZReader, SnappyReader, SnappyWriter, TarWriter,
+    XzWriter, ZipCompressionLevel, ZipReader, ZipWriter, ZstdReader, ZstdWriter,
+};
+use std::io::{BufReader, BufWriter, Seek, SeekFrom};
+use std::path::Path;
+
+pub fn cmd_convert(
+    input: &Path,
+    output: &Path,
+    format: Option<OutputFormat>,
+    compression: CompressionLevel,
+    verbose: bool,
+    quiet: bool,
+    styler: &Styler,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse to clobber an existing output. `convert` used to silently truncate
+    // whatever the destination already held; failing loudly avoids destroying
+    // an unrelated file when the output path is mistyped or already populated.
+    if output.exists() {
+        return Err(format!(
+            "output already exists: {} (remove it first to convert)",
+            output.display()
+        )
+        .into());
+    }
+
+    // Detect input format
+    let file = open_file(input)?;
+    let mut reader = BufReader::new(file);
+    // `detect_with_path` adds a filename-extension fallback for the magic-less
+    // formats (raw Brotli `.br`, raw Snappy `.sz`), which plain `detect` can
+    // only ever report as Unknown.
+    let (input_format, _) = ArchiveFormat::detect_with_path(&mut reader, input)?;
+    reader.seek(SeekFrom::Start(0))?;
+
+    // Determine output format — refuse extensions we cannot write (e.g. .7z)
+    // instead of silently emitting a different format under that name.
+    let output_format = match format {
+        Some(f) => f,
+        None => crate::commands::create::output_format_from_extension(&output.to_string_lossy())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    };
+
+    if !quiet {
+        println!(
+            "Converting {} ({}) to {} ({:?})",
+            input.display(),
+            input_format,
+            output.display(),
+            output_format
+        );
+    }
+
+    // Extract all entries from input archive
+    let entries = extract_all_entries(&mut reader, input_format, input)?;
+
+    if verbose && !quiet {
+        println!("  Found {} entries", entries.len());
+    }
+
+    // Write to output archive
+    match output_format {
+        OutputFormat::Zip => {
+            let file = create_file(output)?;
+            let writer = BufWriter::new(file);
+            let mut zip = ZipWriter::new(writer);
+
+            let level = match compression {
+                CompressionLevel::Store => ZipCompressionLevel::Store,
+                CompressionLevel::Fast => ZipCompressionLevel::Fast,
+                CompressionLevel::Normal => ZipCompressionLevel::Normal,
+                CompressionLevel::Best => ZipCompressionLevel::Best,
+            };
+            zip.set_compression(level);
+
+            for (name, is_dir, data) in &entries {
+                if *is_dir {
+                    zip.add_directory(name)?;
+                    if verbose && !quiet {
+                        println!("  Added: {}/", name);
+                    }
+                } else {
+                    zip.add_file(name, data)?;
+                    if verbose && !quiet {
+                        println!("  Added: {} ({} bytes)", name, data.len());
+                    }
+                }
+            }
+
+            zip.finish()?;
+        }
+        OutputFormat::Tar => {
+            let file = create_file(output)?;
+            let writer = BufWriter::new(file);
+            let mut tar = TarWriter::new(writer);
+
+            for (name, is_dir, data) in &entries {
+                if *is_dir {
+                    tar.add_directory(name)?;
+                    if verbose && !quiet {
+                        println!("  Added: {}/", name);
+                    }
+                } else {
+                    tar.add_file(name, data)?;
+                    if verbose && !quiet {
+                        println!("  Added: {} ({} bytes)", name, data.len());
+                    }
+                }
+            }
+
+            tar.finish()?;
+        }
+        OutputFormat::Lzh => {
+            let file = create_file(output)?;
+            let writer = BufWriter::new(file);
+            let mut lzh = LzhWriter::new(writer);
+
+            let level = match compression {
+                CompressionLevel::Store => LzhCompressionLevel::Store,
+                _ => LzhCompressionLevel::Lh5,
+            };
+            lzh.set_compression(level);
+
+            for (name, is_dir, data) in &entries {
+                if *is_dir {
+                    lzh.add_directory(name)?;
+                    if verbose && !quiet {
+                        println!("  Added: {}/", name);
+                    }
+                } else {
+                    lzh.add_file(name, data)?;
+                    if verbose && !quiet {
+                        println!("  Added: {} ({} bytes)", name, data.len());
+                    }
+                }
+            }
+
+            lzh.finish()?;
+        }
+        OutputFormat::Gzip => {
+            // GZIP can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "GZIP can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let level = match compression {
+                CompressionLevel::Store => 0,
+                CompressionLevel::Fast => 1,
+                CompressionLevel::Normal => 6,
+                CompressionLevel::Best => 9,
+            };
+
+            let compressed = oxiarc_archive::gzip::compress_with_filename(data, name, level)?;
+            write_file(output, &compressed)?;
+
+            if verbose && !quiet {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
+        OutputFormat::Xz => {
+            // XZ can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "XZ can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let level = match compression {
+                CompressionLevel::Store => 0,
+                CompressionLevel::Fast => 1,
+                CompressionLevel::Normal => 6,
+                CompressionLevel::Best => 9,
+            };
+
+            let xz_writer = XzWriter::new(oxiarc_lzma::LzmaLevel::new(level));
+            let compressed = xz_writer.compress(data)?;
+            write_file(output, &compressed)?;
+
+            if verbose && !quiet {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
+        OutputFormat::Lz4 => {
+            // LZ4 can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "LZ4 can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let mut compressed = Vec::new();
+            let mut lz4_writer = Lz4Writer::new(&mut compressed);
+            lz4_writer.write_compressed(data)?;
+            write_file(output, &compressed)?;
+
+            if verbose && !quiet {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
+        OutputFormat::Bz2 => {
+            // Bzip2 can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "Bzip2 can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let level = match compression {
+                CompressionLevel::Store => 1,
+                CompressionLevel::Fast => 1,
+                CompressionLevel::Normal => 6,
+                CompressionLevel::Best => 9,
+            };
+
+            let bzip2_writer = Bzip2Writer::with_level(level);
+            let compressed = bzip2_writer.compress(data)?;
+            write_file(output, &compressed)?;
+
+            if verbose && !quiet {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
+        OutputFormat::Zst => {
+            // Zstandard can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "Zstandard can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let zstd_writer = ZstdWriter::new();
+            let compressed = zstd_writer.compress(data)?;
+            write_file(output, &compressed)?;
+
+            if verbose && !quiet {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
+        OutputFormat::Br => {
+            // Brotli can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "Brotli can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let quality = match compression {
+                CompressionLevel::Store => 0,
+                CompressionLevel::Fast => 1,
+                CompressionLevel::Normal => 6,
+                CompressionLevel::Best => 11,
+            };
+
+            let brotli_writer = BrotliWriter::with_quality(quality);
+            let compressed = brotli_writer.compress(data)?;
+            write_file(output, &compressed)?;
+
+            if verbose && !quiet {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
+        OutputFormat::Snappy => {
+            // Snappy can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "Snappy can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let snappy_writer = SnappyWriter::new();
+            let compressed = snappy_writer.compress(data)?;
+            write_file(output, &compressed)?;
+
+            if verbose && !quiet {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
+    }
+
+    if !quiet {
+        println!("{}", styler.success("Conversion complete"));
+    }
+    Ok(())
+}
+
+/// Extract all entries from an archive into memory.
+fn extract_all_entries<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    format: ArchiveFormat,
+    input_path: &Path,
+) -> Result<Vec<ExtractedEntry>, Box<dyn std::error::Error>> {
+    let mut entries = Vec::new();
+
+    match format {
+        ArchiveFormat::Zip => {
+            let mut zip = ZipReader::new(reader)?;
+            for entry in zip.entries().to_vec() {
+                let is_dir = entry.is_dir();
+                let name = entry.name.clone();
+                let data = if is_dir {
+                    Vec::new()
+                } else {
+                    zip.extract(&entry)?
+                };
+                entries.push((name, is_dir, data));
+            }
+        }
+        ArchiveFormat::Tar => {
+            let mut tar = oxiarc_archive::TarReader::new(reader)?;
+            for entry in tar.entries().to_vec() {
+                let is_dir = entry.is_dir();
+                let name = entry.name.clone();
+                let data = if is_dir {
+                    Vec::new()
+                } else {
+                    tar.extract_to_vec(&entry)?
+                };
+                entries.push((name, is_dir, data));
+            }
+        }
+        ArchiveFormat::Lzh => {
+            let mut lzh = oxiarc_archive::LzhReader::new(reader)?;
+            for entry in lzh.entries().to_vec() {
+                let is_dir = entry.is_dir();
+                let name = entry.name.clone();
+                let data = if is_dir {
+                    Vec::new()
+                } else {
+                    lzh.extract_to_vec(&entry)?
+                };
+                entries.push((name, is_dir, data));
+            }
+        }
+        ArchiveFormat::Gzip => {
+            let mut gzip = oxiarc_archive::GzipReader::new(reader)?;
+            let data = gzip.decompress()?;
+
+            // Use original filename if available, otherwise use input filename without .gz
+            let name = gzip.header().filename.clone().unwrap_or_else(|| {
+                input_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::Xz => {
+            let data = oxiarc_archive::xz::decompress(reader)?;
+
+            // Use input filename without .xz extension
+            let name = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::Lz4 => {
+            let mut lz4 = Lz4Reader::new(reader)?;
+            let data = lz4.decompress()?;
+
+            // Use input filename without .lz4 extension
+            let name = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::Zstd => {
+            let mut zstd = ZstdReader::new(reader)?;
+            let data = zstd.decompress()?;
+
+            // Use input filename without .zst extension
+            let name = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::Bzip2 => {
+            let mut bzip2 = Bzip2Reader::new(reader)?;
+            let data = bzip2.decompress()?;
+
+            // Use input filename without .bz2 extension
+            let name = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::Brotli => {
+            let mut brotli = BrotliReader::new(reader)?;
+            let data = brotli.decompress()?;
+
+            // Use input filename without .br extension
+            let name = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::Snappy => {
+            let mut snappy = SnappyReader::new(reader)?;
+            let data = snappy.decompress()?;
+
+            // Use input filename without .sz extension
+            let name = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::SevenZip => {
+            let mut sevenz = SevenZReader::new(reader)?;
+            let sevenz_entries: Vec<_> = sevenz.sevenz_entries().to_vec();
+
+            for (i, entry) in sevenz_entries.iter().enumerate() {
+                let is_dir = entry.is_dir;
+                let name = entry.name.clone();
+                let data = if is_dir {
+                    Vec::new()
+                } else {
+                    sevenz.extract(i)?
+                };
+                entries.push((name, is_dir, data));
+            }
+        }
+        ArchiveFormat::Cab => {
+            let mut cab = CabReader::new(reader)?;
+            let cab_entries: Vec<_> = cab.entries().to_vec();
+
+            for entry in &cab_entries {
+                let is_dir = entry.is_dir();
+                let name = entry.name.clone();
+                let data = if is_dir {
+                    Vec::new()
+                } else {
+                    cab.extract(entry)?
+                };
+                entries.push((name, is_dir, data));
+            }
+        }
+        _ => {
+            let hint = crate::utils::image_format_hint(reader);
+            return Err(format!("Cannot read entries from {} format{hint}", format).into());
+        }
+    }
+
+    Ok(entries)
+}

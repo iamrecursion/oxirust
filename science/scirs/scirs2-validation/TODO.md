@@ -1,0 +1,55 @@
+# scirs2-validation TODO
+
+## Status: v0.6.3 (2026-07-27)
+
+No scirs2-validation-specific changes shipped in 0.6.3; all content below (verified as of 2026-07-22) remains accurate.
+
+## Purpose
+
+Shared statistical validation framework providing pre-computed analytical reference values, generic validation traits, property-test helpers, and report generation. Designed to be consumed by any COOLJAPAN ecosystem crate without introducing circular dependencies.
+
+## Completed
+
+### Reference Distributions (15+)
+- [x] Normal (0,1) and (2,3)
+- [x] Exponential (rate=1)
+- [x] Uniform (0,1)
+- [x] Beta (2,5)
+- [x] Gamma (2,1)
+- [x] Chi-squared (df=4)
+- [x] Student's t (df=5)
+- [x] Cauchy (0,1)
+- [x] Poisson (lambda=3)
+- [x] Binomial (10, 0.3)
+- [x] Weibull (k=2, scale=1)
+- [x] Log-normal (0,1)
+- [x] Laplace (0,1)
+- [x] Pareto (alpha=1, scale=2)
+
+### Validation Functions
+- [x] `validate_distribution` — PDF/CDF/PPF/moment comparison vs `DistributionReference`
+- [x] `validate_pdf_integral` — trapezoidal rule integration check
+- [x] `validate_cdf_monotone` — non-decreasing CDF verification
+- [x] `validate_ppf_roundtrip` — `cdf(ppf(p)) ≈ p` check
+- [x] `validate_cdf_bounds` — tail behaviour verification
+- [x] `validate_pdf_nonnegative` — non-negativity check
+
+### Reporting
+- [x] ASCII tabular report via `generate_report`
+- [x] JSON report via `generate_json_report` (no serde required for default)
+- [x] `ValidationReport` aggregator with pass/fail summary
+- [x] Optional `serialization` feature for richer serde-based output
+
+## v0.6.1 Quality Gate (verified 2026-07-15)
+
+- 25 `#[test]` functions (all passing) + 1 passing doctest, covering the full distribution validation suite
+- `todo!()`/`unimplemented!()` count: 0
+- cargo check + clippy: clean
+- Pure Rust (no C/Fortran deps); core has zero non-stdlib runtime dependencies (serde optional)
+
+## Notes
+
+- Crate is `publish = false` — designed for internal use by the SciRS2 ecosystem.
+- All reference values are derived analytically and verifiable by hand (no external numerical tools).
+- Wave 8 distribution accuracy fixes (Beta CDF Lentz fraction, F-dist via regularized beta, ChiSquare even-df Poisson sum, Normal PPF Acklam, Pareto PDF strict boundary) were validated through this framework during their development.
+- **Known gap**: despite being designed as the shared reference-value source for `scirs2-stats`, `scirs2-stability-tests`, and sibling ecosystem crates, as of v0.6.3 no other workspace crate (and no other `~/work/*` COOLJAPAN project) actually depends on `scirs2-validation` — a workspace-wide search (re-verified 2026-07-22) still finds zero `scirs2-validation` Cargo dependencies and zero `scirs2_validation::` imports outside this crate itself. The earlier claim in this file that the suite was "consumed by `scirs2-stability-tests` and downstream crates" was not accurate and has been removed. Wiring this framework into an actual consumer (most naturally `scirs2-stats`'s own test suite) remains open future work.

@@ -1,0 +1,37 @@
+[package]
+name = "oximedia-caption-gen"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Advanced caption and subtitle generation — speech alignment, line breaking, WCAG compliance, and speaker diarization for OxiMedia"
+readme = "README.md"
+keywords = ["captions", "subtitles", "accessibility", "speech-to-text", "multimedia"]
+categories = ["multimedia::video", "text-processing"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+## Opt-in ML-assisted caption encoding via the Pure-Rust `oximedia-ml`
+## pipeline. Enabling `onnx` pulls in `oximedia-ml` with its `onnx`
+## feature so callers can load a caption encoder ONNX model and obtain
+## logits for downstream decoding. Default builds remain free of ONNX
+## symbols.
+onnx = [
+    "dep:oximedia-ml",
+    "oximedia-ml/onnx",
+]
+## Enable CUDA dispatch for the ML-assisted caption encoder.
+cuda = ["onnx", "oximedia-ml/cuda"]
+
+[dependencies]
+thiserror.workspace = true
+oximedia-ml = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true

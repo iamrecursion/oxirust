@@ -1,0 +1,64 @@
+[package]
+name = "oxiquic-transport-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxiquic-transport = { path = ".." }
+oxiquic-crypto = { path = "../../oxiquic-crypto" }
+# Mirrors the workspace root's `rustls` entry exactly (version range AND
+# feature set) rather than pinning a specific patch release. This is a
+# separate, detached Cargo workspace (see `[workspace]` below) with its own
+# lockfile, and per the root `.gitignore` ("Library workspace: Cargo.lock is
+# not committed") *neither* lockfile ships -- so on every fresh checkout both
+# workspaces independently re-resolve "0.23" to whatever the newest matching
+# release is at that time. An exact pin here would drift the moment a newer
+# 0.23.x lands and only this checkout's stale lockfile happened to predate
+# it. Because these fuzz targets pass `rustls::quic::{PacketKey,
+# HeaderProtectionKey}` trait objects across the crate boundary into
+# `oxiquic-transport`, the two sides must resolve to the *same* version, so
+# keep this identical (range and features) to the root `Cargo.toml`'s entry.
+#
+# `default-features = false`: rustls's default features pull in the
+# `aws-lc-rs` crypto provider (and its C dependency `aws-lc-sys`), which this
+# fuzz target has no use for (it only needs `rustls::quic::{Keys, Version}` /
+# `Side`) and which the rest of this workspace goes out of its way to avoid.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+
+[[bin]]
+name = "peek_dcid"
+path = "fuzz_targets/peek_dcid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet_decode"
+path = "fuzz_targets/packet_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Detached workspace: this directory is intentionally NOT a member of the
+# main oxiquic workspace (also listed in its root `Cargo.toml` `exclude`).
+# cargo-fuzz needs nightly + sanitizer flags that must not leak into the
+# main workspace's stable-toolchain `cargo build`/`cargo check`, and this
+# crate's own dependency set (libfuzzer-sys, a pinned exact rustls) should
+# not perturb the main workspace's Cargo.lock.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1

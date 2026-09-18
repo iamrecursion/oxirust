@@ -1,0 +1,38 @@
+[package]
+name = "oximedia-proxy"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Proxy and offline editing workflow system for OxiMedia"
+keywords = ["proxy", "offline", "editing", "video", "multimedia"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-transcode = { workspace = true }
+oximedia-edl = { workspace = true }
+oximedia-timecode = { workspace = true }
+oximedia-metadata = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+num_cpus = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+oximedia-container = { path = "../oximedia-container" }
+oximedia-io = { path = "../oximedia-io" }
+bytes = { workspace = true }

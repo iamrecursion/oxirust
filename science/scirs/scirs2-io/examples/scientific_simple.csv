@@ -1,0 +1,25 @@
+# Title: Sample Scientific Experiment Data
+# Author: SciRS2 Team
+# Date: 2025-04-10
+# Description: Temperature measurements across different materials
+# Units:
+#   Time: seconds (s)
+#   Temperature: Celsius (°C)
+#   Pressure: kilopascals (kPa)
+# Experiment ID: EXP-20250410-001
+Time,Temperature,Pressure,Material
+0.0,25.0,101.3,"Aluminum"
+0.5,26.2,101.4,"Aluminum"
+1.0,27.5,101.6,"Aluminum"
+1.5,28.7,101.7,"Aluminum"
+2.0,30.0,101.9,"Aluminum"
+0.0,25.0,101.3,"Copper"
+0.5,28.1,101.4,"Copper"
+1.0,32.5,101.6,"Copper"
+1.5,36.7,101.7,"Copper"
+2.0,40.0,101.9,"Copper"
+0.0,25.0,101.3,"Glass"
+0.5,25.3,101.4,"Glass"
+1.0,25.8,101.6,"Glass"
+1.5,26.2,101.7,"Glass"
+2.0,26.5,101.9,"Glass"

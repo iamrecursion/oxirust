@@ -1,0 +1,35 @@
+[package]
+name = "oxifont-adapter-pure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust FontDatabase adapter for OxiFont (composes discovery + parser)"
+keywords = ["font", "database", "discovery"]
+categories = ["text-processing"]
+
+[dependencies]
+oxifont-core      = { workspace = true }
+oxifont-parser    = { workspace = true }
+oxifont-discovery = { workspace = true }
+serde             = { workspace = true, optional = true }
+serde_json        = { workspace = true, optional = true }
+oxifont-db        = { workspace = true, optional = true }
+oxifont-subset    = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion    = { workspace = true }
+oxifont-db   = { path = "../oxifont-db" }
+oxifont-subset = { path = "../oxifont-subset" }
+
+[features]
+default = []
+cache   = ["dep:serde", "dep:serde_json", "oxifont-core/serde"]
+db      = ["dep:oxifont-db"]
+subset  = ["dep:oxifont-subset"]
+
+[[bench]]
+name = "font_database_find"
+harness = false

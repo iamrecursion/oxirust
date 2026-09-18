@@ -1,0 +1,850 @@
+//! Integration tests for streaming LZH decompression.
+//!
+//! These tests verify the streaming decoder works correctly with various
+//! input patterns and chunk sizes.
+
+use oxiarc_core::traits::{DecompressStatus, Decompressor};
+use oxiarc_lzhuf::{
+    DecoderPhase, LzhMethod, StreamingBitReader, StreamingLzhDecoder, create_streaming_decoder,
+    decode_lzh, decode_lzh_streaming,
+};
+
+// ============================================================================
+// Basic Functionality Tests
+// ============================================================================
+
+#[test]
+fn test_streaming_decoder_stored_full_buffer() {
+    let data = b"Hello, World! This is a test of the streaming LZH decoder.";
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh0, data.len() as u64);
+    let mut output = vec![0u8; data.len()];
+
+    let (consumed, produced, status) = decoder
+        .decompress(data, &mut output)
+        .expect("Decompress failed");
+
+    assert_eq!(consumed, data.len());
+    assert_eq!(produced, data.len());
+    assert_eq!(status, DecompressStatus::Done);
+    assert_eq!(&output, data);
+    assert!(decoder.is_finished());
+}
+
+#[test]
+fn test_streaming_decoder_stored_small_input_chunks() {
+    let data = b"The quick brown fox jumps over the lazy dog.";
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh0, data.len() as u64);
+    let mut output = Vec::new();
+    let mut input_pos = 0;
+
+    // Process with very small input chunks (3 bytes)
+    while input_pos < data.len() {
+        let chunk_end = (input_pos + 3).min(data.len());
+        let input_chunk = &data[input_pos..chunk_end];
+        let mut chunk_output = vec![0u8; 10];
+
+        let (consumed, produced, status) = decoder
+            .decompress(input_chunk, &mut chunk_output)
+            .expect("Decompress failed");
+
+        input_pos += consumed;
+        output.extend_from_slice(&chunk_output[..produced]);
+
+        if status == DecompressStatus::Done {
+            break;
+        }
+    }
+
+    assert_eq!(output, data);
+    assert!(decoder.is_finished());
+}
+
+#[test]
+fn test_streaming_decoder_stored_small_output_buffer() {
+    let data = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit.";
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh0, data.len() as u64);
+    let mut output = Vec::new();
+    let mut input_pos = 0;
+
+    // Process with small output buffer (5 bytes)
+    loop {
+        let mut chunk_output = vec![0u8; 5];
+        let input_slice = &data[input_pos..];
+
+        let (consumed, produced, status) = decoder
+            .decompress(input_slice, &mut chunk_output)
+            .expect("Decompress failed");
+
+        input_pos += consumed;
+        output.extend_from_slice(&chunk_output[..produced]);
+
+        match status {
+            DecompressStatus::Done => break,
+            DecompressStatus::NeedsInput if input_pos >= data.len() => break,
+            DecompressStatus::NeedsOutput => {
+                // Continue with more output space
+            }
+            DecompressStatus::BlockEnd => {}
+            // `DecompressStatus` is `#[non_exhaustive]`; a future variant is
+            // treated as a no-op continuation of the decode loop.
+            _ => {}
+        }
+    }
+
+    assert_eq!(output, data);
+}
+
+#[test]
+fn test_streaming_decoder_stored_single_byte_chunks() {
+    let data = b"Single byte test";
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh0, data.len() as u64);
+    let mut output = Vec::new();
+
+    // Process one byte at a time
+    for byte in data.iter() {
+        let input = [*byte];
+        let mut chunk_output = vec![0u8; 1];
+
+        let (consumed, produced, status) = decoder
+            .decompress(&input, &mut chunk_output)
+            .expect("Decompress failed");
+
+        assert_eq!(consumed, 1);
+        assert_eq!(produced, 1);
+        output.push(chunk_output[0]);
+
+        if status == DecompressStatus::Done {
+            break;
+        }
+    }
+
+    assert_eq!(output, data);
+}
+
+// ============================================================================
+// Convenience Function Tests
+// ============================================================================
+
+#[test]
+fn test_decode_lzh_streaming_stored() {
+    let data = b"Convenience function test data with some extra content.";
+    let result =
+        decode_lzh_streaming(data, LzhMethod::Lh0, data.len() as u64).expect("Decode failed");
+    assert_eq!(result, data);
+}
+
+#[test]
+fn test_create_streaming_decoder() {
+    let decoder = create_streaming_decoder(LzhMethod::Lh5, 1000);
+    assert_eq!(decoder.uncompressed_size(), 1000);
+    assert_eq!(decoder.bytes_decoded(), 0);
+    assert!(!decoder.is_finished());
+    assert_eq!(decoder.phase(), DecoderPhase::ReadBlockSize);
+}
+
+#[test]
+fn test_create_streaming_decoder_stored() {
+    let decoder = create_streaming_decoder(LzhMethod::Lh0, 500);
+    assert_eq!(decoder.uncompressed_size(), 500);
+    assert_eq!(decoder.phase(), DecoderPhase::DecodeBlock);
+}
+
+// ============================================================================
+// Bit Reader Tests
+// ============================================================================
+
+#[test]
+fn test_streaming_bit_reader_multiple_reads() {
+    let data = [0xFF, 0x00, 0xAA, 0x55];
+    let mut reader = StreamingBitReader::new();
+
+    // Read 8 bits (0xFF)
+    assert_eq!(reader.read_bits(&data, 8), Some(0xFF));
+
+    // Read 8 bits (0x00)
+    assert_eq!(reader.read_bits(&data, 8), Some(0x00));
+
+    // Read 4 bits (low nibble of 0xAA = 0xA)
+    assert_eq!(reader.read_bits(&data, 4), Some(0xA));
+
+    // Read 4 bits (high nibble of 0xAA = 0xA)
+    assert_eq!(reader.read_bits(&data, 4), Some(0xA));
+
+    // Read 8 bits (0x55)
+    assert_eq!(reader.read_bits(&data, 8), Some(0x55));
+
+    assert_eq!(reader.bytes_consumed(), 4);
+}
+
+#[test]
+fn test_streaming_bit_reader_peek_without_consume() {
+    let data = [0xAB]; // 0xAB == 1010_1011; MSB-first the high nibble (0xA) is first.
+    let mut reader = StreamingBitReader::new();
+
+    // Peek at 4 bits (high nibble)
+    assert_eq!(reader.peek_bits(&data, 4), Some(0xA));
+
+    // Peek again - should be the same
+    assert_eq!(reader.peek_bits(&data, 4), Some(0xA));
+
+    // Now read - should consume
+    assert_eq!(reader.read_bits(&data, 4), Some(0xA));
+
+    // Peek next 4 bits (low nibble)
+    assert_eq!(reader.peek_bits(&data, 4), Some(0xB));
+}
+
+#[test]
+fn test_streaming_bit_reader_read_single_bits() {
+    let data = [0b10101010]; // 0xAA
+    let mut reader = StreamingBitReader::new();
+
+    // Read MSB first: 1, 0, 1, 0, 1, 0, 1, 0
+    assert_eq!(reader.read_bit(&data), Some(true)); // bit 7 = 1
+    assert_eq!(reader.read_bit(&data), Some(false)); // bit 6 = 0
+    assert_eq!(reader.read_bit(&data), Some(true)); // bit 5 = 1
+    assert_eq!(reader.read_bit(&data), Some(false)); // bit 4 = 0
+    assert_eq!(reader.read_bit(&data), Some(true)); // bit 3 = 1
+    assert_eq!(reader.read_bit(&data), Some(false)); // bit 2 = 0
+    assert_eq!(reader.read_bit(&data), Some(true)); // bit 1 = 1
+    assert_eq!(reader.read_bit(&data), Some(false)); // bit 0 = 0
+}
+
+#[test]
+fn test_streaming_bit_reader_state_save_restore_complex() {
+    let data = [0x12, 0x34, 0x56, 0x78];
+    let mut reader = StreamingBitReader::new();
+
+    // Read some bits
+    reader.read_bits(&data, 12);
+    let state = reader.save_state();
+
+    // Read more bits
+    reader.read_bits(&data, 8);
+    let after_read = reader.bytes_consumed();
+
+    // Restore and verify
+    reader.restore_state(state);
+    assert!(reader.bytes_consumed() < after_read);
+
+    // Read same bits again
+    let result = reader.read_bits(&data, 8);
+    assert!(result.is_some());
+}
+
+// ============================================================================
+// Decoder State Tests
+// ============================================================================
+
+#[test]
+fn test_decoder_reset() {
+    let data = b"Test data";
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh0, data.len() as u64);
+
+    // Partially decompress
+    let mut output = vec![0u8; 5];
+    let _ = decoder.decompress(&data[..5], &mut output);
+
+    assert!(decoder.bytes_decoded() > 0);
+
+    // Reset
+    decoder.reset();
+
+    assert_eq!(decoder.bytes_decoded(), 0);
+    assert!(!decoder.is_finished());
+    assert_eq!(decoder.phase(), DecoderPhase::DecodeBlock);
+}
+
+#[test]
+fn test_decoder_phase_transitions_lh5() {
+    let decoder = StreamingLzhDecoder::new(LzhMethod::Lh5, 100);
+    assert_eq!(decoder.phase(), DecoderPhase::ReadBlockSize);
+
+    let decoder_lh4 = StreamingLzhDecoder::new(LzhMethod::Lh4, 100);
+    assert_eq!(decoder_lh4.phase(), DecoderPhase::ReadBlockSize);
+
+    let decoder_lh6 = StreamingLzhDecoder::new(LzhMethod::Lh6, 100);
+    assert_eq!(decoder_lh6.phase(), DecoderPhase::ReadBlockSize);
+
+    let decoder_lh7 = StreamingLzhDecoder::new(LzhMethod::Lh7, 100);
+    assert_eq!(decoder_lh7.phase(), DecoderPhase::ReadBlockSize);
+}
+
+#[test]
+fn test_decoder_decompressor_trait() {
+    let data = b"Trait test data";
+    let mut decoder: Box<dyn Decompressor> =
+        Box::new(StreamingLzhDecoder::new(LzhMethod::Lh0, data.len() as u64));
+
+    let mut output = vec![0u8; data.len()];
+    let (consumed, produced, status) = decoder
+        .decompress(data, &mut output)
+        .expect("Decompress failed");
+
+    assert_eq!(consumed, data.len());
+    assert_eq!(produced, data.len());
+    assert_eq!(status, DecompressStatus::Done);
+    assert!(decoder.is_finished());
+}
+
+// ============================================================================
+// Edge Case Tests
+// ============================================================================
+
+#[test]
+fn test_empty_input() {
+    let data: &[u8] = b"";
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh0, 0);
+    let mut output = vec![0u8; 0];
+
+    let (consumed, produced, status) = decoder
+        .decompress(data, &mut output)
+        .expect("Decompress failed");
+
+    assert_eq!(consumed, 0);
+    assert_eq!(produced, 0);
+    assert_eq!(status, DecompressStatus::Done);
+}
+
+#[test]
+fn test_large_stored_data() {
+    // Create a larger test data set
+    let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh0, data.len() as u64);
+    let mut output = Vec::new();
+    let mut input_pos = 0;
+
+    // Process in medium-sized chunks
+    while input_pos < data.len() {
+        let chunk_size = 1000.min(data.len() - input_pos);
+        let mut chunk_output = vec![0u8; chunk_size];
+
+        let (consumed, produced, status) = decoder
+            .decompress(&data[input_pos..], &mut chunk_output)
+            .expect("Decompress failed");
+
+        input_pos += consumed;
+        output.extend_from_slice(&chunk_output[..produced]);
+
+        if status == DecompressStatus::Done {
+            break;
+        }
+    }
+
+    assert_eq!(output.len(), data.len());
+    assert_eq!(output, data);
+}
+
+#[test]
+fn test_zero_length_read() {
+    let data = [0xAB, 0xCD];
+    let mut reader = StreamingBitReader::new();
+
+    // Reading 0 bits should return 0
+    assert_eq!(reader.read_bits(&data, 0), Some(0));
+    assert_eq!(reader.bytes_consumed(), 0);
+}
+
+#[test]
+fn test_decoder_progress_tracking() {
+    let data = b"Progress tracking test";
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh0, data.len() as u64);
+
+    let mut output = vec![0u8; 10];
+    let (consumed, _, _) = decoder
+        .decompress(&data[..10], &mut output)
+        .expect("Decompress failed");
+
+    assert_eq!(decoder.bytes_decoded(), consumed as u64);
+    assert_eq!(decoder.uncompressed_size(), data.len() as u64);
+}
+
+// ============================================================================
+// Method-specific Tests
+// ============================================================================
+
+#[test]
+fn test_all_lzh_methods_initial_phase() {
+    let methods = [
+        (LzhMethod::Lh0, DecoderPhase::DecodeBlock),
+        (LzhMethod::Lh4, DecoderPhase::ReadBlockSize),
+        (LzhMethod::Lh5, DecoderPhase::ReadBlockSize),
+        (LzhMethod::Lh6, DecoderPhase::ReadBlockSize),
+        (LzhMethod::Lh7, DecoderPhase::ReadBlockSize),
+    ];
+
+    for (method, expected_phase) in methods {
+        let decoder = StreamingLzhDecoder::new(method, 100);
+        assert_eq!(
+            decoder.phase(),
+            expected_phase,
+            "Method {:?} should start in {:?}",
+            method,
+            expected_phase
+        );
+    }
+}
+
+#[test]
+fn test_decode_lzh_streaming_empty() {
+    let data: &[u8] = b"";
+    let result = decode_lzh_streaming(data, LzhMethod::Lh0, 0).expect("Decode failed");
+    assert!(result.is_empty());
+}
+
+// ============================================================================
+// Lh4/5/6/7 baseline round-trip tests
+// ============================================================================
+
+/// Helper: compress with the LZH encoder, then decompress with both serial and
+/// streaming decoders and return `(serial_output, streaming_output)`.
+fn roundtrip_both(input: &[u8], method: LzhMethod) -> (Vec<u8>, Vec<u8>) {
+    use oxiarc_lzhuf::LzhEncoder;
+    let mut encoder = LzhEncoder::new(method);
+    let compressed = encoder.compress_to_vec(input).expect("encode failed");
+
+    let serial = decode_lzh(&compressed, method, input.len() as u64).expect("serial decode");
+    let streaming =
+        decode_lzh_streaming(&compressed, method, input.len() as u64).expect("streaming decode");
+
+    (serial, streaming)
+}
+
+/// Find the first byte offset where two slices diverge (or the shorter length).
+fn first_divergence(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter()
+        .zip(b.iter())
+        .position(|(x, y)| x != y)
+        .or_else(|| {
+            if a.len() != b.len() {
+                Some(a.len().min(b.len()))
+            } else {
+                None
+            }
+        })
+}
+
+/// Drive `StreamingLzhDecoder` with a fixed `input_chunk_size` and a small
+/// `output_buf_size`, collecting all produced bytes.  Returns the full output.
+fn chunk_sweep_decode(
+    compressed: &[u8],
+    method: LzhMethod,
+    uncompressed_size: u64,
+    input_chunk_size: usize,
+    output_buf_size: usize,
+) -> Vec<u8> {
+    let mut decoder = StreamingLzhDecoder::new(method, uncompressed_size);
+    let mut all_output = Vec::with_capacity(uncompressed_size as usize);
+    let mut input_pos = 0usize;
+    let mut calls = 0u32;
+
+    loop {
+        calls += 1;
+        if calls > 200_000 {
+            panic!(
+                "{:?} chunk_size={} out_buf={}: stuck after {} calls \
+                 (input_pos={}/{}, output={} bytes)",
+                method,
+                input_chunk_size,
+                output_buf_size,
+                calls,
+                input_pos,
+                compressed.len(),
+                all_output.len()
+            );
+        }
+
+        let end = (input_pos + input_chunk_size).min(compressed.len());
+        let slice = &compressed[input_pos..end];
+        let mut buf = vec![0u8; output_buf_size];
+
+        let (consumed, produced, status) = decoder
+            .decompress(slice, &mut buf)
+            .expect("decompress failed");
+
+        input_pos += consumed;
+        all_output.extend_from_slice(&buf[..produced]);
+
+        match status {
+            DecompressStatus::Done => break,
+            DecompressStatus::NeedsInput if input_pos >= compressed.len() && produced == 0 => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    all_output
+}
+
+#[test]
+fn test_streaming_lh4_baseline() {
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let (serial, streaming) = roundtrip_both(&input, LzhMethod::Lh4);
+    if let Some(pos) = first_divergence(&serial, &streaming) {
+        panic!(
+            "Lh4 streaming mismatch at byte {}: serial={:#04x}, streaming={:#04x}",
+            pos,
+            serial.get(pos).copied().unwrap_or(0),
+            streaming.get(pos).copied().unwrap_or(0),
+        );
+    }
+    assert_eq!(streaming, input, "Lh4 streaming mismatch vs original");
+}
+
+#[test]
+fn test_streaming_lh5_baseline() {
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let (serial, streaming) = roundtrip_both(&input, LzhMethod::Lh5);
+    if let Some(pos) = first_divergence(&serial, &streaming) {
+        panic!(
+            "Lh5 streaming mismatch at byte {}: serial={:#04x}, streaming={:#04x}",
+            pos,
+            serial.get(pos).copied().unwrap_or(0),
+            streaming.get(pos).copied().unwrap_or(0),
+        );
+    }
+    assert_eq!(streaming, input, "Lh5 streaming mismatch vs original");
+}
+
+#[test]
+fn test_streaming_lh6_baseline() {
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let (serial, streaming) = roundtrip_both(&input, LzhMethod::Lh6);
+    if let Some(pos) = first_divergence(&serial, &streaming) {
+        panic!(
+            "Lh6 streaming mismatch at byte {}: serial={:#04x}, streaming={:#04x}",
+            pos,
+            serial.get(pos).copied().unwrap_or(0),
+            streaming.get(pos).copied().unwrap_or(0),
+        );
+    }
+    assert_eq!(streaming, input, "Lh6 streaming mismatch vs original");
+}
+
+#[test]
+fn test_streaming_lh7_baseline() {
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let (serial, streaming) = roundtrip_both(&input, LzhMethod::Lh7);
+    if let Some(pos) = first_divergence(&serial, &streaming) {
+        panic!(
+            "Lh7 streaming mismatch at byte {}: serial={:#04x}, streaming={:#04x}",
+            pos,
+            serial.get(pos).copied().unwrap_or(0),
+            streaming.get(pos).copied().unwrap_or(0),
+        );
+    }
+    assert_eq!(streaming, input, "Lh7 streaming mismatch vs original");
+}
+
+// ============================================================================
+// Chunk-sweep tests — exercise cross-call resumption with tiny input/output
+// ============================================================================
+
+/// Chunk sizes chosen to force mid-header, mid-tree, and mid-block resumptions.
+const SWEEP_CHUNK_SIZES: &[usize] = &[1, 2, 3, 7, 17, 64, 256, 1024];
+
+fn run_chunk_sweep(method: LzhMethod) {
+    use oxiarc_lzhuf::LzhEncoder;
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let mut encoder = LzhEncoder::new(method);
+    let compressed = encoder.compress_to_vec(&input).expect("encode failed");
+    let serial = decode_lzh(&compressed, method, input.len() as u64).expect("serial decode");
+
+    for &chunk_size in SWEEP_CHUNK_SIZES {
+        // Use a small output buffer (16 bytes) to also stress output-buffer resumption.
+        let got = chunk_sweep_decode(&compressed, method, input.len() as u64, chunk_size, 16);
+        if let Some(pos) = first_divergence(&serial, &got) {
+            panic!(
+                "{:?} chunk_size={}: mismatch at byte {} \
+                 (serial={:#04x}, streaming={:#04x}), got {} bytes total",
+                method,
+                chunk_size,
+                pos,
+                serial.get(pos).copied().unwrap_or(0),
+                got.get(pos).copied().unwrap_or(0),
+                got.len(),
+            );
+        }
+        assert_eq!(
+            got.len(),
+            input.len(),
+            "{:?} chunk_size={}: wrong output length ({} vs {})",
+            method,
+            chunk_size,
+            got.len(),
+            input.len()
+        );
+    }
+}
+
+#[test]
+fn test_streaming_lh4_chunk_sweep() {
+    run_chunk_sweep(LzhMethod::Lh4);
+}
+
+#[test]
+fn test_streaming_lh5_chunk_sweep() {
+    run_chunk_sweep(LzhMethod::Lh5);
+}
+
+#[test]
+fn test_streaming_lh6_chunk_sweep() {
+    run_chunk_sweep(LzhMethod::Lh6);
+}
+
+#[test]
+fn test_streaming_lh7_chunk_sweep() {
+    run_chunk_sweep(LzhMethod::Lh7);
+}
+
+// ============================================================================
+// Edge-case tests
+// ============================================================================
+
+/// Verify that a single-byte compressible input round-trips correctly.
+fn run_edge_single_byte(method: LzhMethod) {
+    use oxiarc_lzhuf::LzhEncoder;
+    let input = b"A";
+    let mut encoder = LzhEncoder::new(method);
+    let compressed = encoder.compress_to_vec(input).expect("encode failed");
+    let streaming =
+        decode_lzh_streaming(&compressed, method, input.len() as u64).expect("streaming decode");
+    assert_eq!(
+        streaming.as_slice(),
+        input.as_ref(),
+        "{method:?} single-byte mismatch"
+    );
+}
+
+#[test]
+fn test_streaming_lh4_edge_single_byte() {
+    run_edge_single_byte(LzhMethod::Lh4);
+}
+
+#[test]
+fn test_streaming_lh5_edge_single_byte() {
+    run_edge_single_byte(LzhMethod::Lh5);
+}
+
+#[test]
+fn test_streaming_lh6_edge_single_byte() {
+    run_edge_single_byte(LzhMethod::Lh6);
+}
+
+#[test]
+fn test_streaming_lh7_edge_single_byte() {
+    run_edge_single_byte(LzhMethod::Lh7);
+}
+
+/// Verify that an input close to the method's window size round-trips correctly.
+///
+/// Uses `window - 1` bytes to avoid a known LZH encoder limitation: when the
+/// entire highly-compressible input fits in a single block, the uncompressed
+/// byte count for that block can equal `window_size`, and the 16-bit block-size
+/// header field overflows to 0 for Lh7 (65536 bytes).  Using `window - 1`
+/// avoids this edge case while still exercising large-window decompression.
+fn run_edge_window_size(method: LzhMethod) {
+    use oxiarc_lzhuf::LzhEncoder;
+    let window = method.window_size();
+    // Use window - 1 bytes to avoid the 16-bit block-size overflow at exactly
+    // window = 65536 (Lh7).
+    let len = window - 1;
+    let input: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let mut encoder = LzhEncoder::new(method);
+    let compressed = encoder.compress_to_vec(&input).expect("encode failed");
+    let serial = decode_lzh(&compressed, method, input.len() as u64).expect("serial decode");
+    let streaming =
+        decode_lzh_streaming(&compressed, method, input.len() as u64).expect("streaming decode");
+    assert_eq!(
+        streaming, serial,
+        "{method:?} window-size mismatch vs serial"
+    );
+    assert_eq!(
+        streaming, input,
+        "{method:?} window-size mismatch vs original"
+    );
+}
+
+#[test]
+fn test_streaming_lh4_edge_window_size() {
+    run_edge_window_size(LzhMethod::Lh4);
+}
+
+#[test]
+fn test_streaming_lh5_edge_window_size() {
+    run_edge_window_size(LzhMethod::Lh5);
+}
+
+#[test]
+fn test_streaming_lh6_edge_window_size() {
+    run_edge_window_size(LzhMethod::Lh6);
+}
+
+#[test]
+fn test_streaming_lh7_edge_window_size() {
+    run_edge_window_size(LzhMethod::Lh7);
+}
+
+// ============================================================================
+// Real-LHA corpus fixtures — incremental (chunked) streaming decode
+// ============================================================================
+//
+// These decode the same genuine, third-party `.lzh` archives in `tests/data/`
+// that validate the *serial* decoder (see `tests/corpus_fixtures.rs` and
+// `tests/data/README.md`), but drive the *streaming* decoder one awkward-sized
+// chunk at a time and assert byte-exactness against the paired `.expected`
+// plaintext. Passing here proves the streaming path is genuinely
+// real-LHA-compatible, not merely self-consistent with OxiArc's own encoder.
+
+/// Chase a chain of LZH extension-header chunks (`[u16 LE size][data...]`,
+/// `size` counts itself, `size == 0` terminates). Used by header levels 1/2.
+fn chase_extensions(data: &[u8], mut pos: usize) -> usize {
+    loop {
+        let size = u16::from_le_bytes(data[pos..pos + 2].try_into().expect("2 bytes")) as usize;
+        if size == 0 {
+            return pos + 2;
+        }
+        pos += size;
+    }
+}
+
+/// Parse just enough of an LZH level-0/1/2 header to locate the compressed
+/// payload. Returns `(payload_start_offset, method, uncompressed_size)`.
+fn locate_payload(data: &[u8]) -> (usize, LzhMethod, u64) {
+    let method = LzhMethod::from_id(&data[2..7]).expect("recognised method id");
+    let uncompressed_size = u32::from_le_bytes(data[11..15].try_into().expect("4 bytes")) as u64;
+    let level = data[20];
+    let start = match level {
+        0 => data[0] as usize + 2,
+        1 => {
+            let name_len = data[21] as usize;
+            let os_id_pos = 22 + name_len + 2;
+            chase_extensions(data, os_id_pos + 1)
+        }
+        2 => chase_extensions(data, 24),
+        other => panic!("unsupported LZH header level {other} in test fixture"),
+    };
+    (start, method, uncompressed_size)
+}
+
+/// Read a fixture file from `tests/data/`.
+fn read_data_file(name: &str) -> Vec<u8> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    std::fs::read(
+        std::path::Path::new(manifest_dir)
+            .join("tests/data")
+            .join(name),
+    )
+    .unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
+}
+
+/// Decode a fixture's LZH payload incrementally (feeding `input_chunk_size`
+/// bytes and draining into an `output_buf_size` scratch buffer per call) and
+/// assert byte-exactness against `expected_name`.
+fn assert_fixture_streams_exact(
+    lzh_name: &str,
+    expected_name: &str,
+    input_chunk_size: usize,
+    output_buf_size: usize,
+) {
+    let archive = read_data_file(lzh_name);
+    let expected = read_data_file(expected_name);
+    let (payload_start, method, uncompressed_size) = locate_payload(&archive);
+    let payload = &archive[payload_start..];
+
+    let got = chunk_sweep_decode(
+        payload,
+        method,
+        uncompressed_size,
+        input_chunk_size,
+        output_buf_size,
+    );
+
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "{lzh_name} (chunk={input_chunk_size}): decoded length mismatch",
+    );
+    if got != expected {
+        let first_diff = got
+            .iter()
+            .zip(expected.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(usize::MAX);
+        panic!(
+            "{lzh_name} (chunk={input_chunk_size}): streaming output diverges from \
+             {expected_name} at byte {first_diff}",
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha_unix114i_h0_lh5_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact(
+            "lha_unix114i_h0_lh5.lzh",
+            "lha_unix114i_h0_lh5.expected",
+            chunk,
+            17,
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha_unix114i_h1_lh5_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact(
+            "lha_unix114i_h1_lh5.lzh",
+            "lha_unix114i_h1_lh5.expected",
+            chunk,
+            17,
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha_unix114i_h2_lh5_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact(
+            "lha_unix114i_h2_lh5.lzh",
+            "lha_unix114i_h2_lh5.expected",
+            chunk,
+            17,
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha255e_lh5_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact("lha255e_lh5.lzh", "lha255e_lh5.expected", chunk, 17);
+    }
+}
+
+#[test]
+fn stream_corpus_lha_unix114i_h0_lh0_stored_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact(
+            "lha_unix114i_h0_lh0.lzh",
+            "lha_unix114i_h0_lh0.expected",
+            chunk,
+            13,
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha213_lh5_long_multiblock() {
+    // 1.24 MB across many Huffman blocks (re-sent code tables). Awkward but
+    // larger chunks keep the call count reasonable while still crossing block,
+    // table, and byte boundaries mid-symbol.
+    for &(chunk, out_buf) in &[(7usize, 4096usize), (13, 8192), (1023, 512)] {
+        assert_fixture_streams_exact(
+            "lha213_lh5_long.lzh",
+            "lha213_lh5_long.expected",
+            chunk,
+            out_buf,
+        );
+    }
+}

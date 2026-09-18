@@ -1,0 +1,53 @@
+[package]
+name = "oxigaf-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigaf-render"
+description = "Differentiable 3D Gaussian Splatting rasterizer (wgpu)"
+readme = "README.md"
+keywords = ["rendering", "gaussian-splatting", "3d", "gpu", "rasterization"]
+categories = ["rendering", "graphics", "multimedia"]
+
+[package.metadata.docs.rs]
+# `gpu_debug` gates `Rasterizer::debug_snapshot` (see rasterizer.rs); listed
+# so it renders on docs.rs, mirroring the other six crates.
+features = ["gpu_debug"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+nalgebra = { workspace = true }
+rayon = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+safetensors = { workspace = true }
+
+oxigaf-flame = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+pollster = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+# Default features (none - minimal configuration)
+default = []
+# Enable GPU debug mode with validation layers and debug markers
+# This adds runtime overhead but provides detailed error messages and validation
+gpu_debug = []
+
+[[bench]]
+name = "render_bench"
+harness = false

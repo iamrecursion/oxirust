@@ -1,0 +1,58 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: trustformers-server
+  namespace: trustformers
+  labels:
+    app: trustformers-server
+    app.kubernetes.io/name: trustformers-server
+    app.kubernetes.io/instance: trustformers
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: trustformers-server
+  minReplicas: 2
+  maxReplicas: 10
+  # CPU and memory only. A previous version of this file also scaled on a
+  # `http_requests_per_second` Pods metric, which requires both a Prometheus
+  # Adapter (or another custom-metrics API server) wired into this cluster
+  # and a workload that publishes that metric — trustformers-server exposes
+  # no /metrics endpoint at all (verified against src/main.rs's route table),
+  # so nothing was ever producing that metric and the rule could never fire.
+  # CPU/memory come from metrics-server, which most clusters already run.
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+      - type: Pods
+        value: 1
+        periodSeconds: 60
+      selectPolicy: Min
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Max

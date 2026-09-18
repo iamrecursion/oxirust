@@ -1,0 +1,709 @@
+//! Distributed Cache Implementation
+//!
+//! Provides distributed caching capabilities with consistency guarantees.
+
+use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{debug, info, trace, warn};
+
+use super::config::{ConsistencyLevel, DistributedConfig};
+
+/// Cache node in the distributed system
+#[derive(Debug, Clone)]
+pub struct CacheNode {
+    pub id: String,
+    pub address: String,
+    pub is_healthy: bool,
+    pub last_health_check: u64,
+}
+
+/// Consistent hashing ring for node selection
+pub struct ConsistentHashing {
+    nodes: Vec<CacheNode>,
+    ring: HashMap<u64, String>, // hash -> node_id
+}
+
+impl ConsistentHashing {
+    pub fn new(nodes: Vec<CacheNode>) -> Self {
+        let mut ring = HashMap::new();
+
+        // Simple implementation - each node gets multiple positions
+        for node in &nodes {
+            for i in 0..100 {
+                let hash = self::hash_key(&format!("{}-{}", node.id, i));
+                ring.insert(hash, node.id.clone());
+            }
+        }
+
+        Self { nodes, ring }
+    }
+
+    /// Get node for a given key
+    pub fn get_node(&self, key: &str) -> Option<&CacheNode> {
+        let key_hash = hash_key(key);
+
+        // Find the first node with hash >= key_hash
+        let mut min_hash = u64::MAX;
+        let mut selected_node_id = None;
+
+        for (&node_hash, node_id) in &self.ring {
+            if node_hash >= key_hash && node_hash < min_hash {
+                min_hash = node_hash;
+                selected_node_id = Some(node_id);
+            }
+        }
+
+        // If no node found, wrap around to the smallest hash
+        if selected_node_id.is_none() {
+            if let Some((&_, node_id)) = self.ring.iter().min_by_key(|(&hash, _)| hash) {
+                selected_node_id = Some(node_id);
+            }
+        }
+
+        selected_node_id.and_then(|id| self.nodes.iter().find(|n| &n.id == id))
+    }
+}
+
+/// Replication strategy
+#[derive(Debug, Clone)]
+pub enum ReplicationStrategy {
+    None,
+    Master { replicas: usize },
+    MultiMaster,
+}
+
+/// Distributed cache cluster
+pub struct CacheCluster {
+    nodes: Vec<CacheNode>,
+    consistent_hash: ConsistentHashing,
+    replication: ReplicationStrategy,
+    config: DistributedConfig,
+    // In-memory storage simulating distributed nodes
+    node_storage: Arc<RwLock<HashMap<String, HashMap<String, Vec<u8>>>>>,
+}
+
+impl CacheCluster {
+    pub fn new(config: DistributedConfig) -> Self {
+        let nodes: Vec<CacheNode> = config
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| CacheNode {
+                id: format!("node-{}", i),
+                address: addr.clone(),
+                is_healthy: true,
+                last_health_check: 0,
+            })
+            .collect();
+
+        let consistent_hash = ConsistentHashing::new(nodes.clone());
+
+        // Initialize storage for each node
+        let mut storage = HashMap::new();
+        for node in &nodes {
+            storage.insert(node.id.clone(), HashMap::new());
+        }
+
+        Self {
+            nodes,
+            consistent_hash,
+            replication: ReplicationStrategy::Master {
+                replicas: config.replication_factor,
+            },
+            config,
+            node_storage: Arc::new(RwLock::new(storage)),
+        }
+    }
+
+    /// Get value from distributed cache
+    pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
+        // Find the primary node for this key
+        let primary_node = self.consistent_hash.get_node(key)?;
+
+        // Get storage and try to read from primary node
+        let storage = self.node_storage.read().await;
+        if let Some(node_cache) = storage.get(&primary_node.id) {
+            if let Some(value) = node_cache.get(key) {
+                return Some(value.clone());
+            }
+        }
+
+        // If primary node doesn't have the value, try replica nodes
+        let replica_nodes = self.get_replica_nodes(key);
+        for node in replica_nodes {
+            if let Some(node_cache) = storage.get(&node.id) {
+                if let Some(value) = node_cache.get(key) {
+                    return Some(value.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Put value in distributed cache
+    pub async fn put(&self, key: &str, value: Vec<u8>) -> Result<()> {
+        // Find the primary node for this key
+        let primary_node = self
+            .consistent_hash
+            .get_node(key)
+            .ok_or_else(|| anyhow::anyhow!("No available nodes for key: {}", key))?;
+
+        let mut storage = self.node_storage.write().await;
+
+        // Store on primary node
+        if let Some(node_cache) = storage.get_mut(&primary_node.id) {
+            node_cache.insert(key.to_string(), value.clone());
+        }
+
+        // Store on replica nodes based on replication strategy
+        let replica_nodes = self.get_replica_nodes(key);
+        let max_replicas = match &self.replication {
+            ReplicationStrategy::None => 0,
+            ReplicationStrategy::Master { replicas } => *replicas,
+            ReplicationStrategy::MultiMaster => self.nodes.len().saturating_sub(1),
+        };
+
+        for (i, node) in replica_nodes.iter().enumerate() {
+            if i >= max_replicas {
+                break;
+            }
+            if let Some(node_cache) = storage.get_mut(&node.id) {
+                node_cache.insert(key.to_string(), value.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove value from distributed cache
+    pub async fn remove(&self, key: &str) -> Result<()> {
+        // Find the primary node for this key
+        let primary_node = self
+            .consistent_hash
+            .get_node(key)
+            .ok_or_else(|| anyhow::anyhow!("No available nodes for key: {}", key))?;
+
+        let mut storage = self.node_storage.write().await;
+
+        // Remove from primary node
+        if let Some(node_cache) = storage.get_mut(&primary_node.id) {
+            node_cache.remove(key);
+        }
+
+        // Remove from replica nodes
+        let replica_nodes = self.get_replica_nodes(key);
+        for node in replica_nodes {
+            if let Some(node_cache) = storage.get_mut(&node.id) {
+                node_cache.remove(key);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get replica nodes for a given key
+    fn get_replica_nodes(&self, key: &str) -> Vec<&CacheNode> {
+        let key_hash = hash_key(key);
+        let mut replica_nodes = Vec::new();
+
+        // Sort nodes by their distance from the key hash
+        let mut node_distances: Vec<(u64, &CacheNode)> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                let node_hash = hash_key(&node.id);
+                let distance = if node_hash >= key_hash {
+                    node_hash - key_hash
+                } else {
+                    (u64::MAX - key_hash) + node_hash
+                };
+                (distance, node)
+            })
+            .collect();
+
+        node_distances.sort_by_key(|(distance, _)| *distance);
+
+        // Skip the first node (primary) and return the rest as replicas
+        for (_, node) in node_distances.iter().skip(1) {
+            if node.is_healthy {
+                replica_nodes.push(*node);
+            }
+        }
+
+        replica_nodes
+    }
+
+    /// Clear all data from all nodes in the cluster
+    pub async fn clear_all(&self) -> Result<()> {
+        let mut storage = self.node_storage.write().await;
+
+        // Clear all data from all nodes
+        for (node_id, node_cache) in storage.iter_mut() {
+            node_cache.clear();
+            trace!("Cleared cache for node: {}", node_id);
+        }
+
+        info!("Cleared all data from {} cache nodes", self.nodes.len());
+        Ok(())
+    }
+
+    /// Get the number of nodes in the cluster
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+/// Main distributed cache service
+pub struct DistributedCache {
+    cluster: Arc<RwLock<CacheCluster>>,
+    config: DistributedConfig,
+}
+
+impl DistributedCache {
+    pub fn new(config: DistributedConfig) -> Self {
+        let cluster = CacheCluster::new(config.clone());
+
+        Self {
+            cluster: Arc::new(RwLock::new(cluster)),
+            config,
+        }
+    }
+
+    /// Timeout for one node liveness probe.
+    const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Check health of a cache node by opening a TCP connection to it.
+    ///
+    /// A node is healthy when its `host:port` resolves and accepts a connection
+    /// within [`DistributedCache::HEALTH_PROBE_TIMEOUT`]. Anything else — an
+    /// unparseable address, a DNS failure, a refused connection, a timeout — is
+    /// unhealthy, which is the only reading the probe can honestly produce.
+    ///
+    /// Before 0.2.1 this function never touched the network: it reported every
+    /// loopback address as healthy unconditionally, and for every other address
+    /// hashed the address together with the current second and called the node
+    /// healthy when `hash % 100 > 5`. A down node was reported up 95% of the
+    /// time, and the cluster's `healthy_nodes` count was noise.
+    async fn check_node_health(address: &str) -> bool {
+        use tokio::net::TcpStream;
+
+        match tokio::time::timeout(Self::HEALTH_PROBE_TIMEOUT, TcpStream::connect(address)).await {
+            Ok(Ok(_stream)) => true,
+            Ok(Err(error)) => {
+                debug!("Health probe for {address} failed: {error}");
+                false
+            },
+            Err(_) => {
+                debug!(
+                    "Health probe for {address} timed out after {:?}",
+                    Self::HEALTH_PROBE_TIMEOUT
+                );
+                false
+            },
+        }
+    }
+
+    /// Start the distributed cache service
+    pub async fn start(&self) -> Result<()> {
+        info!(
+            "Starting distributed cache service with {} nodes",
+            self.config.nodes.len()
+        );
+
+        // Start health checking background task
+        let cluster_clone = Arc::clone(&self.cluster);
+        let health_check_interval = std::time::Duration::from_secs(30); // Check every 30 seconds
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(health_check_interval);
+            loop {
+                interval.tick().await;
+
+                // Perform health check on all nodes
+                {
+                    let mut cluster = cluster_clone.write().await;
+                    let current_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    for node in &mut cluster.nodes {
+                        let was_healthy = node.is_healthy;
+                        node.is_healthy = Self::check_node_health(&node.address).await;
+                        node.last_health_check = current_time;
+
+                        if was_healthy != node.is_healthy {
+                            if node.is_healthy {
+                                info!(
+                                    "Node {} ({}) recovered and is now healthy",
+                                    node.id, node.address
+                                );
+                            } else {
+                                warn!("Node {} ({}) is now unhealthy", node.id, node.address);
+                            }
+                        }
+                    }
+
+                    // Update consistent hashing ring if needed
+                    let healthy_nodes: Vec<CacheNode> =
+                        cluster.nodes.iter().filter(|n| n.is_healthy).cloned().collect();
+
+                    if !healthy_nodes.is_empty() {
+                        cluster.consistent_hash = ConsistentHashing::new(healthy_nodes);
+                    }
+                }
+
+                trace!("Completed health check for all cache nodes");
+            }
+        });
+
+        info!("Distributed cache service started successfully");
+        Ok(())
+    }
+
+    /// Get value from cache
+    pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
+        let cluster = self.cluster.read().await;
+        cluster.get(key).await
+    }
+
+    /// Put value in cache
+    pub async fn put(&self, key: &str, value: Vec<u8>) -> Result<()> {
+        let cluster = self.cluster.read().await;
+        cluster.put(key, value).await
+    }
+
+    /// Invalidate all caches
+    pub async fn invalidate_all(&self) -> Result<()> {
+        let cluster = self.cluster.write().await;
+        cluster.clear_all().await?;
+        info!(
+            "Invalidated all caches across {} nodes",
+            cluster.node_count()
+        );
+        Ok(())
+    }
+
+    /// Update configuration
+    pub async fn update_config(&self, config: DistributedConfig) -> Result<()> {
+        info!("Updating distributed cache configuration");
+
+        let mut cluster = self.cluster.write().await;
+
+        // Update cluster configuration
+        cluster.config = config.clone();
+
+        // Rebuild nodes if the node list changed
+        let new_nodes: Vec<CacheNode> = config
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                // Try to preserve health status for existing nodes
+                let existing_node = cluster.nodes.iter().find(|n| n.address == *addr);
+
+                CacheNode {
+                    id: format!("node-{}", i),
+                    address: addr.clone(),
+                    is_healthy: existing_node.map(|n| n.is_healthy).unwrap_or(true),
+                    last_health_check: existing_node.map(|n| n.last_health_check).unwrap_or(0),
+                }
+            })
+            .collect();
+
+        // Update nodes and rebuild consistent hashing
+        cluster.nodes = new_nodes.clone();
+        cluster.consistent_hash = ConsistentHashing::new(new_nodes);
+
+        // Update replication strategy based on config
+        cluster.replication = match config.consistency_level {
+            ConsistencyLevel::Eventual => ReplicationStrategy::Master { replicas: 1 },
+            ConsistencyLevel::Strong => ReplicationStrategy::Master {
+                replicas: (cluster.nodes.len() / 2).max(1),
+            },
+            ConsistencyLevel::Weak => ReplicationStrategy::None,
+            ConsistencyLevel::Session => ReplicationStrategy::Master {
+                replicas: 2, // Session consistency requires at least 2 replicas for session affinity
+            },
+        };
+
+        // Initialize storage for any new nodes
+        let mut storage = cluster.node_storage.write().await;
+        for node in &cluster.nodes {
+            storage.entry(node.id.clone()).or_default();
+        }
+
+        // Remove storage for nodes that are no longer present
+        let current_node_ids: std::collections::HashSet<String> =
+            cluster.nodes.iter().map(|n| n.id.clone()).collect();
+
+        storage.retain(|node_id, _| current_node_ids.contains(node_id));
+
+        info!(
+            "Successfully updated distributed cache configuration with {} nodes",
+            cluster.nodes.len()
+        );
+        Ok(())
+    }
+
+    /// Get distributed cache statistics
+    pub async fn get_stats(&self) -> Result<DistributedCacheStats> {
+        let cluster = self.cluster.read().await;
+        let healthy_nodes = cluster.nodes.iter().filter(|n| n.is_healthy).count();
+
+        let replication_factor = match cluster.replication {
+            ReplicationStrategy::None => 1,
+            ReplicationStrategy::Master { replicas } => replicas + 1,
+            ReplicationStrategy::MultiMaster => cluster.nodes.len(),
+        };
+
+        Ok(DistributedCacheStats {
+            node_count: cluster.nodes.len(),
+            healthy_nodes,
+            replication_factor,
+            consistency_level: cluster.config.consistency_level,
+        })
+    }
+}
+
+/// Distributed cache statistics
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DistributedCacheStats {
+    pub node_count: usize,
+    pub healthy_nodes: usize,
+    pub replication_factor: usize,
+    pub consistency_level: ConsistencyLevel,
+}
+
+/// Simple hash function
+fn hash_key(key: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::caching::config::{ConsistencyLevel, DistributedConfig};
+    use std::time::Duration;
+
+    fn make_config_with_nodes(node_addrs: Vec<&str>) -> DistributedConfig {
+        DistributedConfig {
+            nodes: node_addrs.into_iter().map(|s| s.to_string()).collect(),
+            replication_factor: 1,
+            consistency_level: ConsistencyLevel::Eventual,
+            connection_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+            retry_attempts: 1,
+            enable_failover: true,
+            health_check_interval: Duration::from_secs(30),
+        }
+    }
+
+    // --- CacheNode tests ---
+
+    #[test]
+    fn test_cache_node_construction() {
+        let node = CacheNode {
+            id: "node-0".to_string(),
+            address: "localhost:6379".to_string(),
+            is_healthy: true,
+            last_health_check: 0,
+        };
+        assert_eq!(node.id, "node-0");
+        assert!(node.is_healthy);
+    }
+
+    // --- ConsistentHashing tests ---
+
+    #[test]
+    fn test_consistent_hashing_finds_node() {
+        let nodes = vec![CacheNode {
+            id: "n0".to_string(),
+            address: "localhost:6379".to_string(),
+            is_healthy: true,
+            last_health_check: 0,
+        }];
+        let ring = ConsistentHashing::new(nodes);
+        let result = ring.get_node("some_key");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_consistent_hashing_empty_nodes_returns_none() {
+        let ring = ConsistentHashing::new(vec![]);
+        let result = ring.get_node("any_key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_consistent_hashing_same_key_same_node() {
+        let nodes = vec![
+            CacheNode {
+                id: "n0".to_string(),
+                address: "a:1".to_string(),
+                is_healthy: true,
+                last_health_check: 0,
+            },
+            CacheNode {
+                id: "n1".to_string(),
+                address: "b:2".to_string(),
+                is_healthy: true,
+                last_health_check: 0,
+            },
+        ];
+        let ring = ConsistentHashing::new(nodes);
+        let r1 = ring.get_node("stable_key");
+        let r2 = ring.get_node("stable_key");
+        match (r1, r2) {
+            (Some(a), Some(b)) => assert_eq!(a.id, b.id),
+            _ => panic!("Expected both to return a node"),
+        }
+    }
+
+    // --- CacheCluster tests ---
+
+    #[tokio::test]
+    async fn test_cluster_put_and_get() {
+        let config = make_config_with_nodes(vec!["localhost:6379"]);
+        let cluster = CacheCluster::new(config);
+        cluster.put("key1", b"value1".to_vec()).await.expect("put should succeed");
+        let result = cluster.get("key1").await;
+        assert!(result.is_some());
+        assert_eq!(result.expect("should be Some"), b"value1");
+    }
+
+    #[tokio::test]
+    async fn test_cluster_get_missing_key_returns_none() {
+        let config = make_config_with_nodes(vec!["localhost:6379"]);
+        let cluster = CacheCluster::new(config);
+        assert!(cluster.get("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cluster_remove_deletes_key() {
+        let config = make_config_with_nodes(vec!["localhost:6379"]);
+        let cluster = CacheCluster::new(config);
+        cluster.put("del_key", b"v".to_vec()).await.expect("put should succeed");
+        cluster.remove("del_key").await.expect("remove should succeed");
+        assert!(cluster.get("del_key").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cluster_clear_all_removes_everything() {
+        let config = make_config_with_nodes(vec!["localhost:6379"]);
+        let cluster = CacheCluster::new(config);
+        cluster.put("a", b"1".to_vec()).await.expect("put should succeed");
+        cluster.put("b", b"2".to_vec()).await.expect("put should succeed");
+        cluster.clear_all().await.expect("clear_all should succeed");
+        assert!(cluster.get("a").await.is_none());
+        assert!(cluster.get("b").await.is_none());
+    }
+
+    #[test]
+    fn test_cluster_node_count() {
+        let config = make_config_with_nodes(vec!["a:1", "b:2", "c:3"]);
+        let cluster = CacheCluster::new(config);
+        assert_eq!(cluster.node_count(), 3);
+    }
+
+    // --- DistributedCache tests ---
+
+    #[tokio::test]
+    async fn test_distributed_cache_put_and_get() {
+        let config = make_config_with_nodes(vec!["localhost:6379"]);
+        let cache = DistributedCache::new(config);
+        cache.put("test_key", b"test_val".to_vec()).await.expect("put should succeed");
+        let result = cache.get("test_key").await;
+        assert!(result.is_some());
+        assert_eq!(result.expect("should be Some"), b"test_val");
+    }
+
+    #[tokio::test]
+    async fn test_distributed_cache_invalidate_all() {
+        let config = make_config_with_nodes(vec!["localhost:6379"]);
+        let cache = DistributedCache::new(config);
+        cache.put("k1", b"v1".to_vec()).await.expect("put should succeed");
+        cache.invalidate_all().await.expect("invalidate_all should succeed");
+        assert!(cache.get("k1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_distributed_cache_stats_reports_healthy_nodes() {
+        let config = make_config_with_nodes(vec!["localhost:1", "localhost:2"]);
+        let cache = DistributedCache::new(config);
+        let stats = cache.get_stats().await.expect("stats should succeed");
+        assert_eq!(stats.node_count, 2);
+        assert_eq!(stats.healthy_nodes, 2);
+    }
+
+    #[tokio::test]
+    async fn test_distributed_cache_update_config_changes_node_count() {
+        let config_1 = make_config_with_nodes(vec!["localhost:1"]);
+        let cache = DistributedCache::new(config_1);
+        let config_2 = make_config_with_nodes(vec!["localhost:1", "localhost:2"]);
+        cache.update_config(config_2).await.expect("update_config should succeed");
+        let stats = cache.get_stats().await.expect("stats should succeed");
+        assert_eq!(stats.node_count, 2);
+    }
+
+    // --- hash_key determinism ---
+
+    #[test]
+    fn test_hash_key_deterministic() {
+        let h1 = hash_key("hello");
+        let h2 = hash_key("hello");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_key_different_inputs_different_hashes() {
+        let h1 = hash_key("key_a");
+        let h2 = hash_key("key_b");
+        assert_ne!(h1, h2);
+    }
+
+    #[tokio::test]
+    async fn health_probe_reports_a_listening_node_as_healthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            // Accept one connection so the probe completes.
+            let _ = listener.accept().await;
+        });
+
+        assert!(
+            DistributedCache::check_node_health(&addr.to_string()).await,
+            "a socket that accepts a connection is healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_probe_reports_a_dead_loopback_node_as_unhealthy() {
+        // Bind then drop, so the port is almost certainly free and refusing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        assert!(
+            !DistributedCache::check_node_health(&addr.to_string()).await,
+            "a loopback address with nothing listening must be reported unhealthy; \
+             the old probe short-circuited every 127.0.0.1 address to healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_probe_reports_an_unparseable_address_as_unhealthy() {
+        assert!(
+            !DistributedCache::check_node_health("not a socket address").await,
+            "an address that cannot even be resolved is not a healthy node"
+        );
+    }
+}

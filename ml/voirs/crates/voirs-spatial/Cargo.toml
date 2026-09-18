@@ -1,0 +1,99 @@
+[package]
+name = "voirs-spatial"
+version.workspace = true
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+documentation = "https://docs.rs/voirs-spatial"
+keywords = ["voirs", "spatial", "3d-audio", "hrtf", "binaural"]
+categories = ["multimedia::audio", "science", "simulation"]
+rust-version.workspace = true
+description = "3D spatial audio and HRTF processing for VoiRS"
+readme = "README.md"
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core = { workspace = true }
+scirs2-fft = { workspace = true }
+
+# Core ML and tensor operations
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
+# Audio processing
+hound = { workspace = true }
+dasp = { workspace = true }
+
+# Async and concurrency
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+
+# Error handling and utilities
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Math and random
+fastrand = { workspace = true }
+
+# Date and time
+chrono = { workspace = true }
+
+# ONNX inference backend
+oxionnx = { workspace = true, optional = true }
+
+# File handling
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+
+# VR/AR Platform Integration Dependencies
+openvr = { version = "0.9", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["d3d11", "dxgi"], optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", optional = true }
+ndk-sys = { version = "0.6", optional = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc = { version = "0.2", optional = true }
+cocoa = { version = "0.26", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal-rs = { version = "0.27", optional = true, package = "metal" }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[features]
+default = []
+gpu = ["oxionnx?/gpu"]
+onnx = ["dep:oxionnx"]
+cuda = ["candle-core/cuda"]
+metal = ["dep:metal-rs"]
+
+# VR/AR Platform Features
+steamvr = ["dep:openvr"]
+webxr = ["wasm-bindgen", "web-sys", "js-sys"]
+windows_mr = ["winapi"]
+arcore = ["ndk", "ndk-sys"]
+arkit = ["objc", "cocoa"]
+all_platforms = ["steamvr", "webxr", "windows_mr", "arcore", "arkit"]
+
+[lints]
+workspace = true

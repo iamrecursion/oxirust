@@ -1,0 +1,80 @@
+[package]
+name = "tensorlogic-sklears-kernels"
+version.workspace = true
+description = "Logic-derived similarity kernels for SkleaRS integration"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tensorlogic-sklears-kernels"
+readme = "README.md"
+keywords = ["tensor", "logic", "machine-learning", "kernels", "sklearn"]
+categories = ["science", "algorithms", "mathematics"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tensorlogic-ir.workspace = true
+tensorlogic-compiler.workspace = true
+tensorlogic-infer.workspace = true
+scirs2-core = { workspace = true, features = ["random"] }
+scirs2-linalg.workspace = true
+rayon.workspace = true
+
+# SkleaRS integration (optional feature)
+sklears-core = { workspace = true, optional = true }
+sklears-kernel-approximation = { workspace = true, optional = true }
+
+[features]
+default = []
+sklears = ["sklears-core", "sklears-kernel-approximation"]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "kernel_computation"
+harness = false
+
+[[bench]]
+name = "matrix_operations"
+harness = false
+
+[[bench]]
+name = "caching_performance"
+harness = false
+
+[[bench]]
+name = "composite_kernels"
+harness = false
+
+[[bench]]
+name = "graph_kernels"
+harness = false
+
+[[example]]
+name = "tree_kernels_demo"
+
+[[example]]
+name = "low_rank_approximation"
+
+[[example]]
+name = "ml_workflow"
+
+[[example]]
+name = "provenance_tracking"
+
+[[example]]
+name = "symbolic_kernels"
+
+[[example]]
+name = "online_kernel_updates"
+
+[[example]]
+name = "multitask_learning"
+
+[[example]]
+name = "sklears_integration_demo"
+required-features = ["sklears"]

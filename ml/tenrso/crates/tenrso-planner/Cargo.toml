@@ -1,0 +1,43 @@
+[package]
+name = "tenrso-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Contraction order planning and optimization for TenRSo"
+categories = ["algorithms", "science", "mathematics", "caching"]
+keywords = ["tenrso", "einsum", "contraction-order", "cost-model", "planner"]
+
+[dependencies]
+tenrso-core.workspace = true
+scirs2-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+indexmap.workspace = true
+smallvec.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "planner_benchmarks"
+harness = false
+
+[[bench]]
+name = "comprehensive_comparison"
+harness = false
+
+[[bench]]
+name = "parallel_planners"
+harness = false

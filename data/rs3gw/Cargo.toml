@@ -1,0 +1,466 @@
+[workspace]
+members = [
+    ".",
+    "examples/wasm-plugins/rust-uppercase",
+    "examples/wasm-plugins/uppercase-rust",
+    "examples/wasm-plugins/rust-json-filter",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.3"
+edition = "2021"
+rust-version = "1.85"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/rs3gw"
+
+[workspace.dependencies]
+# Core async runtime
+tokio = { version = "1.52", features = ["full"] }
+tokio-stream = "0.1"
+
+# Web framework
+axum = { version = "0.8.9", features = ["multipart", "ws"] }
+tower = { version = "0.5.3", features = ["limit"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace", "request-id", "util", "timeout"] }
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml = "0.9"
+quick-xml = { package = "oxixml-quickxml-compat", version = "0.1.2", features = ["serialize"] }
+toml = "1.1.2"
+
+# Error handling
+thiserror = "2.0.18"
+
+# Logging and tracing
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# OpenTelemetry distributed tracing
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "grpc-tonic"] }
+opentelemetry-semantic-conventions = "0.32"
+tracing-opentelemetry = "0.33"
+
+# Utilities
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+bytes = "1.12"
+futures = "0.3"
+percent-encoding = "2.3"
+regex = "1.12"
+base64 = "0.22"
+hex = "0.4"
+hmac = "0.13"
+sha2 = "0.11"
+tokio-util = { version = "0.7", features = ["io"] }
+http-body-util = "0.1"
+num_cpus = "1.17"
+hostname = "0.4"
+
+# Encryption
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
+md5 = "0.8"
+getrandom = "0.4"
+
+# Checksums
+crc32c = "0.6"
+crc32fast = "1.5"
+sha1 = "0.11"
+
+# HTTP client for webhooks
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+url = "2.5"
+
+# Compression
+oxiarc-zstd = "0.4.2"
+oxiarc-lz4 = "0.4.2"
+oxiarc-deflate = "0.4.2"
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
+# SciRS2 Ecosystem (SCIRS2 POLICY)
+scirs2-core = "0.6.5"
+scirs2-io = "0.6.5"
+
+# Parquet support for S3 Select
+# Pinned to 58.3: orc-rust 0.8.0 (latest on crates.io) has not yet updated its
+# internal arrow/parquet dependency to 59.x, and its ArrowReaderBuilder/
+# ArrowWriterBuilder types (used in src/api/select/types.rs and
+# src/api/select/tests.rs for ORC support) are not interchangeable across arrow
+# major versions. Revisit when orc-rust ships an arrow-59-compatible release.
+parquet = "58.3"
+arrow = "58.3"
+
+# Apache Avro support for S3 Select
+apache-avro = "0.21"
+
+# Apache ORC support for S3 Select
+orc-rust = "0.8"
+
+# Protocol Buffers support for S3 Select
+prost-reflect = "0.16"
+
+# MessagePack support for S3 Select
+rmp-serde = "1.3"
+
+# Image processing
+image = "0.25.10"
+
+# Video transcoding (feature-gated due to C dependencies)
+ffmpeg-next = "8.1"
+
+# WASM runtime (pure Rust)
+wasmtime = "46.0"
+
+# Parallel processing
+rayon = "1.12"
+
+# Async traits
+async-trait = "0.1"
+async-stream = "0.3"
+
+# Time parsing for config
+humantime = "2.3"
+
+# CLI and error handling
+clap = { version = "4.6.1", features = ["derive"] }
+anyhow = "1.0"
+indicatif = "0.18"
+
+# Directory walking
+walkdir = "2.5"
+
+# Memory mapping
+memmap2 = "0.9"
+
+# TLS support
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rustls-pemfile = "2.2"
+
+# gRPC support
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+
+# GraphQL support
+async-graphql = "7.2.1"
+async-graphql-axum = "7.2.1"
+
+# OpenAPI/Swagger support
+utoipa = { version = "5.5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+
+# AWS SDK for S3-compatible backends (MinIO, AWS S3)
+aws-sdk-s3 = "1.137"
+aws-config = "1.8.18"
+
+# Google Cloud Storage SDK
+google-cloud-storage = "1.15"
+google-cloud-auth = "1.13"
+google-cloud-gax = "1.11"
+google-cloud-wkt = "1.5"
+
+# Azure Storage SDK
+azure_storage = "0.21"
+azure_storage_blobs = "0.21"
+azure_core = "1.0"
+
+# Linux-specific dependencies
+libc = "0.2"
+tokio-uring = "0.5.0"
+
+# Testing
+tokio-test = "0.4"
+tempfile = "3.27"
+tokio-tungstenite = "0.29"
+
+# Benchmarking
+criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
+
+# Build dependencies
+tonic-prost-build = "0.14"
+# Pure-Rust protobuf compiler (no system/vendored protoc required)
+protox = "0.9"
+
+# WASM dependencies
+wee_alloc = "0.4"
+
+[package]
+name = "rs3gw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "High-Performance AI/HPC Object Storage Gateway powered by scirs2-io"
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/cool-japan/rs3gw"
+documentation = "https://docs.rs/rs3gw"
+keywords = ["s3", "storage", "gateway", "hpc", "ai"]
+categories = ["web-programming::http-server", "filesystem"]
+
+[features]
+default = ["server"]
+local = []
+server = [
+    "dep:axum", "dep:axum-server", "dep:tower", "dep:tower-http",
+    "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tokio-stream",
+    "dep:async-graphql", "dep:async-graphql-axum", "dep:utoipa", "dep:utoipa-swagger-ui",
+    "dep:metrics-exporter-prometheus",
+    "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp",
+    "dep:opentelemetry-semantic-conventions", "dep:tracing-opentelemetry",
+    "dep:reqwest", "dep:http-body-util", "dep:rustls-pemfile", "dep:quick-xml",
+    "dep:crc32c", "dep:sha1", "dep:md5", "dep:rayon", "dep:async-stream",
+    "dep:tracing-subscriber",
+]
+io_uring = ["dep:tokio-uring"]
+video-transcoding = ["dep:ffmpeg-next"]
+wasm-plugins = ["dep:wasmtime"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:google-cloud-gax", "dep:google-cloud-wkt"]
+azure = ["dep:azure_storage", "dep:azure_storage_blobs", "dep:azure_core"]
+formats = ["dep:parquet", "dep:arrow", "dep:apache-avro", "dep:orc-rust", "dep:prost-reflect", "dep:rmp-serde"]
+all-backends = ["s3", "gcs", "azure", "formats"]
+
+[dependencies]
+# Core async runtime
+tokio.workspace = true
+tokio-stream = { workspace = true, optional = true }
+
+# Web framework
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+quick-xml = { workspace = true, optional = true }
+toml.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging and tracing
+tracing.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
+
+# OpenTelemetry distributed tracing
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+# Utilities
+uuid.workspace = true
+chrono.workspace = true
+bytes.workspace = true
+futures.workspace = true
+percent-encoding.workspace = true
+regex.workspace = true
+base64.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+tokio-util.workspace = true
+http-body-util = { workspace = true, optional = true }
+num_cpus.workspace = true
+hostname.workspace = true
+
+# Encryption
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+md5 = { workspace = true, optional = true }
+getrandom.workspace = true
+
+# Checksums
+crc32c = { workspace = true, optional = true }
+crc32fast.workspace = true
+sha1 = { workspace = true, optional = true }
+
+# HTTP client for webhooks
+reqwest = { workspace = true, optional = true }
+url.workspace = true
+
+# Compression
+oxiarc-zstd.workspace = true
+oxiarc-lz4.workspace = true
+oxiarc-deflate.workspace = true
+
+# Metrics
+metrics.workspace = true
+metrics-exporter-prometheus = { workspace = true, optional = true }
+
+# SciRS2 Ecosystem (SCIRS2 POLICY)
+scirs2-core.workspace = true
+scirs2-io.workspace = true
+
+# Parquet support for S3 Select
+parquet = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
+
+# Apache Avro support for S3 Select
+apache-avro = { workspace = true, optional = true }
+
+# Apache ORC support for S3 Select
+orc-rust = { workspace = true, optional = true }
+
+# Protocol Buffers support for S3 Select
+prost-reflect = { workspace = true, optional = true }
+
+# MessagePack support for S3 Select
+rmp-serde = { workspace = true, optional = true }
+
+# Image processing
+image.workspace = true
+
+# Video transcoding (optional, feature-gated due to C dependencies)
+ffmpeg-next = { workspace = true, optional = true }
+
+# WASM runtime (optional, pure Rust)
+wasmtime = { workspace = true, optional = true }
+
+# Parallel processing
+rayon = { workspace = true, optional = true }
+
+# Async traits
+async-trait.workspace = true
+async-stream = { workspace = true, optional = true }
+
+# Time parsing for config
+humantime.workspace = true
+
+# CLI and error handling
+clap.workspace = true
+anyhow.workspace = true
+indicatif.workspace = true
+
+# Directory walking
+walkdir.workspace = true
+
+# Memory mapping
+memmap2.workspace = true
+
+# TLS support
+axum-server = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+
+# gRPC support
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+prost-types = { workspace = true, optional = true }
+
+# GraphQL support
+async-graphql = { workspace = true, optional = true }
+async-graphql-axum = { workspace = true, optional = true }
+
+# OpenAPI/Swagger support
+utoipa = { workspace = true, optional = true }
+utoipa-swagger-ui = { workspace = true, optional = true }
+
+# AWS SDK for S3-compatible backends (MinIO, AWS S3)
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+
+# Google Cloud Storage SDK
+google-cloud-storage = { workspace = true, optional = true }
+google-cloud-auth = { workspace = true, optional = true }
+google-cloud-gax = { workspace = true, optional = true }
+google-cloud-wkt = { workspace = true, optional = true }
+
+# Azure Storage SDK
+azure_storage = { workspace = true, optional = true }
+azure_storage_blobs = { workspace = true, optional = true }
+azure_core = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Unix-specific dependencies
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# io_uring support (Linux only, optional)
+tokio-uring = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Testing
+tokio-test.workspace = true
+tempfile.workspace = true
+aws-sdk-s3.workspace = true
+aws-config.workspace = true
+reqwest = { workspace = true, features = ["json", "multipart"] }
+tokio-tungstenite.workspace = true
+
+# Benchmarking
+criterion.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protox.workspace = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+
+[[bench]]
+name = "storage_benchmarks"
+harness = false
+
+[[bench]]
+name = "compression_benchmarks"
+harness = false
+
+[[bench]]
+name = "api_benchmarks"
+harness = false
+
+[[bench]]
+name = "load_testing_benchmarks"
+harness = false
+
+[[bench]]
+name = "s3_api_benchmarks"
+harness = false
+
+[[bench]]
+name = "grpc_vs_rest_benchmarks"
+harness = false
+
+[[bin]]
+name = "rs3gw"
+path = "src/main.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "testdata-generator"
+path = "src/bin/testdata_generator.rs"
+required-features = ["formats"]
+
+[[bin]]
+name = "s3-migrate"
+path = "src/bin/s3_migrate.rs"
+required-features = ["s3", "server"]
+
+[[bin]]
+name = "rs3ctl"
+path = "src/bin/rs3ctl.rs"
+required-features = ["server"]

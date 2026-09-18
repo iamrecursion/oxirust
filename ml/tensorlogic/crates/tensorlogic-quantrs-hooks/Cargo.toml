@@ -1,0 +1,49 @@
+[package]
+name = "tensorlogic-quantrs-hooks"
+version.workspace = true
+description = "Probabilistic graphical model and message-passing interoperability for QuantRS2"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tensorlogic-quantrs-hooks"
+readme = "README.md"
+keywords = ["tensor", "logic", "quantum-computing", "quantum-circuits", "hooks"]
+categories = ["science::quantum-computing", "algorithms", "simulation"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+chrono.workspace = true
+tensorlogic-ir.workspace = true
+tensorlogic-compiler.workspace = true
+tensorlogic-infer.workspace = true
+scirs2-core = { workspace = true, features = ["random"] }
+rayon.workspace = true
+
+# QuantRS2 integration - Quantum computing & probabilistic inference
+quantrs2-core.workspace = true
+quantrs2-circuit.workspace = true
+quantrs2-sim.workspace = true
+
+[features]
+fuzzing = []
+
+[dev-dependencies]
+approx.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "inference_algorithms"
+harness = false
+
+[[bench]]
+name = "factor_operations"
+harness = false
+
+[[bench]]
+name = "message_passing"
+harness = false

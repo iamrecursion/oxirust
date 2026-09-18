@@ -1,0 +1,57 @@
+[package]
+name = "celers-broker-redis"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Redis broker implementation for CeleRS with Lua scripts and priority queues"
+readme = "README.md"
+keywords = ["celery", "redis", "broker", "queue", "async"]
+categories = ["asynchronous", "network-programming", "caching"]
+
+[dependencies]
+celers-core = { workspace = true }
+celers-protocol = { workspace = true, features = ["gzip", "zlib"] }
+celers-metrics = { workspace = true, optional = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+redis = { workspace = true, features = ["cluster-async"] }
+# Supplies the Pure-Rust rustls crypto provider that
+# `install_pure_tls_provider()` installs as the process default. Mandatory, not
+# optional: no rustls provider *feature* is enabled anywhere in this workspace,
+# so `redis`'s bare `rustls::ClientConfig::builder()` panics without it.
+oxitls = { workspace = true }
+tracing = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxiarc-zstd = { workspace = true, optional = true }
+chrono = { workspace = true }
+cron = { workspace = true }
+uuid = { workspace = true }
+crc32fast = { workspace = true }
+rand = { workspace = true }
+oxihttp-client = { workspace = true }
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+twox-hash = { workspace = true }
+# Real SHA-256 for `ChecksumAlgorithm::Sha256` (integrity.rs); `hex` renders
+# the digest in the same lowercase form the other algorithms use.
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+metrics = ["celers-metrics"]
+zstd-compression = ["oxiarc-zstd", "celers-protocol/zstd-compression"]
+
+[[bench]]
+name = "redis_broker_benchmarks"
+harness = false

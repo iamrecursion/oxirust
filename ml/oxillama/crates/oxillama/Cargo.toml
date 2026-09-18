@@ -1,0 +1,85 @@
+[package]
+name = "oxillama"
+description = "Pure Rust LLM inference engine — the sovereign alternative to llama.cpp (meta crate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords = ["llm", "inference", "gguf", "llama", "pure-rust"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+# P4: `default` must name at least one architecture feature. Before this fix,
+# a caller selecting features without `server` (e.g. `default-features =
+# false, features = ["bench"]`) got a crate that compiled cleanly and then
+# failed at *runtime* with "unsupported architecture: 'llama'" on any model,
+# because `oxillama-runtime::build_forward_pass` gates every forward-pass arm
+# on a runtime architecture feature and `server` was the only thing that
+# happened to enable one transitively (via `oxillama-server`).
+# See crates/oxillama/tests/feature_matrix.rs::test_default_features_include_at_least_one_architecture.
+#
+# P6: `bench` was dropped from `default` — it pulled the full Criterion stack
+# (plotters, rayon, regex) plus `tabled` and `sysinfo` into every downstream
+# `cargo add oxillama`, even for consumers who only want inference. Depend on
+# `oxillama-bench` directly, or enable the `bench` feature explicitly, to get
+# the benchmark suite.
+default = ["server", "llama", "simd-neon", "simd-avx2"]
+server = ["dep:oxillama-server"]
+bench = ["dep:oxillama-bench"]
+gpu = ["dep:oxillama-gpu", "oxillama-gpu/gpu"]
+simd-avx2 = ["oxillama-quant/simd-avx2", "oxillama-runtime/simd-avx2"]
+simd-avx512 = ["oxillama-quant/simd-avx512", "oxillama-runtime/simd-avx512"]
+simd-neon = ["oxillama-quant/simd-neon", "oxillama-runtime/simd-neon"]
+# Architecture feature flags
+llama = ["oxillama-arch/llama", "oxillama-runtime/llama"]
+qwen3 = ["oxillama-arch/qwen3", "oxillama-runtime/qwen3"]
+mistral = ["oxillama-arch/mistral", "oxillama-runtime/mistral"]
+gemma = ["oxillama-arch/gemma", "oxillama-runtime/gemma"]
+phi = ["oxillama-arch/phi", "oxillama-runtime/phi"]
+command-r = ["oxillama-arch/command-r", "oxillama-runtime/command-r"]
+starcoder = ["oxillama-arch/starcoder", "oxillama-runtime/starcoder"]
+llava = ["oxillama-arch/llava"]
+deepseek = ["oxillama-arch/deepseek"]
+dbrx = ["oxillama-arch/dbrx"]
+grok = ["oxillama-arch/grok"]
+mamba2 = ["oxillama-arch/mamba2"]
+jamba = ["oxillama-arch/jamba"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+
+[[example]]
+name = "load_and_generate"
+path = "examples/load_and_generate.rs"
+required-features = []
+
+[[example]]
+name = "lora_apply"
+path = "examples/lora_apply.rs"
+required-features = []
+
+[[example]]
+name = "speculative"
+path = "examples/speculative.rs"
+required-features = []
+
+[dependencies]
+anyhow = { workspace = true }
+oxillama-gguf = { workspace = true, features = ["mmap"] }
+oxillama-quant = { workspace = true, features = ["parallel"] }
+oxillama-arch.workspace = true
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "parallel", "native-async", "mmap"] }
+oxillama-server = { workspace = true, optional = true }
+oxillama-bench = { workspace = true, optional = true }
+oxillama-gpu = { workspace = true, optional = true }

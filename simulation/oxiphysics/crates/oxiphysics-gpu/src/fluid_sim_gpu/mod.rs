@@ -1,0 +1,23 @@
+//! Auto-generated module structure
+
+pub mod fluidsimconfig_traits;
+pub mod functions;
+pub mod functions_2;
+pub mod sphconfig_traits;
+pub mod types;
+
+// Re-export all types
+pub use functions::*;
+pub use types::*;
+
+#[cfg(test)]
+mod flip_tests;
+
+#[cfg(test)]
+mod lbm_boundary_tests;
+
+#[cfg(test)]
+mod sph_force_tests;
+
+#[cfg(test)]
+mod sph_grid_tests;

@@ -1,0 +1,291 @@
+# OxiGeo Google Cloud Deployment Manager Configuration
+# Deploys OxiGeo on GCP with Cloud Run and Cloud SQL
+# Author: COOLJAPAN OU (Team Kitasan)
+
+imports:
+- path: templates/cloud-run.jinja
+- path: templates/cloud-sql.jinja
+- path: templates/memorystore.jinja
+- path: templates/storage.jinja
+- path: templates/networking.jinja
+
+resources:
+# VPC Network
+- name: oxigeo-network
+  type: compute.v1.network
+  properties:
+    autoCreateSubnetworks: false
+
+# Subnet
+- name: oxigeo-subnet
+  type: compute.v1.subnetwork
+  properties:
+    network: $(ref.oxigeo-network.selfLink)
+    ipCidrRange: 10.0.0.0/24
+    region: us-central1
+    privateIpGoogleAccess: true
+
+# Cloud SQL PostgreSQL Instance
+- name: oxigeo-postgres
+  type: sqladmin.v1beta4.instance
+  properties:
+    region: us-central1
+    databaseVersion: POSTGRES_16
+    settings:
+      tier: db-custom-2-4096
+      ipConfiguration:
+        ipv4Enabled: true
+        authorizedNetworks:
+        - name: allow-all
+          value: 0.0.0.0/0  # TODO: Restrict in production
+        privateNetwork: $(ref.oxigeo-network.selfLink)
+      backupConfiguration:
+        enabled: true
+        startTime: "03:00"
+        backupRetentionSettings:
+          retainedBackups: 7
+          retentionUnit: COUNT
+      databaseFlags:
+      - name: max_connections
+        value: "100"
+      - name: shared_buffers
+        value: "262144"
+      availabilityType: REGIONAL
+      dataDiskType: PD_SSD
+      dataDiskSizeGb: 20
+
+# Cloud SQL Database
+- name: oxigeo-database
+  type: sqladmin.v1beta4.database
+  properties:
+    instance: $(ref.oxigeo-postgres.name)
+    name: oxigeo
+    charset: UTF8
+
+# Cloud SQL User
+- name: oxigeo-db-user
+  type: sqladmin.v1beta4.user
+  properties:
+    instance: $(ref.oxigeo-postgres.name)
+    name: oxigeo
+    password: CHANGE_ME  # Use Secret Manager in production
+
+# Memorystore Redis Instance
+- name: oxigeo-redis
+  type: redis.v1.instance
+  properties:
+    tier: STANDARD_HA
+    memorySizeGb: 2
+    region: us-central1
+    redisVersion: REDIS_7_0
+    authorizedNetwork: $(ref.oxigeo-network.selfLink)
+    redisConfigs:
+      maxmemory-policy: allkeys-lru
+
+# Cloud Storage Bucket
+- name: oxigeo-data-bucket
+  type: storage.v1.bucket
+  properties:
+    location: US
+    storageClass: STANDARD
+    versioning:
+      enabled: true
+    lifecycle:
+      rule:
+      - action:
+          type: SetStorageClass
+          storageClass: NEARLINE
+        condition:
+          age: 90
+      - action:
+          type: SetStorageClass
+          storageClass: COLDLINE
+        condition:
+          age: 180
+    iamConfiguration:
+      uniformBucketLevelAccess:
+        enabled: true
+
+# Service Account for Cloud Run
+- name: oxigeo-service-account
+  type: iam.v1.serviceAccount
+  properties:
+    accountId: oxigeo-server
+    displayName: OxiGeo Server Service Account
+
+# IAM Policy Bindings
+- name: oxigeo-storage-access
+  type: storage.v1.bucket
+  properties:
+    bucket: $(ref.oxigeo-data-bucket.name)
+  accessControl:
+    entity: serviceAccount:$(ref.oxigeo-service-account.email)
+    role: READER
+
+# Cloud Run Service
+- name: oxigeo-server
+  type: run.v1.service
+  properties:
+    apiVersion: serving.knative.dev/v1
+    kind: Service
+    metadata:
+      name: oxigeo-server
+      namespace: PROJECT_ID  # Replace with actual project ID
+      annotations:
+        run.googleapis.com/ingress: all
+        run.googleapis.com/client-name: gcloud
+    spec:
+      template:
+        metadata:
+          annotations:
+            autoscaling.knative.dev/minScale: "2"
+            autoscaling.knative.dev/maxScale: "20"
+            run.googleapis.com/vpc-access-connector: oxigeo-connector
+            run.googleapis.com/vpc-access-egress: private-ranges-only
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          serviceAccountName: $(ref.oxigeo-service-account.email)
+          containerConcurrency: 80
+          timeoutSeconds: 300
+          containers:
+          - image: ghcr.io/cool-japan/oxigeo-server:latest
+            ports:
+            - containerPort: 8080
+              protocol: TCP
+            env:
+            - name: RUST_LOG
+              value: info
+            - name: OXIGEO_HOST
+              value: "0.0.0.0"
+            - name: OXIGEO_PORT
+              value: "8080"
+            - name: POSTGRES_HOST
+              value: /cloudsql/PROJECT_ID:us-central1:oxigeo-postgres
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: oxigeo
+            - name: POSTGRES_USER
+              value: oxigeo
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: oxigeo-db-password
+                  key: password
+            - name: REDIS_HOST
+              value: $(ref.oxigeo-redis.host)
+            - name: REDIS_PORT
+              value: $(ref.oxigeo-redis.port)
+            - name: GCS_BUCKET
+              value: $(ref.oxigeo-data-bucket.name)
+            resources:
+              limits:
+                cpu: "2000m"
+                memory: 4Gi
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              initialDelaySeconds: 10
+              periodSeconds: 10
+            startupProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              initialDelaySeconds: 0
+              periodSeconds: 1
+              failureThreshold: 30
+
+# VPC Access Connector
+- name: oxigeo-connector
+  type: vpcaccess.v1.connector
+  properties:
+    network: $(ref.oxigeo-network.name)
+    ipCidrRange: 10.8.0.0/28
+    region: us-central1
+    minThroughput: 200
+    maxThroughput: 1000
+
+# Cloud Monitoring Alert Policy
+- name: oxigeo-cpu-alert
+  type: monitoring.v3.alertPolicy
+  properties:
+    displayName: OxiGeo High CPU Usage
+    combiner: OR
+    conditions:
+    - displayName: CPU Utilization above 80%
+      conditionThreshold:
+        filter: |
+          metric.type="run.googleapis.com/container/cpu/utilizations"
+          resource.type="cloud_run_revision"
+          resource.label.service_name="oxigeo-server"
+        comparison: COMPARISON_GT
+        thresholdValue: 0.8
+        duration: 300s
+    notificationChannels: []  # Add notification channels as needed
+    enabled: true
+
+# Cloud Monitoring Dashboard
+- name: oxigeo-dashboard
+  type: monitoring.v1.dashboard
+  properties:
+    displayName: OxiGeo Monitoring Dashboard
+    dashboardFilters: []
+    gridLayout:
+      columns: 12
+      widgets:
+      - title: CPU Utilization
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: |
+                  metric.type="run.googleapis.com/container/cpu/utilizations"
+                  resource.type="cloud_run_revision"
+                  resource.label.service_name="oxigeo-server"
+              unitOverride: "1"
+          timeshiftDuration: 0s
+          yAxis:
+            label: y1Axis
+            scale: LINEAR
+      - title: Memory Utilization
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: |
+                  metric.type="run.googleapis.com/container/memory/utilizations"
+                  resource.type="cloud_run_revision"
+                  resource.label.service_name="oxigeo-server"
+              unitOverride: "1"
+          timeshiftDuration: 0s
+          yAxis:
+            label: y1Axis
+            scale: LINEAR
+      - title: Request Count
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: |
+                  metric.type="run.googleapis.com/request_count"
+                  resource.type="cloud_run_revision"
+                  resource.label.service_name="oxigeo-server"
+          timeshiftDuration: 0s
+          yAxis:
+            label: y1Axis
+            scale: LINEAR
+
+outputs:
+- name: cloud-run-url
+  value: $(ref.oxigeo-server.status.url)
+- name: postgres-connection
+  value: $(ref.oxigeo-postgres.connectionName)
+- name: redis-host
+  value: $(ref.oxigeo-redis.host)
+- name: redis-port
+  value: $(ref.oxigeo-redis.port)
+- name: storage-bucket
+  value: $(ref.oxigeo-data-bucket.name)
+- name: service-account-email
+  value: $(ref.oxigeo-service-account.email)

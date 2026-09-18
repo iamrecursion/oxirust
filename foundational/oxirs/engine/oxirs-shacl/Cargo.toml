@@ -1,0 +1,103 @@
+[package]
+name = "oxirs-shacl"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SHACL Core + SHACL-SPARQL validator for RDF data validation"
+keywords = ["shacl", "validation", "rdf", "constraints", "semantic-web"]
+categories = ["data-structures", "parser-implementations", "science"]
+readme = "README.md"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxirs-core.workspace = true
+
+# SciRS2 dependencies for graph validation and analysis
+scirs2-graph = { workspace = true }
+scirs2-stats = { workspace = true }
+scirs2-core = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+regex.workspace = true
+uuid.workspace = true
+indexmap = { workspace = true, features = ["serde"] }
+petgraph.workspace = true
+rayon = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"], optional = true }
+futures = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+once_cell.workspace = true
+dashmap.workspace = true
+chrono.workspace = true
+url.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+# rand functionality now provided by scirs2-core (use scirs2_core::random)
+serde_yaml.workspace = true
+semver = { version = "1.0", features = ["serde"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+wasmi = "1.1"  # Lightweight WASM interpreter for custom validators
+tower-lsp = { version = "0.20", optional = true }  # LSP server implementation (includes lsp-types)
+
+[dev-dependencies]
+criterion.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "w3c_test_runner"
+path = "src/bin/w3c_test_runner.rs"
+
+[[bin]]
+name = "shacl_validator"
+path = "src/bin/shacl_validator.rs"
+
+[[bin]]
+name = "constraint_tester"
+path = "src/bin/constraint_tester.rs"
+
+[[bin]]
+name = "shape_analyzer"
+path = "src/bin/shape_analyzer.rs"
+
+[[bin]]
+name = "shacl_lsp"
+path = "src/bin/shacl_lsp.rs"
+required-features = ["lsp"]
+
+[features]
+default = ["core", "async", "parallel"]
+core = []
+sparql = []
+serde = []
+async = ["tokio", "futures", "futures-util", "tokio-stream"]
+parallel = ["rayon"]
+lsp = ["tower-lsp", "async", "tokio/full"]
+gpu = ["scirs2-core/gpu"]
+
+[[bench]]
+name = "validation_benchmarks"
+harness = false
+
+[[example]]
+name = "basic_validation"
+path = "examples/basic_validation.rs"
+
+[[example]]
+name = "advanced_shapes"
+path = "examples/advanced_shapes.rs"
+
+[[example]]
+name = "parallel_validation"
+path = "examples/parallel_validation.rs"
+required-features = ["parallel"]
+

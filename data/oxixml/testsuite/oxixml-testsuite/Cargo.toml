@@ -1,0 +1,90 @@
+[package]
+name = "oxixml-testsuite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Workspace-wide W3C/oxigraph conformance harness for OxiXML (development only, never published)."
+keywords = ["conformance", "testsuite", "w3c", "xml", "rdf"]
+categories = ["development-tools::testing"]
+readme = "README.md"
+# This crate drives externally-provisioned conformance suites against the sibling crates; it
+# ships no reusable API and has nothing to publish to crates.io.
+publish = false
+
+[features]
+default = []
+# Drives the RDF-family runners against the RDF 1.2 shape of the model (embedded triple terms).
+# Kept in step with the sibling crates so a `--all-features` workspace build stays coherent:
+# without it, feature unification would hand this crate an `oxixml_model::Term` variant its
+# isomorphism checker was not compiled to see.
+rdf-12 = [
+    "oxixml-model/rdf-12",
+    "oxixml-turtle/rdf-12",
+    "oxixml-canon/rdf-12",
+    "oxixml-sparql-syntax/sparql-12",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bin]]
+name = "oxixml-conformance-report"
+path = "src/bin/report.rs"
+
+[dependencies]
+# XML well-formedness (xmlconf "not-wf"/"error").
+oxixml-xml = { workspace = true }
+# DTD validation (xmlconf "valid"/"invalid").
+oxixml-dtd = { workspace = true }
+# DOM tree used by c14n, RELAX NG and the XSD suite's document parsing.
+oxixml-dom = { workspace = true }
+# Encoding sniffing for the XSD suite's UTF-16 fixtures.
+oxixml-encoding = { workspace = true }
+# W3C XML Schema Test Suite (xsts).
+oxixml-schema = { workspace = true }
+# XDM tree + sequences shared by the QT3 and XSLT 3.0 drivers.
+oxixml-infoset = { workspace = true }
+# The XPath function library context (trace sink) used while evaluating QT3/XSLT cases.
+oxixml-fn = { workspace = true }
+# XPath 3.1 engine, also used to check QT3/XSLT assertions.
+oxixml-xpath = { workspace = true }
+# XQuery 3.1 engine (qt3 XQuery driver).
+oxixml-xquery = { workspace = true }
+# XSLT 3.0 processor (xslt30-test).
+oxixml-xslt = { workspace = true }
+# `serialization-matches` assertions in the QT3 and XSLT 3.0 catalogues.
+oxixml-regex = { workspace = true }
+# XInclude 1.0 processing for the one xslt30-test source document that asks for it
+# (`<source role="." xinclude="true"/>`).
+oxixml-xinclude = { workspace = true }
+# RELAX NG (jing-trang spectest/compacttest).
+oxixml-relaxng = { workspace = true }
+# Schematron (ISO-namespace reference-suite compile smoke test).
+oxixml-schematron = { workspace = true }
+# Canonical XML 1.0/1.1/2.0 (xml-c14n2-testcases) and the SignedInfo half of xmldsig.
+oxixml-c14n = { workspace = true }
+# XML Signature verification (xmldsig-core1-interop).
+oxixml-dsig = { workspace = true }
+# N-Triples/N-Quads/Turtle/TriG (rdf-tests, rdf-canon, sparql manifests).
+oxixml-turtle = { workspace = true }
+# RDF/XML (rdf-tests rdf-xml family).
+oxixml-rdfxml = { workspace = true }
+# RDF term/triple/quad model shared by every RDF-family runner.
+oxixml-model = { workspace = true }
+# RDFC-1.0 canonicalization (rdf-canon).
+oxixml-canon = { workspace = true }
+# JSON-LD 1.1 API + streaming profile (json-ld).
+oxixml-jsonld = { workspace = true }
+# SPARQL query/update parser (sparql syntax tests).
+oxixml-sparql-syntax = { workspace = true }
+# RDFa 1.1 extraction (optional OXIXML_RDFA_SUITE_DIR runner: the W3C RDFa Test Suite, re-driven
+# through RdfaParser).
+oxixml-rdfa = { workspace = true }
+
+[lints]
+workspace = true

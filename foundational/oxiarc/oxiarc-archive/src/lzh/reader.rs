@@ -1,0 +1,408 @@
+//! LZH archive reader with extraction support.
+
+use crate::lenient::{LenientWarning, LenientWarningKind};
+use crate::lzh::header::LzhHeader;
+use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
+use oxiarc_core::{Crc16, Entry};
+use oxiarc_lzhuf::{LzhMethod, decode_lzh};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+/// Read exactly `declared_len` bytes of the compressed payload starting at
+/// the reader's current position.
+///
+/// `declared_len` originates from an untrusted LZH header field
+/// (`compressed_size`), so it must never drive an unconditional
+/// `vec![0u8; declared_len]` allocation directly — a crafted archive could
+/// declare an implausible size (e.g. several GiB) for what is actually a
+/// tiny or truncated file, aborting the process on allocation before a
+/// single byte is read. Instead the declared length is first bounded
+/// against the number of bytes actually remaining in the underlying
+/// stream, and the allocation itself goes through `try_reserve_exact` so
+/// an oversized-but-still-"remaining" declaration yields a proper `Err`
+/// rather than an allocator panic.
+fn read_compressed_bounded<R: Read + Seek>(reader: &mut R, declared_len: u32) -> Result<Vec<u8>> {
+    let declared_len = declared_len as u64;
+    let current = reader.stream_position()?;
+    let end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(current))?;
+    let remaining = end.saturating_sub(current);
+
+    if declared_len > remaining {
+        return Err(OxiArcError::corrupted(
+            current,
+            format!(
+                "LZH entry declares compressed size {declared_len} but only {remaining} bytes remain in the stream"
+            ),
+        ));
+    }
+
+    let mut data = Vec::new();
+    data.try_reserve_exact(declared_len as usize).map_err(|_| {
+        OxiArcError::corrupted(
+            current,
+            format!("unable to allocate {declared_len} bytes for LZH entry data"),
+        )
+    })?;
+    data.resize(declared_len as usize, 0);
+    reader.read_exact(&mut data)?;
+    Ok(data)
+}
+
+/// Internal entry info for extraction.
+#[derive(Debug, Clone)]
+pub(crate) struct LzhEntryInfo {
+    pub(crate) entry: Entry,
+    pub(crate) method: LzhMethod,
+    pub(crate) crc16: u16,
+    pub(crate) compressed_size: u32,
+}
+
+/// LZH archive reader with extraction support.
+pub struct LzhReader<R: Read + Seek> {
+    pub(crate) reader: R,
+    pub(crate) entries: Vec<LzhEntryInfo>,
+    /// Optional progress handle for tracking extraction progress.
+    pub(crate) progress: Option<ProgressHandle>,
+    /// When `true`, CRC-16 mismatches during extraction are recorded in
+    /// [`LzhReader::warnings`] instead of returning an error. Disabled
+    /// by default; toggle via [`LzhReader::lenient`].
+    pub(crate) lenient: bool,
+    /// Accumulated non-fatal warnings emitted while operating in
+    /// lenient mode. Empty unless [`LzhReader::lenient`] has been set
+    /// to `true`.
+    pub(crate) warnings: Vec<LenientWarning>,
+}
+
+impl<R: Read + Seek> LzhReader<R> {
+    /// Create a new LZH reader.
+    pub fn new(mut reader: R) -> Result<Self> {
+        let entries = Self::read_entries(&mut reader, None)?;
+        Ok(Self {
+            reader,
+            entries,
+            progress: None,
+            lenient: false,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Create a new LZH reader with progress reporting during entry scanning.
+    pub fn new_with_progress(mut reader: R, handle: ProgressHandle) -> Result<Self> {
+        let entries = Self::read_entries(&mut reader, Some(&handle))?;
+        Ok(Self {
+            reader,
+            entries,
+            progress: Some(handle),
+            lenient: false,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Attach a progress callback handle (for extraction progress only;
+    /// does not retroactively replay entry-scan progress).
+    #[must_use]
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Enable or disable lenient-mode extraction.
+    ///
+    /// When enabled, CRC-16 mismatches during extraction are recorded
+    /// in [`LzhReader::warnings`] and the (possibly corrupted) payload
+    /// is returned to the caller anyway. When disabled (default),
+    /// CRC-16 mismatches abort the extraction with
+    /// [`OxiArcError::CorruptedData`].
+    #[must_use]
+    pub fn lenient(mut self, enabled: bool) -> Self {
+        self.lenient = enabled;
+        self
+    }
+
+    /// Return the accumulated non-fatal warnings from lenient-mode
+    /// operations. Empty unless [`LzhReader::lenient`] has been set to
+    /// `true`.
+    pub fn warnings(&self) -> &[LenientWarning] {
+        &self.warnings
+    }
+
+    /// Read all entries, optionally reporting progress.
+    fn read_entries(
+        reader: &mut R,
+        progress: Option<&ProgressHandle>,
+    ) -> Result<Vec<LzhEntryInfo>> {
+        let mut entries = Vec::new();
+        let mut offset = 0u64;
+        let mut index: u64 = 0;
+
+        while let Some(header) = LzhHeader::read(reader, offset)? {
+            let entry = header.to_entry();
+            let method = header.method;
+            let crc16 = header.crc16;
+            let compressed_size = header.compressed_size;
+
+            if let Some(handle) = progress {
+                handle.on_entry(&entry.name, index);
+                handle.on_progress(entry.size, Some(entry.size));
+            }
+
+            // Skip compressed data using seek
+            reader.seek(SeekFrom::Current(header.compressed_size as i64))?;
+
+            offset = header.data_offset + header.compressed_size as u64;
+            index += 1;
+
+            entries.push(LzhEntryInfo {
+                entry,
+                method,
+                crc16,
+                compressed_size,
+            });
+        }
+
+        if let Some(handle) = progress {
+            handle.on_finish();
+        }
+
+        Ok(entries)
+    }
+
+    /// Get entries.
+    pub fn entries(&self) -> Vec<Entry> {
+        self.entries.iter().map(|e| e.entry.clone()).collect()
+    }
+
+    /// Extract an entry to a writer.
+    pub fn extract<W: Write>(&mut self, entry: &Entry, writer: &mut W) -> Result<u64> {
+        // Find the entry info
+        let info = self
+            .entries
+            .iter()
+            .find(|e| e.entry.offset == entry.offset)
+            .ok_or_else(|| OxiArcError::invalid_header("Entry not found"))?
+            .clone();
+
+        // Emit extraction progress start
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(&entry.name, 0);
+        }
+
+        // Directory entries (-lhd-) carry no data.
+        if info.method.is_directory() {
+            if let Some(ref handle) = self.progress {
+                handle.on_progress(0, Some(0));
+            }
+            return Ok(0);
+        }
+
+        // Unsupported methods are listed but rejected per entry at
+        // extraction time (the rest of the archive stays accessible).
+        if let LzhMethod::Unknown(id) = info.method {
+            return Err(OxiArcError::unsupported_method(
+                String::from_utf8_lossy(&id).into_owned(),
+            ));
+        }
+
+        // Seek to data offset
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+
+        // Read compressed data
+        let compressed = read_compressed_bounded(&mut self.reader, info.compressed_size)?;
+
+        // Decompress
+        let decompressed = if info.method == LzhMethod::Lh0 {
+            // Stored (no compression)
+            compressed
+        } else {
+            decode_lzh(&compressed, info.method, entry.size)?
+        };
+
+        // Verify CRC-16
+        let computed_crc = Crc16::compute(&decompressed);
+        if computed_crc != info.crc16 {
+            if self.lenient {
+                self.warnings.push(LenientWarning {
+                    format: "LZH",
+                    entry_name: Some(entry.name.clone()),
+                    kind: LenientWarningKind::CrcMismatch {
+                        expected: info.crc16 as u32,
+                        computed: computed_crc as u32,
+                    },
+                    message: format!(
+                        "CRC-16 mismatch for entry {:?} at offset {}: expected {:04X}, computed {:04X}",
+                        entry.name, entry.offset, info.crc16, computed_crc
+                    ),
+                });
+            } else {
+                return Err(OxiArcError::corrupted(
+                    entry.offset,
+                    format!(
+                        "CRC-16 mismatch: expected {:04X}, computed {:04X}",
+                        info.crc16, computed_crc
+                    ),
+                ));
+            }
+        }
+
+        // Write to output
+        writer.write_all(&decompressed)?;
+
+        // Emit extraction progress completion
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(decompressed.len() as u64, Some(entry.size));
+        }
+
+        Ok(decompressed.len() as u64)
+    }
+
+    /// Extract an entry to a Vec.
+    ///
+    /// `entry.size` (the declared *uncompressed* size) is untrusted header
+    /// data, so it is never used to pre-size the output buffer directly —
+    /// a crafted header could declare an implausible uncompressed size for
+    /// a tiny compressed payload. The buffer instead starts empty and is
+    /// grown incrementally by `extract`'s `write_all` calls as bytes are
+    /// actually produced.
+    pub fn extract_to_vec(&mut self, entry: &Entry) -> Result<Vec<u8>> {
+        let mut data = Vec::new();
+        self.extract(entry, &mut data)?;
+        Ok(data)
+    }
+
+    /// Extract an entry by name.
+    pub fn extract_by_name(&mut self, name: &str) -> Result<Option<Vec<u8>>> {
+        let entry = self.entries.iter().find(|e| e.entry.name == name).cloned();
+        match entry {
+            Some(info) => Ok(Some(self.extract_to_vec(&info.entry)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the raw compressed payload for an entry without decompressing.
+    ///
+    /// Returns `(method, raw_compressed_bytes, crc16)`. The CRC-16 is the
+    /// original value stored in the header and is **not** verified — the
+    /// caller receives exactly `entry.compressed_size` bytes from disk.
+    ///
+    /// This is the LZH counterpart of `ZipReader::extract_raw` and is used
+    /// by `oxiarc add` to preserve byte-fidelity when rewriting archives.
+    pub fn read_raw_method_data(&mut self, entry: &Entry) -> Result<(LzhMethod, Vec<u8>, u16)> {
+        let info = self
+            .entries
+            .iter()
+            .find(|e| e.entry.offset == entry.offset)
+            .ok_or_else(|| OxiArcError::invalid_header("Entry not found in LZH reader"))?
+            .clone();
+
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+        let compressed = read_compressed_bounded(&mut self.reader, info.compressed_size)?;
+
+        Ok((info.method, compressed, info.crc16))
+    }
+}
+
+/// Open a LZH archive using memory-mapped I/O for efficient large-file reading.
+///
+/// This is a convenience wrapper around [`LzhReader::new`] that opens the file
+/// at `path` with [`oxiarc_core::mmap::MmapReader`], avoiding a full read into
+/// memory while still offering random-access semantics.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened, cannot be memory-mapped, or
+/// does not contain a valid LZH archive.
+///
+/// # Example
+///
+/// ```no_run
+/// use oxiarc_archive::lzh::open_lzh_mmap;
+///
+/// let reader = open_lzh_mmap("large_archive.lzh").unwrap();
+/// for entry in reader.entries() {
+///     println!("{}", entry.name);
+/// }
+/// ```
+#[cfg(feature = "mmap")]
+pub fn open_lzh_mmap<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<LzhReader<oxiarc_core::mmap::MmapReader>> {
+    let reader = oxiarc_core::mmap::MmapReader::open(path)?;
+    LzhReader::new(reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lzh::writer::LzhWriter;
+    use std::io::Cursor;
+
+    fn build_lzh(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        {
+            let mut writer = LzhWriter::new(&mut archive);
+            writer.add_file(name, data).expect("add_file");
+            writer.finish().expect("finish");
+        }
+        archive
+    }
+
+    /// A header field declaring a `compressed_size` far larger than what
+    /// is actually present in the stream must be rejected with a proper
+    /// `Err` from `read_compressed_bounded`, not turned into a multi-GiB
+    /// `vec![0u8; ...]` allocation.
+    #[test]
+    fn test_extract_oversized_compressed_size_errors() {
+        let archive = build_lzh("small.txt", b"hello world");
+        let mut reader = LzhReader::new(Cursor::new(archive)).expect("open archive");
+
+        // Directly corrupt the internally recorded compressed size to an
+        // implausible value — simulating a crafted header field.
+        reader.entries[0].compressed_size = u32::MAX;
+
+        let entry = reader.entries()[0].clone();
+        let result = reader.extract_to_vec(&entry);
+        assert!(
+            result.is_err(),
+            "oversized declared compressed_size must not succeed"
+        );
+    }
+
+    /// A stream truncated well before the declared `compressed_size` is
+    /// reached must yield a clean `Err`, not a panic or an attempt to
+    /// zero-fill a buffer sized from the untrusted declaration.
+    #[test]
+    fn test_extract_truncated_stream_errors() {
+        let mut archive = build_lzh("small.txt", b"hello world, this is a test payload");
+
+        // Truncate the archive well past the header but before the full
+        // declared compressed payload, so `remaining < declared_len`.
+        let truncated_len = archive.len().saturating_sub(5).max(1);
+        archive.truncate(truncated_len);
+
+        let mut reader = LzhReader::new(Cursor::new(archive)).expect("open truncated archive");
+        let entry = reader.entries()[0].clone();
+        let result = reader.extract_to_vec(&entry);
+        assert!(
+            result.is_err(),
+            "truncated stream must error rather than panic"
+        );
+    }
+
+    /// `read_compressed_bounded` itself: a declared length larger than the
+    /// remaining bytes must error without attempting the allocation.
+    #[test]
+    fn test_read_compressed_bounded_rejects_oversized_declaration() {
+        let mut cursor = Cursor::new(vec![1u8, 2, 3, 4]);
+        let result = read_compressed_bounded(&mut cursor, u32::MAX);
+        assert!(result.is_err());
+    }
+
+    /// Sanity check that the bounded reader still works correctly for a
+    /// plausible, in-range declaration.
+    #[test]
+    fn test_read_compressed_bounded_reads_valid_declaration() {
+        let mut cursor = Cursor::new(vec![10u8, 20, 30, 40, 50]);
+        let data = read_compressed_bounded(&mut cursor, 3).expect("read within bounds");
+        assert_eq!(data, vec![10, 20, 30]);
+    }
+}

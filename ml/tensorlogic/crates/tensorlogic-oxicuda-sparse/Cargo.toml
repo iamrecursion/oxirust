@@ -1,0 +1,29 @@
+[package]
+name = "tensorlogic-oxicuda-sparse"
+version.workspace = true
+description = "OxiCUDA sparse matrix wrapper for TensorLogic (GPU + CPU fallback)"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["sparse", "gpu", "cuda", "matrix", "linear-algebra"]
+categories = ["science", "algorithms", "mathematics"]
+
+[features]
+default = ["cpu"]
+# The cpu feature marker exists so downstream crates can express `features = ["cpu"]`
+# and get the pure-Rust path without any CUDA dependency.  No extra crate is required
+# because the CPU implementation is always compiled in (it is the fallback for `gpu`).
+cpu = []
+# GPU path: NVIDIA-only, requires libcuda.so at runtime — no build.rs, no CUDA SDK
+gpu = ["dep:oxicuda-sparse", "dep:oxicuda-driver", "dep:oxicuda-memory", "dep:oxicuda-blas"]
+
+[dependencies]
+thiserror.workspace = true
+scirs2-core.workspace = true
+# GPU path
+oxicuda-sparse  = { workspace = true, optional = true }
+oxicuda-driver  = { workspace = true, optional = true }
+oxicuda-memory  = { workspace = true, optional = true }
+oxicuda-blas    = { workspace = true, optional = true }

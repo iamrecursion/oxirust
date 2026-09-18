@@ -1,0 +1,33 @@
+[package]
+name = "oxixml-rdfa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "RDFa 1.1 parser over HTML and XML."
+keywords = ["rdfa", "rdf", "html", "xhtml", "parser"]
+categories = ["parser-implementations", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-model = { workspace = true }
+oxixml-iri = { workspace = true }
+oxixml-dom = { workspace = true }
+oxixml-html = { workspace = true }
+oxixml-xml = { workspace = true }
+oxixml-qname = { workspace = true }
+oxixml-xsd = { workspace = true }
+
+[dev-dependencies]
+oxixml-turtle = { path = "../oxixml-turtle" }
+oxixml-sparql-syntax = { path = "../../sparql/oxixml-sparql-syntax" }
+
+[lints]
+workspace = true

@@ -1,0 +1,63 @@
+{
+  "name": "scirs2-wasm",
+  "version": "0.6.6",
+  "description": "WebAssembly bindings for SciRS2 - High-performance scientific computing in JavaScript",
+  "main": "pkg/scirs2_wasm.js",
+  "types": "pkg/scirs2_wasm.d.ts",
+  "module": "pkg/scirs2_wasm.js",
+  "files": [
+    "pkg/**/*"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target bundler --out-dir pkg",
+    "build:web": "wasm-pack build --target web --out-dir pkg-web",
+    "build:nodejs": "wasm-pack build --target nodejs --out-dir pkg-node",
+    "build:all": "npm run build && npm run build:web && npm run build:nodejs",
+    "build:release": "wasm-pack build --release --target bundler --out-dir pkg",
+    "build:simd": "RUSTFLAGS='-C target-feature=+simd128' wasm-pack build --target bundler --out-dir pkg-simd",
+    "test": "wasm-pack test --headless --firefox",
+    "test:chrome": "wasm-pack test --headless --chrome",
+    "test:node": "wasm-pack test --node",
+    "optimize": "wasm-opt -Oz -o pkg/scirs2_wasm_bg_opt.wasm pkg/scirs2_wasm_bg.wasm",
+    "serve": "cd www && npm run start",
+    "example": "cd examples/web && npm start"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cool-japan/scirs.git"
+  },
+  "keywords": [
+    "scientific",
+    "computing",
+    "mathematics",
+    "wasm",
+    "webassembly",
+    "numpy",
+    "scipy",
+    "array",
+    "linalg",
+    "statistics",
+    "fft",
+    "signal-processing"
+  ],
+  "author": "COOLJAPAN OU (Team KitaSan)",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/cool-japan/scirs/issues"
+  },
+  "homepage": "https://github.com/cool-japan/scirs#readme",
+  "devDependencies": {
+    "wasm-pack": "^0.12.1",
+    "wasm-opt": "^1.4.0",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "browser": {
+    "fs": false,
+    "path": false
+  }
+}

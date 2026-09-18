@@ -1,0 +1,96 @@
+[package]
+name = "oxigeo-services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigeo-services"
+readme = "README.md"
+description = "OGC Web Services (WFS, WCS, WPS, CSW) for OxiGeo"
+keywords = ["gis", "science", "ogc", "wfs", "wcs"]
+categories = ["web-programming::http-server", "science::geo"]
+
+[features]
+# Pure-Rust default: no network client, no database driver in the closure.
+default = []
+# Enable real PostGIS-backed WFS transactions, feature retrieval and counting.
+postgis = ["dep:oxigeo-postgis", "dep:tokio-postgres", "dep:deadpool-postgres"]
+# Enable fetching WCS coverages from remote HTTP(S) URLs.
+remote = ["dep:reqwest"]
+
+[dependencies]
+# Internal dependencies
+oxigeo-core = { workspace = true, default-features = true }
+oxigeo-algorithms = { workspace = true, default-features = true }
+oxigeo-geotiff.workspace = true
+
+# Optional database backend (PostGIS) — enabled via the `postgis` feature
+oxigeo-postgis = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true, features = ["with-serde_json-1"] }
+deadpool-postgres = { workspace = true, optional = true }
+
+# Optional HTTP client for remote WCS coverages — enabled via the `remote` feature
+reqwest = { workspace = true, optional = true }
+
+# Web framework
+axum.workspace = true
+tower.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# XML processing
+quick-xml.workspace = true
+
+# GeoJSON and geometry
+geojson.workspace = true
+
+# Logging
+tracing-subscriber.workspace = true
+
+# Utilities
+bytes.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+# Caching and concurrency
+dashmap.workspace = true
+
+# Image encoding (WCS GetCoverage PNG/JPEG output) — pure-Rust codecs only
+image.workspace = true
+
+[dev-dependencies]
+# Testing
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "oxigeo_services"
+path = "src/lib.rs"
+
+# `all-features = true` would also turn on `remote`, which pulls `reqwest`'s
+# rustls backend -> `aws-lc-sys` (C + assembly crypto), same trade-off as
+# oxigeo-cloud's optional `http`/`s3`/`azure-blob`/`gcs` features. `postgis`
+# stays in: it only adds `oxigeo-postgis`/`tokio-postgres`/`deadpool-postgres`,
+# all Pure Rust (see the docs.rs note on oxigeo-postgis). Excluding `remote`
+# keeps the docs.rs build on the same Pure-Rust closure as the default feature
+# set (mirrors the pattern in oxigeo-cloud-enhanced).
+[package.metadata.docs.rs]
+features = ["postgis"]
+rustdoc-args = ["--cfg", "docsrs"]

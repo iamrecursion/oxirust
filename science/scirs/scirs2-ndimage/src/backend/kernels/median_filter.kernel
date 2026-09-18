@@ -1,0 +1,225 @@
+// Enhanced median filter kernel for GPU execution
+// Optimized with sorting networks and multiple algorithms based on window size
+
+// Efficient min/max swap function
+inline void swap_if_greater(float* a, float* b) {
+    if (*a > *b) {
+        float temp = *a;
+        *a = *b;
+        *b = temp;
+    }
+}
+
+// Optimized median for 3x3 window using sorting network
+inline float median_3x3(float window[9]) {
+    // Sorting network for 9 elements (optimal)
+    swap_if_greater(&window[0], &window[1]);
+    swap_if_greater(&window[3], &window[4]);
+    swap_if_greater(&window[6], &window[7]);
+    swap_if_greater(&window[1], &window[2]);
+    swap_if_greater(&window[4], &window[5]);
+    swap_if_greater(&window[7], &window[8]);
+    swap_if_greater(&window[0], &window[1]);
+    swap_if_greater(&window[3], &window[4]);
+    swap_if_greater(&window[6], &window[7]);
+    swap_if_greater(&window[0], &window[3]);
+    swap_if_greater(&window[1], &window[4]);
+    swap_if_greater(&window[2], &window[5]);
+    swap_if_greater(&window[3], &window[6]);
+    swap_if_greater(&window[4], &window[7]);
+    swap_if_greater(&window[5], &window[8]);
+    swap_if_greater(&window[0], &window[3]);
+    swap_if_greater(&window[1], &window[4]);
+    swap_if_greater(&window[2], &window[5]);
+    swap_if_greater(&window[3], &window[6]);
+    swap_if_greater(&window[4], &window[7]);
+    swap_if_greater(&window[1], &window[3]);
+    swap_if_greater(&window[2], &window[6]);
+    swap_if_greater(&window[4], &window[6]);
+    swap_if_greater(&window[2], &window[4]);
+    swap_if_greater(&window[2], &window[3]);
+    return window[4]; // Middle element
+}
+
+// Optimized median for 5x5 window using partial sorting
+inline float median_5x5(float window[25]) {
+    // Use quickselect-like approach to find median without full sort
+    // This is more efficient than full sorting for median finding
+    
+    // Simple selection for now - can be optimized further
+    for (int i = 0; i < 25; i++) {
+        for (int j = i + 1; j < 25; j++) {
+            swap_if_greater(&window[i], &window[j]);
+        }
+    }
+    return window[12]; // Middle element of 25
+}
+
+// Optimized insertion sort for small arrays
+inline void insertion_sort(float* arr, int n) {
+    for (int i = 1; i < n; i++) {
+        float key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+// Histogram-based median for larger windows
+inline float median_histogram(float* window, int count, float min_val, float max_val) {
+    const int bins = 256;
+    int histogram[256];
+    float bin_width = (max_val - min_val) / bins;
+    
+    // Initialize histogram
+    for (int i = 0; i < bins; i++) {
+        histogram[i] = 0;
+    }
+    
+    // Build histogram
+    for (int i = 0; i < count; i++) {
+        int bin = (int)((window[i] - min_val) / bin_width);
+        bin = clamp(bin, 0, bins - 1);
+        histogram[bin]++;
+    }
+    
+    // Find median bin
+    int target = count / 2;
+    int sum = 0;
+    for (int i = 0; i < bins; i++) {
+        sum += histogram[i];
+        if (sum > target) {
+            return min_val + (i + 0.5f) * bin_width;
+        }
+    }
+    return min_val + (bins - 0.5f) * bin_width;
+}
+
+__kernel void median_filter_2d(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const int filter_height,
+    const int filter_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int fhalf_h = filter_height / 2;
+    int fhalf_w = filter_width / 2;
+    int window_size = filter_height * filter_width;
+    
+    // Use different algorithms based on window size
+    if (window_size == 9 && filter_height == 3 && filter_width == 3) {
+        // Optimized 3x3 median using sorting network
+        float window[9];
+        int idx = 0;
+        
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int px = clamp(x + dx, 0, width - 1);
+                int py = clamp(y + dy, 0, height - 1);
+                window[idx++] = input[py * width + px];
+            }
+        }
+        
+        output[y * width + x] = median_3x3(window);
+        
+    } else if (window_size == 25 && filter_height == 5 && filter_width == 5) {
+        // Optimized 5x5 median
+        float window[25];
+        int idx = 0;
+        
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                int px = clamp(x + dx, 0, width - 1);
+                int py = clamp(y + dy, 0, height - 1);
+                window[idx++] = input[py * width + px];
+            }
+        }
+        
+        output[y * width + x] = median_5x5(window);
+        
+    } else {
+        // General case for arbitrary window sizes
+        float window[121]; // Max for 11x11 filter
+        int count = 0;
+        float min_val = FLT_MAX;
+        float max_val = -FLT_MAX;
+        
+        // Collect values and find min/max
+        for (int dy = -fhalf_h; dy <= fhalf_h; dy++) {
+            for (int dx = -fhalf_w; dx <= fhalf_w; dx++) {
+                int px = clamp(x + dx, 0, width - 1);
+                int py = clamp(y + dy, 0, height - 1);
+                
+                if (count < 121) {
+                    float val = input[py * width + px];
+                    window[count++] = val;
+                    min_val = min(min_val, val);
+                    max_val = max(max_val, val);
+                }
+            }
+        }
+        
+        float median;
+        if (count <= 49) {
+            // Use insertion sort for small arrays
+            insertion_sort(window, count);
+            if (count % 2 == 0) {
+                median = (window[count/2 - 1] + window[count/2]) * 0.5f;
+            } else {
+                median = window[count/2];
+            }
+        } else {
+            // Use histogram-based median for large arrays
+            median = median_histogram(window, count, min_val, max_val);
+        }
+        
+        output[y * width + x] = median;
+    }
+}
+
+// Separable approximation median filter (faster but less accurate)
+__kernel void median_filter_separable(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const int radius
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float window[21]; // Max radius 10
+    int window_size = 2 * radius + 1;
+    
+    // Horizontal median approximation
+    for (int i = 0; i < window_size; i++) {
+        int px = clamp(x + i - radius, 0, width - 1);
+        window[i] = input[y * width + px];
+    }
+    
+    insertion_sort(window, window_size);
+    float h_median = window[radius];
+    
+    // Vertical median approximation  
+    for (int i = 0; i < window_size; i++) {
+        int py = clamp(y + i - radius, 0, height - 1);
+        window[i] = input[py * width + x];
+    }
+    
+    insertion_sort(window, window_size);
+    float v_median = window[radius];
+    
+    // Combine horizontal and vertical medians
+    output[y * width + x] = (h_median + v_median) * 0.5f;
+}

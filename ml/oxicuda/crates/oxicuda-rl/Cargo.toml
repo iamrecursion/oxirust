@@ -1,0 +1,37 @@
+[package]
+name = "oxicuda-rl"
+description = "GPU-accelerated reinforcement learning primitives for OxiCUDA"
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["gpu", "reinforcement", "cuda", "deep-learning", "rl"]
+categories = ["science", "algorithms"]
+
+[features]
+# Enables on-device GPU tests that JIT-compile the hand-written PTX kernels,
+# launch them on a real CUDA device, and assert numerical equivalence to the
+# crate's CPU references. The tests skip gracefully when no GPU is present, so
+# this feature is safe to enable on CPU-only machines.
+gpu-tests = []
+
+[dependencies]
+oxicuda-driver = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+num-traits = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

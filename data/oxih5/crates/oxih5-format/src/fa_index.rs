@@ -1,0 +1,576 @@
+use crate::btree_v2::ChunkRecord;
+/// Fixed Array chunk index parser (HDF5 1.10+).
+///
+/// The Fixed Array (FA) index is used for chunked datasets that have no
+/// unlimited dimensions, so the maximum number of chunks is known at creation
+/// time.
+use oxih5_core::OxiH5Error;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Parse a fixed array chunk index rooted at `header_address`.
+///
+/// Returns all chunk records stored in the fixed array.  If the data block
+/// address in the header is `u64::MAX` (undefined), an empty list is returned.
+///
+/// `ndims` is the dataset's dimensionality (rank), used to compute per-chunk
+/// N-dimensional offsets from each element's position in the fixed array.
+///
+/// `chunk_dims` is the per-dimension chunk shape in elements (length `ndims`).
+/// Pass an empty slice when calling from legacy (non-v4) code paths — chunk
+/// offsets will be reconstructed from element position only if `chunk_dims` is
+/// provided.
+///
+/// `uncompressed_chunk_bytes` is the uncompressed size of one full chunk (used
+/// for client_id=0, unfiltered arrays where no size is stored in the element).
+pub fn parse_fixed_array(
+    file_data: &[u8],
+    header_address: u64,
+    ndims: usize,
+) -> Result<Vec<ChunkRecord>, OxiH5Error> {
+    parse_fixed_array_inner(file_data, header_address, ndims, &[], &[], 0)
+}
+
+/// Like [`parse_fixed_array`] but supplies the chunk dimensions and element
+/// size needed to reconstruct offsets and uncompressed sizes for v4/v5 layouts.
+pub fn parse_fixed_array_v4(
+    file_data: &[u8],
+    header_address: u64,
+    ndims: usize,
+    chunk_dims: &[u64],
+    uncompressed_chunk_bytes: usize,
+) -> Result<Vec<ChunkRecord>, OxiH5Error> {
+    parse_fixed_array_inner(
+        file_data,
+        header_address,
+        ndims,
+        chunk_dims,
+        &[],
+        uncompressed_chunk_bytes,
+    )
+}
+
+/// Like [`parse_fixed_array_v4`] but also supplies the full dataset dimensions
+/// so that the chunk grid can be computed exactly via `ceil(dataset_dims[d]/chunk_dims[d])`.
+pub fn parse_fixed_array_v4_with_dataset_dims(
+    file_data: &[u8],
+    header_address: u64,
+    ndims: usize,
+    chunk_dims: &[u64],
+    dataset_dims: &[u64],
+    uncompressed_chunk_bytes: usize,
+) -> Result<Vec<ChunkRecord>, OxiH5Error> {
+    parse_fixed_array_inner(
+        file_data,
+        header_address,
+        ndims,
+        chunk_dims,
+        dataset_dims,
+        uncompressed_chunk_bytes,
+    )
+}
+
+fn parse_fixed_array_inner(
+    file_data: &[u8],
+    header_address: u64,
+    ndims: usize,
+    chunk_dims: &[u64],
+    dataset_dims: &[u64],
+    uncompressed_chunk_bytes: usize,
+) -> Result<Vec<ChunkRecord>, OxiH5Error> {
+    let base = header_address as usize;
+
+    // -----------------------------------------------------------------------
+    // FA Header layout ("FAHD") — corrected per HDF5 spec / empirical analysis:
+    //  0  4   Signature "FAHD"
+    //  4  1   Version (must be 0)
+    //  5  1   Client ID (0 = no filter, 1 = filtered)
+    //  6  1   Element size (bytes per chunk record in the data block)
+    //  7  1   Maximum Number of Elements Bits (log₂ of max elements)
+    //  8  8   Number of Elements / chunks (u64 LE)
+    // 16  8   Data block address (u64 LE)
+    // 24  4   Checksum
+    // Total: 28 bytes
+    // -----------------------------------------------------------------------
+
+    let hdr_end = base
+        .checked_add(28)
+        .ok_or_else(|| OxiH5Error::Format("FA: header address overflow".into()))?;
+    if hdr_end > file_data.len() {
+        return Err(OxiH5Error::Format(format!(
+            "FA: header at {base:#x} exceeds file length {}",
+            file_data.len()
+        )));
+    }
+
+    let sig = &file_data[base..base + 4];
+    if sig != b"FAHD" {
+        return Err(OxiH5Error::Format(format!(
+            "FA: bad signature {sig:?} at {base:#x}"
+        )));
+    }
+
+    let version = file_data[base + 4];
+    if version != 0 {
+        return Err(OxiH5Error::Format(format!(
+            "FA: unsupported version {version}"
+        )));
+    }
+
+    let element_size = file_data[base + 6] as usize;
+    // base + 7 = max_nelmts_bits (1 byte, not used here)
+    let max_nelmts = u64::from_le_bytes(
+        file_data[base + 8..base + 16]
+            .try_into()
+            .map_err(|_| OxiH5Error::Format("FA: max_nelmts slice".into()))?,
+    );
+    let data_block_addr = u64::from_le_bytes(
+        file_data[base + 16..base + 24]
+            .try_into()
+            .map_err(|_| OxiH5Error::Format("FA: data_block_addr slice".into()))?,
+    );
+
+    if data_block_addr == u64::MAX {
+        return Ok(Vec::new());
+    }
+
+    // -----------------------------------------------------------------------
+    // FA Data Block layout ("FADB"):
+    //  0  4   Signature "FADB"
+    //  4  1   Version (must be 0)
+    //  5  1   Client ID
+    //  6  8   Header address (back-pointer)
+    // 14  N*element_size  Elements
+    //   …  4   Checksum
+    //
+    // Note: the spec also defines an optional page bitmap when
+    // max_dblk_page_nelmts_bits > 0. For the initial implementation we do not
+    // support paged data blocks; we assume all elements are stored inline.
+    // -----------------------------------------------------------------------
+
+    let db = data_block_addr as usize;
+    let db_hdr_end = db
+        .checked_add(14)
+        .ok_or_else(|| OxiH5Error::Format("FA: data block address overflow".into()))?;
+    if db_hdr_end > file_data.len() {
+        return Err(OxiH5Error::Format(format!(
+            "FA: data block at {db:#x} truncated (file len={})",
+            file_data.len()
+        )));
+    }
+
+    let db_sig = &file_data[db..db + 4];
+    if db_sig != b"FADB" {
+        return Err(OxiH5Error::Format(format!(
+            "FA: bad data block signature {db_sig:?} at {db:#x}"
+        )));
+    }
+
+    let db_version = file_data[db + 4];
+    if db_version != 0 {
+        return Err(OxiH5Error::Format(format!(
+            "FA: unsupported data block version {db_version}"
+        )));
+    }
+
+    // Elements start at offset 14 in the data block.
+    let elem_start = db + 14;
+    let n = max_nelmts as usize;
+
+    // -----------------------------------------------------------------------
+    // Fixed Array element format (HDF5 layout v4/v5, empirically derived):
+    //
+    //  client_id == 0 (unfiltered / "no filter client"):
+    //    element_size = 8 bytes
+    //    [0..8]  chunk_addr  (u64 LE)
+    //    No size or filter_mask stored; derived from chunk_dims * elem_size.
+    //    No per-chunk offsets stored; derived from element position.
+    //
+    //  client_id == 1 (filtered):
+    //    element_size = 20 bytes
+    //    [0..8]  chunk_addr       (u64 LE)
+    //    [8..16] compressed_size  (u64 LE)
+    //    [16..20] filter_mask     (u32 LE)
+    //    No per-chunk offsets stored; derived from element position.
+    //
+    // Offsets are derived from element index `i` using chunk_dims and
+    // N-dimensional row-major counting (when chunk_dims is provided).
+    // -----------------------------------------------------------------------
+    let client_id = file_data[db + 5];
+
+    // Validate the element count against a sane bound and against the data
+    // actually remaining in the file *before* reserving capacity for it.  A
+    // crafted/corrupted file can claim an enormous "Number of Elements"
+    // value in the FA header; using it directly as a `Vec::with_capacity`
+    // argument would otherwise cause a capacity-overflow panic (or an
+    // unbounded allocation attempt) before a single element is read.
+    const FA_MAX_ELEMENTS: usize = 1 << 24; // 16Mi elements is already far beyond any realistic fixed array.
+    let remaining = file_data.len().saturating_sub(elem_start);
+    let max_possible_elements = remaining.checked_div(element_size).unwrap_or(0);
+    if n > FA_MAX_ELEMENTS || n > max_possible_elements {
+        return Err(OxiH5Error::Format(format!(
+            "FA: implausible element count {n} (element_size={element_size}, remaining data={remaining} bytes)"
+        )));
+    }
+
+    // Pre-compute grid strides for deriving per-chunk N-dim offsets from flat
+    // index `i`.  strides[d] = product(grid_dims[d+1..]).
+    let grid_dims: Vec<u64> = if !chunk_dims.is_empty() && ndims == chunk_dims.len() {
+        compute_grid_dims(n as u64, ndims, chunk_dims, dataset_dims)
+    } else {
+        vec![]
+    };
+
+    let grid_strides: Vec<u64> = if !grid_dims.is_empty() {
+        let mut s = vec![1u64; ndims];
+        for d in (0..ndims.saturating_sub(1)).rev() {
+            s[d] = s[d + 1] * grid_dims[d + 1];
+        }
+        s
+    } else {
+        vec![]
+    };
+
+    let mut records = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let e = elem_start + i * element_size;
+        let e_end = e + element_size;
+        if e_end > file_data.len() {
+            // The element area is truncated; stop here.
+            break;
+        }
+
+        let addr = u64::from_le_bytes(
+            file_data[e..e + 8]
+                .try_into()
+                .map_err(|_| OxiH5Error::Format(format!("FA: element {i} address slice")))?,
+        );
+
+        if addr == u64::MAX {
+            continue; // Empty slot.
+        }
+
+        let (size, filter_mask) = if client_id == 0 {
+            // Unfiltered: size = uncompressed_chunk_bytes, filter_mask = 0.
+            (uncompressed_chunk_bytes as u32, 0u32)
+        } else if element_size >= 20 {
+            // Filtered: compressed_size as u64, filter_mask as u32.
+            let sz = u64::from_le_bytes(
+                file_data[e + 8..e + 16]
+                    .try_into()
+                    .map_err(|_| OxiH5Error::Format(format!("FA: element {i} size slice")))?,
+            ) as u32;
+            let fm =
+                u32::from_le_bytes(file_data[e + 16..e + 20].try_into().map_err(|_| {
+                    OxiH5Error::Format(format!("FA: element {i} filter_mask slice"))
+                })?);
+            (sz, fm)
+        } else if element_size >= 16 {
+            // Legacy format: addr(8) + size(4) + filter_mask(4)
+            let sz = u32::from_le_bytes(
+                file_data[e + 8..e + 12]
+                    .try_into()
+                    .map_err(|_| OxiH5Error::Format(format!("FA: element {i} size slice")))?,
+            );
+            let fm =
+                u32::from_le_bytes(file_data[e + 12..e + 16].try_into().map_err(|_| {
+                    OxiH5Error::Format(format!("FA: element {i} filter_mask slice"))
+                })?);
+            (sz, fm)
+        } else {
+            (0u32, 0u32)
+        };
+
+        // Derive N-dimensional offsets from element position `i`.
+        let offsets = if !grid_strides.is_empty() {
+            let mut rem = i as u64;
+            let mut offs = vec![0u64; ndims];
+            for d in 0..ndims {
+                let grid_coord = rem.checked_div(grid_strides[d]).unwrap_or(0);
+                rem %= grid_strides[d].max(1);
+                offs[d] = grid_coord * chunk_dims[d];
+            }
+            offs
+        } else if element_size >= 16 {
+            // Legacy path: offsets stored inline after filter_mask.
+            let offset_bytes = element_size.saturating_sub(16);
+            let bytes_per_dim = if ndims > 0 && offset_bytes > 0 {
+                offset_bytes / ndims
+            } else {
+                0
+            };
+            parse_offsets(&file_data[e + 16..e_end], ndims, bytes_per_dim)?
+        } else {
+            vec![]
+        };
+
+        records.push(ChunkRecord {
+            address: addr,
+            size,
+            filter_mask,
+            offsets,
+        });
+    }
+
+    Ok(records)
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Compute the N-dimensional grid dimensions (number of chunks per dim) from
+/// the total chunk count, chunk_dims, and optionally the dataset_dims.
+///
+/// When `dataset_dims` is provided and matches the expected rank, the exact
+/// grid is computed as `ceil(dataset_dims[d] / chunk_dims[d])` per dimension.
+/// Otherwise, a conservative approximation is used.
+fn compute_grid_dims(n: u64, ndims: usize, chunk_dims: &[u64], dataset_dims: &[u64]) -> Vec<u64> {
+    if ndims == 0 || n == 0 {
+        return vec![];
+    }
+    if chunk_dims.len() == ndims && dataset_dims.len() == ndims {
+        chunk_dims
+            .iter()
+            .zip(dataset_dims.iter())
+            .map(|(&cd, &dd)| dd.div_ceil(cd))
+            .collect()
+    } else {
+        // Fallback: approximate (should not occur in practice).
+        let per_dim = (n as f64).powf(1.0 / ndims as f64).ceil() as u64;
+        let mut dims = vec![per_dim; ndims];
+        let product: u64 = dims[..ndims - 1].iter().product::<u64>().max(1);
+        dims[ndims - 1] = n.div_ceil(product);
+        dims
+    }
+}
+
+/// Parse `ndims` offsets from `data`, each `bytes_per_dim` bytes wide (LE).
+fn parse_offsets(data: &[u8], ndims: usize, bytes_per_dim: usize) -> Result<Vec<u64>, OxiH5Error> {
+    if ndims == 0 || bytes_per_dim == 0 {
+        return Ok(Vec::new());
+    }
+    let mut offs = Vec::with_capacity(ndims);
+    for d in 0..ndims {
+        let o = d * bytes_per_dim;
+        if o + bytes_per_dim > data.len() {
+            return Err(OxiH5Error::Format(format!(
+                "FA: offset field {d} out of bounds"
+            )));
+        }
+        let val = match bytes_per_dim {
+            8 => u64::from_le_bytes(
+                data[o..o + 8]
+                    .try_into()
+                    .map_err(|_| OxiH5Error::Format("FA: offset u64".into()))?,
+            ),
+            4 => u32::from_le_bytes(
+                data[o..o + 4]
+                    .try_into()
+                    .map_err(|_| OxiH5Error::Format("FA: offset u32".into()))?,
+            ) as u64,
+            2 => u16::from_le_bytes(
+                data[o..o + 2]
+                    .try_into()
+                    .map_err(|_| OxiH5Error::Format("FA: offset u16".into()))?,
+            ) as u64,
+            1 => data[o] as u64,
+            other => {
+                return Err(OxiH5Error::Format(format!(
+                    "FA: unsupported bytes_per_dim {other}"
+                )))
+            }
+        };
+        offs.push(val);
+    }
+    Ok(offs)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal FA header in `buf` at offset `hdr_off`.
+    ///
+    /// Layout (corrected):
+    ///  0  4  "FAHD"
+    ///  4  1  version = 0
+    ///  5  1  client_id = 0
+    ///  6  1  element_size
+    ///  7  1  max_nelmts_bits = 0 (placeholder)
+    ///  8  8  max_nelmts (u64 LE)
+    /// 16  8  data_block_addr (u64 LE)
+    /// 24  4  checksum (zeros)
+    fn write_fa_header(
+        buf: &mut [u8],
+        hdr_off: usize,
+        element_size: u8,
+        max_nelmts: u64,
+        data_block_addr: u64,
+    ) {
+        buf[hdr_off..hdr_off + 4].copy_from_slice(b"FAHD");
+        buf[hdr_off + 4] = 0; // version
+        buf[hdr_off + 5] = 0; // client_id
+        buf[hdr_off + 6] = element_size;
+        buf[hdr_off + 7] = 0; // max_nelmts_bits (placeholder)
+        buf[hdr_off + 8..hdr_off + 16].copy_from_slice(&max_nelmts.to_le_bytes());
+        buf[hdr_off + 16..hdr_off + 24].copy_from_slice(&data_block_addr.to_le_bytes());
+        // checksum bytes at hdr_off+24..+28 stay as 0
+    }
+
+    #[test]
+    fn test_fa_no_data_block() {
+        let mut buf = vec![0u8; 32];
+        write_fa_header(&mut buf, 0, 24, 4, u64::MAX);
+        let result = parse_fixed_array(&buf, 0, 1).expect("parse failed");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_fa_one_element_1d() {
+        // 1D dataset, filtered (client_id=1): element_size = 8(addr)+8(size_u64)+4(filter_mask) = 20
+        // Offsets are derived from element position (index 0 → dataset offset 0).
+        let element_size: u8 = 20;
+        let max_nelmts: u64 = 1;
+        let db_addr: u64 = 64;
+        let chunk_dim: u64 = 10;
+        let elem_sz: u64 = 8;
+
+        let mut buf = vec![0u8; 256];
+        write_fa_header(&mut buf, 0, element_size, max_nelmts, db_addr);
+        // Set client_id = 1 (filtered) in the FAHD header.
+        buf[5] = 1;
+
+        // Data block at 64: FADB header (14 bytes) + 1 element (20 bytes).
+        let db = db_addr as usize;
+        buf[db..db + 4].copy_from_slice(b"FADB");
+        buf[db + 4] = 0; // version
+        buf[db + 5] = 1; // client_id = 1 (filtered)
+        buf[db + 6..db + 14].copy_from_slice(&0u64.to_le_bytes()); // back-ptr
+
+        let e = db + 14;
+        buf[e..e + 8].copy_from_slice(&0x4000u64.to_le_bytes()); // address
+        buf[e + 8..e + 16].copy_from_slice(&1024u64.to_le_bytes()); // compressed size (u64)
+        buf[e + 16..e + 20].copy_from_slice(&0u32.to_le_bytes()); // filter_mask
+
+        let records =
+            parse_fixed_array_v4(&buf, 0, 1, &[chunk_dim], (chunk_dim * elem_sz) as usize)
+                .expect("parse failed");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].address, 0x4000);
+        assert_eq!(records[0].size, 1024);
+        assert_eq!(records[0].filter_mask, 0);
+        // Offset derived from element position 0: chunk_dim * 0 = 0
+        assert_eq!(records[0].offsets, vec![0u64]);
+    }
+
+    #[test]
+    fn test_fa_two_elements_second_empty() {
+        // Two slots, first is valid, second is empty (UNDEF address).
+        let element_size: u8 = 24;
+        let db_addr: u64 = 64;
+
+        let mut buf = vec![0u8; 256];
+        write_fa_header(&mut buf, 0, element_size, 2, db_addr);
+
+        let db = db_addr as usize;
+        buf[db..db + 4].copy_from_slice(b"FADB");
+        buf[db + 4] = 0;
+        buf[db + 5] = 0;
+        buf[db + 6..db + 14].copy_from_slice(&0u64.to_le_bytes());
+
+        let e0 = db + 14;
+        buf[e0..e0 + 8].copy_from_slice(&0x5000u64.to_le_bytes());
+        buf[e0 + 8..e0 + 12].copy_from_slice(&64u32.to_le_bytes());
+        buf[e0 + 12..e0 + 16].copy_from_slice(&0u32.to_le_bytes());
+        buf[e0 + 16..e0 + 24].copy_from_slice(&0u64.to_le_bytes());
+
+        let e1 = e0 + 24;
+        buf[e1..e1 + 8].copy_from_slice(&u64::MAX.to_le_bytes()); // UNDEF
+                                                                  // rest stays zero
+
+        let records = parse_fixed_array(&buf, 0, 1).expect("parse failed");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].address, 0x5000);
+    }
+
+    #[test]
+    fn test_fa_bad_signature() {
+        let buf = vec![0u8; 64];
+        assert!(parse_fixed_array(&buf, 0, 1).is_err());
+    }
+
+    #[test]
+    fn test_fa_bad_data_block_signature() {
+        let element_size: u8 = 24;
+        let db_addr: u64 = 64;
+        let mut buf = vec![0u8; 256];
+        write_fa_header(&mut buf, 0, element_size, 1, db_addr);
+        // Leave data block signature as zeros (invalid).
+        let result = parse_fixed_array(&buf, 0, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fa_2d_offsets() {
+        // 2D dataset: element_size = 8+4+4+8+8 = 32 (two 8-byte offsets)
+        let element_size: u8 = 32;
+        let db_addr: u64 = 64;
+
+        let mut buf = vec![0u8; 256];
+        write_fa_header(&mut buf, 0, element_size, 1, db_addr);
+
+        let db = db_addr as usize;
+        buf[db..db + 4].copy_from_slice(b"FADB");
+        buf[db + 4] = 0;
+        buf[db + 5] = 0;
+        buf[db + 6..db + 14].copy_from_slice(&0u64.to_le_bytes());
+
+        let e = db + 14;
+        buf[e..e + 8].copy_from_slice(&0x6000u64.to_le_bytes()); // address
+        buf[e + 8..e + 12].copy_from_slice(&2048u32.to_le_bytes()); // size
+        buf[e + 12..e + 16].copy_from_slice(&0u32.to_le_bytes()); // filter_mask
+        buf[e + 16..e + 24].copy_from_slice(&4u64.to_le_bytes()); // offset[0] = 4
+        buf[e + 24..e + 32].copy_from_slice(&8u64.to_le_bytes()); // offset[1] = 8
+
+        let records = parse_fixed_array(&buf, 0, 2).expect("parse failed");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offsets, vec![4u64, 8u64]);
+    }
+
+    /// Regression test: an implausibly large "Number of Elements" header
+    /// value (far exceeding both the sane bound and what the (small) file
+    /// buffer could possibly hold) must be rejected with a typed error
+    /// instead of being used directly as a `Vec::with_capacity` argument,
+    /// which would otherwise panic (capacity overflow) or attempt a huge
+    /// allocation.
+    #[test]
+    fn test_fa_oversized_element_count_rejected() {
+        let element_size: u8 = 8;
+        let db_addr: u64 = 64;
+
+        // Small buffer: the data block only has room for a handful of
+        // 8-byte elements, yet the header claims u64::MAX elements.
+        let mut buf = vec![0u8; 128];
+        write_fa_header(&mut buf, 0, element_size, u64::MAX, db_addr);
+
+        let db = db_addr as usize;
+        buf[db..db + 4].copy_from_slice(b"FADB");
+        buf[db + 4] = 0; // version
+        buf[db + 5] = 0; // client_id = 0 (unfiltered)
+        buf[db + 6..db + 14].copy_from_slice(&0u64.to_le_bytes());
+
+        let result = parse_fixed_array(&buf, 0, 1);
+        assert!(
+            result.is_err(),
+            "an implausible element count must be rejected, not used as a Vec capacity"
+        );
+    }
+}

@@ -1,0 +1,1780 @@
+//! Tensor inspection and analysis tools
+
+use anyhow::Result;
+use scirs2_core::ndarray::*; // SciRS2 Integration Policy - was: use ndarray::{Array, ArrayD, Axis, IxDyn};
+use scirs2_core::random::random; // SciRS2 Integration Policy
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::time::Instant;
+use uuid::Uuid;
+
+use crate::DebugConfig;
+
+/// Statistics about a tensor
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorStats {
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    pub total_elements: usize,
+    pub mean: f64,
+    pub std: f64,
+    pub min: f64,
+    pub max: f64,
+    pub median: f64,
+    pub l1_norm: f64,
+    pub l2_norm: f64,
+    pub infinity_norm: f64,
+    pub nan_count: usize,
+    pub inf_count: usize,
+    pub zero_count: usize,
+    pub memory_usage_bytes: usize,
+    pub sparsity: f64,
+}
+
+/// Distribution analysis of tensor values
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorDistribution {
+    pub histogram: Vec<(f64, usize)>,
+    pub percentiles: HashMap<String, f64>,
+    pub outliers: Vec<f64>,
+    pub skewness: f64,
+    pub kurtosis: f64,
+}
+
+/// Tensor metadata and tracking information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub layer_name: Option<String>,
+    pub operation: Option<String>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub stats: TensorStats,
+    pub distribution: Option<TensorDistribution>,
+    pub gradient_stats: Option<TensorStats>,
+}
+
+/// Comparison between two tensors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorComparison {
+    pub tensor1_id: Uuid,
+    pub tensor2_id: Uuid,
+    pub mse: f64,
+    pub mae: f64,
+    pub max_diff: f64,
+    pub cosine_similarity: f64,
+    /// Pearson correlation between the two tensors' real element-wise
+    /// values. `None` when it cannot be honestly computed -- see
+    /// `TensorInspector::compute_correlation` for why that is currently
+    /// always the case (this crate only retains [`TensorStats`] summaries,
+    /// not raw tensor data, once a tensor has been inspected).
+    pub correlation: Option<f64>,
+    pub shape_match: bool,
+    pub dtype_match: bool,
+}
+
+/// Real-time tensor monitoring data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorTimeSeries {
+    pub tensor_id: Uuid,
+    pub timestamps: VecDeque<chrono::DateTime<chrono::Utc>>,
+    pub values: VecDeque<TensorStats>,
+    pub max_history: usize,
+}
+
+/// Tensor dependency tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorDependency {
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub operation: String,
+    pub weight: f64,
+}
+
+/// Tensor lifecycle event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TensorLifecycleEvent {
+    Created { size_bytes: usize },
+    Modified { operation: String },
+    Accessed { access_type: String },
+    Destroyed,
+}
+
+/// Tensor lifecycle tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorLifecycle {
+    pub tensor_id: Uuid,
+    pub events: Vec<(chrono::DateTime<chrono::Utc>, TensorLifecycleEvent)>,
+    pub total_accesses: usize,
+    pub creation_time: chrono::DateTime<chrono::Utc>,
+}
+
+/// Advanced tensor analysis results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedTensorAnalysis {
+    pub spectral_analysis: Option<SpectralAnalysis>,
+    pub information_content: InformationContent,
+    pub stability_metrics: StabilityMetrics,
+    pub relationship_analysis: RelationshipAnalysis,
+}
+
+/// Spectral analysis of tensor values
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpectralAnalysis {
+    /// Every singular value of the matrix, sorted descending.
+    ///
+    /// This field used to be called `eigenvalues` and held a single number
+    /// produced by ten steps of power iteration -- which is not an eigenvalue
+    /// for a non-symmetric matrix and was hardcoded to `0.0` for every
+    /// non-square matrix. Singular values are what a rectangular matrix
+    /// actually has, and these are the real ones from a full SVD.
+    pub singular_values: Vec<f64>,
+    /// 2-norm condition number `sigma_max / sigma_min`.
+    ///
+    /// `f64::INFINITY` when the smallest singular value is numerically zero,
+    /// i.e. the matrix is singular. (The previous value, `lambda_max` divided
+    /// by the Frobenius norm, was not a condition number under any definition.)
+    pub condition_number: f64,
+    /// Numerical rank: the number of singular values above the standard
+    /// LAPACK/NumPy tolerance `max(rows, cols) * sigma_max * f64::EPSILON`.
+    pub rank: usize,
+    /// Spectral norm (largest singular value).
+    pub spectral_norm: f64,
+    /// Roy & Vetterli (2007) effective rank: `exp(H(p))` where `p_i` is the
+    /// singular-value distribution `sigma_i / sum(sigma)` and `H` is its
+    /// Shannon entropy in nats. Lies in `[1, rank]`.
+    pub effective_rank: f64,
+}
+
+/// Information content metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InformationContent {
+    /// Shannon entropy (bits) of the tensor's values after quantising them
+    /// into 100 equal-width buckets over `[min, max]`.
+    pub entropy: f64,
+    /// Mutual information with another tensor.
+    ///
+    /// Always `None` from [`TensorInspector::perform_advanced_analysis`]: mutual
+    /// information is a property of a *pair* of aligned variables and this call
+    /// only ever sees one tensor, so there is nothing to compute it against.
+    /// It used to be published as a hardcoded `0.0`, which reads as "measured
+    /// zero mutual information".
+    pub mutual_information: Option<f64>,
+    /// Perplexity `2^entropy` of the quantised value distribution, i.e. the
+    /// effective number of distinct value buckets the tensor occupies.
+    ///
+    /// This was called `effective_rank`, which in linear algebra means
+    /// `exp(H(singular value distribution))` -- an entirely different quantity
+    /// that this function cannot compute because it never sees the matrix
+    /// shape. The real effective rank now lives on
+    /// [`SpectralAnalysis::effective_rank`].
+    pub value_distribution_perplexity: f64,
+    /// Fraction of elements that are distinct at a `1e-10` tolerance
+    /// (`distinct / total`).
+    ///
+    /// This was called `compression_ratio`, which it is not: nothing is
+    /// compressed and no codec is consulted. It is a crude proxy for
+    /// redundancy, so it is now named for what it measures.
+    pub distinct_value_fraction: f64,
+}
+
+/// Stability metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StabilityMetrics {
+    pub numerical_stability: f64,
+    /// Coefficient-of-variation-based stability of the real gradient
+    /// values, computed the same way as `numerical_stability` but over the
+    /// gradient tensor. `None` (never a fabricated constant) when
+    /// [`TensorInspector::perform_advanced_analysis`] was called without a
+    /// gradient tensor.
+    pub gradient_stability: Option<f64>,
+    pub perturbation_sensitivity: f64,
+    pub robustness_score: f64,
+}
+
+/// Relationship analysis between tensors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationshipAnalysis {
+    pub cross_correlations: HashMap<Uuid, f64>,
+    pub dependency_strength: HashMap<Uuid, f64>,
+    pub causal_relationships: Vec<TensorDependency>,
+}
+
+/// Enhanced tensor inspector for detailed analysis
+#[derive(Debug)]
+pub struct TensorInspector {
+    config: DebugConfig,
+    tracked_tensors: HashMap<Uuid, TensorInfo>,
+    comparisons: Vec<TensorComparison>,
+    alerts: Vec<TensorAlert>,
+    // New advanced features
+    time_series: HashMap<Uuid, TensorTimeSeries>,
+    dependencies: Vec<TensorDependency>,
+    lifecycles: HashMap<Uuid, TensorLifecycle>,
+    monitoring_enabled: bool,
+    last_analysis_time: Option<Instant>,
+}
+
+impl TensorInspector {
+    /// Create a new tensor inspector
+    pub fn new(config: &DebugConfig) -> Self {
+        Self {
+            config: config.clone(),
+            tracked_tensors: HashMap::new(),
+            comparisons: Vec::new(),
+            alerts: Vec::new(),
+            // Initialize new advanced features
+            time_series: HashMap::new(),
+            dependencies: Vec::new(),
+            lifecycles: HashMap::new(),
+            monitoring_enabled: false,
+            last_analysis_time: None,
+        }
+    }
+
+    /// Start the tensor inspector
+    pub async fn start(&mut self) -> Result<()> {
+        tracing::info!("Starting tensor inspector");
+        Ok(())
+    }
+
+    /// Inspect a tensor and return detailed analysis
+    pub fn inspect_tensor<T>(
+        &mut self,
+        tensor: &ArrayD<T>,
+        name: &str,
+        layer_name: Option<&str>,
+        operation: Option<&str>,
+    ) -> Result<Uuid>
+    where
+        T: Clone + Into<f64> + fmt::Debug + 'static,
+    {
+        let id = Uuid::new_v4();
+
+        // Convert to f64 for analysis
+        let values: Vec<f64> = tensor.iter().map(|x| x.clone().into()).collect();
+        let shape = tensor.shape().to_vec();
+
+        let stats = self.compute_tensor_stats(
+            &values,
+            &shape,
+            std::mem::size_of::<T>(),
+            std::any::type_name::<T>(),
+        )?;
+        let distribution = if self.should_compute_distribution() {
+            Some(self.compute_distribution(&values)?)
+        } else {
+            None
+        };
+
+        let tensor_info = TensorInfo {
+            id,
+            name: name.to_string(),
+            layer_name: layer_name.map(|s| s.to_string()),
+            operation: operation.map(|s| s.to_string()),
+            timestamp: chrono::Utc::now(),
+            stats,
+            distribution,
+            gradient_stats: None,
+        };
+
+        // Check for alerts
+        self.check_tensor_alerts(&tensor_info)?;
+
+        // Store tensor info if we have space
+        if self.tracked_tensors.len() < self.config.max_tracked_tensors {
+            self.tracked_tensors.insert(id, tensor_info.clone());
+        }
+
+        // Advanced features integration
+        self.record_lifecycle_event(
+            id,
+            TensorLifecycleEvent::Created {
+                size_bytes: std::mem::size_of::<T>() * tensor.len(),
+            },
+        );
+
+        if self.monitoring_enabled {
+            if let Some(tensor_info) = self.tracked_tensors.get(&id) {
+                self.update_time_series(id, tensor_info.stats.clone());
+            }
+        }
+
+        Ok(id)
+    }
+
+    /// Inspect tensor gradients
+    pub fn inspect_gradients<T>(&mut self, tensor_id: Uuid, gradients: &ArrayD<T>) -> Result<()>
+    where
+        T: Clone + Into<f64> + fmt::Debug + 'static,
+    {
+        let values: Vec<f64> = gradients.iter().map(|x| x.clone().into()).collect();
+        let shape = gradients.shape().to_vec();
+
+        let gradient_stats = self.compute_tensor_stats(
+            &values,
+            &shape,
+            std::mem::size_of::<T>(),
+            std::any::type_name::<T>(),
+        )?;
+
+        if let Some(tensor_info) = self.tracked_tensors.get_mut(&tensor_id) {
+            tensor_info.gradient_stats = Some(gradient_stats);
+        }
+
+        // Check for gradient-specific alerts - get the data we need first
+        let tensor_info_for_alerts = self
+            .tracked_tensors
+            .get(&tensor_id)
+            .map(|info| (info.id, info.name.clone(), info.gradient_stats.clone()));
+
+        if let Some((id, name, grad_stats)) = tensor_info_for_alerts {
+            self.check_gradient_alerts_with_data(id, &name, grad_stats)?;
+        }
+
+        Ok(())
+    }
+
+    /// Compare two tensors
+    pub fn compare_tensors(&mut self, id1: Uuid, id2: Uuid) -> Result<TensorComparison> {
+        let tensor1 = self
+            .tracked_tensors
+            .get(&id1)
+            .ok_or_else(|| anyhow::anyhow!("Tensor {} not found", id1))?;
+        let tensor2 = self
+            .tracked_tensors
+            .get(&id2)
+            .ok_or_else(|| anyhow::anyhow!("Tensor {} not found", id2))?;
+
+        let comparison = TensorComparison {
+            tensor1_id: id1,
+            tensor2_id: id2,
+            mse: self.compute_mse(&tensor1.stats, &tensor2.stats),
+            mae: self.compute_mae(&tensor1.stats, &tensor2.stats),
+            max_diff: (tensor1.stats.max - tensor2.stats.max).abs(),
+            cosine_similarity: self.compute_cosine_similarity(&tensor1.stats, &tensor2.stats),
+            correlation: self.compute_correlation(&tensor1.stats, &tensor2.stats),
+            shape_match: tensor1.stats.shape == tensor2.stats.shape,
+            dtype_match: tensor1.stats.dtype == tensor2.stats.dtype,
+        };
+
+        self.comparisons.push(comparison.clone());
+        Ok(comparison)
+    }
+
+    /// Get tensor information by ID
+    pub fn get_tensor_info(&self, id: Uuid) -> Option<&TensorInfo> {
+        self.tracked_tensors.get(&id)
+    }
+
+    /// Get all tracked tensors
+    pub fn get_all_tensors(&self) -> Vec<&TensorInfo> {
+        self.tracked_tensors.values().collect()
+    }
+
+    /// Get tensors by layer name
+    /// Id of the most recently inspected tensor with this name, if any.
+    ///
+    /// Names are not unique (the same tensor can be inspected at many steps),
+    /// so this returns the newest by inspection timestamp.
+    pub fn tensor_id_for_name(&self, name: &str) -> Option<Uuid> {
+        self.tracked_tensors
+            .values()
+            .filter(|info| info.name == name)
+            .max_by_key(|info| info.timestamp)
+            .map(|info| info.id)
+    }
+
+    pub fn get_tensors_by_layer(&self, layer_name: &str) -> Vec<&TensorInfo> {
+        self.tracked_tensors
+            .values()
+            .filter(|info| info.layer_name.as_ref() == Some(&layer_name.to_string()))
+            .collect()
+    }
+
+    /// Get all alerts
+    pub fn get_alerts(&self) -> &[TensorAlert] {
+        &self.alerts
+    }
+
+    /// Clear tracking data
+    pub fn clear(&mut self) {
+        self.tracked_tensors.clear();
+        self.comparisons.clear();
+        self.alerts.clear();
+        // Clear new advanced features
+        self.time_series.clear();
+        self.dependencies.clear();
+        self.lifecycles.clear();
+        self.last_analysis_time = None;
+    }
+
+    /// Generate inspection report
+    pub async fn generate_report(&self) -> Result<TensorInspectionReport> {
+        let total_tensors = self.tracked_tensors.len();
+        let tensors_with_issues = self
+            .tracked_tensors
+            .values()
+            .filter(|info| info.stats.nan_count > 0 || info.stats.inf_count > 0)
+            .count();
+
+        let memory_usage =
+            self.tracked_tensors.values().map(|info| info.stats.memory_usage_bytes).sum();
+
+        Ok(TensorInspectionReport {
+            total_tensors,
+            tensors_with_issues,
+            total_memory_usage: memory_usage,
+            alerts: self.alerts.clone(),
+            comparisons: self.comparisons.clone(),
+            summary_stats: self.compute_summary_stats(),
+        })
+    }
+
+    // Advanced debugging features
+
+    /// Enable real-time tensor monitoring
+    pub fn enable_monitoring(&mut self, enable: bool) {
+        self.monitoring_enabled = enable;
+        if enable {
+            tracing::info!("Real-time tensor monitoring enabled");
+        } else {
+            tracing::info!("Real-time tensor monitoring disabled");
+        }
+    }
+
+    /// Track tensor dependency
+    pub fn track_dependency(
+        &mut self,
+        source_id: Uuid,
+        target_id: Uuid,
+        operation: &str,
+        weight: f64,
+    ) {
+        let dependency = TensorDependency {
+            source_id,
+            target_id,
+            operation: operation.to_string(),
+            weight,
+        };
+        self.dependencies.push(dependency);
+    }
+
+    /// Record tensor lifecycle event
+    pub fn record_lifecycle_event(&mut self, tensor_id: Uuid, event: TensorLifecycleEvent) {
+        let lifecycle = self.lifecycles.entry(tensor_id).or_insert_with(|| TensorLifecycle {
+            tensor_id,
+            events: Vec::new(),
+            total_accesses: 0,
+            creation_time: chrono::Utc::now(),
+        });
+
+        lifecycle.events.push((chrono::Utc::now(), event.clone()));
+
+        if matches!(event, TensorLifecycleEvent::Accessed { .. }) {
+            lifecycle.total_accesses += 1;
+        }
+    }
+
+    /// Update tensor time series data
+    pub fn update_time_series(&mut self, tensor_id: Uuid, stats: TensorStats) {
+        if !self.monitoring_enabled {
+            return;
+        }
+
+        let time_series = self.time_series.entry(tensor_id).or_insert_with(|| TensorTimeSeries {
+            tensor_id,
+            timestamps: VecDeque::new(),
+            values: VecDeque::new(),
+            max_history: 1000, // Default history size
+        });
+
+        time_series.timestamps.push_back(chrono::Utc::now());
+        time_series.values.push_back(stats);
+
+        // Maintain maximum history size
+        while time_series.timestamps.len() > time_series.max_history {
+            time_series.timestamps.pop_front();
+            time_series.values.pop_front();
+        }
+    }
+
+    /// Perform advanced tensor analysis.
+    ///
+    /// `gradients`, when supplied, must be the real gradient tensor for
+    /// `tensor` (same element count) and is used to compute a real
+    /// `stability_metrics.gradient_stability` (see
+    /// `Self::compute_stability_metrics`). Without it, `gradient_stability`
+    /// is honestly `None` rather than a fabricated constant.
+    pub fn perform_advanced_analysis<T>(
+        &self,
+        tensor: &ArrayD<T>,
+        gradients: Option<&ArrayD<T>>,
+    ) -> Result<AdvancedTensorAnalysis>
+    where
+        T: Clone + Into<f64> + fmt::Debug + 'static,
+    {
+        let values: Vec<f64> = tensor.iter().map(|x| x.clone().into()).collect();
+        let gradient_values: Option<Vec<f64>> =
+            gradients.map(|g| g.iter().map(|x| x.clone().into()).collect());
+
+        Ok(AdvancedTensorAnalysis {
+            spectral_analysis: self.compute_spectral_analysis(&values, tensor.shape())?,
+            information_content: self.compute_information_content(&values)?,
+            stability_metrics: self
+                .compute_stability_metrics(&values, gradient_values.as_deref())?,
+            relationship_analysis: self.compute_relationship_analysis(&values)?,
+        })
+    }
+
+    /// Detect tensor anomalies using advanced algorithms
+    pub fn detect_advanced_anomalies(&self, tensor_id: Uuid) -> Result<Vec<TensorAlert>> {
+        let mut alerts = Vec::new();
+
+        if let Some(time_series) = self.time_series.get(&tensor_id) {
+            // Detect drift in tensor statistics over time
+            if time_series.values.len() >= 10 {
+                let recent_mean =
+                    time_series.values.iter().rev().take(5).map(|stats| stats.mean).sum::<f64>()
+                        / 5.0;
+                let historical_mean =
+                    time_series.values.iter().take(5).map(|stats| stats.mean).sum::<f64>() / 5.0;
+
+                let drift_ratio =
+                    (recent_mean - historical_mean).abs() / historical_mean.abs().max(1e-8);
+
+                if drift_ratio > 0.5 {
+                    if let Some(tensor_info) = self.tracked_tensors.get(&tensor_id) {
+                        alerts.push(TensorAlert {
+                            id: Uuid::new_v4(),
+                            tensor_id,
+                            tensor_name: tensor_info.name.clone(),
+                            alert_type: TensorAlertType::ExtremeValues,
+                            severity: AlertSeverity::Warning,
+                            message: format!(
+                                "Detected statistical drift in tensor '{}': {:.2}% change",
+                                tensor_info.name,
+                                drift_ratio * 100.0
+                            ),
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(alerts)
+    }
+
+    /// Get tensor dependencies
+    pub fn get_dependencies(&self) -> &[TensorDependency] {
+        &self.dependencies
+    }
+
+    /// Get tensor lifecycle
+    pub fn get_lifecycle(&self, tensor_id: Uuid) -> Option<&TensorLifecycle> {
+        self.lifecycles.get(&tensor_id)
+    }
+
+    /// Get tensor time series
+    pub fn get_time_series(&self, tensor_id: Uuid) -> Option<&TensorTimeSeries> {
+        self.time_series.get(&tensor_id)
+    }
+
+    /// Analyze tensor relationships
+    pub fn analyze_tensor_relationships(&self) -> HashMap<Uuid, Vec<Uuid>> {
+        let mut relationships = HashMap::new();
+
+        for dependency in &self.dependencies {
+            relationships
+                .entry(dependency.source_id)
+                .or_insert_with(Vec::new)
+                .push(dependency.target_id);
+        }
+
+        relationships
+    }
+
+    /// Get frequently accessed tensors
+    pub fn get_frequent_tensors(&self, min_accesses: usize) -> Vec<Uuid> {
+        self.lifecycles
+            .iter()
+            .filter(|(_, lifecycle)| lifecycle.total_accesses >= min_accesses)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    // Private helper methods
+
+    /// Compute [`TensorStats`] for an already-flattened `f64` view of a tensor.
+    ///
+    /// `dtype` must be the caller's real element type name (the callers pass
+    /// `std::any::type_name::<T>()`); it used to be hardcoded to `"f64"`, which
+    /// reported the analysis working type rather than the tensor's own dtype and
+    /// was therefore wrong for every `f32`/`f16`/integer tensor ever inspected.
+    fn compute_tensor_stats(
+        &self,
+        values: &[f64],
+        shape: &[usize],
+        element_size: usize,
+        dtype: &str,
+    ) -> Result<TensorStats> {
+        let total_elements = values.len();
+        let mean = values.iter().sum::<f64>() / total_elements as f64;
+
+        let variance =
+            values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / total_elements as f64;
+        let std = variance.sqrt();
+
+        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        let mut sorted_values = values.to_vec();
+        // Filter out NaN values before sorting to avoid panic
+        sorted_values.retain(|x| !x.is_nan());
+        sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if sorted_values.is_empty() {
+            f64::NAN
+        } else if sorted_values.len().is_multiple_of(2) {
+            (sorted_values[sorted_values.len() / 2 - 1] + sorted_values[sorted_values.len() / 2])
+                / 2.0
+        } else {
+            sorted_values[sorted_values.len() / 2]
+        };
+
+        let l1_norm = values.iter().map(|x| x.abs()).sum::<f64>();
+        let l2_norm = values.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let infinity_norm = values.iter().map(|x| x.abs()).fold(0.0, f64::max);
+
+        let nan_count = values.iter().filter(|x| x.is_nan()).count();
+        let inf_count = values.iter().filter(|x| x.is_infinite()).count();
+        let zero_count = values.iter().filter(|x| **x == 0.0).count();
+
+        let memory_usage_bytes = total_elements * element_size;
+        let sparsity = zero_count as f64 / total_elements as f64;
+
+        Ok(TensorStats {
+            shape: shape.to_vec(),
+            dtype: dtype.to_string(),
+            total_elements,
+            mean,
+            std,
+            min,
+            max,
+            median,
+            l1_norm,
+            l2_norm,
+            infinity_norm,
+            nan_count,
+            inf_count,
+            zero_count,
+            memory_usage_bytes,
+            sparsity,
+        })
+    }
+
+    fn compute_distribution(&self, values: &[f64]) -> Result<TensorDistribution> {
+        // Simple histogram computation
+        let num_bins = 50;
+        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let bin_width = (max - min) / num_bins as f64;
+
+        let mut histogram = vec![(0.0, 0); num_bins];
+        for &value in values {
+            if !value.is_finite() {
+                continue;
+            }
+            let bin_idx = ((value - min) / bin_width).floor() as usize;
+            let bin_idx = bin_idx.min(num_bins - 1);
+            histogram[bin_idx].0 = min + bin_idx as f64 * bin_width;
+            histogram[bin_idx].1 += 1;
+        }
+
+        // Compute percentiles
+        let mut sorted_values =
+            values.iter().cloned().filter(|x| x.is_finite()).collect::<Vec<_>>();
+        sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut percentiles = HashMap::new();
+        for &p in &[5.0, 25.0, 50.0, 75.0, 95.0, 99.0] {
+            let idx = ((p / 100.0) * (sorted_values.len() - 1) as f64) as usize;
+            percentiles.insert(format!("p{}", p as u8), sorted_values[idx]);
+        }
+
+        // Identify outliers (simple method using IQR)
+        let q1 = percentiles["p25"];
+        let q3 = percentiles["p75"];
+        let iqr = q3 - q1;
+        let lower_bound = q1 - 1.5 * iqr;
+        let upper_bound = q3 + 1.5 * iqr;
+
+        let outliers: Vec<f64> = sorted_values
+            .iter()
+            .cloned()
+            .filter(|&x| x < lower_bound || x > upper_bound)
+            .take(100) // Limit outliers to avoid memory issues
+            .collect();
+
+        // Population (method-of-moments) skewness `g1 = m3 / m2^(3/2)` and
+        // population EXCESS kurtosis `g2 = m4 / m2^2 - 3`, both computed over
+        // the NaN-filtered values with the biased (divide-by-n) central
+        // moments. These are the standard estimators -- not an approximation --
+        // and they match `scipy.stats.skew(bias=True)` /
+        // `scipy.stats.kurtosis(bias=True, fisher=True)` exactly.
+        let mean = sorted_values.iter().sum::<f64>() / sorted_values.len() as f64;
+        let variance = sorted_values.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+            / sorted_values.len() as f64;
+        let std = variance.sqrt();
+
+        let skewness = if std > 0.0 {
+            sorted_values.iter().map(|x| ((x - mean) / std).powi(3)).sum::<f64>()
+                / sorted_values.len() as f64
+        } else {
+            0.0
+        };
+
+        let kurtosis = if std > 0.0 {
+            sorted_values.iter().map(|x| ((x - mean) / std).powi(4)).sum::<f64>()
+                / sorted_values.len() as f64
+                - 3.0
+        } else {
+            0.0
+        };
+
+        Ok(TensorDistribution {
+            histogram,
+            percentiles,
+            outliers,
+            skewness,
+            kurtosis,
+        })
+    }
+
+    fn should_compute_distribution(&self) -> bool {
+        self.config.sampling_rate >= 1.0
+            || (self.config.sampling_rate > 0.0 && random::<f32>() < self.config.sampling_rate)
+    }
+
+    fn check_tensor_alerts(&mut self, tensor_info: &TensorInfo) -> Result<()> {
+        // Check for NaN values
+        if tensor_info.stats.nan_count > 0 {
+            self.alerts.push(TensorAlert {
+                id: Uuid::new_v4(),
+                tensor_id: tensor_info.id,
+                tensor_name: tensor_info.name.clone(),
+                alert_type: TensorAlertType::NaNValues,
+                severity: AlertSeverity::Critical,
+                message: format!(
+                    "Found {} NaN values in tensor '{}'",
+                    tensor_info.stats.nan_count, tensor_info.name
+                ),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        // Check for infinite values
+        if tensor_info.stats.inf_count > 0 {
+            self.alerts.push(TensorAlert {
+                id: Uuid::new_v4(),
+                tensor_id: tensor_info.id,
+                tensor_name: tensor_info.name.clone(),
+                alert_type: TensorAlertType::InfiniteValues,
+                severity: AlertSeverity::Critical,
+                message: format!(
+                    "Found {} infinite values in tensor '{}'",
+                    tensor_info.stats.inf_count, tensor_info.name
+                ),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        // Check for extreme values
+        if tensor_info.stats.max.abs() > 1e10 || tensor_info.stats.min.abs() > 1e10 {
+            self.alerts.push(TensorAlert {
+                id: Uuid::new_v4(),
+                tensor_id: tensor_info.id,
+                tensor_name: tensor_info.name.clone(),
+                alert_type: TensorAlertType::ExtremeValues,
+                severity: AlertSeverity::Warning,
+                message: format!(
+                    "Extreme values detected in tensor '{}': min={:.2e}, max={:.2e}",
+                    tensor_info.name, tensor_info.stats.min, tensor_info.stats.max
+                ),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn check_gradient_alerts_with_data(
+        &mut self,
+        tensor_id: Uuid,
+        tensor_name: &str,
+        grad_stats: Option<TensorStats>,
+    ) -> Result<()> {
+        if let Some(ref stats) = grad_stats {
+            // Check for vanishing gradients
+            if stats.l2_norm < 1e-8 {
+                self.alerts.push(TensorAlert {
+                    id: Uuid::new_v4(),
+                    tensor_id,
+                    tensor_name: tensor_name.to_string(),
+                    alert_type: TensorAlertType::VanishingGradients,
+                    severity: AlertSeverity::Warning,
+                    message: format!(
+                        "Vanishing gradients detected in '{}': L2 norm = {:.2e}",
+                        tensor_name, stats.l2_norm
+                    ),
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+
+            // Check for exploding gradients
+            if stats.l2_norm > 100.0 {
+                self.alerts.push(TensorAlert {
+                    id: Uuid::new_v4(),
+                    tensor_id,
+                    tensor_name: tensor_name.to_string(),
+                    alert_type: TensorAlertType::ExplodingGradients,
+                    severity: AlertSeverity::Critical,
+                    message: format!(
+                        "Exploding gradients detected in '{}': L2 norm = {:.2e}",
+                        tensor_name, stats.l2_norm
+                    ),
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compute_mse(&self, stats1: &TensorStats, stats2: &TensorStats) -> f64 {
+        // Simplified MSE using means (would need actual tensor data for real MSE)
+        (stats1.mean - stats2.mean).powi(2)
+    }
+
+    fn compute_mae(&self, stats1: &TensorStats, stats2: &TensorStats) -> f64 {
+        // Simplified MAE using means
+        (stats1.mean - stats2.mean).abs()
+    }
+
+    fn compute_cosine_similarity(&self, stats1: &TensorStats, stats2: &TensorStats) -> f64 {
+        // Simplified using L2 norms (would need actual tensors for real cosine similarity)
+        if stats1.l2_norm == 0.0 || stats2.l2_norm == 0.0 {
+            0.0
+        } else {
+            (stats1.mean * stats2.mean) / (stats1.l2_norm * stats2.l2_norm)
+        }
+    }
+
+    /// Pearson correlation requires paired per-element values (`sum((x_i -
+    /// mean_x)(y_i - mean_y))`), but `TensorInspector` only retains
+    /// [`TensorStats`] summaries once a tensor has been inspected -- see
+    /// [`TensorInspector::tracked_tensors`] -- never the raw values, so it
+    /// can be tracked across many tensors without unbounded memory growth.
+    /// With only `(mean, std, ...)` for each side there is no honest way to
+    /// recover the cross term, so this returns `None` rather than a
+    /// fabricated constant. [`Self::compute_relationship_analysis`] returns an
+    /// empty relationship map for the same reason.
+    fn compute_correlation(&self, _stats1: &TensorStats, _stats2: &TensorStats) -> Option<f64> {
+        None
+    }
+
+    // Advanced analysis helper methods
+
+    /// Real spectral analysis of a 2-D tensor via a full singular value
+    /// decomposition (`nalgebra`, Pure Rust).
+    ///
+    /// Returns `Ok(None)` -- an honest absence, never fabricated numbers --
+    /// when the tensor is not a 2-D matrix, when the element count does not
+    /// match `rows * cols`, when any element is non-finite (an SVD of a matrix
+    /// containing NaN/inf is meaningless), or when the iterative SVD does not
+    /// converge.
+    fn compute_spectral_analysis(
+        &self,
+        values: &[f64],
+        shape: &[usize],
+    ) -> Result<Option<SpectralAnalysis>> {
+        // Only perform spectral analysis for 2D matrices
+        if shape.len() != 2 || values.len() < 4 {
+            return Ok(None);
+        }
+
+        let rows = shape[0];
+        let cols = shape[1];
+        if rows == 0 || cols == 0 || rows.saturating_mul(cols) != values.len() {
+            tracing::debug!(
+                rows,
+                cols,
+                len = values.len(),
+                "skipping spectral analysis: shape does not match the element count"
+            );
+            return Ok(None);
+        }
+        if values.iter().any(|v| !v.is_finite()) {
+            tracing::debug!("skipping spectral analysis: matrix contains non-finite entries");
+            return Ok(None);
+        }
+
+        let matrix = nalgebra::DMatrix::<f64>::from_row_slice(rows, cols, values);
+        // `try_new` returns `None` instead of panicking when the implicit-shift
+        // QR sweep fails to converge; `0` means "no iteration cap".
+        let Some(svd) = nalgebra::linalg::SVD::try_new(matrix, false, false, f64::EPSILON, 0)
+        else {
+            tracing::debug!(
+                rows,
+                cols,
+                "SVD did not converge; reporting no spectral analysis"
+            );
+            return Ok(None);
+        };
+
+        let mut singular_values: Vec<f64> = svd.singular_values.iter().copied().collect();
+        // nalgebra does not guarantee an ordering, and every metric below
+        // depends on sigma_max / sigma_min.
+        singular_values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+        let sigma_max = singular_values.first().copied().unwrap_or(0.0);
+        let sigma_min = singular_values.last().copied().unwrap_or(0.0);
+
+        // Standard LAPACK/NumPy numerical-rank tolerance.
+        let tol = rows.max(cols) as f64 * sigma_max * f64::EPSILON;
+        let rank = singular_values.iter().filter(|&&s| s > tol).count();
+
+        let condition_number = if sigma_min > tol { sigma_max / sigma_min } else { f64::INFINITY };
+
+        // Roy & Vetterli (2007), "The effective rank: a measure of effective
+        // dimensionality": erank(A) = exp(H(p)), p_i = sigma_i / sum(sigma).
+        let sigma_sum: f64 = singular_values.iter().sum();
+        let effective_rank = if sigma_sum > 0.0 {
+            let entropy: f64 = singular_values
+                .iter()
+                .map(|&s| s / sigma_sum)
+                .filter(|&p| p > 0.0)
+                .map(|p| -p * p.ln())
+                .sum();
+            entropy.exp()
+        } else {
+            0.0
+        };
+
+        Ok(Some(SpectralAnalysis {
+            singular_values,
+            condition_number,
+            rank,
+            spectral_norm: sigma_max,
+            effective_rank,
+        }))
+    }
+
+    fn compute_information_content(&self, values: &[f64]) -> Result<InformationContent> {
+        // Shannon entropy calculation
+        let mut histogram = std::collections::HashMap::new();
+        let quantization_levels = 100;
+        let min_val = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let range = max_val - min_val;
+
+        if range > 1e-12 {
+            for &value in values {
+                let bucket = ((value - min_val) / range * quantization_levels as f64) as usize;
+                let bucket = bucket.min(quantization_levels - 1);
+                *histogram.entry(bucket).or_insert(0) += 1;
+            }
+        }
+
+        let total_count = values.len() as f64;
+        let entropy = if total_count > 0.0 {
+            histogram
+                .values()
+                .map(|&count| {
+                    let p = count as f64 / total_count;
+                    if p > 0.0 {
+                        -p * p.log2()
+                    } else {
+                        0.0
+                    }
+                })
+                .sum()
+        } else {
+            0.0
+        };
+
+        // Perplexity of the quantised value distribution: 2^H.
+        let value_distribution_perplexity = if entropy > 0.0 { 2.0_f64.powf(entropy) } else { 1.0 };
+
+        let mut sorted_values = values.to_vec();
+        sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_values.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+        let unique_values = sorted_values.len();
+        let distinct_value_fraction =
+            if values.is_empty() { 0.0 } else { unique_values as f64 / values.len() as f64 };
+
+        Ok(InformationContent {
+            entropy,
+            // Single-tensor call: there is no second variable to share
+            // information with, so this is an honest absence.
+            mutual_information: None,
+            value_distribution_perplexity,
+            distinct_value_fraction,
+        })
+    }
+
+    fn compute_stability_metrics(
+        &self,
+        values: &[f64],
+        gradients: Option<&[f64]>,
+    ) -> Result<StabilityMetrics> {
+        // Numerical stability based on condition of values
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        let std_dev = variance.sqrt();
+
+        let numerical_stability = if std_dev > 1e-12 {
+            1.0 / (1.0 + std_dev / mean.abs().max(1e-12))
+        } else {
+            1.0
+        };
+
+        // Simple perturbation sensitivity
+        let max_abs = values.iter().map(|x| x.abs()).fold(0.0, f64::max);
+        let perturbation_sensitivity = if max_abs > 1e-12 { std_dev / max_abs } else { 0.0 };
+
+        // Overall robustness score
+        let robustness_score = numerical_stability * (1.0 - perturbation_sensitivity.min(1.0));
+
+        // Real gradient stability: the same coefficient-of-variation-based
+        // formula as `numerical_stability`, computed over the real gradient
+        // values when they were provided. `None` (never the old hardcoded
+        // `0.8`) when no gradient tensor is available to this call.
+        let gradient_stability = gradients.filter(|g| !g.is_empty()).map(|g| {
+            let g_mean = g.iter().sum::<f64>() / g.len() as f64;
+            let g_variance = g.iter().map(|x| (x - g_mean).powi(2)).sum::<f64>() / g.len() as f64;
+            let g_std = g_variance.sqrt();
+            if g_std > 1e-12 {
+                1.0 / (1.0 + g_std / g_mean.abs().max(1e-12))
+            } else {
+                1.0
+            }
+        });
+
+        Ok(StabilityMetrics {
+            numerical_stability,
+            gradient_stability,
+            perturbation_sensitivity,
+            robustness_score,
+        })
+    }
+
+    /// Cross-tensor relationships for the tensor being analysed.
+    ///
+    /// Always empty, and deliberately so. Pearson correlation needs paired
+    /// per-element values from both tensors, but [`Self::tracked_tensors`]
+    /// retains only [`TensorStats`] summaries (see [`Self::compute_correlation`]
+    /// for the same reasoning) -- the raw values of previously inspected
+    /// tensors are dropped so tracking stays O(1) per tensor.
+    ///
+    /// The previous implementation looked like it computed something: it called
+    /// `compute_simple_correlation(values, &[other.stats.mean])`, correlating an
+    /// N-element vector against a ONE-element vector. With `min_len == 1` the
+    /// second sum-of-squares term is identically zero, so the denominator was
+    /// always below the `1e-12` guard and the function returned `0.0` for every
+    /// pair, every time. Publishing that as a measured cross-correlation of
+    /// zero is worse than publishing nothing.
+    fn compute_relationship_analysis(&self, _values: &[f64]) -> Result<RelationshipAnalysis> {
+        Ok(RelationshipAnalysis {
+            cross_correlations: HashMap::new(),
+            dependency_strength: HashMap::new(),
+            // Causal discovery needs temporal ordering across tensors, which
+            // this call does not receive.
+            causal_relationships: Vec::new(),
+        })
+    }
+
+    fn compute_summary_stats(&self) -> HashMap<String, f64> {
+        let mut stats = HashMap::new();
+
+        if !self.tracked_tensors.is_empty() {
+            let values: Vec<f64> = self.tracked_tensors.values().map(|t| t.stats.mean).collect();
+            stats.insert(
+                "mean_of_means".to_string(),
+                values.iter().sum::<f64>() / values.len() as f64,
+            );
+
+            let total_memory: usize =
+                self.tracked_tensors.values().map(|t| t.stats.memory_usage_bytes).sum();
+            stats.insert(
+                "total_memory_mb".to_string(),
+                total_memory as f64 / (1024.0 * 1024.0),
+            );
+
+            let avg_sparsity: f64 =
+                self.tracked_tensors.values().map(|t| t.stats.sparsity).sum::<f64>()
+                    / self.tracked_tensors.len() as f64;
+            stats.insert("avg_sparsity".to_string(), avg_sparsity);
+
+            // Add advanced statistics
+            stats.insert(
+                "total_dependencies".to_string(),
+                self.dependencies.len() as f64,
+            );
+            stats.insert(
+                "monitored_tensors".to_string(),
+                self.time_series.len() as f64,
+            );
+            stats.insert(
+                "active_lifecycles".to_string(),
+                self.lifecycles.len() as f64,
+            );
+        }
+
+        stats
+    }
+}
+
+/// Alert types for tensor issues
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TensorAlertType {
+    NaNValues,
+    InfiniteValues,
+    ExtremeValues,
+    VanishingGradients,
+    ExplodingGradients,
+    MemoryUsage,
+    ShapeMismatch,
+}
+
+/// Alert severity levels
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+/// Tensor alert information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorAlert {
+    pub id: Uuid,
+    pub tensor_id: Uuid,
+    pub tensor_name: String,
+    pub alert_type: TensorAlertType,
+    pub severity: AlertSeverity,
+    pub message: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Tensor inspection report
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TensorInspectionReport {
+    pub total_tensors: usize,
+    pub tensors_with_issues: usize,
+    pub total_memory_usage: usize,
+    pub alerts: Vec<TensorAlert>,
+    pub comparisons: Vec<TensorComparison>,
+    pub summary_stats: HashMap<String, f64>,
+}
+
+impl TensorInspectionReport {
+    pub fn has_nan_values(&self) -> bool {
+        self.alerts.iter().any(|a| matches!(a.alert_type, TensorAlertType::NaNValues))
+    }
+
+    pub fn has_inf_values(&self) -> bool {
+        self.alerts
+            .iter()
+            .any(|a| matches!(a.alert_type, TensorAlertType::InfiniteValues))
+    }
+
+    pub fn total_nan_count(&self) -> usize {
+        self.alerts
+            .iter()
+            .filter(|a| matches!(a.alert_type, TensorAlertType::NaNValues))
+            .count()
+    }
+
+    pub fn total_inf_count(&self) -> usize {
+        self.alerts
+            .iter()
+            .filter(|a| matches!(a.alert_type, TensorAlertType::InfiniteValues))
+            .count()
+    }
+
+    pub fn has_critical_alerts(&self) -> bool {
+        self.alerts.iter().any(|a| matches!(a.severity, AlertSeverity::Critical))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scirs2_core::ndarray::{ArrayD, IxDyn};
+
+    fn make_config() -> DebugConfig {
+        DebugConfig::default()
+    }
+
+    fn make_tensor(values: &[f64], shape: &[usize]) -> ArrayD<f64> {
+        ArrayD::from_shape_vec(IxDyn(shape), values.to_vec())
+            .expect("tensor creation should succeed")
+    }
+
+    // ---- honesty regression tests (Wave 6c debug-sweep2) -----------------
+
+    #[test]
+    fn dtype_reports_the_real_element_type_not_a_hardcoded_f64() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let tensor: ArrayD<f32> =
+            ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0f32, 2.0, 3.0, 4.0]).expect("tensor");
+        let id = inspector.inspect_tensor(&tensor, "f32_tensor", None, None).expect("inspect");
+        let info = inspector.get_tensor_info(id).expect("tracked");
+        assert_eq!(
+            info.stats.dtype, "f32",
+            "dtype was hardcoded to \"f64\" before"
+        );
+        assert_eq!(info.stats.memory_usage_bytes, 4 * 4);
+    }
+
+    #[test]
+    fn spectral_rank_is_a_real_rank_not_a_non_zero_element_count() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        // Every entry non-zero, but every row identical: real rank is 1.
+        // The old implementation counted non-zero ENTRIES (9) and clamped to
+        // min(rows, cols) = 3.
+        let ones = make_tensor(&[1.0; 9], &[3, 3]);
+        let analysis = inspector.perform_advanced_analysis(&ones, None).expect("analysis");
+        let spectral = analysis.spectral_analysis.expect("2-D matrix must get spectral analysis");
+        assert_eq!(spectral.rank, 1, "rank-1 matrix must report rank 1");
+        assert!(
+            spectral.condition_number.is_infinite(),
+            "a singular matrix is ill-conditioned"
+        );
+        assert!(
+            (spectral.spectral_norm - 3.0).abs() < 1e-9,
+            "sigma_max of the 3x3 all-ones matrix is exactly 3, got {}",
+            spectral.spectral_norm
+        );
+        assert!(
+            (spectral.effective_rank - 1.0).abs() < 1e-9,
+            "one non-zero singular value => effective rank 1, got {}",
+            spectral.effective_rank
+        );
+    }
+
+    #[test]
+    fn spectral_condition_number_matches_the_closed_form() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        // diag(4, 1): singular values 4 and 1 => cond = 4, rank 2.
+        let m = make_tensor(&[4.0, 0.0, 0.0, 1.0], &[2, 2]);
+        let spectral = inspector
+            .perform_advanced_analysis(&m, None)
+            .expect("analysis")
+            .spectral_analysis
+            .expect("2-D matrix");
+        assert_eq!(spectral.rank, 2);
+        assert!(
+            (spectral.condition_number - 4.0).abs() < 1e-9,
+            "{}",
+            spectral.condition_number
+        );
+        assert_eq!(spectral.singular_values.len(), 2);
+        assert!((spectral.singular_values[0] - 4.0).abs() < 1e-9);
+        assert!((spectral.singular_values[1] - 1.0).abs() < 1e-9);
+        assert!(
+            spectral.singular_values[0] >= spectral.singular_values[1],
+            "singular values must come back sorted descending"
+        );
+    }
+
+    #[test]
+    fn spectral_analysis_handles_rectangular_matrices() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        // 2x3 with rank 2. The old power_iteration returned 0.0 for every
+        // non-square matrix and published it as the spectral norm.
+        let m = make_tensor(&[1.0, 0.0, 0.0, 0.0, 2.0, 0.0], &[2, 3]);
+        let spectral = inspector
+            .perform_advanced_analysis(&m, None)
+            .expect("analysis")
+            .spectral_analysis
+            .expect("2-D matrix");
+        assert!(
+            spectral.spectral_norm > 0.0,
+            "must not be the old hardcoded 0.0"
+        );
+        assert!((spectral.spectral_norm - 2.0).abs() < 1e-9);
+        assert_eq!(spectral.rank, 2);
+    }
+
+    #[test]
+    fn spectral_analysis_is_absent_for_non_finite_matrices() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        let m = make_tensor(&[1.0, f64::NAN, 3.0, 4.0], &[2, 2]);
+        let analysis = inspector.perform_advanced_analysis(&m, None).expect("analysis");
+        assert!(
+            analysis.spectral_analysis.is_none(),
+            "an SVD of a NaN matrix is meaningless: report absence, not numbers"
+        );
+    }
+
+    #[test]
+    fn mutual_information_is_absent_rather_than_a_measured_zero() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        let m = make_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let info = inspector
+            .perform_advanced_analysis(&m, None)
+            .expect("analysis")
+            .information_content;
+        assert!(
+            info.mutual_information.is_none(),
+            "one tensor cannot yield a real MI"
+        );
+        assert!(
+            info.entropy > 0.0,
+            "entropy over distinct values must be positive"
+        );
+        assert!(info.value_distribution_perplexity >= 1.0);
+        assert!(
+            (info.distinct_value_fraction - 1.0).abs() < 1e-12,
+            "4 distinct of 4"
+        );
+    }
+
+    #[test]
+    fn relationship_analysis_reports_nothing_instead_of_a_fabricated_zero() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let a = make_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        inspector.inspect_tensor(&a, "a", None, None).expect("inspect");
+        let b = make_tensor(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
+        let rel = inspector
+            .perform_advanced_analysis(&b, None)
+            .expect("analysis")
+            .relationship_analysis;
+        // The old code inserted a 0.0 "correlation" for every tracked tensor.
+        assert!(
+            rel.cross_correlations.is_empty(),
+            "raw values of past tensors are not retained, so no correlation is computable"
+        );
+        assert!(rel.dependency_strength.is_empty());
+    }
+
+    #[test]
+    fn skewness_and_kurtosis_match_the_population_estimators() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        // Symmetric data => skew 0; this exact sample has a known excess
+        // kurtosis of -1.3 for the population (Fisher) estimator.
+        let data = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
+        let tensor = make_tensor(&data, &[5]);
+        let dist = inspector.compute_distribution(&data).expect("distribution");
+        assert!(
+            dist.skewness.abs() < 1e-12,
+            "symmetric data has zero skew: {}",
+            dist.skewness
+        );
+        // m2 = 2, m4 = 6.8 => g2 = 6.8 / 4 - 3 = -1.3
+        assert!(
+            (dist.kurtosis + 1.3).abs() < 1e-12,
+            "population excess kurtosis must be -1.3, got {}",
+            dist.kurtosis
+        );
+        let _ = tensor;
+    }
+
+    #[test]
+    fn test_tensor_inspector_creation() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        assert!(inspector.get_all_tensors().is_empty());
+        assert!(inspector.get_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_inspect_tensor_basic() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let data: Vec<f64> = (0..12).map(|i| i as f64).collect();
+        let tensor = make_tensor(&data, &[3, 4]);
+        let result = inspector.inspect_tensor(&tensor, "test_tensor", None, None);
+        assert!(result.is_ok());
+        let id = result.expect("inspect should succeed");
+        let info = inspector.get_tensor_info(id);
+        assert!(info.is_some());
+        let i = info.expect("info should exist");
+        assert_eq!(i.name, "test_tensor");
+        assert_eq!(i.stats.shape, vec![3, 4]);
+        assert_eq!(i.stats.total_elements, 12);
+    }
+
+    #[test]
+    fn test_inspect_tensor_with_layer_name() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let tensor = make_tensor(&[1.0, 2.0, 3.0, 4.0], &[4]);
+        let id = inspector
+            .inspect_tensor(&tensor, "w", Some("layer_0"), Some("matmul"))
+            .expect("inspect should succeed");
+        let info = inspector.get_tensor_info(id).expect("info should exist");
+        assert_eq!(info.layer_name, Some("layer_0".to_string()));
+        assert_eq!(info.operation, Some("matmul".to_string()));
+    }
+
+    #[test]
+    fn test_tensor_stats_computation() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let tensor = make_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0], &[5]);
+        let id = inspector
+            .inspect_tensor(&tensor, "stats_test", None, None)
+            .expect("inspect should succeed");
+        let info = inspector.get_tensor_info(id).expect("info should exist");
+        assert!((info.stats.mean - 3.0).abs() < 0.01);
+        assert!((info.stats.min - 1.0).abs() < f64::EPSILON);
+        assert!((info.stats.max - 5.0).abs() < f64::EPSILON);
+        assert_eq!(info.stats.nan_count, 0);
+        assert_eq!(info.stats.inf_count, 0);
+    }
+
+    #[test]
+    fn test_tensor_stats_sparsity() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let tensor = make_tensor(&[0.0, 0.0, 1.0, 0.0, 2.0], &[5]);
+        let id = inspector
+            .inspect_tensor(&tensor, "sparse_test", None, None)
+            .expect("inspect should succeed");
+        let info = inspector.get_tensor_info(id).expect("info should exist");
+        assert!((info.stats.sparsity - 0.6).abs() < 0.01);
+        assert_eq!(info.stats.zero_count, 3);
+    }
+
+    #[test]
+    fn test_tensor_norms() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let tensor = make_tensor(&[3.0, 4.0], &[2]);
+        let id = inspector
+            .inspect_tensor(&tensor, "norm_test", None, None)
+            .expect("inspect should succeed");
+        let info = inspector.get_tensor_info(id).expect("info should exist");
+        assert!((info.stats.l1_norm - 7.0).abs() < 0.01);
+        assert!((info.stats.l2_norm - 5.0).abs() < 0.01);
+        assert!((info.stats.infinity_norm - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_get_all_tensors() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let t1 = make_tensor(&[1.0, 2.0], &[2]);
+        let t2 = make_tensor(&[3.0, 4.0], &[2]);
+        let _ = inspector.inspect_tensor(&t1, "t1", None, None);
+        let _ = inspector.inspect_tensor(&t2, "t2", None, None);
+        assert_eq!(inspector.get_all_tensors().len(), 2);
+    }
+
+    #[test]
+    fn test_get_tensors_by_layer() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let t1 = make_tensor(&[1.0], &[1]);
+        let t2 = make_tensor(&[2.0], &[1]);
+        let t3 = make_tensor(&[3.0], &[1]);
+        let _ = inspector.inspect_tensor(&t1, "w1", Some("attn"), None);
+        let _ = inspector.inspect_tensor(&t2, "w2", Some("attn"), None);
+        let _ = inspector.inspect_tensor(&t3, "w3", Some("ffn"), None);
+        let attn_tensors = inspector.get_tensors_by_layer("attn");
+        assert_eq!(attn_tensors.len(), 2);
+        let ffn_tensors = inspector.get_tensors_by_layer("ffn");
+        assert_eq!(ffn_tensors.len(), 1);
+    }
+
+    #[test]
+    fn test_clear() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let t = make_tensor(&[1.0, 2.0], &[2]);
+        let _ = inspector.inspect_tensor(&t, "t", None, None);
+        inspector.clear();
+        assert!(inspector.get_all_tensors().is_empty());
+        assert!(inspector.get_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_enable_monitoring() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        inspector.enable_monitoring(true);
+        assert!(inspector.monitoring_enabled);
+        inspector.enable_monitoring(false);
+        assert!(!inspector.monitoring_enabled);
+    }
+
+    #[test]
+    fn test_track_dependency() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let src = Uuid::new_v4();
+        let tgt = Uuid::new_v4();
+        inspector.track_dependency(src, tgt, "matmul", 1.0);
+        assert_eq!(inspector.get_dependencies().len(), 1);
+    }
+
+    #[test]
+    fn test_record_lifecycle_event() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let tid = Uuid::new_v4();
+        inspector.record_lifecycle_event(tid, TensorLifecycleEvent::Created { size_bytes: 100 });
+        inspector.record_lifecycle_event(
+            tid,
+            TensorLifecycleEvent::Accessed {
+                access_type: "read".to_string(),
+            },
+        );
+        let lifecycle = inspector.get_lifecycle(tid);
+        assert!(lifecycle.is_some());
+        let lc = lifecycle.expect("lifecycle should exist");
+        assert_eq!(lc.events.len(), 2);
+        assert_eq!(lc.total_accesses, 1);
+    }
+
+    #[test]
+    fn test_update_time_series_disabled() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let tid = Uuid::new_v4();
+        let stats = TensorStats {
+            shape: vec![2],
+            dtype: "f64".to_string(),
+            total_elements: 2,
+            mean: 1.0,
+            std: 0.5,
+            min: 0.5,
+            max: 1.5,
+            median: 1.0,
+            l1_norm: 2.0,
+            l2_norm: 1.5,
+            infinity_norm: 1.5,
+            nan_count: 0,
+            inf_count: 0,
+            zero_count: 0,
+            memory_usage_bytes: 16,
+            sparsity: 0.0,
+        };
+        inspector.update_time_series(tid, stats);
+        assert!(inspector.get_time_series(tid).is_none());
+    }
+
+    #[test]
+    fn test_update_time_series_enabled() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        inspector.enable_monitoring(true);
+        let tid = Uuid::new_v4();
+        let stats = TensorStats {
+            shape: vec![2],
+            dtype: "f64".to_string(),
+            total_elements: 2,
+            mean: 1.0,
+            std: 0.5,
+            min: 0.5,
+            max: 1.5,
+            median: 1.0,
+            l1_norm: 2.0,
+            l2_norm: 1.5,
+            infinity_norm: 1.5,
+            nan_count: 0,
+            inf_count: 0,
+            zero_count: 0,
+            memory_usage_bytes: 16,
+            sparsity: 0.0,
+        };
+        inspector.update_time_series(tid, stats);
+        let ts = inspector.get_time_series(tid);
+        assert!(ts.is_some());
+        assert_eq!(ts.expect("ts should exist").values.len(), 1);
+    }
+
+    #[test]
+    fn test_analyze_tensor_relationships_empty() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        let rels = inspector.analyze_tensor_relationships();
+        assert!(rels.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_tensor_relationships_with_deps() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        inspector.track_dependency(a, b, "add", 1.0);
+        inspector.track_dependency(a, c, "mul", 0.5);
+        let rels = inspector.analyze_tensor_relationships();
+        assert_eq!(rels.len(), 1);
+        let targets = &rels[&a];
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn test_get_frequent_tensors() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let tid = Uuid::new_v4();
+        for _ in 0..5 {
+            inspector.record_lifecycle_event(
+                tid,
+                TensorLifecycleEvent::Accessed {
+                    access_type: "read".to_string(),
+                },
+            );
+        }
+        let frequent = inspector.get_frequent_tensors(3);
+        assert_eq!(frequent.len(), 1);
+        let infrequent = inspector.get_frequent_tensors(10);
+        assert!(infrequent.is_empty());
+    }
+
+    #[test]
+    fn test_perform_advanced_analysis() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        let tensor = make_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let result = inspector.perform_advanced_analysis(&tensor, None);
+        assert!(result.is_ok());
+        let analysis = result.expect("analysis should succeed");
+        assert!(analysis.information_content.entropy >= 0.0);
+    }
+
+    /// Regression test: without a gradient tensor, `gradient_stability` must
+    /// be honestly `None`, never the old hardcoded `0.8`.
+    #[test]
+    fn test_gradient_stability_is_none_without_gradients() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        let tensor = make_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let analysis = inspector
+            .perform_advanced_analysis(&tensor, None)
+            .expect("analysis should succeed");
+        assert_eq!(
+            analysis.stability_metrics.gradient_stability, None,
+            "must be None (not the old hardcoded 0.8) when no gradients were provided"
+        );
+    }
+
+    /// Regression test: with a real gradient tensor, `gradient_stability`
+    /// must be a real, data-dependent value computed from those gradients
+    /// -- never the old hardcoded `0.8` -- and must actually change when the
+    /// gradients change.
+    #[test]
+    fn test_gradient_stability_is_computed_from_real_gradients() {
+        let config = make_config();
+        let inspector = TensorInspector::new(&config);
+        let tensor = make_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        let stable_gradients = make_tensor(&[0.01, 0.01, 0.01, 0.01, 0.01, 0.01], &[2, 3]);
+        let volatile_gradients = make_tensor(&[10.0, -8.0, 6.0, -12.0, 9.0, -7.0], &[2, 3]);
+
+        let stable = inspector
+            .perform_advanced_analysis(&tensor, Some(&stable_gradients))
+            .expect("analysis should succeed")
+            .stability_metrics
+            .gradient_stability
+            .expect("gradient_stability must be Some when gradients are provided");
+        let volatile = inspector
+            .perform_advanced_analysis(&tensor, Some(&volatile_gradients))
+            .expect("analysis should succeed")
+            .stability_metrics
+            .gradient_stability
+            .expect("gradient_stability must be Some when gradients are provided");
+
+        assert_ne!(stable, 0.8, "must not be the old fabricated constant");
+        assert_ne!(volatile, 0.8, "must not be the old fabricated constant");
+        assert!(
+            stable > volatile,
+            "low-variance gradients ({stable}) must score more stable than \
+             high-variance gradients ({volatile})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_report() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let t = make_tensor(&[1.0, 2.0, 3.0], &[3]);
+        let _ = inspector.inspect_tensor(&t, "report_test", None, None);
+        let report = inspector.generate_report().await;
+        assert!(report.is_ok());
+        let r = report.expect("report should succeed");
+        assert_eq!(r.total_tensors, 1);
+        assert_eq!(r.tensors_with_issues, 0);
+    }
+
+    #[tokio::test]
+    async fn test_start() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let result = inspector.start().await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_inspection_report_methods() {
+        let report = TensorInspectionReport {
+            total_tensors: 5,
+            tensors_with_issues: 0,
+            total_memory_usage: 1024,
+            alerts: vec![],
+            comparisons: vec![],
+            summary_stats: HashMap::new(),
+        };
+        assert!(!report.has_nan_values());
+        assert!(!report.has_inf_values());
+        assert_eq!(report.total_nan_count(), 0);
+        assert_eq!(report.total_inf_count(), 0);
+        assert!(!report.has_critical_alerts());
+    }
+
+    #[test]
+    fn test_compare_tensors() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let t1 = make_tensor(&[1.0, 2.0, 3.0], &[3]);
+        let t2 = make_tensor(&[1.1, 2.1, 3.1], &[3]);
+        let id1 = inspector.inspect_tensor(&t1, "t1", None, None).expect("inspect should succeed");
+        let id2 = inspector.inspect_tensor(&t2, "t2", None, None).expect("inspect should succeed");
+        let comparison = inspector.compare_tensors(id1, id2);
+        assert!(comparison.is_ok());
+        let c = comparison.expect("comparison should succeed");
+        assert!(c.shape_match);
+        assert!(c.dtype_match);
+        // Regression: the old implementation returned a hardcoded `0.5`
+        // (or `0.0`) `correlation` regardless of the tensors involved. Since
+        // only summary stats are retained (see `compute_correlation`'s
+        // docs), a real correlation cannot be computed here, and must be
+        // honestly `None` rather than any fabricated float.
+        assert_eq!(c.correlation, None);
+    }
+
+    #[test]
+    fn test_compare_tensors_missing() {
+        let config = make_config();
+        let mut inspector = TensorInspector::new(&config);
+        let missing = Uuid::new_v4();
+        let result = inspector.compare_tensors(missing, missing);
+        assert!(result.is_err());
+    }
+}

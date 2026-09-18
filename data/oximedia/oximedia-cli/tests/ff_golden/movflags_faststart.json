@@ -1,0 +1,9 @@
+{
+  "name": "movflags_faststart",
+  "args": ["-i", "in.mkv", "-movflags", "+faststart", "out.mp4"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "contains_muxer_actions": ["FastStart"]
+  }
+}

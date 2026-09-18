@@ -1,0 +1,1131 @@
+// Optimizer composition framework
+//
+// This module provides compositions of optimizers to create more sophisticated
+// optimization strategies. It includes three main types of compositions:
+//
+// 1. **Sequential**: Apply multiple optimizers in sequence
+// 2. **Parallel**: Apply different optimizers to different parameter groups
+// 3. **Chained**: Wrap an optimizer with another (similar to Lookahead wrapping other optimizers)
+
+use crate::error::{OptimError, Result};
+use crate::optimizers::Optimizer;
+use scirs2_core::ndarray::{Array, Dimension, ScalarOperand};
+use scirs2_core::numeric::Float;
+use std::fmt::Debug;
+
+/// A sequential composition of optimizers
+///
+/// This applies multiple optimizers in sequence to the same parameters.
+/// Each optimizer's output becomes the input to the next optimizer.
+///
+/// # Example
+///
+/// ```
+/// use scirs2_core::ndarray::Array1;
+/// use optirs_core::optimizer_composition::SequentialOptimizer;
+/// use optirs_core::optimizers::{SGD, Adam, Optimizer};
+///
+/// // Create optimizers
+/// let sgd = SGD::new(0.1);
+/// let adam = Adam::new(0.01);
+///
+/// // Combine them sequentially
+/// let mut seq_optimizer = SequentialOptimizer::new(vec![
+///     Box::new(sgd),
+///     Box::new(adam),
+/// ]);
+///
+/// // Use the sequential optimizer
+/// let params = Array1::zeros(5);
+/// let gradients = Array1::ones(5);
+/// let updated_params = seq_optimizer.step(&params, &gradients).expect("seq_optimizer.step succeeds");
+/// ```
+pub struct SequentialOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// List of optimizers to apply in sequence
+    optimizers: Vec<Box<dyn Optimizer<A, D>>>,
+}
+
+impl<A, D> SequentialOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// Create a new sequential optimizer
+    ///
+    /// # Arguments
+    ///
+    /// * `optimizers` - List of optimizers to apply in sequence
+    pub fn new(optimizers: Vec<Box<dyn Optimizer<A, D>>>) -> Self {
+        Self { optimizers }
+    }
+
+    /// Add an optimizer to the sequence
+    ///
+    /// # Arguments
+    ///
+    /// * `optimizer` - The optimizer to add
+    pub fn add_optimizer(&mut self, optimizer: Box<dyn Optimizer<A, D>>) {
+        self.optimizers.push(optimizer);
+    }
+
+    /// Get the number of optimizers in the sequence
+    pub fn num_optimizers(&self) -> usize {
+        self.optimizers.len()
+    }
+
+    /// Get a reference to an optimizer by index
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the optimizer
+    ///
+    /// # Returns
+    ///
+    /// A reference to the optimizer at the given index, or None if out of bounds
+    pub fn get_optimizer(&self, index: usize) -> Option<&dyn Optimizer<A, D>> {
+        if index < self.optimizers.len() {
+            Some(self.optimizers[index].as_ref())
+        } else {
+            None
+        }
+    }
+
+    /// Get a mutable reference to an optimizer by index
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the optimizer
+    ///
+    /// # Returns
+    ///
+    /// A mutable reference to the optimizer at the given index, or None if out of bounds
+    pub fn get_optimizer_mut(&mut self, index: usize) -> Option<&mut dyn Optimizer<A, D>> {
+        if index < self.optimizers.len() {
+            Some(self.optimizers[index].as_mut())
+        } else {
+            None
+        }
+    }
+}
+
+impl<A, D> Optimizer<A, D> for SequentialOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    fn step(&mut self, params: &Array<A, D>, gradients: &Array<A, D>) -> Result<Array<A, D>> {
+        // Check if we have any optimizers
+        if self.optimizers.is_empty() {
+            return Err(OptimError::InvalidConfig(
+                "SequentialOptimizer has no optimizers".to_string(),
+            ));
+        }
+
+        // Start with the initial parameters
+        let mut current_params = params.clone();
+
+        // Apply each optimizer in sequence
+        for optimizer in &mut self.optimizers {
+            current_params = optimizer.step(&current_params, gradients)?;
+        }
+
+        Ok(current_params)
+    }
+
+    fn get_learning_rate(&self) -> A {
+        // Return the learning rate of the first optimizer, or a default if empty
+        match self.optimizers.first() {
+            Some(optimizer) => optimizer.get_learning_rate(),
+            // Default learning rate; falls back to zero for exotic float types
+            None => A::from(0.01).unwrap_or_else(A::zero),
+        }
+    }
+
+    fn set_learning_rate(&mut self, learningrate: A) {
+        // Set the learning _rate for all optimizers
+        for optimizer in &mut self.optimizers {
+            optimizer.set_learning_rate(learningrate);
+        }
+    }
+}
+
+/// A struct for assigning parameters to specific groups for parallel optimization
+pub struct ParameterGroup<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// The parameters in this group
+    pub params: Array<A, D>,
+    /// The index of the optimizer to use for this group
+    pub optimizerindex: usize,
+}
+
+impl<A, D> ParameterGroup<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// Create a new parameter group
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - The parameters in this group
+    /// * `optimizerindex` - The index of the optimizer to use for this group
+    pub fn new(params: Array<A, D>, optimizerindex: usize) -> Self {
+        Self {
+            params,
+            optimizerindex,
+        }
+    }
+}
+
+/// A parallel composition of optimizers
+///
+/// This applies different optimizers to different parameter groups.
+/// Each group of parameters is updated using its assigned optimizer.
+///
+/// # Example
+///
+/// ```
+/// use scirs2_core::ndarray::Array1;
+/// use optirs_core::optimizer_composition::{ParallelOptimizer, ParameterGroup};
+/// use optirs_core::optimizers::{SGD, Adam, Optimizer};
+///
+/// // Create optimizers
+/// let sgd = SGD::new(0.1);
+/// let adam = Adam::new(0.01);
+///
+/// // Create parameter groups
+/// let params1 = Array1::zeros(3);
+/// let params2 = Array1::zeros(5);
+///
+/// let group1 = ParameterGroup::new(params1, 0); // Use SGD
+/// let group2 = ParameterGroup::new(params2, 1); // Use Adam
+///
+/// // Combine them in parallel
+/// let mut parallel_optimizer = ParallelOptimizer::new(
+///     vec![Box::new(sgd), Box::new(adam)],
+///     vec![group1, group2],
+/// );
+///
+/// // The step method will update all parameter groups using their assigned optimizers
+/// // (In a real use case, you'd provide the corresponding gradients)
+/// ```
+pub struct ParallelOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// List of optimizers to apply to different parameter groups
+    optimizers: Vec<Box<dyn Optimizer<A, D>>>,
+    /// Groups of parameters with their assigned optimizer indices
+    parameter_groups: Vec<ParameterGroup<A, D>>,
+}
+
+impl<A, D> ParallelOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// Create a new parallel optimizer
+    ///
+    /// # Arguments
+    ///
+    /// * `optimizers` - List of optimizers to use
+    /// * `parameter_groups` - Groups of parameters with their assigned optimizer indices
+    pub fn new(
+        optimizers: Vec<Box<dyn Optimizer<A, D>>>,
+        parameter_groups: Vec<ParameterGroup<A, D>>,
+    ) -> Self {
+        Self {
+            optimizers,
+            parameter_groups,
+        }
+    }
+
+    /// Add an optimizer
+    ///
+    /// # Arguments
+    ///
+    /// * `optimizer` - The optimizer to add
+    ///
+    /// # Returns
+    ///
+    /// The index of the added optimizer
+    pub fn add_optimizer(&mut self, optimizer: Box<dyn Optimizer<A, D>>) -> usize {
+        let index = self.optimizers.len();
+        self.optimizers.push(optimizer);
+        index
+    }
+
+    /// Add a parameter group
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - The parameters in this group
+    /// * `optimizerindex` - The index of the optimizer to use for this group
+    ///
+    /// # Returns
+    ///
+    /// Result with the index of the added parameter group, or an error if the optimizer index is invalid
+    pub fn add_parameter_group(
+        &mut self,
+        params: Array<A, D>,
+        optimizerindex: usize,
+    ) -> Result<usize> {
+        // Check if the optimizer _index is valid
+        if optimizerindex >= self.optimizers.len() {
+            return Err(OptimError::InvalidConfig(format!(
+                "Invalid optimizer _index: {}. Only {} optimizers available.",
+                optimizerindex,
+                self.optimizers.len()
+            )));
+        }
+
+        let _index = self.parameter_groups.len();
+        self.parameter_groups
+            .push(ParameterGroup::new(params, optimizerindex));
+        Ok(_index)
+    }
+
+    /// Get the number of optimizers
+    pub fn num_optimizers(&self) -> usize {
+        self.optimizers.len()
+    }
+
+    /// Get the number of parameter groups
+    pub fn num_parameter_groups(&self) -> usize {
+        self.parameter_groups.len()
+    }
+
+    /// Get a reference to an optimizer by index
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the optimizer
+    ///
+    /// # Returns
+    ///
+    /// A reference to the optimizer at the given index, or None if out of bounds
+    pub fn get_optimizer(&self, index: usize) -> Option<&dyn Optimizer<A, D>> {
+        if index < self.optimizers.len() {
+            Some(self.optimizers[index].as_ref())
+        } else {
+            None
+        }
+    }
+
+    /// Get a mutable reference to an optimizer by index
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the optimizer
+    ///
+    /// # Returns
+    ///
+    /// A mutable reference to the optimizer at the given index, or None if out of bounds
+    pub fn get_optimizer_mut(&mut self, index: usize) -> Option<&mut dyn Optimizer<A, D>> {
+        if index < self.optimizers.len() {
+            Some(self.optimizers[index].as_mut())
+        } else {
+            None
+        }
+    }
+
+    /// Get a reference to a parameter group by index
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the parameter group
+    ///
+    /// # Returns
+    ///
+    /// A reference to the parameter group at the given index, or None if out of bounds
+    pub fn get_parameter_group(&self, index: usize) -> Option<&ParameterGroup<A, D>> {
+        self.parameter_groups.get(index)
+    }
+
+    /// Get a mutable reference to a parameter group by index
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the parameter group
+    ///
+    /// # Returns
+    ///
+    /// A mutable reference to the parameter group at the given index, or None if out of bounds
+    pub fn get_parameter_group_mut(&mut self, index: usize) -> Option<&mut ParameterGroup<A, D>> {
+        self.parameter_groups.get_mut(index)
+    }
+
+    /// Get all current parameter values as a single array
+    ///
+    /// # Returns
+    ///
+    /// A result containing all parameter values concatenated into a single array
+    pub fn get_all_parameters(&self) -> Result<Vec<Array<A, D>>> {
+        Ok(self
+            .parameter_groups
+            .iter()
+            .map(|group| group.params.clone())
+            .collect())
+    }
+
+    /// Update all parameter groups using their assigned optimizers
+    ///
+    /// # Arguments
+    ///
+    /// * `gradients` - List of gradient arrays corresponding to parameter groups
+    ///
+    /// # Returns
+    ///
+    /// Result with the updated parameter values, or an error
+    pub fn update_all_parameters(&mut self, gradients: &[Array<A, D>]) -> Result<Vec<Array<A, D>>> {
+        // Check if the number of gradients matches the number of parameter groups
+        if gradients.len() != self.parameter_groups.len() {
+            return Err(OptimError::InvalidConfig(format!(
+                "Number of gradients ({}) does not match number of parameter groups ({})",
+                gradients.len(),
+                self.parameter_groups.len()
+            )));
+        }
+
+        let mut updated_params = Vec::with_capacity(self.parameter_groups.len());
+
+        // Update each parameter group using its assigned optimizer
+        for (i, group) in self.parameter_groups.iter_mut().enumerate() {
+            let optimizerindex = group.optimizerindex;
+
+            // Check if the optimizer index is valid
+            if optimizerindex >= self.optimizers.len() {
+                return Err(OptimError::InvalidConfig(format!(
+                    "Invalid optimizer index: {}. Only {} optimizers available.",
+                    optimizerindex,
+                    self.optimizers.len()
+                )));
+            }
+
+            // Get the optimizer and update the parameters
+            let optimizer = &mut self.optimizers[optimizerindex];
+            let params = &group.params;
+            let gradient = &gradients[i];
+
+            // Update the parameters
+            let updated = optimizer.step(params, gradient)?;
+            group.params = updated.clone();
+            updated_params.push(updated);
+        }
+
+        Ok(updated_params)
+    }
+}
+
+impl<A, D> Optimizer<A, D> for ParallelOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    fn step(&mut self, _params: &Array<A, D>, _gradients: &Array<A, D>) -> Result<Array<A, D>> {
+        // This implementation is a bit tricky since we have multiple parameter groups
+        // We'll return an error message directing users to use update_all_parameters instead
+        Err(OptimError::InvalidConfig(
+            "ParallelOptimizer doesn't support the standard step method. Use update_all_parameters instead."
+                .to_string(),
+        ))
+    }
+
+    /// Updates several parameter tensors, one per parameter group
+    ///
+    /// Existing parameter groups are **reused**: only their parameter values are
+    /// refreshed, so the optimizer assignment made by
+    /// [`ParallelOptimizer::add_parameter_group`] survives across calls. Groups are
+    /// rebuilt only when the caller changes the number of tensors or their shapes, in
+    /// which case tensor `i` is assigned to optimizer `min(i, optimizers.len() - 1)`.
+    fn step_list(
+        &mut self,
+        params_list: &[&Array<A, D>],
+        gradients_list: &[&Array<A, D>],
+    ) -> Result<Vec<Array<A, D>>> {
+        if params_list.len() != gradients_list.len() {
+            return Err(OptimError::InvalidConfig(format!(
+                "Number of parameter arrays ({}) does not match number of gradient arrays ({})",
+                params_list.len(),
+                gradients_list.len()
+            )));
+        }
+
+        // Guard against an empty optimizer list: the fallback assignment below would
+        // otherwise underflow when computing `optimizers.len() - 1`.
+        let last_optimizer = self.optimizers.len().checked_sub(1).ok_or_else(|| {
+            OptimError::InvalidConfig(
+                "ParallelOptimizer has no optimizers; add at least one with add_optimizer \
+                 before calling step_list."
+                    .to_string(),
+            )
+        })?;
+
+        // Reuse the existing groups when they still describe the same tensors, so that
+        // per-group optimizer assignments are not silently discarded on every call.
+        let layout_matches = self.parameter_groups.len() == params_list.len()
+            && self
+                .parameter_groups
+                .iter()
+                .zip(params_list.iter())
+                .all(|(group, params)| group.params.raw_dim() == params.raw_dim());
+
+        if layout_matches {
+            for (group, params) in self.parameter_groups.iter_mut().zip(params_list.iter()) {
+                group.params = (*params).clone();
+            }
+        } else {
+            self.parameter_groups = params_list
+                .iter()
+                .enumerate()
+                .map(|(i, params)| {
+                    // Use the last optimizer for any tensor beyond the optimizer list
+                    ParameterGroup::new((*params).clone(), i.min(last_optimizer))
+                })
+                .collect();
+        }
+
+        // Convert gradients_list to owned arrays
+        let gradients_vec: Vec<Array<A, D>> = gradients_list.iter().map(|&g| g.clone()).collect();
+
+        // Update parameter groups using their assigned optimizers
+        self.update_all_parameters(&gradients_vec)
+    }
+
+    fn get_learning_rate(&self) -> A {
+        // Return the learning rate of the first optimizer, or a default if empty
+        if let Some(optimizer) = self.optimizers.first() {
+            optimizer.get_learning_rate()
+        } else {
+            // Default learning rate: 0.01 always fits in A (f32/f64)
+            A::from(0.01).expect("SequentialOptimizer: default learning rate (0.01) must fit in A")
+        }
+    }
+
+    fn set_learning_rate(&mut self, learningrate: A) {
+        // Set the learning _rate for all optimizers
+        for optimizer in &mut self.optimizers {
+            optimizer.set_learning_rate(learningrate);
+        }
+    }
+}
+
+/// A chained composition of optimizers
+///
+/// This wraps one optimizer with another, similar to how Lookahead wraps
+/// another optimizer. The inner optimizer is applied first, and then the
+/// outer optimizer is applied to the result.
+///
+/// # Example
+///
+/// ```
+/// use scirs2_core::ndarray::Array1;
+/// use optirs_core::optimizer_composition::ChainedOptimizer;
+/// use optirs_core::optimizers::{SGD, Adam, Optimizer};
+///
+/// // Create optimizers
+/// let inner = SGD::new(0.1);
+/// let outer = Adam::new(0.01);
+///
+/// // Chain them together
+/// let mut chained_optimizer = ChainedOptimizer::new(Box::new(inner), Box::new(outer));
+///
+/// // Use the chained optimizer
+/// let params = Array1::zeros(5);
+/// let gradients = Array1::ones(5);
+/// let updated_params = chained_optimizer.step(&params, &gradients).expect("chained_optimizer.step succeeds");
+/// ```
+pub struct ChainedOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// The inner optimizer, applied first
+    inner: Box<dyn Optimizer<A, D>>,
+    /// The outer optimizer, applied to the result of the inner optimizer
+    outer: Box<dyn Optimizer<A, D>>,
+}
+
+impl<A, D> ChainedOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// Create a new chained optimizer
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` - The inner optimizer, applied first
+    /// * `outer` - The outer optimizer, applied to the result of the inner optimizer
+    pub fn new(inner: Box<dyn Optimizer<A, D>>, outer: Box<dyn Optimizer<A, D>>) -> Self {
+        Self { inner, outer }
+    }
+
+    /// Get a reference to the inner optimizer
+    pub fn inner(&self) -> &dyn Optimizer<A, D> {
+        self.inner.as_ref()
+    }
+
+    /// Get a mutable reference to the inner optimizer
+    pub fn inner_mut(&mut self) -> &mut dyn Optimizer<A, D> {
+        self.inner.as_mut()
+    }
+
+    /// Get a reference to the outer optimizer
+    pub fn outer(&self) -> &dyn Optimizer<A, D> {
+        self.outer.as_ref()
+    }
+
+    /// Get a mutable reference to the outer optimizer
+    pub fn outer_mut(&mut self) -> &mut dyn Optimizer<A, D> {
+        self.outer.as_mut()
+    }
+}
+
+impl<A, D> Optimizer<A, D> for ChainedOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    fn step(&mut self, params: &Array<A, D>, gradients: &Array<A, D>) -> Result<Array<A, D>> {
+        // Apply the inner optimizer first
+        let intermediate_params = self.inner.step(params, gradients)?;
+
+        // Then apply the outer optimizer to the result
+        self.outer.step(&intermediate_params, gradients)
+    }
+
+    fn get_learning_rate(&self) -> A {
+        // Return the learning rate of the inner optimizer
+        self.inner.get_learning_rate()
+    }
+
+    fn set_learning_rate(&mut self, learningrate: A) {
+        // Set the learning _rate for both optimizers
+        self.inner.set_learning_rate(learningrate);
+        self.outer.set_learning_rate(learningrate);
+    }
+}
+
+/// A weighted composition of optimizers
+///
+/// Runs all optimizers on the same parameters/gradients and returns the
+/// weighted average of their outputs. This allows blending the behavior
+/// of multiple optimization strategies.
+///
+/// # Example
+///
+/// ```
+/// use scirs2_core::ndarray::Array1;
+/// use optirs_core::optimizer_composition::WeightedOptimizer;
+/// use optirs_core::optimizers::{SGD, Adam, Optimizer};
+///
+/// // Create a weighted combination of SGD and Adam
+/// let mut weighted = WeightedOptimizer::new()
+///     .add_optimizer(Box::new(SGD::new(0.1)), 0.7)
+///     .add_optimizer(Box::new(Adam::new(0.01)), 0.3);
+///
+/// let params = Array1::zeros(3);
+/// let gradients = Array1::ones(3);
+/// let updated = weighted.step(&params, &gradients).expect("step failed");
+/// ```
+pub struct WeightedOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// The optimizers and their associated weights
+    optimizers: Vec<Box<dyn Optimizer<A, D>>>,
+    /// The weight for each optimizer
+    weights: Vec<A>,
+}
+
+impl<A, D> Default for WeightedOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A, D> WeightedOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    /// Create a new empty weighted optimizer
+    pub fn new() -> Self {
+        Self {
+            optimizers: Vec::new(),
+            weights: Vec::new(),
+        }
+    }
+
+    /// Add an optimizer with a given weight (builder pattern)
+    ///
+    /// # Arguments
+    ///
+    /// * `opt` - The optimizer to add
+    /// * `weight` - The weight for this optimizer
+    pub fn add_optimizer(mut self, opt: Box<dyn Optimizer<A, D>>, weight: A) -> Self {
+        self.optimizers.push(opt);
+        self.weights.push(weight);
+        self
+    }
+
+    /// Add multiple optimizers at once (builder pattern)
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - A vector of (optimizer, weight) pairs
+    pub fn with_optimizers(mut self, opts: Vec<(Box<dyn Optimizer<A, D>>, A)>) -> Self {
+        for (opt, weight) in opts {
+            self.optimizers.push(opt);
+            self.weights.push(weight);
+        }
+        self
+    }
+
+    /// Normalize weights so they sum to 1
+    pub fn normalize_weights(&mut self) {
+        let sum: A = self.weights.iter().copied().fold(A::zero(), |a, b| a + b);
+        if sum > A::zero() {
+            for w in &mut self.weights {
+                *w = *w / sum;
+            }
+        }
+    }
+
+    /// Get the number of optimizers
+    pub fn num_optimizers(&self) -> usize {
+        self.optimizers.len()
+    }
+
+    /// Get the current weights
+    pub fn weights(&self) -> &[A] {
+        &self.weights
+    }
+}
+
+impl<A, D> Optimizer<A, D> for WeightedOptimizer<A, D>
+where
+    A: Float + ScalarOperand + Debug,
+    D: Dimension,
+{
+    fn step(&mut self, params: &Array<A, D>, gradients: &Array<A, D>) -> Result<Array<A, D>> {
+        if self.optimizers.is_empty() {
+            return Err(OptimError::InvalidConfig(
+                "WeightedOptimizer has no optimizers".to_string(),
+            ));
+        }
+
+        // Compute the weight sum for normalization
+        let weight_sum: A = self.weights.iter().copied().fold(A::zero(), |a, b| a + b);
+        if weight_sum <= A::zero() {
+            return Err(OptimError::InvalidConfig(
+                "WeightedOptimizer weight sum must be positive".to_string(),
+            ));
+        }
+
+        // Run each optimizer and accumulate the weighted result
+        let mut result: Option<Array<A, D>> = None;
+
+        for (optimizer, &weight) in self.optimizers.iter_mut().zip(self.weights.iter()) {
+            let updated = optimizer.step(params, gradients)?;
+            let normalized_weight = weight / weight_sum;
+
+            match result {
+                None => {
+                    result = Some(updated * normalized_weight);
+                }
+                Some(ref mut acc) => {
+                    acc.zip_mut_with(&updated, |a, &b| {
+                        *a = *a + b * normalized_weight;
+                    });
+                }
+            }
+        }
+
+        result.ok_or_else(|| {
+            OptimError::InvalidConfig("WeightedOptimizer produced no result".to_string())
+        })
+    }
+
+    fn get_learning_rate(&self) -> A {
+        if let Some(optimizer) = self.optimizers.first() {
+            optimizer.get_learning_rate()
+        } else {
+            A::from(0.01).expect("failed to convert default learning rate")
+        }
+    }
+
+    fn set_learning_rate(&mut self, learning_rate: A) {
+        for optimizer in &mut self.optimizers {
+            optimizer.set_learning_rate(learning_rate);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::optimizers::{Adam, SGD};
+    use approx::assert_abs_diff_eq;
+    use scirs2_core::ndarray::Array1;
+
+    #[test]
+    fn test_sequential_optimizer() {
+        // Create a sequential optimizer with SGD followed by Adam
+        let sgd = SGD::new(0.1);
+        let adam = Adam::new(0.01);
+
+        let mut seq_optimizer: SequentialOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            SequentialOptimizer::new(vec![Box::new(sgd), Box::new(adam)]);
+
+        // Create test parameters and gradients
+        let params = Array1::zeros(3);
+        let gradients = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+
+        // Apply the sequential optimizer
+        let updated_params = seq_optimizer
+            .step(&params, &gradients)
+            .expect("step succeeds in test_sequential_optimizer");
+
+        // Verify the result
+        // First SGD updates: params - 0.1 * gradients = [0, 0, 0] - 0.1 * [1, 2, 3] = [-0.1, -0.2, -0.3]
+        // Then Adam makes additional updates
+        assert!(updated_params[0] < -0.1);
+        assert!(updated_params[1] < -0.2);
+        assert!(updated_params[2] < -0.3);
+    }
+
+    #[test]
+    fn test_parallel_optimizer() {
+        // Create a parallel optimizer with SGD and Adam
+        let sgd = SGD::new(0.1);
+        let adam = Adam::new(0.01);
+
+        let params1 = Array1::zeros(2);
+        let params2 = Array1::zeros(3);
+
+        let group1 = ParameterGroup::new(params1.clone(), 0); // Use SGD
+        let group2 = ParameterGroup::new(params2.clone(), 1); // Use Adam
+
+        let mut parallel_optimizer: ParallelOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            ParallelOptimizer::new(vec![Box::new(sgd), Box::new(adam)], vec![group1, group2]);
+
+        // Create test gradients
+        let gradients1 = Array1::from_vec(vec![1.0, 2.0]);
+        let gradients2 = Array1::from_vec(vec![3.0, 4.0, 5.0]);
+
+        // Update the parameters
+        let updated_params = parallel_optimizer
+            .update_all_parameters(&[gradients1, gradients2])
+            .expect("update_all_parameters succeeds in test_parallel_optimizer");
+
+        // Verify the results
+        // Group 1 (SGD): params - 0.1 * gradients = [0, 0] - 0.1 * [1, 2] = [-0.1, -0.2]
+        assert_abs_diff_eq!(updated_params[0][0], -0.1);
+        assert_abs_diff_eq!(updated_params[0][1], -0.2);
+
+        // Group 2 (Adam): The update will be different due to Adam's adaptive nature
+        // Just verify it's different from the original params
+        assert!(updated_params[1][0] != 0.0);
+        assert!(updated_params[1][1] != 0.0);
+        assert!(updated_params[1][2] != 0.0);
+    }
+
+    #[test]
+    fn test_chained_optimizer() {
+        // Create a chained optimizer with SGD as inner and Adam as outer
+        let inner = SGD::new(0.1);
+        let outer = Adam::new(0.01);
+
+        let mut chained_optimizer: ChainedOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            ChainedOptimizer::new(Box::new(inner), Box::new(outer));
+
+        // Create test parameters and gradients
+        let params = Array1::zeros(3);
+        let gradients = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+
+        // Apply the chained optimizer
+        let updated_params = chained_optimizer
+            .step(&params, &gradients)
+            .expect("step succeeds in test_chained_optimizer");
+
+        // Verify the result
+        // Inner (SGD): params - 0.1 * gradients = [0, 0, 0] - 0.1 * [1, 2, 3] = [-0.1, -0.2, -0.3]
+        // Then outer (Adam) applies another update
+        assert!(updated_params[0] < -0.1);
+        assert!(updated_params[1] < -0.2);
+        assert!(updated_params[2] < -0.3);
+    }
+
+    #[test]
+    fn test_sequential_learning_rate() {
+        // Create a sequential optimizer with SGD followed by Adam
+        let sgd = SGD::new(0.1);
+        let adam = Adam::new(0.01);
+
+        let mut seq_optimizer: SequentialOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            SequentialOptimizer::new(vec![Box::new(sgd), Box::new(adam)]);
+
+        // Test getting the learning rate (should be from the first optimizer)
+        assert_abs_diff_eq!(seq_optimizer.get_learning_rate(), 0.1);
+
+        // Test setting the learning rate for all optimizers
+        seq_optimizer.set_learning_rate(0.05);
+
+        // Verify the learning rate has been set for both optimizers
+        assert_abs_diff_eq!(seq_optimizer.get_learning_rate(), 0.05);
+        assert_abs_diff_eq!(
+            seq_optimizer
+                .get_optimizer(0)
+                .expect("get_optimizer succeeds in test_sequential_learning_rate")
+                .get_learning_rate(),
+            0.05
+        );
+        assert_abs_diff_eq!(
+            seq_optimizer
+                .get_optimizer(1)
+                .expect("get_optimizer succeeds in test_sequential_learning_rate")
+                .get_learning_rate(),
+            0.05
+        );
+    }
+
+    #[test]
+    fn test_parallel_optimizer_step_list() {
+        // Create a parallel optimizer with SGD and Adam
+        let sgd = SGD::new(0.1);
+        let adam = Adam::new(0.01);
+
+        let mut parallel_optimizer: ParallelOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            ParallelOptimizer::new(vec![Box::new(sgd), Box::new(adam)], vec![]);
+
+        // Create test parameters and gradients
+        let params1 = Array1::zeros(2);
+        let params2 = Array1::zeros(3);
+        let params3 = Array1::zeros(4);
+
+        let gradients1 = Array1::from_vec(vec![1.0, 2.0]);
+        let gradients2 = Array1::from_vec(vec![3.0, 4.0, 5.0]);
+        let gradients3 = Array1::from_vec(vec![6.0, 7.0, 8.0, 9.0]);
+
+        // Use step_list to update all parameters
+        let params_refs = vec![&params1, &params2, &params3];
+        let gradients_refs = vec![&gradients1, &gradients2, &gradients3];
+
+        let updated_params = parallel_optimizer
+            .step_list(&params_refs, &gradients_refs)
+            .expect("step_list succeeds in test_parallel_optimizer_step_list");
+
+        // Verify the results
+        // Group 1 (SGD): params - 0.1 * gradients = [0, 0] - 0.1 * [1, 2] = [-0.1, -0.2]
+        assert_abs_diff_eq!(updated_params[0][0], -0.1);
+        assert_abs_diff_eq!(updated_params[0][1], -0.2);
+
+        // Group 2 will use SGD since we only have 2 optimizers and index 1 % 2 = 1 (Adam)
+        // Adam: The update will be different than SGD
+        assert!(updated_params[1][0] != -0.3);
+
+        // Group 3 will wrap around to optimize with Adam
+        // Just check that it's been updated from zero
+        assert!(updated_params[2][0] < 0.0);
+    }
+
+    #[test]
+    fn test_chained_optimizer_learning_rate() {
+        // Create a chained optimizer with SGD as inner and Adam as outer
+        let inner = SGD::new(0.1);
+        let outer = Adam::new(0.01);
+
+        let mut chained_optimizer: ChainedOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            ChainedOptimizer::new(Box::new(inner), Box::new(outer));
+
+        // Test getting the learning rate (should be from the inner optimizer)
+        assert_abs_diff_eq!(chained_optimizer.get_learning_rate(), 0.1);
+
+        // Test setting the learning rate for both optimizers
+        chained_optimizer.set_learning_rate(0.05);
+
+        // Verify the learning rate has been set for both optimizers
+        assert_abs_diff_eq!(chained_optimizer.get_learning_rate(), 0.05);
+        assert_abs_diff_eq!(chained_optimizer.inner().get_learning_rate(), 0.05);
+        assert_abs_diff_eq!(chained_optimizer.outer().get_learning_rate(), 0.05);
+    }
+
+    #[test]
+    fn test_weighted_optimizer_basic() {
+        // Create two SGD optimizers with different learning rates
+        let sgd1 = SGD::new(0.1);
+        let sgd2 = SGD::new(0.2);
+
+        let mut weighted: WeightedOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            WeightedOptimizer::new()
+                .add_optimizer(Box::new(sgd1), 0.5)
+                .add_optimizer(Box::new(sgd2), 0.5);
+
+        let params = Array1::zeros(3);
+        let gradients = Array1::ones(3);
+
+        let updated = weighted.step(&params, &gradients).expect("step failed");
+
+        // SGD1: params - 0.1 * grads = [-0.1, -0.1, -0.1]
+        // SGD2: params - 0.2 * grads = [-0.2, -0.2, -0.2]
+        // Weighted avg (0.5 each): 0.5*(-0.1) + 0.5*(-0.2) = -0.15
+        assert_abs_diff_eq!(updated[0], -0.15, epsilon = 1e-10);
+        assert_abs_diff_eq!(updated[1], -0.15, epsilon = 1e-10);
+        assert_abs_diff_eq!(updated[2], -0.15, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_weighted_optimizer_unequal_weights() {
+        let sgd1 = SGD::new(0.1);
+        let sgd2 = SGD::new(0.2);
+
+        let mut weighted: WeightedOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            WeightedOptimizer::new()
+                .add_optimizer(Box::new(sgd1), 3.0)
+                .add_optimizer(Box::new(sgd2), 1.0);
+
+        let params = Array1::zeros(2);
+        let gradients = Array1::ones(2);
+
+        let updated = weighted.step(&params, &gradients).expect("step failed");
+
+        // SGD1: [-0.1, -0.1], SGD2: [-0.2, -0.2]
+        // Weights normalized: 3/4=0.75, 1/4=0.25
+        // Result: 0.75*(-0.1) + 0.25*(-0.2) = -0.075 - 0.05 = -0.125
+        assert_abs_diff_eq!(updated[0], -0.125, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_weighted_optimizer_empty() {
+        let mut weighted: WeightedOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            WeightedOptimizer::new();
+
+        let params = Array1::zeros(3);
+        let gradients = Array1::ones(3);
+
+        let result = weighted.step(&params, &gradients);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_weighted_optimizer_normalize_weights() {
+        let mut weighted: WeightedOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            WeightedOptimizer::new()
+                .add_optimizer(Box::new(SGD::new(0.1)), 2.0)
+                .add_optimizer(Box::new(SGD::new(0.2)), 8.0);
+
+        weighted.normalize_weights();
+
+        assert_abs_diff_eq!(weighted.weights()[0], 0.2, epsilon = 1e-10);
+        assert_abs_diff_eq!(weighted.weights()[1], 0.8, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_weighted_optimizer_learning_rate() {
+        let mut weighted: WeightedOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            WeightedOptimizer::new()
+                .add_optimizer(Box::new(SGD::new(0.1)), 1.0)
+                .add_optimizer(Box::new(Adam::new(0.01)), 1.0);
+
+        // Learning rate comes from the first optimizer
+        assert_abs_diff_eq!(weighted.get_learning_rate(), 0.1);
+
+        // Setting learning rate applies to all
+        weighted.set_learning_rate(0.05);
+        assert_abs_diff_eq!(weighted.get_learning_rate(), 0.05);
+    }
+
+    #[test]
+    fn test_weighted_optimizer_with_optimizers() {
+        let opts: Vec<(Box<dyn Optimizer<f64, scirs2_core::ndarray::Ix1>>, f64)> = vec![
+            (Box::new(SGD::new(0.1)), 1.0),
+            (Box::new(SGD::new(0.2)), 1.0),
+        ];
+
+        let weighted: WeightedOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            WeightedOptimizer::new().with_optimizers(opts);
+
+        assert_eq!(weighted.num_optimizers(), 2);
+        assert_abs_diff_eq!(weighted.weights()[0], 1.0);
+        assert_abs_diff_eq!(weighted.weights()[1], 1.0);
+    }
+
+    /// Regression test for F88: `step_list` used to rebuild every parameter group on
+    /// each call, discarding the optimizer assignment set up by
+    /// `add_parameter_group`, and it underflowed on an empty optimizer list.
+    #[test]
+    fn test_parallel_optimizer_step_list_preserves_group_assignment() {
+        let sgd = SGD::new(0.1);
+        let adam = Adam::new(0.01);
+
+        let mut parallel_optimizer: ParallelOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            ParallelOptimizer::new(vec![Box::new(sgd), Box::new(adam)], vec![]);
+
+        // Deliberately assign BOTH tensors to optimizer 1 (Adam).
+        parallel_optimizer
+            .add_parameter_group(Array1::zeros(2), 1)
+            .expect("add group 0");
+        parallel_optimizer
+            .add_parameter_group(Array1::zeros(2), 1)
+            .expect("add group 1");
+
+        let params1 = Array1::zeros(2);
+        let params2 = Array1::zeros(2);
+        let grads1 = Array1::from_vec(vec![1.0, 2.0]);
+        let grads2 = Array1::from_vec(vec![1.0, 2.0]);
+
+        let updated = parallel_optimizer
+            .step_list(&[&params1, &params2], &[&grads1, &grads2])
+            .expect("step_list failed");
+
+        // Both groups must still be assigned to Adam, so neither may show the plain
+        // SGD result of -0.1 that the rebuilt-groups bug produced for group 0.
+        assert_eq!(
+            parallel_optimizer
+                .get_parameter_group(0)
+                .expect("group 0")
+                .optimizerindex,
+            1
+        );
+        assert_eq!(
+            parallel_optimizer
+                .get_parameter_group(1)
+                .expect("group 1")
+                .optimizerindex,
+            1
+        );
+        assert!(
+            (updated[0][0] + 0.1).abs() > 1e-6,
+            "group 0 was silently reassigned to SGD: {}",
+            updated[0][0]
+        );
+    }
+
+    /// An empty optimizer list must produce a clear error instead of underflowing.
+    #[test]
+    fn test_parallel_optimizer_step_list_rejects_empty_optimizers() {
+        let mut parallel_optimizer: ParallelOptimizer<f64, scirs2_core::ndarray::Ix1> =
+            ParallelOptimizer::new(vec![], vec![]);
+
+        let params = Array1::zeros(2);
+        let grads = Array1::from_vec(vec![1.0, 2.0]);
+
+        let result = parallel_optimizer.step_list(&[&params], &[&grads]);
+        assert!(result.is_err(), "empty optimizer list must be rejected");
+    }
+}

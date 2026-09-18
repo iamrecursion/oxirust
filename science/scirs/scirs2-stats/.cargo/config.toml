@@ -1,0 +1,1 @@
+# Note: OpenBLAS/LAPACK linker flags removed - using pure Rust OxiBLAS for BLAS/LAPACK operations

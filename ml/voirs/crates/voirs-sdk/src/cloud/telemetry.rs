@@ -1,0 +1,1683 @@
+use super::*;
+use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{interval, Duration};
+use uuid::Uuid;
+
+/// Comprehensive telemetry provider for VoiRS analytics and monitoring
+pub struct VoirsTelemetryProvider {
+    config: TelemetryConfig,
+    event_collector: Arc<EventCollector>,
+    metrics_collector: Arc<MetricsCollector>,
+    analytics_engine: Arc<AnalyticsEngine>,
+    ab_testing_manager: Arc<ABTestingManager>,
+    exporters: Vec<Arc<dyn TelemetryExporter>>,
+}
+
+struct EventCollector {
+    event_buffer: Arc<Mutex<VecDeque<TelemetryEvent>>>,
+    event_stats: Arc<EventStats>,
+    sampling_controller: Arc<SamplingController>,
+    batch_processor: Arc<BatchProcessor>,
+}
+
+struct EventStats {
+    total_events: AtomicU64,
+    events_by_type: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    events_per_minute: AtomicU64,
+    dropped_events: AtomicU64,
+    processing_errors: AtomicU64,
+}
+
+struct SamplingController {
+    sampling_rules: Arc<RwLock<Vec<SamplingRule>>>,
+    adaptive_sampling: bool,
+    current_load: AtomicU32,
+}
+
+struct SamplingRule {
+    event_type: String,
+    sampling_rate: f32,
+    condition: Option<SamplingCondition>,
+    priority: u32,
+}
+
+#[derive(Debug, Clone)]
+enum SamplingCondition {
+    UserProperty(String, Value),
+    EventProperty(String, Value),
+    SessionProperty(String, Value),
+    Custom(String),
+}
+
+struct BatchProcessor {
+    batch_buffer: Arc<Mutex<Vec<TelemetryEvent>>>,
+    batch_size: usize,
+    flush_interval: Duration,
+    compression_enabled: bool,
+}
+
+struct MetricsCollector {
+    metrics_buffer: Arc<Mutex<VecDeque<Metric>>>,
+    aggregators: Arc<RwLock<HashMap<String, MetricAggregator>>>,
+    time_series_store: Arc<TimeSeriesStore>,
+    alert_manager: Arc<AlertManager>,
+}
+
+struct MetricAggregator {
+    metric_name: String,
+    aggregation_type: AggregationType,
+    window_size: Duration,
+    values: VecDeque<TimestampedValue>,
+    current_value: f64,
+}
+
+struct TimestampedValue {
+    timestamp: DateTime<Utc>,
+    value: f64,
+    tags: HashMap<String, String>,
+}
+
+struct TimeSeriesStore {
+    series: Arc<RwLock<HashMap<String, TimeSeries>>>,
+    retention_policy: RetentionPolicy,
+    compression_settings: CompressionSettings,
+}
+
+struct TimeSeries {
+    name: String,
+    data_points: VecDeque<DataPoint>,
+    metadata: TimeSeriesMetadata,
+}
+
+struct TimeSeriesMetadata {
+    created_at: DateTime<Utc>,
+    last_updated: DateTime<Utc>,
+    sample_count: u64,
+    min_value: f64,
+    max_value: f64,
+    tags: HashMap<String, String>,
+}
+
+struct RetentionPolicy {
+    max_age: Duration,
+    max_points: usize,
+    downsampling_rules: Vec<DownsamplingRule>,
+}
+
+struct DownsamplingRule {
+    age_threshold: Duration,
+    aggregation: AggregationType,
+    interval: Duration,
+}
+
+struct CompressionSettings {
+    enabled: bool,
+    algorithm: CompressionAlgorithm,
+    compression_level: u32,
+}
+
+#[derive(Debug, Clone)]
+enum CompressionAlgorithm {
+    Gzip,
+    Zstd,
+    Snappy,
+}
+
+struct AlertManager {
+    alert_rules: Arc<RwLock<Vec<AlertRule>>>,
+    alert_history: Arc<Mutex<VecDeque<Alert>>>,
+    notification_channels: Vec<Arc<dyn NotificationChannel>>,
+}
+
+struct AlertRule {
+    id: String,
+    name: String,
+    condition: AlertCondition,
+    threshold: f64,
+    duration: Duration,
+    severity: AlertSeverity,
+    enabled: bool,
+    tags: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+enum AlertCondition {
+    MetricAbove(String),
+    MetricBelow(String),
+    MetricMissing(String),
+    EventRateHigh(String, f64),
+    ErrorRateHigh(f64),
+    Custom(String),
+}
+
+#[derive(Debug, Clone)]
+enum AlertSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+struct Alert {
+    id: String,
+    rule_id: String,
+    triggered_at: DateTime<Utc>,
+    resolved_at: Option<DateTime<Utc>>,
+    severity: AlertSeverity,
+    message: String,
+    tags: HashMap<String, String>,
+}
+
+trait NotificationChannel: Send + Sync {
+    fn send_alert(&self, alert: &Alert) -> Result<()>;
+    fn get_channel_name(&self) -> &str;
+}
+
+struct AnalyticsEngine {
+    query_processor: Arc<QueryProcessor>,
+    report_generator: Arc<ReportGenerator>,
+    dashboard_manager: Arc<DashboardManager>,
+    real_time_processor: Arc<RealTimeProcessor>,
+    /// Real metrics store queried by [`VoirsTelemetryProvider::get_analytics`]
+    /// (via `query_processor`'s helpers) and by
+    /// `DashboardManager::get_widget_data` — analytics results always
+    /// reflect genuinely recorded [`Metric`]s, never a fabricated series.
+    metrics_collector: Arc<MetricsCollector>,
+}
+
+struct QueryProcessor {
+    query_cache: Arc<RwLock<HashMap<String, CachedQuery>>>,
+    query_optimizer: Arc<QueryOptimizer>,
+    execution_engine: Arc<QueryExecutionEngine>,
+}
+
+struct CachedQuery {
+    query_hash: String,
+    result: AnalyticsResult,
+    cached_at: DateTime<Utc>,
+    ttl: Duration,
+}
+
+struct QueryOptimizer {
+    optimization_rules: Vec<OptimizationRule>,
+    statistics: QueryStatistics,
+}
+
+struct OptimizationRule {
+    rule_type: OptimizationType,
+    condition: String,
+    transformation: String,
+}
+
+#[derive(Debug, Clone)]
+enum OptimizationType {
+    IndexUsage,
+    Aggregation,
+    Filtering,
+    Projection,
+}
+
+struct QueryStatistics {
+    query_count: AtomicU64,
+    average_execution_time: f64,
+    cache_hit_rate: f64,
+    most_expensive_queries: Vec<String>,
+}
+
+struct QueryExecutionEngine {
+    executors: Vec<Arc<dyn QueryExecutor>>,
+    execution_stats: ExecutionStats,
+}
+
+trait QueryExecutor: Send + Sync {
+    fn can_execute(&self, query: &AnalyticsQuery) -> bool;
+    fn execute(&self, query: &AnalyticsQuery) -> Result<AnalyticsResult>;
+    fn get_executor_name(&self) -> &str;
+}
+
+struct ExecutionStats {
+    total_queries: AtomicU64,
+    successful_queries: AtomicU64,
+    failed_queries: AtomicU64,
+    average_execution_time: f64,
+}
+
+struct ReportGenerator {
+    report_templates: Arc<RwLock<HashMap<String, ReportTemplate>>>,
+    scheduled_reports: Arc<RwLock<Vec<ScheduledReport>>>,
+    report_storage: Arc<dyn ReportStorage>,
+}
+
+struct ReportTemplate {
+    id: String,
+    name: String,
+    description: String,
+    queries: Vec<AnalyticsQuery>,
+    format: ReportFormat,
+    parameters: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+enum ReportFormat {
+    Json,
+    Csv,
+    Html,
+    Pdf,
+}
+
+struct ScheduledReport {
+    id: String,
+    template_id: String,
+    schedule: ReportSchedule,
+    recipients: Vec<String>,
+    enabled: bool,
+    last_run: Option<DateTime<Utc>>,
+    next_run: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+enum ReportSchedule {
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+    Custom(String), // Cron expression
+}
+
+trait ReportStorage: Send + Sync {
+    fn store_report(&self, report: &GeneratedReport) -> Result<String>;
+    fn get_report(&self, report_id: &str) -> Result<GeneratedReport>;
+    fn list_reports(&self, filters: &ReportFilters) -> Result<Vec<ReportMetadata>>;
+    fn delete_report(&self, report_id: &str) -> Result<()>;
+}
+
+struct GeneratedReport {
+    id: String,
+    template_id: String,
+    generated_at: DateTime<Utc>,
+    format: ReportFormat,
+    data: Vec<u8>,
+    metadata: ReportMetadata,
+}
+
+struct ReportMetadata {
+    id: String,
+    name: String,
+    generated_at: DateTime<Utc>,
+    size_bytes: u64,
+    tags: HashMap<String, String>,
+}
+
+struct ReportFilters {
+    start_date: Option<DateTime<Utc>>,
+    end_date: Option<DateTime<Utc>>,
+    tags: HashMap<String, String>,
+}
+
+struct DashboardManager {
+    dashboards: Arc<RwLock<HashMap<String, Dashboard>>>,
+    dashboard_storage: Arc<dyn DashboardStorage>,
+    real_time_updates: Arc<RealTimeUpdater>,
+    /// Real metrics store used by [`DashboardManager::get_widget_data`] to
+    /// answer each widget's `query` from genuinely recorded metrics.
+    metrics_collector: Arc<MetricsCollector>,
+}
+
+/// Telemetry dashboard configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dashboard {
+    /// Unique dashboard identifier
+    pub id: String,
+    /// Dashboard name
+    pub name: String,
+    /// Dashboard description
+    pub description: String,
+    /// List of widgets in the dashboard
+    pub widgets: Vec<Widget>,
+    /// Dashboard layout configuration
+    pub layout: DashboardLayout,
+    /// Dashboard access permissions
+    pub permissions: DashboardPermissions,
+    /// Dashboard creation timestamp
+    pub created_at: DateTime<Utc>,
+    /// Dashboard last update timestamp
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Dashboard widget configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Widget {
+    /// Widget identifier
+    pub id: String,
+    /// Type of widget
+    pub widget_type: WidgetType,
+    /// Widget title
+    pub title: String,
+    /// Data query for the widget
+    pub query: AnalyticsQuery,
+    /// Visualization settings
+    pub visualization: VisualizationSettings,
+    /// Widget position in the dashboard
+    pub position: WidgetPosition,
+    /// Auto-refresh interval
+    pub refresh_interval: Option<Duration>,
+}
+
+/// Type of dashboard widget
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WidgetType {
+    /// Line chart visualization
+    LineChart,
+    /// Bar chart visualization
+    BarChart,
+    /// Pie chart visualization
+    PieChart,
+    /// Counter/metric display
+    Counter,
+    /// Table view
+    Table,
+    /// Heatmap visualization
+    Heatmap,
+    /// Gauge/dial display
+    Gauge,
+}
+
+/// Visualization settings for widgets
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualizationSettings {
+    /// Color scheme for the visualization
+    pub color_scheme: String,
+    /// Whether to show legend
+    pub show_legend: bool,
+    /// Whether to show grid
+    pub show_grid: bool,
+    /// Whether animation is enabled
+    pub animation_enabled: bool,
+    /// Custom visualization settings
+    pub custom_settings: HashMap<String, Value>,
+}
+
+/// Position and size of a widget in the dashboard
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetPosition {
+    /// X coordinate
+    pub x: u32,
+    /// Y coordinate
+    pub y: u32,
+    /// Widget width
+    pub width: u32,
+    /// Widget height
+    pub height: u32,
+}
+
+/// Dashboard layout configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardLayout {
+    /// Grid size (columns, rows)
+    pub grid_size: (u32, u32),
+    /// Whether layout is responsive
+    pub responsive: bool,
+    /// Theme name
+    pub theme: String,
+}
+
+/// Dashboard access permissions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardPermissions {
+    /// List of users with view permission
+    pub viewers: Vec<String>,
+    /// List of users with edit permission
+    pub editors: Vec<String>,
+    /// Whether dashboard is publicly accessible
+    pub public: bool,
+}
+
+trait DashboardStorage: Send + Sync {
+    fn save_dashboard(&self, dashboard: &Dashboard) -> Result<()>;
+    fn load_dashboard(&self, dashboard_id: &str) -> Result<Dashboard>;
+    fn list_dashboards(&self, user_id: &str) -> Result<Vec<DashboardMetadata>>;
+    fn delete_dashboard(&self, dashboard_id: &str) -> Result<()>;
+}
+
+struct DashboardMetadata {
+    id: String,
+    name: String,
+    description: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    owner: String,
+}
+
+struct RealTimeUpdater {
+    active_subscriptions: Arc<RwLock<HashMap<String, Subscription>>>,
+    update_dispatcher: Arc<UpdateDispatcher>,
+}
+
+struct Subscription {
+    id: String,
+    dashboard_id: String,
+    widget_id: String,
+    user_id: String,
+    last_update: DateTime<Utc>,
+}
+
+struct UpdateDispatcher {
+    // WebSocket or Server-Sent Events implementation
+    // For now, we'll keep it simple
+}
+
+struct RealTimeProcessor {
+    stream_processors: Vec<Arc<dyn StreamProcessor>>,
+    anomaly_detector: Arc<AnomalyDetector>,
+    trend_analyzer: Arc<TrendAnalyzer>,
+}
+
+trait StreamProcessor: Send + Sync {
+    fn process_event(&self, event: &TelemetryEvent) -> Result<Vec<ProcessedEvent>>;
+    fn process_metric(&self, metric: &Metric) -> Result<Vec<ProcessedMetric>>;
+    fn get_processor_name(&self) -> &str;
+}
+
+struct ProcessedEvent {
+    original_event: TelemetryEvent,
+    derived_metrics: Vec<Metric>,
+    anomaly_score: Option<f64>,
+    tags: HashMap<String, String>,
+}
+
+struct ProcessedMetric {
+    original_metric: Metric,
+    trend_direction: TrendDirection,
+    velocity: f64,
+    acceleration: f64,
+    anomaly_score: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+enum TrendDirection {
+    Increasing,
+    Decreasing,
+    Stable,
+    Volatile,
+}
+
+struct AnomalyDetector {
+    algorithms: Vec<Arc<dyn AnomalyAlgorithm>>,
+    detection_config: AnomalyDetectionConfig,
+    anomaly_history: Arc<Mutex<VecDeque<Anomaly>>>,
+}
+
+trait AnomalyAlgorithm: Send + Sync {
+    fn detect(&self, data: &[DataPoint]) -> Result<Vec<Anomaly>>;
+    fn get_algorithm_name(&self) -> &str;
+}
+
+struct AnomalyDetectionConfig {
+    sensitivity: f64,
+    min_data_points: usize,
+    window_size: Duration,
+    enabled_algorithms: Vec<String>,
+}
+
+struct Anomaly {
+    id: String,
+    detected_at: DateTime<Utc>,
+    metric_name: String,
+    value: f64,
+    expected_value: f64,
+    confidence: f64,
+    severity: AnomalySeverity,
+    algorithm: String,
+}
+
+#[derive(Debug, Clone)]
+enum AnomalySeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+struct TrendAnalyzer {
+    trend_models: HashMap<String, TrendModel>,
+    forecasting_enabled: bool,
+    forecast_horizon: Duration,
+}
+
+struct TrendModel {
+    metric_name: String,
+    model_type: TrendModelType,
+    parameters: HashMap<String, f64>,
+    accuracy: f64,
+    last_trained: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+enum TrendModelType {
+    Linear,
+    Exponential,
+    Seasonal,
+    Arima,
+}
+
+struct ABTestingManager {
+    experiments: Arc<RwLock<HashMap<String, Experiment>>>,
+    participant_tracker: Arc<ParticipantTracker>,
+    statistical_engine: Arc<StatisticalEngine>,
+}
+
+/// A/B testing experiment configuration
+pub struct Experiment {
+    /// Unique experiment identifier
+    pub id: String,
+    /// Human-readable experiment name
+    pub name: String,
+    /// Experiment description
+    pub description: String,
+    /// Current status of the experiment
+    pub status: ExperimentStatus,
+    /// List of experiment variants
+    pub variants: Vec<Variant>,
+    /// Strategy for allocating users to variants
+    pub allocation: AllocationStrategy,
+    /// Experiment start date
+    pub start_date: DateTime<Utc>,
+    /// Optional experiment end date
+    pub end_date: Option<DateTime<Utc>>,
+    /// Metrics used to measure success
+    pub success_metrics: Vec<String>,
+    /// Required sample size
+    pub sample_size: u32,
+    /// Statistical confidence level
+    pub confidence_level: f64,
+}
+
+/// Status of an A/B testing experiment
+#[derive(Debug, Clone)]
+pub enum ExperimentStatus {
+    /// Experiment is being prepared
+    Draft,
+    /// Experiment is currently running
+    Running,
+    /// Experiment has been temporarily paused
+    Paused,
+    /// Experiment has finished
+    Completed,
+    /// Experiment was cancelled
+    Cancelled,
+}
+
+/// A variant in an A/B test
+#[derive(Debug, Clone)]
+pub struct Variant {
+    /// Variant identifier
+    pub id: String,
+    /// Variant name
+    pub name: String,
+    /// Variant description
+    pub description: String,
+    /// Percentage of users allocated to this variant
+    pub allocation_percentage: f32,
+    /// Variant-specific configuration
+    pub configuration: HashMap<String, Value>,
+}
+
+/// Strategy for allocating users to experiment variants
+#[derive(Debug, Clone)]
+pub enum AllocationStrategy {
+    /// Random allocation
+    Random,
+    /// Allocate based on user property
+    UserProperty(String),
+    /// Deterministic allocation based on hash
+    Deterministic(String),
+}
+
+struct ParticipantTracker {
+    participants: Arc<RwLock<HashMap<String, ParticipantInfo>>>,
+    assignment_cache: Arc<RwLock<HashMap<String, VariantAssignment>>>,
+}
+
+struct ParticipantInfo {
+    user_id: String,
+    joined_at: DateTime<Utc>,
+    experiments: Vec<String>,
+    properties: HashMap<String, Value>,
+}
+
+struct VariantAssignment {
+    experiment_id: String,
+    variant_id: String,
+    assigned_at: DateTime<Utc>,
+    sticky: bool,
+}
+
+struct StatisticalEngine {
+    test_types: Vec<StatisticalTest>,
+    significance_calculator: Arc<SignificanceCalculator>,
+}
+
+#[derive(Debug, Clone)]
+enum StatisticalTest {
+    TTest,
+    ChiSquare,
+    MannWhitney,
+    Bayesian,
+}
+
+struct SignificanceCalculator {
+    // Statistical calculation implementations
+}
+
+trait TelemetryExporter: Send + Sync {
+    fn export_events(&self, events: &[TelemetryEvent]) -> Result<()>;
+    fn export_metrics(&self, metrics: &[Metric]) -> Result<()>;
+    fn get_exporter_name(&self) -> &str;
+}
+
+impl VoirsTelemetryProvider {
+    pub async fn new(config: TelemetryConfig) -> Result<Self> {
+        let event_collector = Arc::new(EventCollector::new(&config).await?);
+        let metrics_collector = Arc::new(MetricsCollector::new(&config).await?);
+        let analytics_engine =
+            Arc::new(AnalyticsEngine::new(Arc::clone(&metrics_collector)).await?);
+        let ab_testing_manager = Arc::new(ABTestingManager::new().await?);
+
+        let provider = Self {
+            config: config.clone(),
+            event_collector,
+            metrics_collector,
+            analytics_engine,
+            ab_testing_manager,
+            exporters: Vec::new(),
+        };
+
+        // Start background tasks
+        provider.start_batch_processing().await?;
+        provider.start_metrics_aggregation().await?;
+        provider.start_analytics_processing().await?;
+
+        Ok(provider)
+    }
+
+    async fn start_batch_processing(&self) -> Result<()> {
+        let event_collector = self.event_collector.clone();
+        let exporters = self.exporters.clone();
+        let flush_interval = Duration::from_secs(self.config.flush_interval_seconds as u64);
+
+        tokio::spawn(async move {
+            let mut interval = interval(flush_interval);
+
+            loop {
+                interval.tick().await;
+                let _ = Self::process_event_batch(event_collector.clone(), exporters.clone()).await;
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn process_event_batch(
+        event_collector: Arc<EventCollector>,
+        exporters: Vec<Arc<dyn TelemetryExporter>>,
+    ) -> Result<()> {
+        let events = event_collector.get_batch().await;
+
+        for exporter in &exporters {
+            if let Err(e) = exporter.export_events(&events) {
+                tracing::error!(
+                    "Failed to export events to {}: {}",
+                    exporter.get_exporter_name(),
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn start_metrics_aggregation(&self) -> Result<()> {
+        let metrics_collector = self.metrics_collector.clone();
+
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(60)); // Aggregate every minute
+
+            loop {
+                interval.tick().await;
+                let _ = metrics_collector.aggregate_metrics().await;
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn start_analytics_processing(&self) -> Result<()> {
+        let analytics_engine = self.analytics_engine.clone();
+
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(300)); // Process every 5 minutes
+
+            loop {
+                interval.tick().await;
+                let _ = analytics_engine.process_real_time_analytics().await;
+            }
+        });
+
+        Ok(())
+    }
+
+    pub async fn create_experiment(&self, experiment: Experiment) -> Result<String> {
+        let mut experiments = self.ab_testing_manager.experiments.write().await;
+        let experiment_id = experiment.id.clone();
+        experiments.insert(experiment_id.clone(), experiment);
+        Ok(experiment_id)
+    }
+
+    pub async fn get_variant_for_user(
+        &self,
+        experiment_id: &str,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        self.ab_testing_manager
+            .get_variant_assignment(experiment_id, user_id)
+            .await
+    }
+
+    pub async fn record_conversion(
+        &self,
+        experiment_id: &str,
+        user_id: &str,
+        metric_name: &str,
+        value: f64,
+    ) -> Result<()> {
+        let event = TelemetryEvent {
+            id: Uuid::new_v4().to_string(),
+            event_type: "conversion".to_string(),
+            timestamp: Utc::now(),
+            user_id: Some(user_id.to_string()),
+            session_id: None,
+            properties: [
+                (
+                    "experiment_id".to_string(),
+                    serde_json::Value::String(experiment_id.to_string()),
+                ),
+                (
+                    "metric_name".to_string(),
+                    serde_json::Value::String(metric_name.to_string()),
+                ),
+                (
+                    "value".to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(value).expect("value should be present"),
+                    ),
+                ),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
+        };
+
+        self.record_event(event).await
+    }
+
+    pub async fn create_dashboard(&self, dashboard: Dashboard) -> Result<String> {
+        self.analytics_engine
+            .dashboard_manager
+            .create_dashboard(dashboard)
+            .await
+    }
+
+    pub async fn get_dashboard_data(&self, dashboard_id: &str) -> Result<DashboardData> {
+        self.analytics_engine
+            .dashboard_manager
+            .get_dashboard_data(dashboard_id)
+            .await
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardData {
+    pub dashboard: Dashboard,
+    pub widget_data: HashMap<String, WidgetData>,
+    pub last_updated: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetData {
+    pub data: AnalyticsResult,
+    pub cached: bool,
+    pub cache_age: Duration,
+}
+
+impl EventCollector {
+    async fn new(config: &TelemetryConfig) -> Result<Self> {
+        Ok(Self {
+            event_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            event_stats: Arc::new(EventStats::new()),
+            sampling_controller: Arc::new(SamplingController::new(config.sampling_rate)),
+            batch_processor: Arc::new(BatchProcessor::new(
+                config.batch_size,
+                Duration::from_secs(config.flush_interval_seconds as u64),
+            )),
+        })
+    }
+
+    async fn get_batch(&self) -> Vec<TelemetryEvent> {
+        let mut buffer = self.event_buffer.lock().await;
+        let batch_size = self.batch_processor.batch_size;
+        let mut batch = Vec::with_capacity(batch_size);
+
+        for _ in 0..batch_size {
+            if let Some(event) = buffer.pop_front() {
+                batch.push(event);
+            } else {
+                break;
+            }
+        }
+
+        batch
+    }
+}
+
+impl EventStats {
+    fn new() -> Self {
+        Self {
+            total_events: AtomicU64::new(0),
+            events_by_type: Arc::new(RwLock::new(HashMap::new())),
+            events_per_minute: AtomicU64::new(0),
+            dropped_events: AtomicU64::new(0),
+            processing_errors: AtomicU64::new(0),
+        }
+    }
+}
+
+impl SamplingController {
+    fn new(default_rate: f32) -> Self {
+        Self {
+            sampling_rules: Arc::new(RwLock::new(vec![SamplingRule {
+                event_type: "*".to_string(),
+                sampling_rate: default_rate,
+                condition: None,
+                priority: 0,
+            }])),
+            adaptive_sampling: true,
+            current_load: AtomicU32::new(0),
+        }
+    }
+}
+
+impl BatchProcessor {
+    fn new(batch_size: u32, flush_interval: Duration) -> Self {
+        Self {
+            batch_buffer: Arc::new(Mutex::new(Vec::new())),
+            batch_size: batch_size as usize,
+            flush_interval,
+            compression_enabled: true,
+        }
+    }
+}
+
+impl MetricsCollector {
+    async fn new(_config: &TelemetryConfig) -> Result<Self> {
+        Ok(Self {
+            metrics_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            aggregators: Arc::new(RwLock::new(HashMap::new())),
+            time_series_store: Arc::new(TimeSeriesStore::new()),
+            alert_manager: Arc::new(AlertManager::new()),
+        })
+    }
+
+    async fn aggregate_metrics(&self) -> Result<()> {
+        let mut aggregators = self.aggregators.write().await;
+        let now = Utc::now();
+
+        for (_, aggregator) in aggregators.iter_mut() {
+            aggregator.aggregate(now);
+        }
+
+        Ok(())
+    }
+
+    /// Query genuinely recorded metrics matching `query`.
+    ///
+    /// Reads from the same buffer [`Self::record_metric`]-equivalent calls
+    /// (`TelemetryProvider::record_metric`) push into, so results always
+    /// reflect real, previously-recorded [`Metric`]s — matching name,
+    /// timestamp range, and tag filters — never a fabricated/synthetic
+    /// series. An empty result honestly means nothing matching has been
+    /// recorded yet (or it was already evicted by `flush()`), not that the
+    /// query itself failed.
+    async fn query(&self, query: &AnalyticsQuery) -> Vec<DataPoint> {
+        let buffer = self.metrics_buffer.lock().await;
+        buffer
+            .iter()
+            .filter(|m| m.name == query.metric_name)
+            .filter(|m| m.timestamp >= query.start_time && m.timestamp <= query.end_time)
+            .filter(|m| {
+                query
+                    .filters
+                    .iter()
+                    .all(|(key, value)| m.tags.get(key) == Some(value))
+            })
+            .map(|m| DataPoint {
+                timestamp: m.timestamp,
+                value: m.value,
+                dimensions: m.tags.clone(),
+            })
+            .collect()
+    }
+}
+
+impl MetricAggregator {
+    fn aggregate(&mut self, now: DateTime<Utc>) {
+        // Remove old values outside the window
+        let cutoff = now - self.window_size;
+        self.values.retain(|v| v.timestamp > cutoff);
+
+        // Calculate aggregated value
+        if !self.values.is_empty() {
+            self.current_value = match self.aggregation_type {
+                AggregationType::Sum => self.values.iter().map(|v| v.value).sum(),
+                AggregationType::Average => {
+                    self.values.iter().map(|v| v.value).sum::<f64>() / self.values.len() as f64
+                }
+                AggregationType::Count => self.values.len() as f64,
+                AggregationType::Min => self
+                    .values
+                    .iter()
+                    .map(|v| v.value)
+                    .fold(f64::INFINITY, f64::min),
+                AggregationType::Max => self
+                    .values
+                    .iter()
+                    .map(|v| v.value)
+                    .fold(f64::NEG_INFINITY, f64::max),
+                AggregationType::Percentile(p) => {
+                    let mut sorted_values: Vec<f64> = self.values.iter().map(|v| v.value).collect();
+                    sorted_values
+                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let index = ((p / 100.0) * (sorted_values.len() - 1) as f32) as usize;
+                    sorted_values.get(index).copied().unwrap_or(0.0)
+                }
+            };
+        }
+    }
+}
+
+impl TimeSeriesStore {
+    fn new() -> Self {
+        Self {
+            series: Arc::new(RwLock::new(HashMap::new())),
+            retention_policy: RetentionPolicy {
+                max_age: Duration::from_secs(30 * 24 * 3600), // 30 days
+                max_points: 100_000,
+                downsampling_rules: Vec::new(),
+            },
+            compression_settings: CompressionSettings {
+                enabled: true,
+                algorithm: CompressionAlgorithm::Gzip,
+                compression_level: 6,
+            },
+        }
+    }
+}
+
+impl AlertManager {
+    fn new() -> Self {
+        Self {
+            alert_rules: Arc::new(RwLock::new(Vec::new())),
+            alert_history: Arc::new(Mutex::new(VecDeque::new())),
+            notification_channels: Vec::new(),
+        }
+    }
+}
+
+impl AnalyticsEngine {
+    async fn new(metrics_collector: Arc<MetricsCollector>) -> Result<Self> {
+        Ok(Self {
+            query_processor: Arc::new(QueryProcessor::new()),
+            report_generator: Arc::new(ReportGenerator::new()),
+            dashboard_manager: Arc::new(DashboardManager::new(Arc::clone(&metrics_collector))),
+            real_time_processor: Arc::new(RealTimeProcessor::new()),
+            metrics_collector,
+        })
+    }
+
+    async fn process_real_time_analytics(&self) -> Result<()> {
+        // Process real-time analytics
+        tracing::debug!("Processing real-time analytics");
+        Ok(())
+    }
+}
+
+impl QueryProcessor {
+    fn new() -> Self {
+        Self {
+            query_cache: Arc::new(RwLock::new(HashMap::new())),
+            query_optimizer: Arc::new(QueryOptimizer::new()),
+            execution_engine: Arc::new(QueryExecutionEngine::new()),
+        }
+    }
+}
+
+impl QueryOptimizer {
+    fn new() -> Self {
+        Self {
+            optimization_rules: Vec::new(),
+            statistics: QueryStatistics {
+                query_count: AtomicU64::new(0),
+                average_execution_time: 0.0,
+                cache_hit_rate: 0.0,
+                most_expensive_queries: Vec::new(),
+            },
+        }
+    }
+}
+
+impl QueryExecutionEngine {
+    fn new() -> Self {
+        Self {
+            executors: Vec::new(),
+            execution_stats: ExecutionStats {
+                total_queries: AtomicU64::new(0),
+                successful_queries: AtomicU64::new(0),
+                failed_queries: AtomicU64::new(0),
+                average_execution_time: 0.0,
+            },
+        }
+    }
+}
+
+impl ReportGenerator {
+    fn new() -> Self {
+        Self {
+            report_templates: Arc::new(RwLock::new(HashMap::new())),
+            scheduled_reports: Arc::new(RwLock::new(Vec::new())),
+            report_storage: Arc::new(LocalReportStorage::new()),
+        }
+    }
+}
+
+impl DashboardManager {
+    fn new(metrics_collector: Arc<MetricsCollector>) -> Self {
+        Self {
+            dashboards: Arc::new(RwLock::new(HashMap::new())),
+            dashboard_storage: Arc::new(LocalDashboardStorage::new()),
+            real_time_updates: Arc::new(RealTimeUpdater::new()),
+            metrics_collector,
+        }
+    }
+
+    async fn create_dashboard(&self, dashboard: Dashboard) -> Result<String> {
+        let dashboard_id = dashboard.id.clone();
+        let mut dashboards = self.dashboards.write().await;
+        dashboards.insert(dashboard_id.clone(), dashboard);
+        Ok(dashboard_id)
+    }
+
+    async fn get_dashboard_data(&self, dashboard_id: &str) -> Result<DashboardData> {
+        let dashboards = self.dashboards.read().await;
+        if let Some(dashboard) = dashboards.get(dashboard_id) {
+            let mut widget_data = HashMap::new();
+
+            // Populate widget data for each widget in the dashboard
+            for widget in &dashboard.widgets {
+                let data = self.get_widget_data(widget).await?;
+                widget_data.insert(widget.id.clone(), data);
+            }
+
+            Ok(DashboardData {
+                dashboard: dashboard.clone(),
+                widget_data,
+                last_updated: Utc::now(),
+            })
+        } else {
+            Err(VoirsError::config_error(format!(
+                "Dashboard {} not found",
+                dashboard_id
+            )))
+        }
+    }
+
+    async fn get_widget_data(&self, widget: &Widget) -> Result<WidgetData> {
+        // Real query against genuinely recorded metrics via the widget's own
+        // `query` (never a fabricated/dummy result, regardless of what the
+        // widget asks for).
+        let data_points = self.metrics_collector.query(&widget.query).await;
+        let summary = QueryProcessor::calculate_summary(&data_points, &widget.query.aggregation);
+
+        Ok(WidgetData {
+            data: AnalyticsResult {
+                data_points,
+                summary,
+            },
+            cached: false,
+            cache_age: Duration::from_secs(0),
+        })
+    }
+
+    fn parse_aggregation_type(&self, value: Option<&serde_json::Value>) -> AggregationType {
+        match value {
+            Some(serde_json::Value::String(s)) => match s.as_str() {
+                "sum" => AggregationType::Sum,
+                "average" => AggregationType::Average,
+                "count" => AggregationType::Count,
+                "min" => AggregationType::Min,
+                "max" => AggregationType::Max,
+                _ => AggregationType::Count,
+            },
+            _ => AggregationType::Count,
+        }
+    }
+}
+
+impl RealTimeUpdater {
+    fn new() -> Self {
+        Self {
+            active_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            update_dispatcher: Arc::new(UpdateDispatcher {}),
+        }
+    }
+}
+
+impl RealTimeProcessor {
+    fn new() -> Self {
+        Self {
+            stream_processors: Vec::new(),
+            anomaly_detector: Arc::new(AnomalyDetector::new()),
+            trend_analyzer: Arc::new(TrendAnalyzer::new()),
+        }
+    }
+}
+
+impl AnomalyDetector {
+    fn new() -> Self {
+        Self {
+            algorithms: Vec::new(),
+            detection_config: AnomalyDetectionConfig {
+                sensitivity: 0.8,
+                min_data_points: 10,
+                window_size: Duration::from_secs(3600), // 1 hour
+                enabled_algorithms: vec!["statistical".to_string()],
+            },
+            anomaly_history: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+}
+
+impl TrendAnalyzer {
+    fn new() -> Self {
+        Self {
+            trend_models: HashMap::new(),
+            forecasting_enabled: false,
+            forecast_horizon: Duration::from_secs(24 * 3600), // 1 day
+        }
+    }
+}
+
+impl ABTestingManager {
+    async fn new() -> Result<Self> {
+        Ok(Self {
+            experiments: Arc::new(RwLock::new(HashMap::new())),
+            participant_tracker: Arc::new(ParticipantTracker::new()),
+            statistical_engine: Arc::new(StatisticalEngine::new()),
+        })
+    }
+
+    async fn get_variant_assignment(
+        &self,
+        experiment_id: &str,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        // Check if user is already assigned
+        let assignments = self.participant_tracker.assignment_cache.read().await;
+        let assignment_key = format!("{}:{}", experiment_id, user_id);
+
+        if let Some(assignment) = assignments.get(&assignment_key) {
+            return Ok(Some(assignment.variant_id.clone()));
+        }
+
+        // Assign user to a variant
+        let experiments = self.experiments.read().await;
+        if let Some(experiment) = experiments.get(experiment_id) {
+            if matches!(experiment.status, ExperimentStatus::Running) {
+                // Simple random assignment for now
+                let variant_index = user_id.len() % experiment.variants.len();
+                if let Some(variant) = experiment.variants.get(variant_index) {
+                    return Ok(Some(variant.id.clone()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+impl ParticipantTracker {
+    fn new() -> Self {
+        Self {
+            participants: Arc::new(RwLock::new(HashMap::new())),
+            assignment_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+impl StatisticalEngine {
+    fn new() -> Self {
+        Self {
+            test_types: vec![StatisticalTest::TTest, StatisticalTest::ChiSquare],
+            significance_calculator: Arc::new(SignificanceCalculator {}),
+        }
+    }
+}
+
+// Storage implementations
+struct LocalReportStorage;
+impl LocalReportStorage {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl ReportStorage for LocalReportStorage {
+    fn store_report(&self, _report: &GeneratedReport) -> Result<String> {
+        Ok(Uuid::new_v4().to_string())
+    }
+
+    fn get_report(&self, _report_id: &str) -> Result<GeneratedReport> {
+        Err(VoirsError::config_error("Report not found".to_string()))
+    }
+
+    fn list_reports(&self, _filters: &ReportFilters) -> Result<Vec<ReportMetadata>> {
+        Ok(Vec::new())
+    }
+
+    fn delete_report(&self, _report_id: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct LocalDashboardStorage;
+impl LocalDashboardStorage {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl DashboardStorage for LocalDashboardStorage {
+    fn save_dashboard(&self, _dashboard: &Dashboard) -> Result<()> {
+        Ok(())
+    }
+
+    fn load_dashboard(&self, _dashboard_id: &str) -> Result<Dashboard> {
+        Err(VoirsError::config_error("Dashboard not found".to_string()))
+    }
+
+    fn list_dashboards(&self, _user_id: &str) -> Result<Vec<DashboardMetadata>> {
+        Ok(Vec::new())
+    }
+
+    fn delete_dashboard(&self, _dashboard_id: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TelemetryProvider for VoirsTelemetryProvider {
+    async fn record_event(&self, event: TelemetryEvent) -> Result<()> {
+        // Apply sampling
+        if self
+            .event_collector
+            .sampling_controller
+            .should_sample(&event)
+            .await
+        {
+            let mut buffer = self.event_collector.event_buffer.lock().await;
+            buffer.push_back(event);
+
+            // Update stats
+            self.event_collector
+                .event_stats
+                .total_events
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.event_collector
+                .event_stats
+                .dropped_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
+    async fn record_metric(&self, metric: Metric) -> Result<()> {
+        let mut buffer = self.metrics_collector.metrics_buffer.lock().await;
+        buffer.push_back(metric);
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        // Flush event buffer
+        let events = self.event_collector.get_batch().await;
+        for exporter in &self.exporters {
+            exporter.export_events(&events)?;
+        }
+
+        // Flush metrics buffer
+        let mut buffer = self.metrics_collector.metrics_buffer.lock().await;
+        let metrics: Vec<Metric> = buffer.drain(..).collect();
+        for exporter in &self.exporters {
+            exporter.export_metrics(&metrics)?;
+        }
+
+        Ok(())
+    }
+
+    async fn get_analytics(&self, query: AnalyticsQuery) -> Result<AnalyticsResult> {
+        // Query real recorded metrics (via `MetricsCollector::query`) rather
+        // than a fabricated series: `data_points` always reflects genuine
+        // `Metric`s previously passed to `record_metric`, filtered by name,
+        // time range, and tags.
+        let data_points = self.analytics_engine.metrics_collector.query(&query).await;
+        let summary = QueryProcessor::calculate_summary(&data_points, &query.aggregation);
+
+        Ok(AnalyticsResult {
+            data_points,
+            summary,
+        })
+    }
+}
+
+impl QueryProcessor {
+    /// Summarize `data_points` (min/max/sum/average) — a pure function of
+    /// its arguments so it can be shared by both
+    /// [`VoirsTelemetryProvider::get_analytics`] and
+    /// `DashboardManager::get_widget_data` without needing a `QueryProcessor`
+    /// instance. `aggregation` is accepted for API symmetry with
+    /// [`AnalyticsQuery`] but every summary statistic is always computed
+    /// (real callers pick the field matching their requested aggregation).
+    fn calculate_summary(
+        data_points: &[DataPoint],
+        aggregation: &AggregationType,
+    ) -> AnalyticsSummary {
+        let _ = aggregation;
+        if data_points.is_empty() {
+            return AnalyticsSummary {
+                total_points: 0,
+                min_value: 0.0,
+                max_value: 0.0,
+                average_value: 0.0,
+                sum_value: 0.0,
+            };
+        }
+
+        let values: Vec<f64> = data_points.iter().map(|dp| dp.value).collect();
+        let sum_value: f64 = values.iter().sum();
+        let min_value = values.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max_value = values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let average_value = sum_value / values.len() as f64;
+
+        AnalyticsSummary {
+            total_points: data_points.len() as u32,
+            min_value,
+            max_value,
+            average_value,
+            sum_value,
+        }
+    }
+}
+
+impl SamplingController {
+    async fn should_sample(&self, _event: &TelemetryEvent) -> bool {
+        // Simple sampling logic - in practice this would be more sophisticated
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_telemetry_provider_creation() {
+        let config = TelemetryConfig::default();
+        let provider = VoirsTelemetryProvider::new(config).await;
+        assert!(provider.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_event_recording() {
+        let config = TelemetryConfig::default();
+        let provider = VoirsTelemetryProvider::new(config).await.unwrap();
+
+        let event = TelemetryEvent {
+            id: Uuid::new_v4().to_string(),
+            event_type: "test".to_string(),
+            timestamp: Utc::now(),
+            user_id: Some("user123".to_string()),
+            session_id: Some("session456".to_string()),
+            properties: HashMap::new(),
+        };
+
+        let result = provider.record_event(event).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_metric_recording() {
+        let config = TelemetryConfig::default();
+        let provider = VoirsTelemetryProvider::new(config).await.unwrap();
+
+        let metric = Metric {
+            name: "test_metric".to_string(),
+            value: 42.0,
+            unit: "count".to_string(),
+            timestamp: Utc::now(),
+            tags: HashMap::new(),
+        };
+
+        let result = provider.record_metric(metric).await;
+        assert!(result.is_ok());
+    }
+
+    fn analytics_query(
+        metric_name: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> AnalyticsQuery {
+        AnalyticsQuery {
+            metric_name: metric_name.to_string(),
+            start_time: start,
+            end_time: end,
+            aggregation: AggregationType::Average,
+            filters: HashMap::new(),
+            group_by: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_analytics_reflects_real_recorded_metrics_not_a_fabricated_series() {
+        // Direct regression test for the fabrication bug: the old
+        // implementation ignored every recorded metric entirely and
+        // generated a synthetic sin/cos-based series instead.
+        let config = TelemetryConfig::default();
+        let provider = VoirsTelemetryProvider::new(config).await.unwrap();
+
+        let now = Utc::now();
+        provider
+            .record_metric(Metric {
+                name: "cpu_usage".to_string(),
+                value: 12.5,
+                unit: "percent".to_string(),
+                timestamp: now,
+                tags: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        provider
+            .record_metric(Metric {
+                name: "cpu_usage".to_string(),
+                value: 87.5,
+                unit: "percent".to_string(),
+                timestamp: now,
+                tags: HashMap::new(),
+            })
+            .await
+            .unwrap();
+
+        let query = analytics_query(
+            "cpu_usage",
+            now - chrono::Duration::minutes(5),
+            now + chrono::Duration::minutes(5),
+        );
+        let result = provider.get_analytics(query).await.unwrap();
+
+        assert_eq!(
+            result.data_points.len(),
+            2,
+            "must reflect the two real recorded points"
+        );
+        let values: Vec<f64> = result.data_points.iter().map(|dp| dp.value).collect();
+        assert!(values.contains(&12.5));
+        assert!(values.contains(&87.5));
+        // Real mean of 12.5 and 87.5, not any hardcoded/synthetic pattern.
+        assert!((result.summary.average_value - 50.0).abs() < 1e-9);
+        assert_eq!(result.summary.total_points, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_analytics_for_unrecorded_metric_is_honestly_empty() {
+        // Direct regression test: the old implementation always returned at
+        // least one data point (a fabricated one) for *any* metric name,
+        // including ones nothing had ever recorded.
+        let config = TelemetryConfig::default();
+        let provider = VoirsTelemetryProvider::new(config).await.unwrap();
+
+        let now = Utc::now();
+        let query = analytics_query(
+            "never_recorded_metric",
+            now - chrono::Duration::hours(1),
+            now + chrono::Duration::hours(1),
+        );
+        let result = provider.get_analytics(query).await.unwrap();
+
+        assert!(result.data_points.is_empty());
+        assert_eq!(result.summary.total_points, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_analytics_filters_by_metric_name_and_time_range() {
+        let config = TelemetryConfig::default();
+        let provider = VoirsTelemetryProvider::new(config).await.unwrap();
+
+        let now = Utc::now();
+        provider
+            .record_metric(Metric {
+                name: "throughput".to_string(),
+                value: 111.0,
+                unit: "rps".to_string(),
+                timestamp: now,
+                tags: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        // Different metric name - must not leak into a "throughput" query.
+        provider
+            .record_metric(Metric {
+                name: "error_rate".to_string(),
+                value: 999.0,
+                unit: "percent".to_string(),
+                timestamp: now,
+                tags: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        // Same metric name but well outside the queried time range.
+        provider
+            .record_metric(Metric {
+                name: "throughput".to_string(),
+                value: 222.0,
+                unit: "rps".to_string(),
+                timestamp: now - chrono::Duration::days(30),
+                tags: HashMap::new(),
+            })
+            .await
+            .unwrap();
+
+        let query = analytics_query(
+            "throughput",
+            now - chrono::Duration::minutes(1),
+            now + chrono::Duration::minutes(1),
+        );
+        let result = provider.get_analytics(query).await.unwrap();
+
+        assert_eq!(result.data_points.len(), 1);
+        assert_eq!(result.data_points[0].value, 111.0);
+    }
+
+    #[tokio::test]
+    async fn test_experiment_creation() {
+        let config = TelemetryConfig::default();
+        let provider = VoirsTelemetryProvider::new(config).await.unwrap();
+
+        let experiment = Experiment {
+            id: "test_experiment".to_string(),
+            name: "Test Experiment".to_string(),
+            description: "A test experiment".to_string(),
+            status: ExperimentStatus::Draft,
+            variants: vec![
+                Variant {
+                    id: "variant_a".to_string(),
+                    name: "Variant A".to_string(),
+                    description: "Control variant".to_string(),
+                    allocation_percentage: 50.0,
+                    configuration: HashMap::new(),
+                },
+                Variant {
+                    id: "variant_b".to_string(),
+                    name: "Variant B".to_string(),
+                    description: "Treatment variant".to_string(),
+                    allocation_percentage: 50.0,
+                    configuration: HashMap::new(),
+                },
+            ],
+            allocation: AllocationStrategy::Random,
+            start_date: Utc::now(),
+            end_date: None,
+            success_metrics: vec!["conversion_rate".to_string()],
+            sample_size: 1000,
+            confidence_level: 0.95,
+        };
+
+        let result = provider.create_experiment(experiment).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_trend_direction() {
+        let directions = vec![
+            TrendDirection::Increasing,
+            TrendDirection::Decreasing,
+            TrendDirection::Stable,
+            TrendDirection::Volatile,
+        ];
+
+        assert_eq!(directions.len(), 4);
+    }
+
+    #[test]
+    fn test_statistical_tests() {
+        let tests = vec![
+            StatisticalTest::TTest,
+            StatisticalTest::ChiSquare,
+            StatisticalTest::MannWhitney,
+            StatisticalTest::Bayesian,
+        ];
+
+        assert_eq!(tests.len(), 4);
+    }
+}

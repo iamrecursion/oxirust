@@ -1,0 +1,13 @@
+# rustfmt configuration for the oxinum workspace.
+#
+# Deliberately minimal: the codebase is already clean under rustfmt's stable
+# defaults (`cargo fmt --check` passes with no config file at all), so this
+# pins those defaults explicitly instead of introducing new rules that would
+# trigger a repo-wide reformat. `edition` matches `workspace.package.edition`
+# in the root Cargo.toml; `max_width` and `use_small_heuristics` are restated
+# for clarity even though they equal rustfmt's own defaults. Every key here
+# is a stable-channel option so `cargo fmt --check` stays clean without
+# nightly rustfmt.
+edition = "2021"
+max_width = 100
+use_small_heuristics = "Default"

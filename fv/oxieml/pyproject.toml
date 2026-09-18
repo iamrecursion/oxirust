@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "oxieml"
+requires-python = ">=3.9"
+description = "OxiEML symbolic regression — Python bindings"
+license = { file = "LICENSE" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+dependencies = ["numpy"]
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["python-extension"]
+module-name = "oxieml._core"
+python-source = "python"

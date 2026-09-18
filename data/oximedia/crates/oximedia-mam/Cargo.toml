@@ -1,0 +1,127 @@
+[package]
+name = "oximedia-mam"
+description = "Media Asset Management system for organizing and tracking media files"
+keywords = ["mam", "asset-management", "media", "search", "multimedia"]
+categories = ["multimedia", "data-structures"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+# Pure-Rust by default: no cloud SDK is pulled in.
+default = []
+# Amazon S3 backend for `MamStorage` (s3:// URIs).
+s3 = ["oximedia-storage/s3", "dep:aws-sdk-s3", "dep:aws-config"]
+# Google Cloud Storage backend for `MamStorage` (gs:// URIs).
+gcs = ["oximedia-storage/gcs", "dep:google-cloud-storage"]
+# Azure Blob Storage backend for `MamStorage` (https://<account>.blob.core.windows.net URIs).
+azure = ["oximedia-storage/azure"]
+
+[dependencies]
+# Database (PostgreSQL only).
+# Direct spec instead of `workspace = true`: the workspace-level sqlx enables the
+# "sqlite" feature, which drags in libsqlite3-sys (bundled C). oximedia-mam uses
+# only PostgreSQL, so it opts out here to keep the default build 100% Pure Rust.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "migrate",
+    "json",
+    "uuid",
+    "chrono",
+] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Date/Time
+chrono = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# Search Engine.
+# Direct spec instead of `workspace = true`: tantivy's default feature set includes
+# "columnar-zstd-compression", which drags in zstd-sys (C). This is tantivy's default
+# feature set minus that one; block/doc-store compression uses lz4_flex (Pure Rust).
+tantivy = { version = "0.26", default-features = false, features = [
+    "mmap",
+    "stopwords",
+    "lz4-compression",
+    "stemmer",
+] }
+
+# Web Framework.
+# Direct spec instead of `workspace = true`: actix-web's default "compress-zstd"
+# feature drags in zstd-sys (C) via actix-http. This is actix-web's default feature
+# set minus the compress-* features — HTTP response compression is intentionally
+# disabled so the default build stays 100% Pure Rust.
+actix-web = { version = "4", default-features = false, features = [
+    "macros",
+    "cookies",
+    "http2",
+    "unicode",
+    "compat",
+    "ws",
+] }
+actix-rt = "2"
+
+# GraphQL
+async-graphql = { workspace = true }
+async-graphql-actix-web = "7"
+
+# Authentication
+jsonwebtoken = { workspace = true }
+bcrypt = "0.19"
+
+# Async
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+futures.workspace = true
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+
+# Cryptography
+sha2 = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Storage integration
+oximedia-storage = { workspace = true }
+oximedia-dedup = { workspace = true }
+
+# Pure-Rust pin (feature unification): oximedia-dedup depends on blake3, whose
+# default build compiles C/assembly SIMD kernels (e.g. blake3_neon.c) via `cc`.
+# Declaring blake3 here with the "pure" feature forces the portable pure-Rust
+# implementation for every build that includes oximedia-mam, keeping the default
+# build 100% Pure Rust. Output hashes are identical; only throughput differs.
+blake3.workspace = true
+
+# Cloud storage SDKs (optional — only pulled in by the s3/gcs/azure features)
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+google-cloud-storage = { workspace = true, optional = true }
+
+# Filesystem watching
+notify = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

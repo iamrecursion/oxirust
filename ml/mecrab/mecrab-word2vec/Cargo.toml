@@ -1,0 +1,35 @@
+[package]
+name = "mecrab-word2vec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "High-performance Word2Vec implementation with Hogwild! parallelization for MeCrab"
+keywords = ["nlp", "word2vec", "embeddings", "japanese", "hogwild"]
+categories = ["science", "text-processing"]
+
+[features]
+## Default feature set — no GPU (zero extra deps on plain `cargo build`)
+default = []
+## Enable GPU-accelerated training via wgpu (Vulkan / Metal / DX12 / GL / noop).
+## Falls back to CPU Hogwild! silently when no adapter is available.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+rayon.workspace = true
+rand = "0.10"
+anyhow = "1.0"
+thiserror.workspace = true
+memmap2.workspace = true
+byteorder.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wgpu    = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = "0.8"

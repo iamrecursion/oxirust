@@ -1,0 +1,45 @@
+[package]
+name = "oximedia-archive"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Media archive verification and long-term preservation system"
+keywords = ["archive", "preservation", "verification", "multimedia", "video"]
+categories = ["multimedia", "filesystem"]
+readme = "README.md"
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+sqlite = ["oxisql-core", "oxisql-sqlite-compat"]
+
+[dependencies]
+# "pure" forces the portable pure-Rust blake3 backend; without it a standalone
+# build of this crate would compile C/assembly SIMD kernels via `cc`.
+blake3.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+oxisql-core = { workspace = true, optional = true }
+oxisql-sqlite-compat = { workspace = true, optional = true }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+anyhow.workspace = true
+tracing = { workspace = true }
+hex.workspace = true
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+xxhash-rust = { workspace = true }
+md-5.workspace = true
+crc32fast = "1.5"
+rayon = { workspace = true }
+async-trait = { workspace = true }
+memmap2 = { workspace = true }
+regex.workspace = true
+csv = { workspace = true }

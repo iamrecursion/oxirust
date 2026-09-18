@@ -1,0 +1,47 @@
+[package]
+name = "oxiaudio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiAudio — COOLJAPAN Pure-Rust audio codec + DSP facade"
+categories = ["multimedia::audio"]
+keywords = ["audio", "codec", "pure-rust", "cooljapan", "oxiaudio"]
+readme = "README.md"
+
+[features]
+default = ["pure"]
+pure = [
+    "dep:oxiaudio-decode",
+    "dep:oxiaudio-encode",
+    "dep:oxiaudio-dsp",
+    "dep:rayon",
+]
+serde = ["oxiaudio-core/serde"]
+
+[dependencies]
+oxiaudio-core            = { workspace = true }
+oxiaudio-decode          = { workspace = true, optional = true }
+oxiaudio-encode          = { workspace = true, optional = true }
+oxiaudio-dsp             = { workspace = true, optional = true }
+rayon                    = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "facade_bench"
+harness = false
+
+# Both example files use decode_file/encode_wav/encode_flac/dsp::*/TranscodeStream,
+# all gated behind the `pure` feature (see [features] above) — without this,
+# `cargo build --no-default-features --all-targets` fails to resolve them.
+[[example]]
+name = "decode_dsp_encode"
+required-features = ["pure"]
+
+[[example]]
+name = "streaming_transcode"
+required-features = ["pure"]

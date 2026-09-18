@@ -1,0 +1,35 @@
+[package]
+name = "oximedia-align"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Video alignment and registration tools for multi-camera synchronization in OxiMedia"
+keywords = ["alignment", "synchronization", "multi-camera", "video", "multimedia"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-audio.workspace = true
+oximedia-graph.workspace = true
+thiserror.workspace = true
+nalgebra = "0.35"
+rayon.workspace = true
+serde.workspace = true
+oxifft.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

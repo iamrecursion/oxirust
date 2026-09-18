@@ -1,0 +1,37 @@
+[package]
+name = "oxixml-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "RDF 1.1/1.2 data model with RDF-star (replaces oxrdf)."
+keywords = ["rdf", "sparql", "triple", "dataset", "graph"]
+categories = ["data-structures", "parser-implementations"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+# RDF 1.2 (RDF-star): embedded triple terms and directional language-tagged strings.
+rdf-12 = []
+# RDF Dataset Canonicalization (RDFC-1.0), SHA-256/384 backed by `oxixml-support`.
+rdfc-10 = []
+# `serde` `Serialize`/`Deserialize` implementations for every term, statement and string type,
+# in the same JSON shape the SPARQL results format uses (`{"type": "uri", "value": ...}`).
+serde = ["dep:serde"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-iri = { workspace = true }
+oxixml-langtag = { workspace = true }
+oxixml-xsd = { workspace = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+
+[lints]
+workspace = true

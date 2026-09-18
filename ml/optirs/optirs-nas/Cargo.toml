@@ -1,0 +1,91 @@
+[package]
+name = "optirs-nas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "OptiRS Neural Architecture Search and hyperparameter optimization"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["nas", "neural-architecture", "hyperparameter", "bayesian", "evolutionary"]
+categories = ["science", "algorithms"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Core dependencies
+#
+# NOTE: `optirs-core` and `optirs-learned` were declared here but never used
+# (no `optirs_core::` / `optirs_learned::` path appears anywhere in this
+# crate). `optirs-learned` was pulled in only by the `learned_integration`
+# feature, which had no module behind it. Both are removed so `optirs-nas`
+# builds and tests standalone; the benchmark harness in `evaluation::benchmark`
+# implements its optimizer update rules directly, which also makes NAS scores
+# reproducible independently of sibling-crate changes.
+#
+# The `random` feature is declared explicitly rather than relied upon through
+# feature unification with a sibling crate: every search strategy samples from
+# `scirs2_core::random`, so this crate must request it itself.
+scirs2-core = { workspace = true, features = ["random"] }  # SciRS2 policy compliance
+
+# ❌ FORBIDDEN DEPENDENCIES REMOVED - Use SciRS2-Core abstractions instead
+# ndarray - Use scirs2_core::ndarray
+# num-traits - Use scirs2_core::numeric
+
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+log = { workspace = true }
+
+# Random generation and distributions - REMOVED: Use scirs2_core::random instead
+# rand = { workspace = true }
+# rand_distr = { workspace = true }
+
+# Optimization and search
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
+
+# System information
+num_cpus = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Async support
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+approx = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+# This crate deliberately declares NO optional features.
+#
+# It previously declared `bayesian`, `evolutionary`, `reinforcement`,
+# `progressive` and `multi_objective` (all in `default`), documented as gating
+# "the corresponding module in `search_strategies`". Not one `cfg(feature = ...)`
+# existed anywhere in the crate: every flag was inert, so `--no-default-features`
+# built exactly the same code as the default build and the documentation was
+# simply false. Removing them is the honest resolution — a flag that gates nothing
+# is worse than no flag, because it tells users they can trim the build when they
+# cannot.
+#
+# Real gating is not a drop-in change and is not being pretended at here: the
+# engine holds a `multi_objective::ParetoFront` field, `nas_engine::results`
+# re-exports it, and `nas_engine::engine` dispatches to every strategy through
+# `strategy_adapters`. Gating those modules means cfg-ing struct fields, trait
+# objects and dispatch arms across `nas_engine/`, and yields 2^5 build
+# configurations that nothing in CI exercises. If per-strategy builds are wanted,
+# that refactor should land together with the cfg matrix that proves it works.
+#
+# The `learned_integration` feature is likewise gone: it pulled in `optirs-learned`
+# with no module behind it (see the dependency comment above — that removal, and
+# the removal of the unused `optirs-core` dependency, must not be reverted).
+default = []

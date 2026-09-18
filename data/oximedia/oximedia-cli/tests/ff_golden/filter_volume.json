@@ -1,0 +1,9 @@
+{
+  "name": "filter_volume",
+  "args": ["-i", "in.mkv", "-af", "volume=2.0", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "audio_filters": 1
+  }
+}

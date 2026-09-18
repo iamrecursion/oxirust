@@ -1,0 +1,105 @@
+[package]
+name = "scirs2-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "WebAssembly (WASM) bindings for SciRS2 - JavaScript/TypeScript interop for scientific computing"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["scientific", "wasm", "webassembly", "javascript", "typescript"]
+categories = ["science", "mathematics", "wasm", "web-programming"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core SciRS2 dependencies
+scirs2-core = { workspace = true, features = ["array", "random", "serialization"], default-features = false }
+scirs2-fft = { workspace = true, default-features = false, features = ["oxifft"] }
+scirs2-signal = { workspace = true, default-features = false }
+scirs2-interpolate = { workspace = true, default-features = false }
+
+# WASM bindings
+wasm-bindgen = { workspace = true, features = ["serde-serialize"] }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = [
+    "console",
+    "Window",
+    "Document",
+    "Performance",
+    "PerformanceTiming",
+    "Navigator",
+    "WorkerGlobalScope",
+    "DedicatedWorkerGlobalScope",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+] }
+serde-wasm-bindgen = { workspace = true }
+console_error_panic_hook = { workspace = true, optional = true }
+
+# Core dependencies
+ndarray = { workspace = true, default-features = false, features = ["std", "serde"] }
+num-complex = { workspace = true, default-features = false }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# WASM-optimized dependencies
+# Explicitly add getrandom dependencies to force WASM features for all transitive dependencies
+# Different versions are pulled in by different dependencies, each needs their WASM features enabled
+# Version 0.2 uses "js" feature, while 0.3+ use "wasm_js" feature
+getrandom_v2 = { workspace = true, features = ["js"] }
+getrandom_v3 = { workspace = true }
+getrandom = { workspace = true }
+# UUID needs js feature for WASM
+uuid = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+approx = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "wasm_bench"
+harness = false
+
+[[bench]]
+name = "speedup_target"
+harness = false
+
+[features]
+default = ["console_error_panic_hook"]
+# WASM SIMD support (requires wasm32-simd128 target)
+simd = ["scirs2-core/simd"]
+# Enable all available modules
+all-modules = [
+    "linalg",
+    "stats",
+    "fft",
+    "signal",
+    "integrate",
+    "optimize",
+    "interpolate",
+]
+linalg = []
+stats = []
+fft = []
+signal = []
+integrate = []
+optimize = []
+interpolate = []
+
+[package.metadata.wasm-pack]
+# Configuration for wasm-pack
+profile-release = "production"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+default-target = "wasm32-unknown-unknown"
+
+[package.metadata.cargo-machete]
+# getrandom*/uuid exist solely to activate wasm_js/js features on transitive deps
+ignored = ["getrandom", "getrandom_v2", "getrandom_v3", "uuid"]

@@ -1,0 +1,24 @@
+[package]
+name = "oxixml-hdt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "HDT (Header-Dictionary-Triples) binary RDF: compact self-indexed reader/writer with triple-pattern queries."
+keywords = ["rdf", "hdt", "binary", "compression", "triple"]
+categories = ["data-structures", "parser-implementations", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-model = { workspace = true }
+
+[lints]
+workspace = true

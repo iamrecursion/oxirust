@@ -1,0 +1,1374 @@
+// Copyright 2026 COOLJAPAN OU (Team KitaSan)
+// SPDX-License-Identifier: Apache-2.0
+
+//! Bond length constraints via SHAKE, RATTLE, LINCS and SETTLE.
+//!
+//! SHAKE iteratively adjusts positions to satisfy distance constraints.
+//! RATTLE additionally adjusts velocities so that v_ij . r_ij = 0
+//! (velocity component along bond direction is zero).
+//! [`Lincs`] (LINear Constraint Solver, Hess et al. 1997) solves the linearised constraint
+//! equations with a truncated power-series expansion of the inverse of the constraint
+//! coupling matrix and then corrects the rotational lengthening of the bonds.
+//! [`SettleWater`] (Miyamoto & Kollman 1992) is the closed-form, non-iterative solution of
+//! the three distance constraints of a rigid water molecule.
+
+mod lincs;
+mod settle;
+
+pub use lincs::Lincs;
+pub use settle::SettleWater;
+
+use oxiphysics_core::math::{Real, Vec3};
+
+// ---------------------------------------------------------------------------
+// BondConstraint
+// ---------------------------------------------------------------------------
+
+/// A rigid bond constraint between two atoms.
+///
+/// The constraint enforces |r_i - r_j|^2 = `distance_sq` at every step.
+#[derive(Debug, Clone)]
+pub struct BondConstraint {
+    /// Index of atom i.
+    pub atom_i: usize,
+    /// Index of atom j.
+    pub atom_j: usize,
+    /// Target squared distance d^2 = d_target^2.
+    pub distance_sq: Real,
+}
+
+impl BondConstraint {
+    /// Create a new bond constraint with target distance `d`.
+    pub fn new(atom_i: usize, atom_j: usize, distance: Real) -> Self {
+        Self {
+            atom_i,
+            atom_j,
+            distance_sq: distance * distance,
+        }
+    }
+
+    /// Target distance (not squared).
+    pub fn target_distance(&self) -> Real {
+        self.distance_sq.sqrt()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AngleConstraint
+// ---------------------------------------------------------------------------
+
+/// A constraint on the angle between three atoms (i-j-k).
+///
+/// Enforced indirectly through a distance constraint on atoms i and k
+/// derived from the target angle and bond lengths.
+#[derive(Debug, Clone)]
+pub struct AngleConstraint {
+    /// Index of atom i (first end).
+    pub atom_i: usize,
+    /// Index of central atom j.
+    pub atom_j: usize,
+    /// Index of atom k (second end).
+    pub atom_k: usize,
+    /// Target angle in radians.
+    pub angle_rad: Real,
+    /// Bond length j-i.
+    pub r_ji: Real,
+    /// Bond length j-k.
+    pub r_jk: Real,
+}
+
+impl AngleConstraint {
+    /// Create a new angle constraint.
+    pub fn new(
+        atom_i: usize,
+        atom_j: usize,
+        atom_k: usize,
+        angle_rad: Real,
+        r_ji: Real,
+        r_jk: Real,
+    ) -> Self {
+        Self {
+            atom_i,
+            atom_j,
+            atom_k,
+            angle_rad,
+            r_ji,
+            r_jk,
+        }
+    }
+
+    /// Compute the i-k distance implied by the angle and bond lengths (law of cosines).
+    ///
+    /// r_ik^2 = r_ji^2 + r_jk^2 - 2*r_ji*r_jk*cos(theta)
+    pub fn implied_ik_distance_sq(&self) -> Real {
+        self.r_ji * self.r_ji + self.r_jk * self.r_jk
+            - 2.0 * self.r_ji * self.r_jk * self.angle_rad.cos()
+    }
+
+    /// Convert to a BondConstraint between atoms i and k.
+    pub fn to_bond_constraint(&self) -> BondConstraint {
+        BondConstraint {
+            atom_i: self.atom_i,
+            atom_j: self.atom_k,
+            distance_sq: self.implied_ik_distance_sq(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConstraintStats
+// ---------------------------------------------------------------------------
+
+/// Statistics from a constraint solution step.
+#[derive(Debug, Clone, Copy)]
+pub struct ConstraintStats {
+    /// Number of iterations performed.
+    pub iterations: u32,
+    /// Maximum relative constraint violation after solution.
+    pub max_violation: Real,
+    /// Whether the solver converged within tolerance.
+    pub converged: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Shake
+// ---------------------------------------------------------------------------
+
+/// SHAKE / RATTLE constraint solver.
+///
+/// SHAKE adjusts *positions* so that all bond-length constraints are
+/// satisfied after a time step.  RATTLE follows SHAKE and adjusts
+/// *velocities* so that the time derivative of every constraint is also
+/// satisfied.
+pub struct Shake {
+    /// Bond constraints to enforce.
+    pub constraints: Vec<BondConstraint>,
+    /// Maximum number of SHAKE iterations.
+    pub max_iter: usize,
+    /// Convergence tolerance on |delta(r^2)|.
+    pub tolerance: Real,
+}
+
+impl Shake {
+    /// Create a new SHAKE solver with default `max_iter = 500` and
+    /// `tolerance = 1e-8`.
+    pub fn new(constraints: Vec<BondConstraint>) -> Self {
+        Self {
+            constraints,
+            max_iter: 500,
+            tolerance: 1e-8,
+        }
+    }
+
+    /// Create a SHAKE solver with custom iteration limit and tolerance.
+    pub fn with_params(constraints: Vec<BondConstraint>, max_iter: usize, tolerance: Real) -> Self {
+        Self {
+            constraints,
+            max_iter,
+            tolerance,
+        }
+    }
+
+    /// Apply SHAKE: iteratively adjust `positions` so that every bond
+    /// length constraint is satisfied.
+    ///
+    /// `old_positions` are the positions *before* the unconstrained step.
+    /// `inv_masses[i]` is `1/m_i` for atom `i`.
+    ///
+    /// Returns the number of iterations performed.
+    pub fn apply(&self, positions: &mut [Vec3], old_positions: &[Vec3], inv_masses: &[f64]) -> u32 {
+        self.iterate(positions, old_positions, inv_masses, None)
+    }
+
+    /// The SHAKE sweep loop shared by [`Shake::apply`] and
+    /// [`Shake::constraint_forces`], so that the two can never drift apart.
+    ///
+    /// When `multipliers` is given (one slot per constraint) the Lagrange
+    /// multiplier `λ_c` of every correction is accumulated into the slot of its
+    /// constraint over all sweeps.  Every correction displaces the two atoms of a
+    /// constraint along its reference bond `r_ref` by `∓ λ_c · w · r_ref`
+    /// (`w = 1/m`), so the accumulated multipliers describe the whole constraint
+    /// displacement.
+    fn iterate(
+        &self,
+        positions: &mut [Vec3],
+        old_positions: &[Vec3],
+        inv_masses: &[f64],
+        mut multipliers: Option<&mut [f64]>,
+    ) -> u32 {
+        let mut iter = 0u32;
+
+        for _ in 0..self.max_iter {
+            iter += 1;
+            let mut converged = true;
+
+            for (index, c) in self.constraints.iter().enumerate() {
+                let i = c.atom_i;
+                let j = c.atom_j;
+
+                let r_new = positions[i] - positions[j];
+                let r_new_sq = r_new.norm_squared();
+
+                let delta_sq = r_new_sq - c.distance_sq;
+                if delta_sq.abs() <= self.tolerance * c.distance_sq {
+                    continue;
+                }
+                converged = false;
+
+                let r_ref = old_positions[i] - old_positions[j];
+                let denom = 2.0 * r_ref.dot(&r_new) * (inv_masses[i] + inv_masses[j]);
+                if denom.abs() < 1e-30 {
+                    continue;
+                }
+
+                let lambda = delta_sq / denom;
+
+                positions[i] -= r_ref * (lambda * inv_masses[i]);
+                positions[j] += r_ref * (lambda * inv_masses[j]);
+                if let Some(slot) = multipliers
+                    .as_deref_mut()
+                    .and_then(|accumulated| accumulated.get_mut(index))
+                {
+                    *slot += lambda;
+                }
+            }
+
+            if converged {
+                break;
+            }
+        }
+
+        iter
+    }
+
+    /// Apply SHAKE and return detailed statistics.
+    pub fn apply_with_stats(
+        &self,
+        positions: &mut [Vec3],
+        old_positions: &[Vec3],
+        inv_masses: &[f64],
+    ) -> ConstraintStats {
+        let iters = self.apply(positions, old_positions, inv_masses);
+
+        // Compute max violation
+        let max_violation = self.max_relative_violation(positions);
+        let converged = max_violation <= self.tolerance;
+
+        ConstraintStats {
+            iterations: iters,
+            max_violation,
+            converged,
+        }
+    }
+
+    /// Compute the maximum relative constraint violation.
+    pub fn max_relative_violation(&self, positions: &[Vec3]) -> Real {
+        let mut max_viol = 0.0_f64;
+        for c in &self.constraints {
+            let r = positions[c.atom_i] - positions[c.atom_j];
+            let r_sq = r.norm_squared();
+            let viol = (r_sq - c.distance_sq).abs() / c.distance_sq;
+            if viol > max_viol {
+                max_viol = viol;
+            }
+        }
+        max_viol
+    }
+
+    /// Apply RATTLE: adjust `velocities` after SHAKE so that
+    /// v_ij . r_ij = 0 for every constrained bond.
+    pub fn rattle(
+        &self,
+        positions: &[Vec3],
+        velocities: &mut [Vec3],
+        inv_masses: &[f64],
+        dt: Real,
+    ) {
+        for _ in 0..self.max_iter {
+            let mut converged = true;
+
+            for c in &self.constraints {
+                let i = c.atom_i;
+                let j = c.atom_j;
+
+                let r = positions[i] - positions[j];
+                let v = velocities[i] - velocities[j];
+
+                let rv = r.dot(&v);
+                if rv.abs() <= self.tolerance {
+                    continue;
+                }
+                converged = false;
+
+                let r_sq = r.norm_squared();
+                if r_sq < 1e-30 {
+                    continue;
+                }
+
+                let mu = rv / (r_sq * (inv_masses[i] + inv_masses[j]) * dt);
+
+                velocities[i] -= r * (mu * inv_masses[i] * dt);
+                velocities[j] += r * (mu * inv_masses[j] * dt);
+            }
+
+            if converged {
+                break;
+            }
+        }
+    }
+
+    /// Apply RATTLE and return statistics.
+    pub fn rattle_with_stats(
+        &self,
+        positions: &[Vec3],
+        velocities: &mut [Vec3],
+        inv_masses: &[f64],
+        dt: Real,
+    ) -> ConstraintStats {
+        let mut iters = 0u32;
+        let mut final_converged = false;
+
+        for _ in 0..self.max_iter {
+            iters += 1;
+            let mut converged = true;
+
+            for c in &self.constraints {
+                let i = c.atom_i;
+                let j = c.atom_j;
+                let r = positions[i] - positions[j];
+                let v = velocities[i] - velocities[j];
+                let rv = r.dot(&v);
+                if rv.abs() <= self.tolerance {
+                    continue;
+                }
+                converged = false;
+                let r_sq = r.norm_squared();
+                if r_sq < 1e-30 {
+                    continue;
+                }
+                let mu = rv / (r_sq * (inv_masses[i] + inv_masses[j]) * dt);
+                velocities[i] -= r * (mu * inv_masses[i] * dt);
+                velocities[j] += r * (mu * inv_masses[j] * dt);
+            }
+
+            if converged {
+                final_converged = true;
+                break;
+            }
+        }
+
+        // Max velocity violation
+        let mut max_viol = 0.0_f64;
+        for c in &self.constraints {
+            let r = positions[c.atom_i] - positions[c.atom_j];
+            let v = velocities[c.atom_i] - velocities[c.atom_j];
+            let rv = r.dot(&v).abs();
+            if rv > max_viol {
+                max_viol = rv;
+            }
+        }
+
+        ConstraintStats {
+            iterations: iters,
+            max_violation: max_viol,
+            converged: final_converged,
+        }
+    }
+
+    /// Compute the constraint forces that SHAKE implicitly applies in one step.
+    ///
+    /// `positions` must be the *unconstrained* positions, i.e. the array handed to
+    /// [`Shake::apply`] before it is shaken; `old_positions` are the reference
+    /// positions of that step, `inv_masses[i]` is `1/m_i` and `dt` the (positive)
+    /// time step.  If the already constrained positions are passed instead, no
+    /// constraint is violated, every multiplier is zero and so are the forces.
+    ///
+    /// SHAKE moves the atoms `i` and `j` of constraint `c` along its reference bond
+    /// `r_ref = r_i^old - r_j^old` by `Δr_i = -λ_c w_i r_ref` and
+    /// `Δr_j = +λ_c w_j r_ref`, with `λ_c` the multiplier summed over all sweeps.
+    /// The force that produces this displacement in one time step is
+    /// `F = m Δr / dt²`, so the mass cancels:
+    ///
+    /// ```text
+    /// F_i = -(λ_c / dt²) r_ref,     F_j = +(λ_c / dt²) r_ref.
+    /// ```
+    ///
+    /// The two forces of a constraint are therefore exactly equal and opposite
+    /// (Newton's third law) and, for every atom, `F_i = m_i (shaken_i - unconstrained_i) / dt²`
+    /// holds with `shaken` the result of [`Shake::apply`] with the same `max_iter`
+    /// and tolerance.  Atoms with `inv_masses[i] = 0` (infinite mass) receive the
+    /// finite reaction force of their constraints.
+    ///
+    /// Returns the force on each atom due to the constraints.
+    pub fn constraint_forces(
+        &self,
+        positions: &[Vec3],
+        old_positions: &[Vec3],
+        inv_masses: &[f64],
+        dt: Real,
+    ) -> Vec<Vec3> {
+        let n = positions.len();
+        let mut forces = vec![Vec3::new(0.0, 0.0, 0.0); n];
+
+        let mut scratch = positions.to_vec();
+        let mut multipliers = vec![0.0_f64; self.constraints.len()];
+        self.iterate(
+            &mut scratch,
+            old_positions,
+            inv_masses,
+            Some(multipliers.as_mut_slice()),
+        );
+
+        let f_scale = 1.0 / (dt * dt);
+        for (c, lambda) in self.constraints.iter().zip(multipliers.iter()) {
+            let r_ref = old_positions[c.atom_i] - old_positions[c.atom_j];
+            let constraint_force = r_ref * (lambda * f_scale);
+            forces[c.atom_i] -= constraint_force;
+            forces[c.atom_j] += constraint_force;
+        }
+
+        forces
+    }
+}
+
+// ---------------------------------------------------------------------------
+// water_shake_constraints
+// ---------------------------------------------------------------------------
+
+/// Create O-H and H-H bond constraints for a TIP3P water molecule.
+///
+/// Atom ordering: O = `first_atom`, H1 = `first_atom+1`, H2 = `first_atom+2`.
+///
+/// Distances (in Å):
+/// * O-H : 0.9572 Å
+/// * H-H : 1.5139 Å
+pub fn water_shake_constraints(first_atom: usize) -> Vec<BondConstraint> {
+    let o = first_atom;
+    let h1 = first_atom + 1;
+    let h2 = first_atom + 2;
+
+    let d_oh: Real = 0.9572;
+    let d_hh: Real = 1.5139;
+
+    vec![
+        BondConstraint {
+            atom_i: o,
+            atom_j: h1,
+            distance_sq: d_oh * d_oh,
+        },
+        BondConstraint {
+            atom_i: o,
+            atom_j: h2,
+            distance_sq: d_oh * d_oh,
+        },
+        BondConstraint {
+            atom_i: h1,
+            atom_j: h2,
+            distance_sq: d_hh * d_hh,
+        },
+    ]
+}
+
+/// Create constraints for an SPC water molecule.
+///
+/// O-H = 1.0 Å, H-O-H = 109.47°.
+pub fn water_spc_constraints(first_atom: usize) -> Vec<BondConstraint> {
+    let o = first_atom;
+    let h1 = first_atom + 1;
+    let h2 = first_atom + 2;
+
+    let d_oh: Real = 1.0;
+    let half_angle = 109.47_f64.to_radians() / 2.0;
+    let d_hh: Real = 2.0 * d_oh * half_angle.sin();
+
+    vec![
+        BondConstraint::new(o, h1, d_oh),
+        BondConstraint::new(o, h2, d_oh),
+        BondConstraint::new(h1, h2, d_hh),
+    ]
+}
+
+/// Create constraints for a chain of `n_bonds` equal bonds.
+///
+/// Atoms are numbered `first_atom`, `first_atom+1`, ..., `first_atom+n_bonds`.
+pub fn chain_constraints(
+    first_atom: usize,
+    n_bonds: usize,
+    bond_length: Real,
+) -> Vec<BondConstraint> {
+    (0..n_bonds)
+        .map(|i| BondConstraint::new(first_atom + i, first_atom + i + 1, bond_length))
+        .collect()
+}
+
+/// Total constraint satisfaction error: sum of |r^2 - d^2| / d^2 over all constraints.
+pub fn total_constraint_error(constraints: &[BondConstraint], positions: &[Vec3]) -> Real {
+    constraints
+        .iter()
+        .map(|c| {
+            let r = positions[c.atom_i] - positions[c.atom_j];
+            (r.norm_squared() - c.distance_sq).abs() / c.distance_sq
+        })
+        .sum()
+}
+
+// ---------------------------------------------------------------------------
+// Holonomic constraint matrix
+// ---------------------------------------------------------------------------
+
+/// Compute the holonomic constraint Jacobian matrix G (n_constraints × 3N).
+///
+/// Each row `c` of the matrix is the gradient of the constraint function
+/// `σ_c(q) = |r_i - r_j| - d_0` with respect to all Cartesian coordinates.
+///
+/// The positions are passed in as a flat list of N atoms; the resulting
+/// matrix has shape `[n_constraints][3*n_atoms]`.
+pub fn holonomic_constraint_matrix_with_positions(
+    constraints: &[BondConstraint],
+    positions: &[Vec3],
+) -> Vec<Vec<Real>> {
+    let n = positions.len();
+    let dim = 3 * n;
+    let mut g = vec![vec![0.0_f64; dim]; constraints.len()];
+
+    for (row, c) in constraints.iter().enumerate() {
+        let i = c.atom_i;
+        let j = c.atom_j;
+        let rij = positions[i] - positions[j];
+        let r = rij.norm();
+        if r < 1e-30 {
+            continue;
+        }
+        let unit = rij / r;
+        // dσ/dr_i = +unit, dσ/dr_j = -unit
+        for a in 0..3 {
+            g[row][3 * i + a] = unit[a];
+            g[row][3 * j + a] = -unit[a];
+        }
+    }
+    g
+}
+
+/// Compute the holonomic constraint Jacobian using unit bond vectors along x.
+///
+/// This version is for atoms placed on a line (useful for benchmarks/tests).
+pub fn holonomic_constraint_matrix(
+    constraints: &[BondConstraint],
+    n_atoms: usize,
+) -> Vec<Vec<Real>> {
+    let dim = 3 * n_atoms;
+    let mut g = vec![vec![0.0_f64; dim]; constraints.len()];
+
+    for (row, c) in constraints.iter().enumerate() {
+        let i = c.atom_i;
+        let j = c.atom_j;
+        if i < n_atoms && j < n_atoms {
+            // Default: unit vector along +x
+            g[row][3 * i] = 1.0;
+            g[row][3 * j] = -1.0;
+        }
+    }
+    g
+}
+
+// ---------------------------------------------------------------------------
+// Penalty constraint (soft constraint via large spring constant)
+// ---------------------------------------------------------------------------
+
+/// A penalty (soft) constraint that enforces bond lengths via a stiff harmonic
+/// spring rather than the exact Lagrangian approach.
+///
+/// V_penalty = 0.5 * k_penalty * (|r_i - r_j| - d_0)^2
+#[derive(Debug, Clone)]
+pub struct PenaltyConstraint {
+    /// The underlying bond constraint (target distance).
+    pub bond: BondConstraint,
+    /// Penalty spring constant (force units / length^2).
+    pub k_penalty: Real,
+}
+
+impl PenaltyConstraint {
+    /// Create a new penalty constraint.
+    pub fn new(atom_i: usize, atom_j: usize, distance: Real, k: Real) -> Self {
+        Self {
+            bond: BondConstraint::new(atom_i, atom_j, distance),
+            k_penalty: k,
+        }
+    }
+
+    /// Potential energy of this penalty constraint.
+    pub fn energy(&self, positions: &[Vec3]) -> Real {
+        let r = (positions[self.bond.atom_i] - positions[self.bond.atom_j]).norm();
+        let d0 = self.bond.target_distance();
+        let dr = r - d0;
+        0.5 * self.k_penalty * dr * dr
+    }
+
+    /// Forces on atoms i and j due to this penalty constraint.
+    ///
+    /// Returns a Vec of forces for all atoms (only indices i and j are nonzero).
+    pub fn forces(&self, positions: &[Vec3]) -> Vec<Vec3> {
+        let n = positions.len();
+        let mut forces = vec![Vec3::new(0.0, 0.0, 0.0); n];
+        let i = self.bond.atom_i;
+        let j = self.bond.atom_j;
+        let rij = positions[i] - positions[j];
+        let r = rij.norm();
+        if r < 1e-15 {
+            return forces;
+        }
+        let d0 = self.bond.target_distance();
+        let dr = r - d0;
+        // Force = -∂V/∂r_i = -k*(r-d0)/r * rij (restoring force pulls i toward j)
+        let mag = self.k_penalty * dr / r;
+        forces[i] -= rij * mag;
+        forces[j] += rij * mag;
+        forces
+    }
+
+    /// Apply the penalty force to the accumulated forces array (in-place).
+    pub fn accumulate_forces(&self, positions: &[Vec3], forces: &mut [Vec3]) {
+        let i = self.bond.atom_i;
+        let j = self.bond.atom_j;
+        let rij = positions[i] - positions[j];
+        let r = rij.norm();
+        if r < 1e-15 {
+            return;
+        }
+        let d0 = self.bond.target_distance();
+        let dr = r - d0;
+        // Force = -∂V/∂r_i = -k*(r-d0)/r * rij
+        let mag = self.k_penalty * dr / r;
+        forces[i] -= rij * mag;
+        forces[j] += rij * mag;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RATTLE velocity constraints (standalone helper)
+// ---------------------------------------------------------------------------
+
+/// Apply RATTLE velocity correction to ensure v_ij · r_ij = 0 for all bonds.
+///
+/// This is the same as `Shake::rattle` but exposed as a free function for
+/// use without the full `Shake` struct.
+pub fn rattle_velocities(
+    constraints: &[BondConstraint],
+    positions: &[Vec3],
+    velocities: &mut [Vec3],
+    inv_masses: &[f64],
+    dt: Real,
+    max_iter: usize,
+    tolerance: Real,
+) -> ConstraintStats {
+    let mut iters = 0u32;
+    let mut converged = false;
+
+    for _ in 0..max_iter {
+        iters += 1;
+        let mut all_ok = true;
+
+        for c in constraints {
+            let i = c.atom_i;
+            let j = c.atom_j;
+            let r = positions[i] - positions[j];
+            let v = velocities[i] - velocities[j];
+            let rv = r.dot(&v);
+            if rv.abs() <= tolerance {
+                continue;
+            }
+            all_ok = false;
+            let r_sq = r.norm_squared();
+            if r_sq < 1e-30 {
+                continue;
+            }
+            let mu = rv / (r_sq * (inv_masses[i] + inv_masses[j]) * dt);
+            velocities[i] -= r * (mu * inv_masses[i] * dt);
+            velocities[j] += r * (mu * inv_masses[j] * dt);
+        }
+
+        if all_ok {
+            converged = true;
+            break;
+        }
+    }
+
+    let mut max_viol = 0.0_f64;
+    for c in constraints {
+        let r = positions[c.atom_i] - positions[c.atom_j];
+        let v = velocities[c.atom_i] - velocities[c.atom_j];
+        let rv = r.dot(&v).abs();
+        if rv > max_viol {
+            max_viol = rv;
+        }
+    }
+
+    ConstraintStats {
+        iterations: iters,
+        max_violation: max_viol,
+        converged,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tolerance for position-level assertions (1e-6).
+    const POS_TOL: Real = 1e-6;
+    /// Tolerance for velocity-level assertions (1e-5).
+    const VEL_TOL: Real = 1e-5;
+
+    // ------------------------------------------------------------------
+    // 1. test_shake_single_bond
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_shake_single_bond() {
+        let target_d: Real = 1.0;
+        let c = vec![BondConstraint {
+            atom_i: 0,
+            atom_j: 1,
+            distance_sq: target_d * target_d,
+        }];
+        let shake = Shake::new(c);
+
+        let old_positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)];
+        let mut positions = old_positions.clone();
+        let inv_masses = vec![1.0, 1.0];
+
+        let iters = shake.apply(&mut positions, &old_positions, &inv_masses);
+
+        let dist = (positions[0] - positions[1]).norm();
+        assert!(
+            (dist - target_d).abs() < POS_TOL,
+            "expected dist={target_d}, got {dist}"
+        );
+        assert!(iters > 0);
+    }
+
+    // ------------------------------------------------------------------
+    // 2. test_shake_bond_already_satisfied
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_shake_bond_already_satisfied() {
+        let target_d: Real = 1.0;
+        let c = vec![BondConstraint {
+            atom_i: 0,
+            atom_j: 1,
+            distance_sq: target_d * target_d,
+        }];
+        let shake = Shake::new(c);
+
+        let old_positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)];
+        let mut positions = old_positions.clone();
+        let inv_masses = vec![1.0, 1.0];
+
+        let iters = shake.apply(&mut positions, &old_positions, &inv_masses);
+
+        let dist = (positions[0] - positions[1]).norm();
+        assert!((dist - target_d).abs() < POS_TOL, "dist={dist}");
+        assert_eq!(
+            iters, 1,
+            "already-satisfied constraint should converge in 1 iter"
+        );
+        assert!((positions[0] - old_positions[0]).norm() < POS_TOL);
+        assert!((positions[1] - old_positions[1]).norm() < POS_TOL);
+    }
+
+    // ------------------------------------------------------------------
+    // 3. test_shake_triangle
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_shake_triangle() {
+        let target_d: Real = 1.0;
+        let constraints = vec![
+            BondConstraint {
+                atom_i: 0,
+                atom_j: 1,
+                distance_sq: target_d * target_d,
+            },
+            BondConstraint {
+                atom_i: 1,
+                atom_j: 2,
+                distance_sq: target_d * target_d,
+            },
+            BondConstraint {
+                atom_i: 0,
+                atom_j: 2,
+                distance_sq: target_d * target_d,
+            },
+        ];
+        let shake = Shake::new(constraints);
+
+        let half = 0.5_f64;
+        let h = (3.0_f64 / 4.0).sqrt();
+        let old_positions = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(half, h, 0.0),
+        ];
+
+        let mut positions = vec![
+            Vec3::new(0.05, -0.03, 0.0),
+            Vec3::new(1.04, 0.02, 0.0),
+            Vec3::new(half + 0.01, h - 0.04, 0.0),
+        ];
+
+        let inv_masses = vec![1.0, 1.0, 1.0];
+
+        let iters = shake.apply(&mut positions, &old_positions, &inv_masses);
+
+        for c in shake.constraints.iter() {
+            let d = (positions[c.atom_i] - positions[c.atom_j]).norm();
+            assert!(
+                (d - target_d).abs() < POS_TOL,
+                "bond ({},{}) dist={d}, iters={iters}",
+                c.atom_i,
+                c.atom_j
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 4. test_rattle_velocity_perpendicular
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_rattle_velocity_perpendicular() {
+        let target_d: Real = 1.5;
+        let c = vec![BondConstraint {
+            atom_i: 0,
+            atom_j: 1,
+            distance_sq: target_d * target_d,
+        }];
+        let shake = Shake::new(c);
+
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(target_d, 0.0, 0.0)];
+        let mut velocities = vec![Vec3::new(0.3, 1.0, 0.0), Vec3::new(-0.2, 0.5, 0.0)];
+        let inv_masses = vec![1.0, 1.0];
+        let dt = 0.002;
+
+        shake.rattle(&positions, &mut velocities, &inv_masses, dt);
+
+        let r = positions[0] - positions[1];
+        let v = velocities[0] - velocities[1];
+        let rv = r.dot(&v);
+        assert!(
+            rv.abs() < VEL_TOL,
+            "v_ij . r_ij = {rv} should be < {VEL_TOL}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 5. test_water_constraints
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_water_constraints() {
+        let constraints = water_shake_constraints(0);
+
+        assert_eq!(constraints.len(), 3, "TIP3P water needs 3 constraints");
+
+        let d_oh: Real = 0.9572;
+        let d_hh: Real = 1.5139;
+
+        assert!((constraints[0].distance_sq - d_oh * d_oh).abs() < 1e-10);
+        assert!((constraints[1].distance_sq - d_oh * d_oh).abs() < 1e-10);
+        assert!((constraints[2].distance_sq - d_hh * d_hh).abs() < 1e-10);
+
+        let shake = Shake::new(constraints);
+
+        let angle_half = (104.52_f64.to_radians()) / 2.0;
+        let old_positions = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(d_oh * angle_half.sin(), d_oh * angle_half.cos(), 0.0),
+            Vec3::new(-d_oh * angle_half.sin(), d_oh * angle_half.cos(), 0.0),
+        ];
+
+        let mut positions = vec![
+            old_positions[0] + Vec3::new(0.02, -0.01, 0.0),
+            old_positions[1] + Vec3::new(-0.01, 0.02, 0.0),
+            old_positions[2] + Vec3::new(0.01, 0.01, 0.0),
+        ];
+
+        let inv_masses = vec![1.0 / 16.0, 1.0, 1.0];
+
+        let iters = shake.apply(&mut positions, &old_positions, &inv_masses);
+
+        for c in shake.constraints.iter() {
+            let d = (positions[c.atom_i] - positions[c.atom_j]).norm();
+            let d_target = c.distance_sq.sqrt();
+            assert!(
+                (d - d_target).abs() < POS_TOL,
+                "water bond ({},{}) dist={d}, target={d_target}, iters={iters}",
+                c.atom_i,
+                c.atom_j
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6. test_bond_constraint_constructor
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_bond_constraint_constructor() {
+        let c = BondConstraint::new(0, 1, 1.5);
+        assert_eq!(c.atom_i, 0);
+        assert_eq!(c.atom_j, 1);
+        assert!((c.target_distance() - 1.5).abs() < 1e-12);
+    }
+
+    // ------------------------------------------------------------------
+    // 7. test_angle_constraint_ik_distance
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_angle_constraint_ik_distance() {
+        // Equilateral triangle: angle = 60 deg, r = 1.0
+        let ac = AngleConstraint::new(0, 1, 2, std::f64::consts::FRAC_PI_3, 1.0, 1.0);
+        let d_ik_sq = ac.implied_ik_distance_sq();
+        // For equilateral: d_ik = 1.0
+        assert!(
+            (d_ik_sq - 1.0).abs() < 1e-10,
+            "equilateral d_ik^2 = {d_ik_sq}, expected 1.0"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 8. test_angle_constraint_right_angle
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_angle_constraint_right_angle() {
+        // Right angle: 90 deg, r_ji = 3, r_jk = 4 -> d_ik = 5 (Pythagorean)
+        let ac = AngleConstraint::new(0, 1, 2, std::f64::consts::FRAC_PI_2, 3.0, 4.0);
+        let d_ik = ac.implied_ik_distance_sq().sqrt();
+        assert!(
+            (d_ik - 5.0).abs() < 1e-10,
+            "3-4-5 triangle: d_ik = {d_ik}, expected 5.0"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 9. test_angle_to_bond_constraint
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_angle_to_bond_constraint() {
+        let ac = AngleConstraint::new(0, 1, 2, std::f64::consts::FRAC_PI_3, 1.0, 1.0);
+        let bc = ac.to_bond_constraint();
+        assert_eq!(bc.atom_i, 0);
+        assert_eq!(bc.atom_j, 2);
+        assert!((bc.target_distance() - 1.0).abs() < 1e-10);
+    }
+
+    // ------------------------------------------------------------------
+    // 10. test_shake_with_stats
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_shake_with_stats() {
+        let c = vec![BondConstraint::new(0, 1, 1.0)];
+        let shake = Shake::new(c);
+
+        let old_positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)];
+        let mut positions = old_positions.clone();
+        let inv_masses = vec![1.0, 1.0];
+
+        let stats = shake.apply_with_stats(&mut positions, &old_positions, &inv_masses);
+        assert!(
+            stats.converged,
+            "should converge for already-satisfied constraint"
+        );
+        assert_eq!(stats.iterations, 1);
+        assert!(stats.max_violation < 1e-8);
+    }
+
+    // ------------------------------------------------------------------
+    // 11. test_rattle_with_stats
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_rattle_with_stats() {
+        let c = vec![BondConstraint::new(0, 1, 1.0)];
+        let shake = Shake::new(c);
+
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)];
+        let mut velocities = vec![Vec3::new(1.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)];
+        let inv_masses = vec![1.0, 1.0];
+
+        let stats = shake.rattle_with_stats(&positions, &mut velocities, &inv_masses, 0.001);
+        assert!(stats.converged);
+    }
+
+    // ------------------------------------------------------------------
+    // 12. test_spc_water_constraints
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_spc_water_constraints() {
+        let constraints = water_spc_constraints(0);
+        assert_eq!(constraints.len(), 3);
+
+        // O-H should be 1.0 Å
+        let d_oh = constraints[0].target_distance();
+        assert!((d_oh - 1.0).abs() < 1e-10, "SPC O-H = {d_oh}");
+
+        // H-H from tetrahedral angle
+        let half_angle = 109.47_f64.to_radians() / 2.0;
+        let expected_hh = 2.0 * 1.0 * half_angle.sin();
+        let d_hh = constraints[2].target_distance();
+        assert!(
+            (d_hh - expected_hh).abs() < 1e-6,
+            "SPC H-H = {d_hh}, expected {expected_hh}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 13. test_chain_constraints
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_chain_constraints() {
+        let constraints = chain_constraints(0, 5, 1.5);
+        assert_eq!(constraints.len(), 5);
+        for (i, c) in constraints.iter().enumerate() {
+            assert_eq!(c.atom_i, i);
+            assert_eq!(c.atom_j, i + 1);
+            assert!((c.target_distance() - 1.5).abs() < 1e-12);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 14. test_total_constraint_error
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_total_constraint_error() {
+        let constraints = vec![BondConstraint::new(0, 1, 1.0)];
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)];
+        let err = total_constraint_error(&constraints, &positions);
+        assert!(
+            err < 1e-12,
+            "error should be ~0 for satisfied constraints, got {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 16. test_shake_unequal_masses
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_shake_unequal_masses() {
+        // Heavy atom (mass 100) and light atom (mass 1)
+        let c = vec![BondConstraint::new(0, 1, 2.0)];
+        let shake = Shake::new(c);
+
+        let old_positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)];
+        let mut positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.5, 0.0, 0.0)];
+        let inv_masses = vec![0.01, 1.0]; // heavy vs light
+
+        shake.apply(&mut positions, &old_positions, &inv_masses);
+
+        let d = (positions[0] - positions[1]).norm();
+        assert!((d - 2.0).abs() < POS_TOL, "dist = {d}, expected 2.0");
+
+        // Heavy atom should barely move
+        assert!(
+            (positions[0] - old_positions[0]).norm() < 0.01,
+            "heavy atom should barely move"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 17. test_max_relative_violation
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_max_relative_violation() {
+        let constraints = vec![BondConstraint::new(0, 1, 1.0)];
+        let shake = Shake::new(constraints);
+
+        // Bond length is 1.1 instead of 1.0 -> violation = |1.21 - 1.0| / 1.0 = 0.21
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.1, 0.0, 0.0)];
+        let viol = shake.max_relative_violation(&positions);
+        assert!(
+            (viol - 0.21).abs() < 1e-10,
+            "violation = {viol}, expected 0.21"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 18. test_shake_with_custom_params
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_shake_with_custom_params() {
+        let c = vec![BondConstraint::new(0, 1, 1.0)];
+        let shake = Shake::with_params(c, 100, 1e-12);
+        assert_eq!(shake.max_iter, 100);
+        assert!((shake.tolerance - 1e-12).abs() < 1e-20);
+    }
+
+    // ------------------------------------------------------------------
+    // 21. test_holonomic_constraint_matrix_size
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_holonomic_constraint_matrix_size() {
+        let constraints = vec![
+            BondConstraint::new(0, 1, 1.0),
+            BondConstraint::new(1, 2, 1.0),
+        ];
+        let n_atoms = 3;
+        let mat = holonomic_constraint_matrix(&constraints, n_atoms);
+        // 2 constraints × (3 atoms × 3 coords) = 2 × 9
+        assert_eq!(mat.len(), 2);
+        assert_eq!(mat[0].len(), 9);
+    }
+
+    // ------------------------------------------------------------------
+    // 22. test_holonomic_constraint_matrix_row_sum
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_holonomic_constraint_matrix_row_sum() {
+        let constraints = vec![BondConstraint::new(0, 1, 1.0)];
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)];
+        let mat = holonomic_constraint_matrix_with_positions(&constraints, &positions);
+        // Row sum for gradient of bond length constraint: should be near zero
+        // (forces sum to zero by Newton III in the gradient sense)
+        let row_sum: Real = mat[0].iter().sum();
+        assert!(row_sum.abs() < 1e-10, "Row sum = {row_sum}");
+    }
+
+    // ------------------------------------------------------------------
+    // 23. test_penalty_constraint_energy
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_penalty_constraint_energy() {
+        let c = BondConstraint::new(0, 1, 1.0);
+        let penalty = PenaltyConstraint {
+            bond: c,
+            k_penalty: 1000.0,
+        };
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.5, 0.0, 0.0)];
+        let e = penalty.energy(&positions);
+        // V = 0.5 * k * (r - r0)^2 = 0.5 * 1000 * 0.5^2 = 125
+        assert!((e - 125.0).abs() < 1e-8, "penalty energy = {e}");
+    }
+
+    // ------------------------------------------------------------------
+    // 24. test_penalty_constraint_zero_at_equilibrium
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_penalty_constraint_zero_at_equilibrium() {
+        let c = BondConstraint::new(0, 1, 1.5);
+        let penalty = PenaltyConstraint {
+            bond: c,
+            k_penalty: 500.0,
+        };
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.5, 0.0, 0.0)];
+        let e = penalty.energy(&positions);
+        assert!(
+            e.abs() < 1e-10,
+            "energy at equilibrium should be zero, got {e}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 25. test_penalty_constraint_forces
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_penalty_constraint_forces() {
+        let c = BondConstraint::new(0, 1, 1.0);
+        let penalty = PenaltyConstraint {
+            bond: c,
+            k_penalty: 100.0,
+        };
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)];
+        let forces = penalty.forces(&positions);
+        // Bond is stretched: force on atom 0 should be +x (toward atom 1)
+        assert!(
+            forces[0][0] > 0.0,
+            "Force on atom 0 should be +x: {}",
+            forces[0][0]
+        );
+        assert!(
+            forces[1][0] < 0.0,
+            "Force on atom 1 should be -x: {}",
+            forces[1][0]
+        );
+        // Newton III
+        let sum = forces[0][0] + forces[1][0];
+        assert!(sum.abs() < 1e-10, "force sum = {sum}");
+    }
+
+    // ------------------------------------------------------------------
+    // 26. test_rattle_constraint_force_calculation
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_rattle_constraint_force_calculation() {
+        let c = vec![BondConstraint::new(0, 1, 1.0)];
+        let shake = Shake::new(c);
+        let old_positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)];
+        let positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.05, 0.0, 0.0)];
+        let inv_masses = vec![1.0, 1.0];
+        let dt = 0.001;
+        let forces = shake.constraint_forces(&positions, &old_positions, &inv_masses, dt);
+        assert_eq!(forces.len(), 2);
+        // Constraint forces should be finite
+        for f in &forces {
+            assert!(f.norm().is_finite());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 30. test_constraint_error_multiple
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_constraint_error_multiple() {
+        let constraints = vec![
+            BondConstraint::new(0, 1, 1.0),
+            BondConstraint::new(1, 2, 1.0),
+        ];
+        // Perfectly satisfied
+        let positions = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+        ];
+        let err = total_constraint_error(&constraints, &positions);
+        assert!(err < 1e-12, "error = {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // SHAKE constraint forces
+    // ------------------------------------------------------------------
+
+    /// Water geometry (O, H1, H2) built from the constraint distances themselves
+    /// (O-H 0.9572 Å, H-H 1.5139 Å), so that no constraint is violated.  Rebuilding it
+    /// from the 104.52° angle would miss d_HH by ~1e-6 relative, which already
+    /// produces sizeable constraint forces after the division by dt².
+    fn tip3p_reference() -> Vec<Vec3> {
+        let (d_oh, d_hh): (Real, Real) = (0.9572, 1.5139);
+        let half = 0.5 * d_hh;
+        let height = (d_oh * d_oh - half * half).sqrt();
+        vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(half, height, 0.0),
+            Vec3::new(-half, height, 0.0),
+        ]
+    }
+
+    #[test]
+    fn test_constraint_forces_single_oh_pair_obey_newton_iii() {
+        // One O-H constraint with unequal masses (O 15.9994 u, H 1.008 u); a single SHAKE
+        // sweep, for which the force is exactly m_i * (shaken_i - unconstrained_i) / dt^2.
+        let (m_o, m_h) = (15.9994_f64, 1.008_f64);
+        let inv_masses = vec![1.0 / m_o, 1.0 / m_h];
+        let shake = Shake::with_params(vec![BondConstraint::new(0, 1, 0.9572)], 1, 1e-8);
+        let old_positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.9572, 0.0, 0.0)];
+        let unconstrained = vec![
+            old_positions[0] + Vec3::new(0.012, -0.007, 0.004),
+            old_positions[1] + Vec3::new(-0.02, 0.03, -0.01),
+        ];
+        let dt = 0.002;
+
+        let mut shaken = unconstrained.clone();
+        shake.apply(&mut shaken, &old_positions, &inv_masses);
+        let forces = shake.constraint_forces(&unconstrained, &old_positions, &inv_masses, dt);
+
+        assert!(forces[0].norm() > 1e-3, "the violated bond must be forced");
+        assert_eq!(forces[0], -forces[1], "Newton III: F_O = -F_H");
+        for (atom, mass) in [m_o, m_h].into_iter().enumerate() {
+            let expected = (shaken[atom] - unconstrained[atom]) * (mass / (dt * dt));
+            assert!(
+                (forces[atom] - expected).norm() <= 1e-10 * expected.norm(),
+                "atom {atom}: F = {:?}, m (shaken - unconstrained) / dt^2 = {expected:?}",
+                forces[atom]
+            );
+        }
+        // The force acts along the reference bond.
+        let bond = old_positions[0] - old_positions[1];
+        assert!(forces[0].cross(&bond).norm() < 1e-12 * forces[0].norm() * bond.norm());
+    }
+
+    #[test]
+    fn test_constraint_forces_of_rigid_water_reproduce_the_shake_displacement() {
+        // Three coupled constraints, default (converging) SHAKE: for every atom
+        // F_i = m_i (shaken_i - unconstrained_i) / dt^2 and the forces sum to zero.
+        let masses = [15.9994_f64, 1.008, 1.008];
+        let inv_masses: Vec<f64> = masses.iter().map(|m| 1.0 / m).collect();
+        let shake = Shake::new(water_shake_constraints(0));
+        let old_positions = tip3p_reference();
+        let kicks = [
+            Vec3::new(0.021, -0.013, 0.006),
+            Vec3::new(-0.034, 0.027, -0.012),
+            Vec3::new(0.018, 0.041, 0.009),
+        ];
+        let unconstrained: Vec<Vec3> = old_positions
+            .iter()
+            .zip(kicks.iter())
+            .map(|(p, k)| p + k)
+            .collect();
+        let dt = 0.002;
+
+        let mut shaken = unconstrained.clone();
+        let iters = shake.apply(&mut shaken, &old_positions, &inv_masses);
+        assert!(iters > 1, "the coupled constraints need several sweeps");
+        assert!(shake.max_relative_violation(&shaken) < 1e-7);
+
+        let forces = shake.constraint_forces(&unconstrained, &old_positions, &inv_masses, dt);
+        let mut total = Vec3::new(0.0, 0.0, 0.0);
+        for atom in 0..3 {
+            let expected = (shaken[atom] - unconstrained[atom]) * (masses[atom] / (dt * dt));
+            assert!(
+                (forces[atom] - expected).norm() <= 1e-9 * expected.norm(),
+                "atom {atom}: F = {:?}, m (shaken - unconstrained) / dt^2 = {expected:?}",
+                forces[atom]
+            );
+            total += forces[atom];
+        }
+        let scale = forces.iter().map(|f| f.norm()).fold(0.0_f64, f64::max);
+        assert!(
+            total.norm() < 1e-9 * scale,
+            "constraint forces must sum to zero, got {total:?}"
+        );
+
+        // Applying the forces for one step lands on the shaken positions.
+        for atom in 0..3 {
+            let moved = unconstrained[atom] + forces[atom] * (dt * dt / masses[atom]);
+            assert!((moved - shaken[atom]).norm() < 1e-12, "atom {atom}");
+        }
+    }
+
+    #[test]
+    fn test_constraint_forces_vanish_when_no_constraint_is_violated() {
+        let inv_masses = vec![1.0 / 15.9994, 1.0 / 1.008, 1.0 / 1.008];
+        let shake = Shake::new(water_shake_constraints(0));
+        let reference = tip3p_reference();
+        let dt = 0.002;
+        // Rigid geometry passed as "unconstrained" positions: nothing to enforce.
+        let forces = shake.constraint_forces(&reference, &reference, &inv_masses, dt);
+        assert!(forces.iter().all(|f| f.norm() < 1e-9), "{forces:?}");
+        // The documented precondition: already shaken positions carry no violation either.
+        let mut shaken: Vec<Vec3> = reference
+            .iter()
+            .map(|p| p + Vec3::new(0.02, -0.01, 0.015))
+            .collect();
+        shaken[1] += Vec3::new(0.03, 0.0, 0.0);
+        shake.apply(&mut shaken, &reference, &inv_masses);
+        let forces = shake.constraint_forces(&shaken, &reference, &inv_masses, dt);
+        assert!(forces.iter().all(|f| f.norm() < 1e-6), "{forces:?}");
+    }
+
+    #[test]
+    fn test_constraint_forces_of_a_fixed_atom_are_finite() {
+        // Atom 0 has infinite mass (w = 0): it does not move, yet it receives the finite
+        // reaction of the bond (the old per-mass division produced ~1e30 here).
+        let inv_masses = vec![0.0, 0.5];
+        let shake = Shake::new(vec![BondConstraint::new(0, 1, 1.0)]);
+        let old_positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)];
+        let unconstrained = vec![old_positions[0], Vec3::new(1.2, 0.1, 0.0)];
+        let dt = 0.01;
+        let mut shaken = unconstrained.clone();
+        shake.apply(&mut shaken, &old_positions, &inv_masses);
+        assert_eq!(shaken[0], unconstrained[0]);
+
+        let forces = shake.constraint_forces(&unconstrained, &old_positions, &inv_masses, dt);
+        assert_eq!(forces[0], -forces[1]);
+        let expected = (shaken[1] - unconstrained[1]) * (2.0 / (dt * dt));
+        assert!((forces[1] - expected).norm() <= 1e-10 * expected.norm());
+        assert!(forces[0].norm() < 1e4, "force {:?}", forces[0]);
+    }
+}

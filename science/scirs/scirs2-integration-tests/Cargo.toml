@@ -1,0 +1,54 @@
+[package]
+name = "scirs2-integration-tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Cross-crate integration tests for SciRS2 v0.2.0"
+license.workspace = true
+repository.workspace = true
+publish = false  # Integration tests are not published
+
+[lints]
+workspace = true
+
+[dependencies]
+# Core dependencies
+scirs2-core = { workspace = true, features = ["random", "array", "parallel", "simd", "validation"] }
+ndarray = { workspace = true, default-features = false }
+num-complex = { workspace = true, default-features = false }
+
+# Modules under test
+scirs2-neural = { workspace = true }
+scirs2-optimize = { workspace = true }
+scirs2-fft = { workspace = true, features = ["oxifft"] }
+scirs2-signal = { workspace = true }
+scirs2-sparse = { workspace = true }
+scirs2-linalg = { workspace = true }
+scirs2-ndimage = { workspace = true }
+scirs2-stats = { workspace = true }
+scirs2-special = { workspace = true }
+scirs2-datasets = { workspace = true }
+scirs2-text = { workspace = true }
+scirs2-integrate = { workspace = true }
+scirs2-graph = { workspace = true }
+
+# Testing dependencies
+proptest = { workspace = true }
+approx = { workspace = true }
+
+# Utilities
+num_cpus = { workspace = true }
+num-traits = { workspace = true, default-features = false }
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+[dev-dependencies]
+# Additional test dependencies if needed
+
+[features]
+default = []
+# Feature flags for optional GPU/CUDA tests
+cuda = ["scirs2-linalg/cuda"]
+simd = ["scirs2-core/simd", "scirs2-linalg/simd"]

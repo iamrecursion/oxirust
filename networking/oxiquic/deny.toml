@@ -1,0 +1,22 @@
+# Security-advisory policy. Without this stanza `cargo deny check advisories`
+# has no configuration and never surfaces a RUSTSEC entry — notably for the
+# `rustls-rustcrypto` 0.0.2-alpha crate that currently backs the crypto
+# provider and the Retry-HMAC CSPRNG. This runs against the RustSec DB (network
+# access required); it is intentionally *not* part of the offline `check bans`
+# gate.
+[advisories]
+version = 2
+# Fail on any crate with an active advisory or that has been yanked.
+yanked = "deny"
+# Explicitly-reviewed advisories to tolerate go here, each with a rationale.
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+deny = [
+    { name = "ring" },
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    { name = "openssl" },
+    { name = "openssl-sys" },
+]

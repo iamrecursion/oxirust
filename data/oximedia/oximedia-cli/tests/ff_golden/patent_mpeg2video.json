@@ -1,0 +1,9 @@
+{
+  "name": "patent_mpeg2video",
+  "args": ["-i", "in.ts", "-c:v", "mpeg2video", "out.mkv"],
+  "expect": {
+    "contains_diagnostic_kinds": ["PatentCodecSubstituted"],
+    "jobs": 1,
+    "video_codec": "av1"
+  }
+}

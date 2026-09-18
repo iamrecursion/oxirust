@@ -1,0 +1,34 @@
+[package]
+name = "legalis-porting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Legal system porting - transfer laws between jurisdictions with cultural adaptation"
+categories = ["localization", "internationalization", "artificial-intelligence"]
+keywords = ["legalis", "law-porting", "jurisdiction", "adaptation", "legal-tech"]
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/legalis-porting"
+
+[dependencies]
+legalis-core.workspace = true
+legalis-i18n.workspace = true
+legalis-llm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["async_tokio"] }
+proptest.workspace = true
+
+[[bench]]
+name = "porting"
+harness = false

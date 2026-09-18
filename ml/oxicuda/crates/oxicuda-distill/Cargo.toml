@@ -1,0 +1,35 @@
+[package]
+name = "oxicuda-distill"
+description = "Knowledge-distillation primitives for OxiCUDA — Hinton KD, DIST, DKD, FitNets, AT, PKT, RKD, CRD, CC, DML, BYOT, EMA self-distill, BAN, TAS, progressive, DAFL, ZSK"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+license.workspace = true
+homepage = "https://github.com/cool-japan/oxicuda"
+repository.workspace = true
+keywords = ["gpu", "distillation", "compression", "teacher-student", "pure-rust"]
+categories = ["science", "algorithms"]
+
+[lints]
+workspace = true
+
+[features]
+# Enables on-device GPU tests that JIT-compile the hand-written PTX kernels,
+# launch them on a real CUDA device, and assert numerical equivalence to the
+# crate's CPU references. The tests skip gracefully when no GPU is present, so
+# this feature is safe to enable on CPU-only machines.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name = "distill_ops"
+harness = false

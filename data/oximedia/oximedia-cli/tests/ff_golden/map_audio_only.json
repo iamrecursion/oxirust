@@ -1,0 +1,9 @@
+{
+  "name": "map_audio_only",
+  "args": ["-i", "in.mkv", "-map", "0:a", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "map": 1
+  }
+}

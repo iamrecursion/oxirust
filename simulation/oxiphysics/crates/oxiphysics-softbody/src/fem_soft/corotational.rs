@@ -1,0 +1,549 @@
+// Copyright 2026 COOLJAPAN OU (Team KitaSan)
+// SPDX-License-Identifier: Apache-2.0
+
+//! Corotational FEM element and soft body using nalgebra types.
+
+use oxiphysics_core::math::{Mat3, Real, Vec3};
+
+use crate::particle::SoftParticle;
+
+// ---------------------------------------------------------------------------
+// Corotational element
+// ---------------------------------------------------------------------------
+
+/// A single tetrahedral corotational FEM element.
+#[derive(Debug, Clone)]
+pub struct CorotationalElement {
+    /// Indices of the four vertices of the tetrahedron.
+    pub indices: [usize; 4],
+    /// Rest-shape inverse of the edge matrix (Dm^{-1}).
+    pub rest_inv: Mat3,
+    /// Rest volume.
+    pub rest_volume: Real,
+    /// Young's modulus.
+    pub young: Real,
+    /// Poisson's ratio.
+    pub poisson: Real,
+}
+
+impl CorotationalElement {
+    /// Create a new corotational element from the current particle positions.
+    pub fn new(
+        indices: [usize; 4],
+        particles: &[SoftParticle],
+        young: Real,
+        poisson: Real,
+    ) -> Self {
+        let dm = Self::edge_matrix(
+            &particles[indices[0]].position,
+            &particles[indices[1]].position,
+            &particles[indices[2]].position,
+            &particles[indices[3]].position,
+        );
+        let rest_volume = dm.determinant().abs() / 6.0;
+        // Safe inversion - if singular, fall back to identity.
+        let rest_inv = dm.try_inverse().unwrap_or_else(Mat3::identity);
+
+        Self {
+            indices,
+            rest_inv,
+            rest_volume,
+            young,
+            poisson,
+        }
+    }
+
+    /// Compute the 3x3 edge matrix \[e1 | e2 | e3\] where ei = pi - p0.
+    fn edge_matrix(p0: &Vec3, p1: &Vec3, p2: &Vec3, p3: &Vec3) -> Mat3 {
+        let e1 = p1 - p0;
+        let e2 = p2 - p0;
+        let e3 = p3 - p0;
+        Mat3::new(e1.x, e2.x, e3.x, e1.y, e2.y, e3.y, e1.z, e2.z, e3.z)
+    }
+
+    /// Polar decomposition F = R * S. Returns R (the rotation part).
+    ///
+    /// Uses an iterative method (successive SVD-like correction).
+    fn polar_rotation(f: &Mat3) -> Mat3 {
+        let mut r = *f;
+        // Iterative polar decomposition (a few iterations suffice).
+        for _ in 0..10 {
+            let r_inv_t = match r.try_inverse() {
+                Some(inv) => inv.transpose(),
+                None => return Mat3::identity(),
+            };
+            r = (r + r_inv_t) * 0.5;
+        }
+        // Ensure determinant is positive (proper rotation).
+        if r.determinant() < 0.0 {
+            r = -r;
+        }
+        r
+    }
+
+    /// Compute elastic forces on the four vertices and return them as an array.
+    ///
+    /// The corotational model computes:
+    ///   deformation gradient F = Ds * Dm^{-1}
+    ///   rotation R = polar(F)
+    ///   strain = R^T * Ds * Dm^{-1} - I  (Green-like, linearised)
+    ///   stress via Lame parameters
+    ///   forces = -V * P * Dm^{-T}  distributed to vertices
+    pub fn compute_forces(&self, particles: &[SoftParticle]) -> [Vec3; 4] {
+        let [i0, i1, i2, i3] = self.indices;
+        let p0 = particles[i0].position;
+        let p1 = particles[i1].position;
+        let p2 = particles[i2].position;
+        let p3 = particles[i3].position;
+
+        // Deformed edge matrix.
+        let ds = Self::edge_matrix(&p0, &p1, &p2, &p3);
+        let f = ds * self.rest_inv;
+
+        let r = Self::polar_rotation(&f);
+        let rt = r.transpose();
+
+        // Strain in the rotated frame.
+        let strain = rt * f - Mat3::identity();
+
+        // Lame parameters.
+        let mu = self.young / (2.0 * (1.0 + self.poisson));
+        let lambda =
+            self.young * self.poisson / ((1.0 + self.poisson) * (1.0 - 2.0 * self.poisson));
+
+        // Stress (linear elastic in rotated frame).
+        let trace_strain = strain[(0, 0)] + strain[(1, 1)] + strain[(2, 2)];
+        let stress = strain * (2.0 * mu) + Mat3::identity() * (lambda * trace_strain);
+
+        // First Piola-Kirchhoff in world frame: P = R * stress.
+        let piola = r * stress;
+
+        // Force on edges: H = -V * P * Dm^{-T}.
+        let h = piola * self.rest_inv.transpose() * (-self.rest_volume);
+
+        let f1 = Vec3::new(h[(0, 0)], h[(1, 0)], h[(2, 0)]);
+        let f2 = Vec3::new(h[(0, 1)], h[(1, 1)], h[(2, 1)]);
+        let f3 = Vec3::new(h[(0, 2)], h[(1, 2)], h[(2, 2)]);
+        let f0 = -(f1 + f2 + f3);
+
+        [f0, f1, f2, f3]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FEM soft body
+// ---------------------------------------------------------------------------
+
+/// A soft body simulated with corotational FEM and explicit time integration.
+#[derive(Debug, Clone)]
+pub struct FemSoftBody {
+    /// Particles (shared representation with PBD bodies).
+    pub particles: Vec<SoftParticle>,
+    /// Tetrahedral elements.
+    pub elements: Vec<CorotationalElement>,
+    /// Global damping coefficient.
+    pub damping: Real,
+}
+
+impl FemSoftBody {
+    /// Create a new FEM soft body.
+    pub fn new(
+        particles: Vec<SoftParticle>,
+        elements: Vec<CorotationalElement>,
+        damping: Real,
+    ) -> Self {
+        Self {
+            particles,
+            elements,
+            damping,
+        }
+    }
+
+    /// Compute the total kinetic energy: sum of 0.5 * m * |v|^2.
+    pub fn kinetic_energy(&self) -> Real {
+        let mut ke = 0.0;
+        for p in &self.particles {
+            if !p.is_static() {
+                let mass = 1.0 / p.inverse_mass;
+                ke += 0.5 * mass * p.velocity.norm_squared();
+            }
+        }
+        ke
+    }
+
+    /// Compute the gravitational potential energy: sum of m * g * y.
+    ///
+    /// Uses the Y component of `gravity` as the gravitational acceleration
+    /// magnitude (assumes gravity points in -Y).
+    pub fn potential_energy(&self, gravity: &Vec3) -> Real {
+        let g_mag = gravity.norm();
+        if g_mag < 1e-30 {
+            return 0.0;
+        }
+        let g_dir = gravity / g_mag;
+        let mut pe = 0.0;
+        for p in &self.particles {
+            if !p.is_static() {
+                let mass = 1.0 / p.inverse_mass;
+                // PE = -m * g . r  (so that lower = less PE)
+                pe += -mass * g_mag * g_dir.dot(&p.position);
+            }
+        }
+        pe
+    }
+
+    /// Perform one explicit time step.
+    pub fn step(&mut self, dt: Real, gravity: &Vec3) {
+        let n = self.particles.len();
+
+        // Accumulate forces.
+        let mut forces = vec![Vec3::zeros(); n];
+        for (p_idx, (force, particle)) in forces.iter_mut().zip(self.particles.iter()).enumerate() {
+            let _ = p_idx;
+            if !particle.is_static() {
+                let mass = 1.0 / particle.inverse_mass;
+                *force += gravity * mass;
+                *force += particle.external_force;
+            }
+        }
+
+        // Element forces.
+        for elem in &self.elements {
+            let f = elem.compute_forces(&self.particles);
+            for (k, f_k) in f.iter().enumerate() {
+                forces[elem.indices[k]] += f_k;
+            }
+        }
+
+        // Integrate (symplectic Euler).
+        for (i, (force, p)) in forces.iter().zip(self.particles.iter_mut()).enumerate() {
+            let _ = i;
+            if p.is_static() {
+                continue;
+            }
+            let accel = *force * p.inverse_mass;
+            p.velocity += accel * dt;
+            p.velocity *= 1.0 - self.damping;
+            p.position += p.velocity * dt;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invertible corotational element (Irving 2004 / Stomakhin 2012)
+// ---------------------------------------------------------------------------
+
+/// A tetrahedral element that stays stable under inversion via signed SVD.
+///
+/// Uses the rotation-variant (signed) 3x3 SVD with reflection convention to
+/// diagonalise the deformation gradient `F = U diag(sigma) V^T` with
+/// `det U = det V = +1`, so an inverted element carries `sigma[2] < 0`. The
+/// *signed* singular values are clamped from below at `sigma_clamp` (Irving et
+/// al. 2004), the (Neo-Hookean) first Piola-Kirchhoff stress is evaluated in the
+/// principal frame, and rotated back. An inverted axis is thereby replaced by a
+/// small positive stretch with a strongly compressive principal stress that
+/// pushes it back through zero: a fully inverted tet (`det F < 0`) produces
+/// finite restoring forces, un-inverts, and recovers its rest shape with no NaN
+/// at `J <= 0`.
+#[derive(Debug, Clone)]
+pub struct CorotationalInvertibleElement {
+    /// Node indices `[i0, i1, i2, i3]`.
+    pub indices: [usize; 4],
+    /// Rest-shape inverse of the edge matrix (Dm^{-1}), row-major.
+    pub rest_inv: [[f64; 3]; 3],
+    /// Rest volume.
+    pub rest_volume: f64,
+    /// First Lame parameter mu (shear modulus).
+    pub mu: f64,
+    /// Second Lame parameter lambda.
+    pub lambda: f64,
+    /// Lower clamp applied to the *signed* singular values. It prevents NaN at
+    /// `J = 0` and turns an inverted axis (`sigma < sigma_clamp`) into a strongly
+    /// compressed one whose stress restores the element.
+    pub sigma_clamp: f64,
+}
+
+impl CorotationalInvertibleElement {
+    /// Build from node positions and Young's modulus / Poisson's ratio.
+    pub fn new(indices: [usize; 4], positions: &[[f64; 3]], young: f64, poisson: f64) -> Self {
+        use crate::fem_soft::math_helpers::{det3x3, edge_matrix_raw, inv3x3};
+        let p0 = positions[indices[0]];
+        let p1 = positions[indices[1]];
+        let p2 = positions[indices[2]];
+        let p3 = positions[indices[3]];
+        let dm = edge_matrix_raw(p0, p1, p2, p3);
+        let rest_volume = det3x3(dm).abs() / 6.0;
+        let rest_inv = inv3x3(dm);
+        let mu = young / (2.0 * (1.0 + poisson));
+        let lambda = young * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson));
+        Self {
+            indices,
+            rest_inv,
+            rest_volume,
+            mu,
+            lambda,
+            sigma_clamp: 0.05,
+        }
+    }
+
+    /// Deformation gradient `F = Ds * Dm^{-1}` (row-major).
+    pub fn deformation_gradient(&self, positions: &[[f64; 3]]) -> [[f64; 3]; 3] {
+        use crate::fem_soft::math_helpers::{edge_matrix_raw, mul3x3};
+        let p0 = positions[self.indices[0]];
+        let p1 = positions[self.indices[1]];
+        let p2 = positions[self.indices[2]];
+        let p3 = positions[self.indices[3]];
+        let ds = edge_matrix_raw(p0, p1, p2, p3);
+        mul3x3(ds, self.rest_inv)
+    }
+
+    /// Compute restoring forces on the four nodes, stable under inversion.
+    pub fn compute_forces(&self, positions: &[[f64; 3]]) -> [[f64; 3]; 4] {
+        use crate::fem_soft::math_helpers::{mul3x3, transpose3x3};
+        use crate::fem_soft::svd_helpers::signed_svd3;
+
+        let f = self.deformation_gradient(positions);
+        let (u, sigma, vt) = signed_svd3(f);
+
+        // Irving et al. (2004), "Invertible Finite Elements For Robust
+        // Simulation of Large Deformation". The signed SVD gives
+        // `det(U) = det(V) = +1`, so a reflected (inverted) element is encoded
+        // by `sigma[2] < 0`. The constitutive stress is evaluated on the
+        // SIGNED singular values clamped from below at `sigma_clamp`: an
+        // inverted (or crushed) axis is replaced by the small positive value
+        // `sigma_clamp`, where the principal Neo-Hookean stress
+        // `mu (sigma - 1/sigma) + lambda ln(J) / sigma` is strongly compressive
+        // (`P_hat << 0`). With `H = -V P Dm^{-T}` that stress pushes the axis
+        // back through zero, so the element un-inverts for any depth of
+        // inversion.
+        //
+        // Taking `|sigma|` instead is wrong: the fully mirrored rest shape
+        // `sigma = (1, 1, -1)` maps to `(1, 1, 1)` where `P_hat = 0`, so a
+        // mirrored tet would feel no force at all, and for `sigma_3 < -1` the
+        // stress `P_hat_3 = g(|sigma_3|)` is tensile, which drives `sigma_3`
+        // further negative (deeper inversion). Only the `|sigma_3| < 1` basin
+        // would recover.
+        let sc = [
+            sigma[0].max(self.sigma_clamp),
+            sigma[1].max(self.sigma_clamp),
+            sigma[2].max(self.sigma_clamp),
+        ];
+
+        // Neo-Hookean first Piola stress in the principal (diagonal) frame,
+        // evaluated on the clamped, strictly positive sigmas (Jp = product > 0):
+        //   P_hat_i = mu (sigma_i - 1/sigma_i) + lambda ln(Jp) / sigma_i
+        let jp = sc[0] * sc[1] * sc[2];
+        let ln_jp = jp.ln();
+        let mut p_hat = [0.0f64; 3];
+        for i in 0..3 {
+            p_hat[i] = self.mu * (sc[i] - 1.0 / sc[i]) + self.lambda * ln_jp / sc[i];
+        }
+
+        // Rotate stress back to world frame: P = U diag(P_hat) V^T.
+        let p_diag = [
+            [p_hat[0], 0.0, 0.0],
+            [0.0, p_hat[1], 0.0],
+            [0.0, 0.0, p_hat[2]],
+        ];
+        let p = mul3x3(mul3x3(u, p_diag), vt);
+
+        // Forces: H = -V * P * Dm^{-T}, distributed to the four vertices.
+        let dm_inv_t = transpose3x3(self.rest_inv);
+        let h = mul3x3(p, dm_inv_t);
+        let mut forces = [[0.0f64; 3]; 4];
+        for i in 0..3 {
+            forces[1][i] = -self.rest_volume * h[i][0];
+            forces[2][i] = -self.rest_volume * h[i][1];
+            forces[3][i] = -self.rest_volume * h[i][2];
+            forces[0][i] = -(forces[1][i] + forces[2][i] + forces[3][i]);
+        }
+        forces
+    }
+}
+
+#[cfg(test)]
+mod tests_invertible {
+    use super::*;
+    use crate::fem_soft::math_helpers::det3x3;
+
+    #[test]
+    fn test_invertible_tet_recovery() {
+        // Rest tet (unit corner tetrahedron).
+        let rest = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let elem = CorotationalInvertibleElement::new([0, 1, 2, 3], &rest, 1.0e4, 0.3);
+
+        // Invert the tet by mirroring node 3 below the base plane.
+        let mut pos = rest;
+        pos[3][2] = -0.5;
+        // Confirm inversion (det of deformation gradient < 0).
+        let f0 = elem.deformation_gradient(&pos);
+        assert!(
+            det3x3(f0) < 0.0,
+            "initial tet must be inverted: det={}",
+            det3x3(f0)
+        );
+
+        let mut vel = [[0.0f64; 3]; 4];
+        let mass = 1.0;
+        let dt = 1.0e-3;
+        let damping = 0.02;
+
+        let mut recovered_step = None;
+        for step in 0..2000 {
+            let forces = elem.compute_forces(&pos);
+            for k in 0..4 {
+                for d in 0..3 {
+                    assert!(forces[k][d].is_finite(), "force NaN/Inf at step {step}");
+                    vel[k][d] += forces[k][d] / mass * dt;
+                    vel[k][d] *= 1.0 - damping;
+                    pos[k][d] += vel[k][d] * dt;
+                    assert!(pos[k][d].is_finite(), "position NaN/Inf at step {step}");
+                }
+            }
+            let f = elem.deformation_gradient(&pos);
+            if det3x3(f) > 0.05 && recovered_step.is_none() {
+                recovered_step = Some(step);
+            }
+        }
+        // The tet must have un-inverted (positive volume) by the end.
+        let f_final = elem.deformation_gradient(&pos);
+        assert!(
+            det3x3(f_final) > 0.0,
+            "tet failed to recover: final det={}",
+            det3x3(f_final)
+        );
+        assert!(
+            recovered_step.is_some(),
+            "tet never reached positive volume"
+        );
+    }
+
+    /// Unit corner tetrahedron used as the rest shape.
+    const REST: [[f64; 3]; 4] = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+
+    fn unit_element() -> CorotationalInvertibleElement {
+        CorotationalInvertibleElement::new([0, 1, 2, 3], &REST, 1.0e4, 0.3)
+    }
+
+    /// Damped explicit (symplectic Euler) relaxation of the unit-mass nodes.
+    fn relax(
+        elem: &CorotationalInvertibleElement,
+        start: [[f64; 3]; 4],
+        steps: usize,
+    ) -> [[f64; 3]; 4] {
+        let dt = 1.0e-3;
+        let damping = 0.02;
+        let mut pos = start;
+        let mut vel = [[0.0f64; 3]; 4];
+        for step in 0..steps {
+            let forces = elem.compute_forces(&pos);
+            for k in 0..4 {
+                for d in 0..3 {
+                    assert!(forces[k][d].is_finite(), "force NaN/Inf at step {step}");
+                    vel[k][d] += forces[k][d] * dt;
+                    vel[k][d] *= 1.0 - damping;
+                    pos[k][d] += vel[k][d] * dt;
+                    assert!(pos[k][d].is_finite(), "position NaN/Inf at step {step}");
+                }
+            }
+        }
+        pos
+    }
+
+    fn max_abs(values: &[[f64; 3]; 4]) -> f64 {
+        values
+            .iter()
+            .flatten()
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()))
+    }
+
+    #[test]
+    fn test_mirrored_tet_is_not_a_force_free_state() {
+        // Mirroring node 3 through the base plane gives F = diag(1, 1, -1). With
+        // |sigma| the principal stress of (1, 1, -1) -> (1, 1, 1) vanished, so
+        // this fully inverted tet felt no force at all.
+        let elem = unit_element();
+        let mut pos = REST;
+        pos[3][2] = -1.0;
+        let f = elem.deformation_gradient(&pos);
+        assert!(
+            (det3x3(f) + 1.0).abs() < 1.0e-12,
+            "mirrored tet has det F = -1, got {}",
+            det3x3(f)
+        );
+        let forces = elem.compute_forces(&pos);
+        assert!(
+            max_abs(&forces) > 1.0e3,
+            "a mirrored tet must be pushed hard: |f| = {}",
+            max_abs(&forces)
+        );
+        // Node 3 is pushed back through the base plane (towards +z).
+        assert!(
+            forces[3][2] > 1.0e3,
+            "restoring force on the mirrored node: {:?}",
+            forces[3]
+        );
+        // Internal forces are self-equilibrated.
+        for d in 0..3 {
+            let sum: f64 = forces.iter().map(|f| f[d]).sum();
+            assert!(sum.abs() < 1.0e-9 * max_abs(&forces), "net force {sum}");
+        }
+    }
+
+    #[test]
+    fn test_restoring_force_does_not_depend_on_inversion_depth() {
+        // Below the clamp every inverted state is replaced by the same strongly
+        // compressed principal stretch, so the restoring push on the inverted
+        // node is identical for z = -0.2 ... -0.9 (all have a negative smallest
+        // singular value on the z axis).
+        let elem = unit_element();
+        let reference = {
+            let mut pos = REST;
+            pos[3][2] = -0.2;
+            elem.compute_forces(&pos)
+        };
+        for z in [-0.4, -0.6, -0.9] {
+            let mut pos = REST;
+            pos[3][2] = z;
+            let forces = elem.compute_forces(&pos);
+            for k in 0..4 {
+                for d in 0..3 {
+                    assert!(
+                        (forces[k][d] - reference[k][d]).abs() < 1.0e-6 * max_abs(&reference),
+                        "z = {z}: force of node {k} component {d} differs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_deeply_inverted_tets_recover_from_the_mirror_state() {
+        // z = -1.0 is the exact mirror image of the rest shape (all singular values
+        // equal); z = -1.5 and z = -3.0 lie beyond the |sigma| < 1 basin in which
+        // the former |sigma| clamp happened to work.
+        let elem = unit_element();
+        for z in [-1.0, -1.5, -3.0] {
+            let mut pos = REST;
+            pos[3][2] = z;
+            assert!(det3x3(elem.deformation_gradient(&pos)) < 0.0);
+            let end = relax(&elem, pos, 2000);
+            let f = elem.deformation_gradient(&end);
+            assert!(
+                det3x3(f) > 0.0,
+                "z = {z}: the inverted tet failed to recover, det F = {}",
+                det3x3(f)
+            );
+        }
+    }
+}

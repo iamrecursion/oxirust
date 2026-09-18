@@ -1,0 +1,1064 @@
+// CUDA backend for GPU memory management
+//
+// This module provides NVIDIA CUDA-specific memory management functionality,
+// including device memory allocation, unified memory, streams, and performance
+// optimization features specific to CUDA GPUs.
+//
+// # This is a host-memory simulation, not real CUDA
+//
+// `optirs-gpu` is Pure Rust with no FFI dependencies by default, and
+// `scirs2-core` 0.6.x removed its CUDA backend entirely (see
+// `crate::optimizers`'s module docs). There is therefore no real `cudaMalloc`
+// underneath this module: "device", "host", "unified" and "mapped" memory
+// are all the *same* system-heap allocation (see `sim_alloc`/`sim_dealloc`
+// below), and `CudaDeviceProperties`/`CudaStats` are example numbers, not a
+// query of real hardware. This module models the CUDA memory-management
+// *API shape* (pools, streams, statistics) for testing that shape in
+// isolation; treat every allocation as host memory and every device number
+// as illustrative. Real CUDA execution belongs in the `oxicuda-*` crates,
+// feature-gated off by default per COOLJAPAN policy.
+//
+// This extends to data movement: `memcpy` and `memcpy_async` copy **zero
+// bytes**. They build a `CudaOperation` record, hand it to
+// `CudaStreamManager::execute_operation` (which returns immediately and
+// never dereferences `src_ptr`/`dst_ptr`), and increment
+// `CudaStats::memory_transfers` — that counter says "this many `memcpy`
+// calls were made," not "this many bytes moved." An earlier revision of
+// this module also injected a `std::thread::sleep` here to imitate transfer
+// latency by operation kind; that fake timing has been removed, so the
+// distinction between `MemcpyHostToDevice`/`MemcpyDeviceToHost`/
+// `MemcpyDeviceToDevice`/`MemcpyAsync` no longer affects anything
+// observable. `CudaStats::stream_operations` and `CudaStats::kernel_launches`
+// are declared for API-shape completeness but nothing in this module ever
+// increments them — read a `0` there as "not tracked," not "none occurred."
+
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Byte alignment every simulated allocation below uses.
+const SIM_ALLOC_ALIGN: usize = 256;
+
+/// Allocate `size` bytes through the system allocator, 256-byte aligned,
+/// without the two ways the naive `std::alloc::alloc(Layout::from_size_align_unchecked(size,
+/// 256))` this module used to call was undefined behaviour:
+///
+/// * `GlobalAlloc::alloc`'s safety contract requires a *non-zero*-size
+///   layout; `size == 0` is handled here as the same "dangling, well-aligned,
+///   never-dereferenced sentinel" convention `Vec`/`Box` use for zero-sized
+///   allocations, without calling the allocator at all.
+/// * A real allocation failure returns a null pointer, which the caller must
+///   never treat as valid memory; this returns `Err` instead of a wrapped
+///   null.
+///
+/// The payload is prefixed with one `SIM_ALLOC_ALIGN`-byte header that
+/// records the requested size, so [`sim_dealloc`] can reconstruct the exact
+/// `Layout` this function used — deallocating with a *different* layout than
+/// the one used to allocate is itself undefined behaviour, which the
+/// `Layout::from_size_align_unchecked(1, 1)` this module used at free time
+/// was unconditionally invoking.
+fn sim_alloc(size: usize) -> Result<*mut c_void, CudaError> {
+    if size == 0 {
+        return Ok(SIM_ALLOC_ALIGN as *mut c_void);
+    }
+    let total = SIM_ALLOC_ALIGN.checked_add(size).ok_or_else(|| {
+        CudaError::OutOfMemory(format!(
+            "{size}-byte request overflows the allocator's size limit"
+        ))
+    })?;
+    let layout = std::alloc::Layout::from_size_align(total, SIM_ALLOC_ALIGN)
+        .map_err(|e| CudaError::OutOfMemory(format!("invalid allocation layout: {e}")))?;
+    // SAFETY: `layout` has non-zero size (checked above) and a valid
+    // (power-of-two) alignment constructed by `Layout::from_size_align`.
+    let base = unsafe { std::alloc::alloc(layout) };
+    if base.is_null() {
+        return Err(CudaError::OutOfMemory(format!(
+            "allocator returned null for a {size}-byte request"
+        )));
+    }
+    // SAFETY: `base` is non-null and `layout`'s size is at least
+    // `SIM_ALLOC_ALIGN + size >= SIM_ALLOC_ALIGN >= size_of::<usize>()`, so
+    // writing one `usize` at the start of the block is in-bounds.
+    unsafe { (base as *mut usize).write(size) };
+    // SAFETY: `base` was allocated with `total = SIM_ALLOC_ALIGN + size`
+    // bytes, so offsetting by `SIM_ALLOC_ALIGN` stays within (or one past)
+    // the allocation.
+    Ok(unsafe { base.add(SIM_ALLOC_ALIGN) } as *mut c_void)
+}
+
+/// Free a pointer returned by [`sim_alloc`]. A no-op for a null pointer or
+/// the zero-size sentinel — neither was ever allocated, so neither is passed
+/// to the system allocator.
+///
+/// Only ever called from this module (it is not `pub`) with a pointer
+/// `sim_alloc` returned that has not already been freed — the unsafety of
+/// the pointer arithmetic below is contained to that invariant, matching
+/// this module's existing style of confining `unsafe` to the raw
+/// `std::alloc` calls rather than marking `free()`'s public wrapper unsafe.
+fn sim_dealloc(ptr: *mut c_void) {
+    if ptr.is_null() || (ptr as usize) == SIM_ALLOC_ALIGN {
+        return;
+    }
+    // SAFETY: by this function's contract `ptr` came from `sim_alloc`, which
+    // always returns `base + SIM_ALLOC_ALIGN` for a real allocation, so
+    // stepping back `SIM_ALLOC_ALIGN` bytes recovers `base`.
+    let base = unsafe { (ptr as *mut u8).sub(SIM_ALLOC_ALIGN) };
+    // SAFETY: `sim_alloc` wrote a `usize` at `base` before returning.
+    let size = unsafe { (base as *const usize).read() };
+    if let Ok(layout) = std::alloc::Layout::from_size_align(SIM_ALLOC_ALIGN + size, SIM_ALLOC_ALIGN)
+    {
+        // SAFETY: `layout` is exactly the layout `sim_alloc` allocated
+        // `base` with.
+        unsafe { std::alloc::dealloc(base, layout) };
+    }
+}
+
+/// CUDA memory backend implementation
+pub struct CudaMemoryBackend {
+    /// Backend configuration
+    config: CudaConfig,
+    /// Device properties
+    device_properties: CudaDeviceProperties,
+    /// Active memory contexts
+    contexts: HashMap<u32, CudaContext>,
+    /// Memory pools
+    memory_pools: HashMap<CudaMemoryType, CudaMemoryPool>,
+    /// Statistics
+    stats: CudaStats,
+    /// Stream management
+    stream_manager: CudaStreamManager,
+}
+
+/// CUDA backend configuration
+#[derive(Debug, Clone)]
+pub struct CudaConfig {
+    /// Device ID to use
+    pub device_id: u32,
+    /// Enable unified memory
+    pub enable_unified_memory: bool,
+    /// Enable memory pools
+    pub enable_memory_pools: bool,
+    /// Enable async memory operations
+    pub enable_async_ops: bool,
+    /// Memory pool growth size
+    pub pool_growth_size: usize,
+    /// Enable memory mapped host memory
+    pub enable_mapped_memory: bool,
+    /// Enable CUDA graphs for memory ops
+    pub enable_cuda_graphs: bool,
+    /// Enable cooperative groups
+    pub enable_cooperative_groups: bool,
+    /// Maximum number of streams
+    pub max_streams: u32,
+}
+
+impl Default for CudaConfig {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            enable_unified_memory: true,
+            enable_memory_pools: true,
+            enable_async_ops: true,
+            pool_growth_size: 64 * 1024 * 1024, // 64MB
+            enable_mapped_memory: true,
+            enable_cuda_graphs: false, // Experimental
+            enable_cooperative_groups: false,
+            max_streams: 16,
+        }
+    }
+}
+
+/// CUDA device properties
+#[derive(Debug, Clone)]
+pub struct CudaDeviceProperties {
+    pub device_id: u32,
+    pub name: String,
+    pub compute_capability: (u32, u32),
+    pub total_global_memory: usize,
+    pub shared_memory_per_block: usize,
+    pub warp_size: u32,
+    pub max_threads_per_block: u32,
+    pub max_blocks_per_multiprocessor: u32,
+    pub multiprocessor_count: u32,
+    pub memory_clock_rate: u32,
+    pub memory_bus_width: u32,
+    pub l2_cache_size: usize,
+    pub unified_addressing: bool,
+    pub managed_memory: bool,
+    pub concurrent_kernels: bool,
+    pub async_engine_count: u32,
+}
+
+/// CUDA memory types
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CudaMemoryType {
+    Device,
+    Host,
+    Unified,
+    Mapped,
+    Array,
+    Texture,
+}
+
+/// CUDA context for managing device state
+pub struct CudaContext {
+    /// Context handle (simulated)
+    pub handle: *mut c_void,
+    /// Device ID
+    pub device_id: u32,
+    /// Context flags
+    pub flags: CudaContextFlags,
+    /// Creation time
+    pub created_at: Instant,
+    /// Active streams
+    pub streams: Vec<CudaStream>,
+}
+
+/// CUDA context creation flags
+#[derive(Debug, Clone)]
+pub struct CudaContextFlags {
+    pub sched_auto: bool,
+    pub sched_spin: bool,
+    pub sched_yield: bool,
+    pub sched_blocking_sync: bool,
+    pub map_host: bool,
+    pub lmem_resize_to_max: bool,
+}
+
+impl Default for CudaContextFlags {
+    fn default() -> Self {
+        Self {
+            sched_auto: true,
+            sched_spin: false,
+            sched_yield: false,
+            sched_blocking_sync: false,
+            map_host: false,
+            lmem_resize_to_max: false,
+        }
+    }
+}
+
+/// CUDA stream for asynchronous operations
+pub struct CudaStream {
+    /// Stream handle (simulated)
+    pub handle: *mut c_void,
+    /// Stream ID
+    pub id: u32,
+    /// Stream priority
+    pub priority: i32,
+    /// Stream flags
+    pub flags: CudaStreamFlags,
+    /// Creation time
+    pub created_at: Instant,
+    /// Operations queue
+    pub operations: std::collections::VecDeque<CudaOperation>,
+}
+
+impl std::fmt::Debug for CudaStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaStream")
+            .field("handle", &format!("{:p}", self.handle))
+            .field("id", &self.id)
+            .field("priority", &self.priority)
+            .field("flags", &self.flags)
+            .field("created_at", &self.created_at)
+            .field("operations", &self.operations)
+            .finish()
+    }
+}
+
+/// CUDA stream flags
+#[derive(Debug, Clone)]
+pub struct CudaStreamFlags {
+    pub default: bool,
+    pub non_blocking: bool,
+    pub per_thread: bool,
+}
+
+impl Default for CudaStreamFlags {
+    fn default() -> Self {
+        Self {
+            default: true,
+            non_blocking: false,
+            per_thread: false,
+        }
+    }
+}
+
+/// CUDA asynchronous operation
+#[derive(Debug, Clone)]
+pub struct CudaOperation {
+    pub op_type: CudaOperationType,
+    pub src_ptr: Option<*mut c_void>,
+    pub dst_ptr: Option<*mut c_void>,
+    pub size: usize,
+    pub timestamp: Instant,
+}
+
+/// Types of CUDA operations
+#[derive(Debug, Clone)]
+pub enum CudaOperationType {
+    MemcpyHostToDevice,
+    MemcpyDeviceToHost,
+    MemcpyDeviceToDevice,
+    MemcpyAsync,
+    MemsetAsync,
+    KernelLaunch,
+    EventRecord,
+    EventSynchronize,
+}
+
+/// CUDA memory pool
+pub struct CudaMemoryPool {
+    /// Memory type
+    memory_type: CudaMemoryType,
+    /// Current size
+    current_size: usize,
+    /// Maximum size
+    max_size: usize,
+    /// Used size
+    used_size: usize,
+    /// Free blocks
+    free_blocks: std::collections::VecDeque<CudaMemoryBlock>,
+    /// Allocated blocks
+    allocated_blocks: HashMap<*mut c_void, CudaMemoryBlock>,
+}
+
+/// CUDA memory block
+#[derive(Debug, Clone)]
+pub struct CudaMemoryBlock {
+    pub ptr: *mut c_void,
+    pub size: usize,
+    pub memory_type: CudaMemoryType,
+    pub allocated_at: Instant,
+    pub last_access: Option<Instant>,
+    pub ref_count: u32,
+}
+
+impl CudaMemoryPool {
+    pub fn new(memory_type: CudaMemoryType, max_size: usize) -> Self {
+        Self {
+            memory_type,
+            current_size: 0,
+            max_size,
+            used_size: 0,
+            free_blocks: std::collections::VecDeque::new(),
+            allocated_blocks: HashMap::new(),
+        }
+    }
+
+    /// Allocate from pool
+    pub fn allocate(&mut self, size: usize) -> Result<*mut c_void, CudaError> {
+        // Try to find suitable free block
+        for i in 0..self.free_blocks.len() {
+            if self.free_blocks[i].size >= size {
+                let Some(mut block) = self.free_blocks.remove(i) else {
+                    continue;
+                };
+
+                // Split block if much larger
+                if block.size > size * 2 {
+                    let remaining_block = CudaMemoryBlock {
+                        ptr: unsafe { block.ptr.add(size) },
+                        size: block.size - size,
+                        memory_type: block.memory_type.clone(),
+                        allocated_at: block.allocated_at,
+                        last_access: None,
+                        ref_count: 0,
+                    };
+                    self.free_blocks.push_back(remaining_block);
+                    block.size = size;
+                }
+
+                block.last_access = Some(Instant::now());
+                block.ref_count = 1;
+
+                let ptr = block.ptr;
+                self.allocated_blocks.insert(ptr, block);
+                self.used_size += size;
+
+                return Ok(ptr);
+            }
+        }
+
+        // Need to allocate new memory
+        if self.current_size + size > self.max_size {
+            return Err(CudaError::OutOfMemory(
+                "Pool size limit exceeded".to_string(),
+            ));
+        }
+
+        let ptr = self.cuda_malloc(size)?;
+        let block = CudaMemoryBlock {
+            ptr,
+            size,
+            memory_type: self.memory_type.clone(),
+            allocated_at: Instant::now(),
+            last_access: Some(Instant::now()),
+            ref_count: 1,
+        };
+
+        self.allocated_blocks.insert(ptr, block);
+        self.current_size += size;
+        self.used_size += size;
+
+        Ok(ptr)
+    }
+
+    /// Free back to pool
+    pub fn free(&mut self, ptr: *mut c_void) -> Result<(), CudaError> {
+        if let Some(block) = self.allocated_blocks.remove(&ptr) {
+            self.used_size -= block.size;
+
+            // Add to free blocks
+            self.free_blocks.push_back(CudaMemoryBlock {
+                ptr: block.ptr,
+                size: block.size,
+                memory_type: block.memory_type,
+                allocated_at: block.allocated_at,
+                last_access: None,
+                ref_count: 0,
+            });
+
+            // Try to coalesce adjacent blocks
+            self.coalesce_free_blocks();
+
+            Ok(())
+        } else {
+            Err(CudaError::InvalidPointer(
+                "Pointer not found in pool".to_string(),
+            ))
+        }
+    }
+
+    fn coalesce_free_blocks(&mut self) {
+        // Sort free blocks by address
+        let mut blocks: Vec<CudaMemoryBlock> = self.free_blocks.drain(..).collect();
+        blocks.sort_by_key(|block| block.ptr as usize);
+
+        let mut coalesced = Vec::new();
+        let mut current_block: Option<CudaMemoryBlock> = None;
+
+        for block in blocks {
+            match current_block.take() {
+                None => current_block = Some(block),
+                Some(mut prev_block) => {
+                    let prev_end = prev_block.ptr as usize + prev_block.size;
+                    let block_start = block.ptr as usize;
+
+                    if prev_end == block_start {
+                        // Coalesce blocks
+                        prev_block.size += block.size;
+                        current_block = Some(prev_block);
+                    } else {
+                        coalesced.push(prev_block);
+                        current_block = Some(block);
+                    }
+                }
+            }
+        }
+
+        if let Some(block) = current_block {
+            coalesced.push(block);
+        }
+
+        self.free_blocks = coalesced.into();
+    }
+
+    fn cuda_malloc(&self, size: usize) -> Result<*mut c_void, CudaError> {
+        // Simulate CUDA memory allocation
+        match self.memory_type {
+            CudaMemoryType::Device => sim_alloc(size), // cudaMalloc equivalent
+            CudaMemoryType::Host => sim_alloc(size),   // cudaMallocHost equivalent
+            CudaMemoryType::Unified => sim_alloc(size), // cudaMallocManaged equivalent
+            CudaMemoryType::Mapped => sim_alloc(size), // cudaHostAlloc with mapping flags
+            _ => Err(CudaError::UnsupportedOperation(
+                "Unsupported memory type for allocation".to_string(),
+            )),
+        }
+    }
+}
+
+/// CUDA stream manager
+pub struct CudaStreamManager {
+    /// Available streams
+    streams: Vec<CudaStream>,
+    /// Stream pool for reuse
+    stream_pool: std::collections::VecDeque<CudaStream>,
+    /// Next stream ID
+    next_stream_id: u32,
+    /// Configuration
+    config: CudaStreamConfig,
+}
+
+/// Stream manager configuration
+#[derive(Debug, Clone)]
+pub struct CudaStreamConfig {
+    pub default_priority: i32,
+    pub enable_priorities: bool,
+    pub max_operations_per_stream: usize,
+}
+
+impl Default for CudaStreamConfig {
+    fn default() -> Self {
+        Self {
+            default_priority: 0,
+            enable_priorities: true,
+            max_operations_per_stream: 1000,
+        }
+    }
+}
+
+impl CudaStreamManager {
+    pub fn new(config: CudaStreamConfig) -> Self {
+        Self {
+            streams: Vec::new(),
+            stream_pool: std::collections::VecDeque::new(),
+            next_stream_id: 0,
+            config,
+        }
+    }
+
+    /// Create new stream
+    ///
+    /// Reuses a previously [`Self::destroy_stream`]d stream from
+    /// `stream_pool` when one is available (its operation queue is cleared
+    /// and it is given a fresh ID) instead of always allocating a new one.
+    pub fn create_stream(&mut self, priority: Option<i32>) -> Result<u32, CudaError> {
+        let stream_id = self.next_stream_id;
+        self.next_stream_id += 1;
+
+        let mut stream = self.stream_pool.pop_front().unwrap_or_else(|| CudaStream {
+            handle: std::ptr::null_mut(), // Would be actual CUDA stream
+            id: stream_id,
+            priority: priority.unwrap_or(self.config.default_priority),
+            flags: CudaStreamFlags::default(),
+            created_at: Instant::now(),
+            operations: std::collections::VecDeque::new(),
+        });
+        stream.id = stream_id;
+        stream.priority = priority.unwrap_or(self.config.default_priority);
+        stream.created_at = Instant::now();
+        stream.operations.clear();
+
+        self.streams.push(stream);
+        Ok(stream_id)
+    }
+
+    /// Destroy stream
+    ///
+    /// Returns the stream to `stream_pool` for [`Self::create_stream`] to
+    /// reuse instead of dropping it outright.
+    pub fn destroy_stream(&mut self, stream_id: u32) -> Result<(), CudaError> {
+        if let Some(pos) = self.streams.iter().position(|s| s.id == stream_id) {
+            let stream = self.streams.remove(pos);
+            self.stream_pool.push_back(stream);
+            Ok(())
+        } else {
+            Err(CudaError::InvalidStream("Stream not found".to_string()))
+        }
+    }
+
+    /// Add operation to stream
+    pub fn add_operation(
+        &mut self,
+        stream_id: u32,
+        operation: CudaOperation,
+    ) -> Result<(), CudaError> {
+        if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
+            if stream.operations.len() >= self.config.max_operations_per_stream {
+                return Err(CudaError::StreamFull(
+                    "Stream operation queue is full".to_string(),
+                ));
+            }
+
+            stream.operations.push_back(operation);
+            Ok(())
+        } else {
+            Err(CudaError::InvalidStream("Stream not found".to_string()))
+        }
+    }
+
+    /// Synchronize stream
+    pub fn synchronize_stream(&mut self, stream_id: u32) -> Result<(), CudaError> {
+        // First, collect all operations from the stream
+        let mut operations = Vec::new();
+        if let Some(stream) = self.streams.iter_mut().find(|s| s.id == stream_id) {
+            while let Some(operation) = stream.operations.pop_front() {
+                operations.push(operation);
+            }
+        } else {
+            return Err(CudaError::InvalidStream("Stream not found".to_string()));
+        }
+
+        // Now execute all operations
+        for operation in operations {
+            self.execute_operation(operation)?;
+        }
+
+        Ok(())
+    }
+
+    fn execute_operation(&self, _operation: CudaOperation) -> Result<(), CudaError> {
+        // Host-memory simulation (see module docs): there is no real CUDA
+        // device to transfer to or from, so no data movement happens here.
+        // This used to also inject an artificial `std::thread::sleep` per
+        // operation type to mimic device-transfer latency; that fake timing
+        // has been removed rather than left as an undisclosed simulated
+        // number, so callers now see the true (near-zero) cost of this
+        // simulation instead of a fabricated one.
+        Ok(())
+    }
+}
+
+/// CUDA statistics
+#[derive(Debug, Clone, Default)]
+pub struct CudaStats {
+    pub total_allocations: u64,
+    pub total_deallocations: u64,
+    pub bytes_allocated: u64,
+    pub bytes_deallocated: u64,
+    pub device_memory_used: usize,
+    pub host_memory_used: usize,
+    pub unified_memory_used: usize,
+    pub stream_operations: u64,
+    pub kernel_launches: u64,
+    pub memory_transfers: u64,
+    pub average_allocation_time: Duration,
+    pub peak_memory_usage: usize,
+}
+
+impl CudaMemoryBackend {
+    /// Create new CUDA backend
+    pub fn new(config: CudaConfig) -> Result<Self, CudaError> {
+        // Initialize CUDA device
+        let device_properties = Self::query_device_properties(config.device_id)?;
+
+        // Create memory pools
+        let mut memory_pools = HashMap::new();
+        if config.enable_memory_pools {
+            let pool_size = device_properties.total_global_memory / 4; // Use 1/4 of total memory
+            memory_pools.insert(
+                CudaMemoryType::Device,
+                CudaMemoryPool::new(CudaMemoryType::Device, pool_size),
+            );
+            memory_pools.insert(
+                CudaMemoryType::Host,
+                CudaMemoryPool::new(CudaMemoryType::Host, pool_size),
+            );
+
+            if config.enable_unified_memory && device_properties.managed_memory {
+                memory_pools.insert(
+                    CudaMemoryType::Unified,
+                    CudaMemoryPool::new(CudaMemoryType::Unified, pool_size),
+                );
+            }
+        }
+
+        let stream_manager = CudaStreamManager::new(CudaStreamConfig::default());
+
+        Ok(Self {
+            config,
+            device_properties,
+            contexts: HashMap::new(),
+            memory_pools,
+            stats: CudaStats::default(),
+            stream_manager,
+        })
+    }
+
+    /// Query device properties
+    fn query_device_properties(device_id: u32) -> Result<CudaDeviceProperties, CudaError> {
+        // Simulate querying CUDA device properties
+        Ok(CudaDeviceProperties {
+            device_id,
+            name: format!("CUDA Device {}", device_id),
+            compute_capability: (7, 5), // Simulate Turing architecture
+            total_global_memory: 8 * 1024 * 1024 * 1024, // 8GB
+            shared_memory_per_block: 48 * 1024, // 48KB
+            warp_size: 32,
+            max_threads_per_block: 1024,
+            max_blocks_per_multiprocessor: 16,
+            multiprocessor_count: 68,
+            memory_clock_rate: 7001000, // 7 GHz
+            memory_bus_width: 256,
+            l2_cache_size: 4 * 1024 * 1024, // 4MB
+            unified_addressing: true,
+            managed_memory: true,
+            concurrent_kernels: true,
+            async_engine_count: 2,
+        })
+    }
+
+    /// Allocate device memory
+    pub fn allocate(
+        &mut self,
+        size: usize,
+        memory_type: CudaMemoryType,
+    ) -> Result<*mut c_void, CudaError> {
+        let start_time = Instant::now();
+
+        let ptr = if self.config.enable_memory_pools {
+            if let Some(pool) = self.memory_pools.get_mut(&memory_type) {
+                pool.allocate(size)?
+            } else {
+                return Err(CudaError::UnsupportedMemoryType(
+                    "Memory type not supported".to_string(),
+                ));
+            }
+        } else {
+            // Direct allocation
+            self.direct_allocate(size, memory_type.clone())?
+        };
+
+        // Update statistics
+        self.stats.total_allocations += 1;
+        self.stats.bytes_allocated += size as u64;
+
+        match memory_type {
+            CudaMemoryType::Device => self.stats.device_memory_used += size,
+            CudaMemoryType::Host => self.stats.host_memory_used += size,
+            CudaMemoryType::Unified => self.stats.unified_memory_used += size,
+            _ => {}
+        }
+
+        let allocation_time = start_time.elapsed();
+        let total_time = self.stats.average_allocation_time.as_nanos() as u64
+            * (self.stats.total_allocations - 1)
+            + allocation_time.as_nanos() as u64;
+        self.stats.average_allocation_time =
+            Duration::from_nanos(total_time / self.stats.total_allocations);
+
+        let current_usage = self.stats.device_memory_used
+            + self.stats.host_memory_used
+            + self.stats.unified_memory_used;
+        if current_usage > self.stats.peak_memory_usage {
+            self.stats.peak_memory_usage = current_usage;
+        }
+
+        Ok(ptr)
+    }
+
+    fn direct_allocate(
+        &self,
+        size: usize,
+        memory_type: CudaMemoryType,
+    ) -> Result<*mut c_void, CudaError> {
+        // Simulate direct CUDA allocation
+        match memory_type {
+            CudaMemoryType::Device => sim_alloc(size), // cudaMalloc
+            CudaMemoryType::Host => sim_alloc(size),   // cudaMallocHost
+            CudaMemoryType::Unified => {
+                // cudaMallocManaged
+                if !self.device_properties.managed_memory {
+                    return Err(CudaError::UnsupportedOperation(
+                        "Unified memory not supported".to_string(),
+                    ));
+                }
+                sim_alloc(size)
+            }
+            _ => Err(CudaError::UnsupportedMemoryType(
+                "Unsupported memory type".to_string(),
+            )),
+        }
+    }
+
+    /// Free device memory
+    pub fn free(&mut self, ptr: *mut c_void, memory_type: CudaMemoryType) -> Result<(), CudaError> {
+        if self.config.enable_memory_pools {
+            if let Some(pool) = self.memory_pools.get_mut(&memory_type) {
+                pool.free(ptr)?;
+            } else {
+                return Err(CudaError::UnsupportedMemoryType(
+                    "Memory type not supported".to_string(),
+                ));
+            }
+        } else {
+            // Direct deallocation. `ptr` was returned by `sim_alloc` via
+            // `cuda_malloc`/`direct_allocate` above (the only producers of
+            // pointers this path frees), and this is the first time it is
+            // freed — `free` is not reentrant-called for the same pointer.
+            sim_dealloc(ptr);
+        }
+
+        self.stats.total_deallocations += 1;
+        Ok(())
+    }
+
+    /// Copy memory
+    pub fn memcpy(
+        &mut self,
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        kind: CudaMemcpyKind,
+    ) -> Result<(), CudaError> {
+        let operation = CudaOperation {
+            op_type: match kind {
+                CudaMemcpyKind::HostToDevice => CudaOperationType::MemcpyHostToDevice,
+                CudaMemcpyKind::DeviceToHost => CudaOperationType::MemcpyDeviceToHost,
+                CudaMemcpyKind::DeviceToDevice => CudaOperationType::MemcpyDeviceToDevice,
+                CudaMemcpyKind::HostToHost => CudaOperationType::MemcpyAsync,
+            },
+            src_ptr: Some(src as *mut c_void),
+            dst_ptr: Some(dst),
+            size,
+            timestamp: Instant::now(),
+        };
+
+        // Execute synchronously for now
+        self.stream_manager.execute_operation(operation)?;
+        self.stats.memory_transfers += 1;
+
+        Ok(())
+    }
+
+    /// Asynchronous memory copy
+    pub fn memcpy_async(
+        &mut self,
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        kind: CudaMemcpyKind,
+        stream_id: u32,
+    ) -> Result<(), CudaError> {
+        let operation = CudaOperation {
+            // Mirrors the synchronous `memcpy`'s mapping above so the queued
+            // operation's recorded direction matches what the caller asked
+            // for instead of always reporting a generic `MemcpyAsync`.
+            op_type: match kind {
+                CudaMemcpyKind::HostToDevice => CudaOperationType::MemcpyHostToDevice,
+                CudaMemcpyKind::DeviceToHost => CudaOperationType::MemcpyDeviceToHost,
+                CudaMemcpyKind::DeviceToDevice => CudaOperationType::MemcpyDeviceToDevice,
+                CudaMemcpyKind::HostToHost => CudaOperationType::MemcpyAsync,
+            },
+            src_ptr: Some(src as *mut c_void),
+            dst_ptr: Some(dst),
+            size,
+            timestamp: Instant::now(),
+        };
+
+        self.stream_manager.add_operation(stream_id, operation)?;
+        Ok(())
+    }
+
+    /// Create CUDA context
+    pub fn create_context(&mut self, flags: CudaContextFlags) -> Result<u32, CudaError> {
+        let context_id = self.contexts.len() as u32;
+
+        let context = CudaContext {
+            handle: std::ptr::null_mut(), // Would be actual CUDA context
+            device_id: self.config.device_id,
+            flags,
+            created_at: Instant::now(),
+            streams: Vec::new(),
+        };
+
+        self.contexts.insert(context_id, context);
+        Ok(context_id)
+    }
+
+    /// Get device properties
+    pub fn get_device_properties(&self) -> &CudaDeviceProperties {
+        &self.device_properties
+    }
+
+    /// Get statistics
+    pub fn get_stats(&self) -> &CudaStats {
+        &self.stats
+    }
+
+    /// Synchronize device
+    pub fn device_synchronize(&mut self) -> Result<(), CudaError> {
+        // Synchronize all streams
+        let stream_ids: Vec<u32> = self.stream_manager.streams.iter().map(|s| s.id).collect();
+        for stream_id in stream_ids {
+            self.stream_manager.synchronize_stream(stream_id)?;
+        }
+        Ok(())
+    }
+
+    /// Create stream
+    pub fn create_stream(&mut self, priority: Option<i32>) -> Result<u32, CudaError> {
+        self.stream_manager.create_stream(priority)
+    }
+
+    /// Destroy stream
+    pub fn destroy_stream(&mut self, stream_id: u32) -> Result<(), CudaError> {
+        self.stream_manager.destroy_stream(stream_id)
+    }
+}
+
+// Safety: CudaMemoryBackend manages CUDA GPU memory pointers via *mut c_void.
+// While raw pointers are not Send/Sync by default, it's safe to share across threads
+// when protected by Arc<Mutex<>> because:
+// 1. All pointers point to CUDA GPU memory managed by the CUDA driver
+// 2. The Mutex provides exclusive access for all mutable operations
+// 3. No thread-local state is maintained
+unsafe impl Send for CudaMemoryBackend {}
+unsafe impl Sync for CudaMemoryBackend {}
+
+/// CUDA memory copy kinds
+#[derive(Debug, Clone)]
+pub enum CudaMemcpyKind {
+    HostToDevice,
+    DeviceToHost,
+    DeviceToDevice,
+    HostToHost,
+}
+
+/// CUDA errors
+#[derive(Debug, Clone)]
+pub enum CudaError {
+    DeviceNotFound(String),
+    OutOfMemory(String),
+    InvalidPointer(String),
+    InvalidStream(String),
+    StreamFull(String),
+    UnsupportedOperation(String),
+    UnsupportedMemoryType(String),
+    ContextCreationFailed(String),
+    KernelLaunchFailed(String),
+    SynchronizationFailed(String),
+    InternalError(String),
+}
+
+impl std::fmt::Display for CudaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CudaError::DeviceNotFound(msg) => write!(f, "Device not found: {}", msg),
+            CudaError::OutOfMemory(msg) => write!(f, "Out of memory: {}", msg),
+            CudaError::InvalidPointer(msg) => write!(f, "Invalid pointer: {}", msg),
+            CudaError::InvalidStream(msg) => write!(f, "Invalid stream: {}", msg),
+            CudaError::StreamFull(msg) => write!(f, "Stream full: {}", msg),
+            CudaError::UnsupportedOperation(msg) => write!(f, "Unsupported operation: {}", msg),
+            CudaError::UnsupportedMemoryType(msg) => write!(f, "Unsupported memory type: {}", msg),
+            CudaError::ContextCreationFailed(msg) => write!(f, "Context creation failed: {}", msg),
+            CudaError::KernelLaunchFailed(msg) => write!(f, "Kernel launch failed: {}", msg),
+            CudaError::SynchronizationFailed(msg) => write!(f, "Synchronization failed: {}", msg),
+            CudaError::InternalError(msg) => write!(f, "Internal error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for CudaError {}
+
+/// Thread-safe CUDA backend wrapper
+pub struct ThreadSafeCudaBackend {
+    backend: Arc<Mutex<CudaMemoryBackend>>,
+}
+
+impl ThreadSafeCudaBackend {
+    pub fn new(config: CudaConfig) -> Result<Self, CudaError> {
+        let backend = CudaMemoryBackend::new(config)?;
+        Ok(Self {
+            backend: Arc::new(Mutex::new(backend)),
+        })
+    }
+
+    pub fn allocate(
+        &self,
+        size: usize,
+        memory_type: CudaMemoryType,
+    ) -> Result<*mut c_void, CudaError> {
+        let mut backend = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+        backend.allocate(size, memory_type)
+    }
+
+    pub fn free(&self, ptr: *mut c_void, memory_type: CudaMemoryType) -> Result<(), CudaError> {
+        let mut backend = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+        backend.free(ptr, memory_type)
+    }
+
+    pub fn get_stats(&self) -> CudaStats {
+        let backend = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+        backend.get_stats().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for F26: a zero-size request must not reach
+    /// `std::alloc::alloc` (unsound for a zero-size layout) and must round
+    /// trip through `sim_dealloc` as a safe no-op.
+    #[test]
+    fn sim_alloc_zero_size_is_a_safe_sentinel_not_a_ub_call() {
+        let ptr = sim_alloc(0).expect("zero-size request must succeed");
+        assert!(!ptr.is_null());
+        // The sentinel returned for a zero-size request; freeing it must be
+        // a no-op, never a call into the system allocator.
+        sim_dealloc(ptr);
+    }
+
+    /// A real allocation must be readable/writable across its full
+    /// requested size (proves the header/offset bookkeeping did not corrupt
+    /// the returned pointer) and must free through the *same* layout it was
+    /// allocated with.
+    #[test]
+    fn sim_alloc_real_allocation_round_trips_and_frees_cleanly() {
+        for size in [1usize, 7, 256, 4096, 1_000_003] {
+            let ptr = sim_alloc(size).expect("allocation must succeed") as *mut u8;
+            assert!(!ptr.is_null());
+            // SAFETY: `ptr` was just allocated with `size` bytes available.
+            unsafe {
+                for i in 0..size {
+                    ptr.add(i).write(0xAB);
+                }
+                for i in 0..size {
+                    assert_eq!(ptr.add(i).read(), 0xAB);
+                }
+                sim_dealloc(ptr as *mut c_void);
+            }
+        }
+    }
+
+    #[test]
+    fn sim_dealloc_null_is_a_no_op() {
+        // `sim_dealloc` documents a null pointer as a no-op, which is
+        // exactly what this exercises.
+        sim_dealloc(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn test_cuda_backend_creation() {
+        let config = CudaConfig::default();
+        let backend = CudaMemoryBackend::new(config);
+        assert!(backend.is_ok());
+    }
+
+    #[test]
+    fn test_memory_pool() {
+        let mut pool = CudaMemoryPool::new(CudaMemoryType::Device, 1024 * 1024);
+        let ptr = pool.allocate(1024);
+        assert!(ptr.is_ok());
+
+        let ptr = ptr.expect("unwrap failed");
+        let result = pool.free(ptr);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_stream_manager() {
+        let mut manager = CudaStreamManager::new(CudaStreamConfig::default());
+        let stream_id = manager.create_stream(Some(1));
+        assert!(stream_id.is_ok());
+
+        let stream_id = stream_id.expect("unwrap failed");
+        let result = manager.destroy_stream(stream_id);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_thread_safe_backend() {
+        let config = CudaConfig::default();
+        let backend = ThreadSafeCudaBackend::new(config);
+        assert!(backend.is_ok());
+
+        let backend = backend.expect("unwrap failed");
+        let stats = backend.get_stats();
+        assert_eq!(stats.total_allocations, 0);
+    }
+}

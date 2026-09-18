@@ -1,0 +1,21 @@
+[package]
+name = "scirs2-neural"
+version = "0.1.0-beta.4"
+edition = "2021"
+authors = ["SciRS2 Team"]
+description = "Neural network building blocks module for SciRS2 (scirs2-neural) - Minimal Version"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/scirs"
+keywords = ["neural-network", "deep-learning", "scientific", "ai", "machine-learning"]
+categories = ["science", "mathematics", "algorithms"]
+
+[dependencies]
+# Essential dependencies only
+ndarray = { version = "0.16.1", features = ["serde", "rayon"] }
+num-traits = "0.2.19"
+num-complex = "0.4.6"
+thiserror = "2.0.12"
+approx = "0.5.1"
+
+[features]
+default = []

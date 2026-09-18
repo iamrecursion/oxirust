@@ -1,0 +1,7 @@
+{
+  "name": "hide_banner",
+  "args": ["-hide_banner", "-i", "in.mkv", "out.mkv"],
+  "expect": {
+    "jobs": 1
+  }
+}

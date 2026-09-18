@@ -1,0 +1,370 @@
+// Build script for the `oxiproto` facade crate.
+//
+// Compiles `tests/fixtures/user.proto` so that the integration test can
+// `include!()` the generated code and perform wire-byte cross-validation
+// against the hand-written `OxiMessage` impl.
+//
+// Uses `oxiproto-build` rather than `prost-build` directly: the latter shells
+// out to a `protoc` executable, which meant this crate — the facade of a
+// project whose whole purpose is removing the `protoc` prerequisite — could not
+// be built without `protoc` installed. Dogfooding our own builder keeps the
+// tree buildable on a bare toolchain and exercises the exact code path
+// downstream users are pointed at.
+
+fn main() {
+    let proto_dir = "tests/fixtures";
+    let proto_file = "tests/fixtures/user.proto";
+
+    // Re-run if the proto changes or if this script itself changes.
+    println!("cargo:rerun-if-changed={proto_file}");
+    println!("cargo:rerun-if-changed=build.rs");
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by Cargo");
+
+    // The old `--experimental_allow_proto3_optional` protoc flag has no
+    // equivalent here and needs none: it only ever unlocked proto3 `optional`
+    // on protoc releases older than 3.15, and our parser emits the synthetic
+    // oneofs for proto3 field presence natively.
+    oxiproto_build::Builder::new()
+        .out_dir(&out_dir)
+        .compile(&[proto_file], &[proto_dir])
+        .expect("oxiproto-build failed to compile user.proto");
+
+    // Recursion-depth DoS regression fixture: emit a self-referential message's
+    // OxiMessage impl via oxiproto-codegen so the regenerated-codegen decode
+    // path can be exercised end-to-end. Always emitted (default features).
+    emit_dos_fixture(&out_dir);
+
+    // Protobuf Editions + proto2 group fixture: generated `OxiMessage` impls
+    // for a `edition = "2023"` schema exercising DELIMITED message encoding and
+    // EXPANDED repeated encoding, plus a proto2 `group`. `tests/editions.rs`
+    // `include!()`s it and round-trips real wire bytes.
+    emit_editions_fixture(&out_dir);
+
+    // JSON runtime harness (only when json-runtime-harness feature is active)
+    if std::env::var("CARGO_FEATURE_JSON_RUNTIME_HARNESS").is_ok() {
+        emit_json_test_fixture();
+    }
+}
+
+/// Generate the `OxiMessage` impl for a self-referential `RecNested` message
+/// and write it to `$OUT_DIR/dos_fixture.rs` for `tests/recursion_dos.rs` to
+/// `include!()`. This exercises the *generated* (codegen) decode path against a
+/// deeply nested input.
+fn emit_dos_fixture(out_dir: &str) {
+    use prost_types::field_descriptor_proto::{Label, Type};
+    use prost_types::{
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+    };
+
+    fn field(
+        name: &str,
+        number: i32,
+        label: Label,
+        ty: Type,
+        type_name: Option<&str>,
+    ) -> FieldDescriptorProto {
+        FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            label: Some(label as i32),
+            r#type: Some(ty as i32),
+            type_name: type_name.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    // message RecNested { RecNested child = 1; int32 v = 2; }
+    let fds = FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("dos.proto".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some("RecNested".to_string()),
+                field: vec![
+                    field(
+                        "child",
+                        1,
+                        Label::Optional,
+                        Type::Message,
+                        Some(".RecNested"),
+                    ),
+                    field("v", 2, Label::Optional, Type::Int32, None),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    let mut opts = oxiproto_codegen::CodegenOptions::new();
+    opts.emit_oxi_message_impl = true;
+    let code =
+        oxiproto_codegen::generate_with_options(&fds, &opts).expect("dos fixture codegen failed");
+
+    std::fs::write(std::path::Path::new(out_dir).join("dos_fixture.rs"), code)
+        .expect("failed to write dos_fixture.rs");
+}
+
+/// Generate `OxiMessage` impls for an Editions schema and a proto2 `group`
+/// schema, writing them to `$OUT_DIR/editions_fixture.rs`.
+///
+/// Both sources go through the *native* parser so that feature resolution
+/// (`features.message_encoding`, `features.repeated_field_encoding`) is what
+/// decides the emitted wire format — the generated code is then checked against
+/// hand-computed bytes by `tests/editions.rs`.
+fn emit_editions_fixture(out_dir: &str) {
+    const EDITION_SRC: &str = r#"edition = "2023";
+package edfix;
+
+message Inner {
+  int32 x = 1;
+}
+
+message Outer {
+  Inner delim = 1 [features.message_encoding = DELIMITED];
+  Inner framed = 2;
+  repeated int32 expanded = 3 [features.repeated_field_encoding = EXPANDED];
+  repeated int32 packed = 4;
+}
+
+message DefaultPacking {
+  repeated int32 vals = 1;
+}
+"#;
+
+    const PROTO2_GROUP_SRC: &str = r#"syntax = "proto2";
+package p2fix;
+
+message WithGroup {
+  optional int32 lead = 1;
+  optional group Sub = 2 {
+    optional int32 y = 1;
+  }
+}
+
+message DefaultPacking {
+  repeated int32 vals = 1;
+  repeated int32 forced = 2 [packed = true];
+  repeated fixed64 wide = 3;
+  repeated double reals = 4;
+}
+"#;
+
+    const PROTO3_PACKING_SRC: &str = r#"syntax = "proto3";
+package p3fix;
+
+message DefaultPacking {
+  repeated int32 vals = 1;
+  repeated int32 expanded = 2 [packed = false];
+}
+"#;
+
+    let mut code = String::new();
+    for (src, module) in [
+        (EDITION_SRC, "edfix"),
+        (PROTO2_GROUP_SRC, "p2fix"),
+        (PROTO3_PACKING_SRC, "p3fix"),
+    ] {
+        let fds =
+            oxiproto_build::compile_str_native(src).expect("editions fixture source must compile");
+        let mut opts = oxiproto_codegen::CodegenOptions::new();
+        opts.emit_oxi_message_impl = true;
+        let generated = oxiproto_codegen::generate_with_options(&fds, &opts)
+            .expect("editions fixture codegen failed");
+        code.push_str(&format!("pub mod {module} {{\n{generated}\n}}\n"));
+    }
+
+    std::fs::write(
+        std::path::Path::new(out_dir).join("editions_fixture.rs"),
+        code,
+    )
+    .expect("failed to write editions_fixture.rs");
+}
+
+fn emit_json_test_fixture() {
+    use prost_types::field_descriptor_proto::{Label, Type};
+    use prost_types::{
+        DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
+        FileDescriptorProto, FileDescriptorSet, OneofDescriptorProto,
+    };
+
+    fn field(
+        name: &str,
+        num: i32,
+        ty: Type,
+        label: Label,
+        json_name: &str,
+    ) -> FieldDescriptorProto {
+        FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(num),
+            r#type: Some(ty as i32),
+            label: Some(label as i32),
+            json_name: Some(json_name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // Message: AllScalars — one of each scalar type
+    let all_scalars = DescriptorProto {
+        name: Some("AllScalars".to_string()),
+        field: vec![
+            field("int32_val", 1, Type::Int32, Label::Optional, "int32Val"),
+            field("int64_val", 2, Type::Int64, Label::Optional, "int64Val"),
+            field("uint32_val", 3, Type::Uint32, Label::Optional, "uint32Val"),
+            field("uint64_val", 4, Type::Uint64, Label::Optional, "uint64Val"),
+            field("float_val", 5, Type::Float, Label::Optional, "floatVal"),
+            field("double_val", 6, Type::Double, Label::Optional, "doubleVal"),
+            field("bool_val", 7, Type::Bool, Label::Optional, "boolVal"),
+            field("string_val", 8, Type::String, Label::Optional, "stringVal"),
+            field("bytes_val", 9, Type::Bytes, Label::Optional, "bytesVal"),
+        ],
+        ..Default::default()
+    };
+
+    // Message: BigInts — int64/uint64 for string-repr testing
+    let big_ints = DescriptorProto {
+        name: Some("BigInts".to_string()),
+        field: vec![
+            field("signed", 1, Type::Int64, Label::Optional, "signed"),
+            field("unsigned", 2, Type::Uint64, Label::Optional, "unsigned"),
+        ],
+        ..Default::default()
+    };
+
+    // Message: BinaryData — bytes field
+    let binary_data = DescriptorProto {
+        name: Some("BinaryData".to_string()),
+        field: vec![field("payload", 1, Type::Bytes, Label::Optional, "payload")],
+        ..Default::default()
+    };
+
+    // Message: Floats — float/double for NaN/Inf testing
+    let floats = DescriptorProto {
+        name: Some("Floats".to_string()),
+        field: vec![
+            field("f32", 1, Type::Float, Label::Optional, "f32"),
+            field("f64", 2, Type::Double, Label::Optional, "f64"),
+        ],
+        ..Default::default()
+    };
+
+    // Message: RepMsg — repeated field
+    let rep_msg = DescriptorProto {
+        name: Some("RepMsg".to_string()),
+        field: vec![field("tags", 1, Type::String, Label::Repeated, "tags")],
+        ..Default::default()
+    };
+
+    // Message: CamelMsg — camelCase json_name test
+    let camel_msg = DescriptorProto {
+        name: Some("CamelMsg".to_string()),
+        field: vec![FieldDescriptorProto {
+            name: Some("user_id".to_string()),
+            number: Some(1),
+            r#type: Some(Type::Int32 as i32),
+            label: Some(Label::Optional as i32),
+            json_name: Some("userId".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Enum: Color
+    let color_enum = EnumDescriptorProto {
+        name: Some("Color".to_string()),
+        value: vec![
+            EnumValueDescriptorProto {
+                name: Some("COLOR_UNSPECIFIED".to_string()),
+                number: Some(0),
+                ..Default::default()
+            },
+            EnumValueDescriptorProto {
+                name: Some("RED".to_string()),
+                number: Some(1),
+                ..Default::default()
+            },
+            EnumValueDescriptorProto {
+                name: Some("GREEN".to_string()),
+                number: Some(2),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    // Message: EnumMsg — has a Color field
+    let enum_msg = DescriptorProto {
+        name: Some("EnumMsg".to_string()),
+        field: vec![FieldDescriptorProto {
+            name: Some("color".to_string()),
+            number: Some(1),
+            r#type: Some(Type::Enum as i32),
+            label: Some(Label::Optional as i32),
+            type_name: Some(".harness.Color".to_string()),
+            json_name: Some("color".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Message: OneofMsg — tests oneof JSON roundtrip
+    let oneof_msg = DescriptorProto {
+        name: Some("OneofMsg".to_string()),
+        field: vec![
+            FieldDescriptorProto {
+                name: Some("int_v".to_string()),
+                number: Some(1),
+                r#type: Some(Type::Int32 as i32),
+                label: Some(Label::Optional as i32),
+                json_name: Some("intV".to_string()),
+                oneof_index: Some(0),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("str_v".to_string()),
+                number: Some(2),
+                r#type: Some(Type::String as i32),
+                label: Some(Label::Optional as i32),
+                json_name: Some("strV".to_string()),
+                oneof_index: Some(0),
+                ..Default::default()
+            },
+        ],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("value".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let fds = FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("harness.proto".to_string()),
+            package: Some("harness".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![
+                all_scalars,
+                big_ints,
+                binary_data,
+                floats,
+                rep_msg,
+                camel_msg,
+                enum_msg,
+                oneof_msg,
+            ],
+            enum_type: vec![color_enum],
+            ..Default::default()
+        }],
+    };
+
+    let mut opts = oxiproto_codegen::CodegenOptions::new();
+    opts.emit_json = true;
+    let code =
+        oxiproto_codegen::generate_with_options(&fds, &opts).expect("json fixture codegen failed");
+
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR must be set"));
+    std::fs::write(out_dir.join("json_test_fixture.rs"), code)
+        .expect("failed to write json_test_fixture.rs");
+}

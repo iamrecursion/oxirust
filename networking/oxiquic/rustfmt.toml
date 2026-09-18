@@ -1,0 +1,9 @@
+# OxiQUIC rustfmt configuration.
+#
+# Intentionally minimal: the existing codebase already conforms to rustfmt's
+# stable defaults (verified via `cargo fmt --check` before this file was
+# added), so this pins only the one setting that is not safely inferable
+# from `Cargo.toml` alone when `rustfmt` is invoked directly (rather than via
+# `cargo fmt`, which reads each crate's `edition` automatically). Every other
+# key intentionally uses the stable default.
+edition = "2021"

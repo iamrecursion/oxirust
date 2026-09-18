@@ -1,0 +1,5 @@
+[package]
+name = "test_bounds"
+version.workspace = true
+edition.workspace = true
+publish = false

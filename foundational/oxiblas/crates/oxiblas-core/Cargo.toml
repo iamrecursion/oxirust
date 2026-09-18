@@ -1,0 +1,61 @@
+[package]
+name = "oxiblas-core"
+description = "Core traits and SIMD abstractions for OxiBLAS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["blas", "lapack", "simd", "linear-algebra", "numerics"]
+categories = ["mathematics", "science", "algorithms"]
+
+[dependencies]
+num-complex.workspace = true
+num-traits.workspace = true
+bytemuck.workspace = true
+rayon = { workspace = true, optional = true }
+half = { workspace = true, optional = true, features = ["num-traits", "bytemuck"] }
+twofloat = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+std = ["libc", "num-traits/std", "num-complex/std", "half?/std", "twofloat?/std"]
+parallel = ["rayon", "std"]
+f16 = ["half"]  # Half-precision (16-bit float) support
+f128 = ["dep:twofloat"]  # Quad-precision (double-double) support
+# ARM SVE (Scalable Vector Extension) kernels. OFF by default and NIGHTLY-ONLY:
+# the SVE intrinsics live behind the unstable `stdarch_aarch64_sve` feature gate,
+# and the code additionally requires the target to enable SVE (e.g. via
+# `-C target-feature=+sve`). On stable, or without this feature, OxiBLAS uses the
+# always-available NEON / emulated-256-bit fallbacks.
+sve-nightly = []
+
+# SIMD control features
+force-scalar = []  # Force scalar operations, disable all SIMD (useful for debugging)
+max-simd-128 = []  # Limit SIMD to 128-bit (SSE/NEON) maximum
+max-simd-256 = []  # Limit SIMD to 256-bit (AVX2) maximum
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true, features = ["rayon"] }
+
+[[bench]]
+name = "simd"
+harness = false
+
+[[bench]]
+name = "blocking"
+harness = false
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

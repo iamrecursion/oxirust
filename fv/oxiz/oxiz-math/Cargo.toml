@@ -1,0 +1,52 @@
+[package]
+name = "oxiz-math"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Mathematical foundations for OxiZ SMT solver"
+readme = "README.md"
+keywords = ["smt", "math", "simplex", "polynomial", "algebra"]
+categories = ["algorithms", "mathematics"]
+
+[dependencies]
+num-rational = { workspace = true, default-features = false, features = ["num-bigint"] }
+num-bigint = { workspace = true, default-features = false }
+num-traits = { workspace = true, default-features = false }
+num-integer = { workspace = true, default-features = false }
+smallvec.workspace = true
+rustc-hash.workspace = true
+thiserror = { workspace = true, default-features = false }
+rand = { workspace = true, optional = true }
+hashbrown.workspace = true
+oxiz-time = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "num-rational/std",
+    "num-bigint/std",
+    "num-traits/std",
+    "num-integer/std",
+    "thiserror/std",
+    "rustc-hash/std",
+    "rand",
+    "oxiz-time/std",
+]
+# Reserved: the `simd` module is compiled unconditionally and relies on
+# auto-vectorization, so this feature currently enables no extra code. It is
+# kept so that an explicit opt-in can be added without a breaking change.
+simd = []
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "math_benchmarks"
+harness = false
+
+[lints.clippy]
+unwrap_used = "deny"

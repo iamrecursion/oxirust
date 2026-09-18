@@ -1,0 +1,108 @@
+#version 430
+
+// Advanced error estimation compute shader with mixed-precision support
+// Implements Richardson extrapolation and higher-order error estimates
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer Y1Buffer {
+    float y1[];  // Solution from full step
+};
+
+layout(std430, binding = 1) buffer Y2Buffer {
+    float y2[];  // Solution from two half steps
+};
+
+layout(std430, binding = 2) buffer Y3Buffer {
+    float y3[];  // Solution from four quarter steps (optional)
+};
+
+layout(std430, binding = 3) buffer ErrorBuffer {
+    float error[];  // Output error estimates
+};
+
+layout(std430, binding = 4) buffer HighOrderErrorBuffer {
+    float high_order_error[];  // Higher-order error estimates
+};
+
+layout(std430, binding = 5) buffer PrecisionMaskBuffer {
+    int precision_mask[];  // Precision level per element (0=half, 1=single, 2=double)
+};
+
+uniform float rtol;  // Relative tolerance
+uniform float atol;  // Absolute tolerance
+uniform int n;       // Number of elements
+uniform int order;   // Method order (for Richardson extrapolation)
+uniform bool use_richardson;  // Enable Richardson extrapolation
+uniform bool mixed_precision_mode;  // Enable mixed-precision analysis
+
+// Shared memory for reduction operations
+shared float shared_errors[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint index = gl_GlobalInvocationID.x;
+    
+    if (index >= n) return;
+    
+    float val1 = y1[index];
+    float val2 = y2[index];
+    float local_error = 0.0;
+    float high_order_err = 0.0;
+    
+    // Basic error estimate
+    float scale = atol + rtol * max(abs(val1), abs(val2));
+    float diff = abs(val2 - val1);
+    local_error = diff / scale;
+    
+    // Richardson extrapolation for higher-order error estimate
+    if (use_richardson && index < n && y3[index] != 0.0) {
+        float val3 = y3[index];
+        
+        // Richardson extrapolation: E_h ≈ (y_h - y_{h/2}) / (2^p - 1)
+        float richardson_factor = pow(2.0, float(order)) - 1.0;
+        float richardson_err = abs(val2 - val3) / richardson_factor;
+        high_order_err = richardson_err / scale;
+    } else {
+        high_order_err = local_error;
+    }
+    
+    // Mixed-precision analysis
+    if (mixed_precision_mode) {
+        // Analyze required precision based on error magnitude
+        float error_magnitude = max(local_error, high_order_err);
+        
+        int required_precision;
+        if (error_magnitude > 1e-3) {
+            required_precision = 0;  // Half precision sufficient
+        } else if (error_magnitude > 1e-9) {
+            required_precision = 1;  // Single precision needed
+        } else {
+            required_precision = 2;  // Double precision required
+        }
+        
+        precision_mask[index] = required_precision;
+    }
+    
+    // Store error estimates
+    error[index] = local_error;
+    high_order_error[index] = high_order_err;
+    
+    // Store in shared memory for reduction operations
+    shared_errors[tid] = max(local_error, high_order_err);
+    barrier();
+    
+    // Parallel reduction to find maximum error in work group
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_errors[tid] = max(shared_errors[tid], shared_errors[tid + s]);
+        }
+        barrier();
+    }
+    
+    // First thread writes work group maximum
+    if (tid == 0) {
+        uint group_id = gl_WorkGroupID.x;
+        error[n + group_id] = shared_errors[0];  // Store group max at end of buffer
+    }
+}

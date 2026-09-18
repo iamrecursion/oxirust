@@ -1,0 +1,127 @@
+[package]
+name = "oxirs-tdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Apache Jena TDB/TDB2 compatible RDF storage engine with B+Tree indexes"
+keywords = ["rdf", "sparql", "storage", "database", "tdb"]
+categories = ["database", "data-structures"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Core
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+# SciRS2 Integration
+scirs2-core = { workspace = true, features = ["profiling", "parallel"] }
+
+# Storage
+memmap2.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+oxicode.workspace = true  # Replaces bincode per COOLJAPAN Policy
+
+# Utilities
+log = "0.4"
+bytes = { workspace = true }
+crc32fast.workspace = true
+chrono.workspace = true
+
+# Async I/O
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
+futures.workspace = true
+# Tantivy full-text search engine (optional — gated behind `full-text-search`).
+# Pulls C `zstd-sys` transitively, so it is NOT enabled by default per the
+# COOLJAPAN Pure Rust default policy.
+tantivy = { workspace = true, optional = true }
+geo.workspace = true
+rstar.workspace = true
+geojson.workspace = true
+wkt.workspace = true
+oxiarc-lz4.workspace = true
+oxiarc-zstd.workspace = true
+oxiarc-snappy.workspace = true
+oxiarc-brotli.workspace = true
+
+oxiarc-deflate.workspace = true
+
+# Encryption
+aes-gcm.workspace = true
+# CSPRNG for salt/nonce generation (true OS entropy via getrandom). NOTE
+# (cargo-upgrade sweep, 2026-07-02): aes-gcm 0.11's aead 0.6 dropped the
+# `aead::OsRng` re-export, and the underlying rand_core reachable via
+# `aes_gcm::aead::rand_core` is 0.10 (no OsRng). Rather than re-source OsRng or
+# fall back to scirs2-core's timestamp/PID-seeded `SecureRandom` (a security
+# downgrade for a backup-encryption module), switched backup_encryption.rs to the
+# COOLJAPAN crypto RNG `oxicrypto_rand::random_bytes` (the same primary CSPRNG the
+# sibling oxirs-cluster/tls.rs already uses). Returns Result -> no unwrap.
+oxicrypto-rand.workspace = true
+# NOTE (cargo-upgrade sweep, 2026-07-02): pbkdf2 0.13.0's own CHANGELOG documents the
+# "simple" feature being renamed to "phc" (RustCrypto/password-hashes#776) -- a
+# required, mechanical companion change of the pbkdf2 0.12->0.13 major bump itself
+# (the old "simple" name unconditionally broke workspace-wide dependency resolution).
+# backup_encryption.rs only calls the raw `pbkdf2::pbkdf2_hmac::<Sha256>` function,
+# which is gated by the "hmac" feature (a *default* feature since 0.13, per the
+# crate's docs.rs feature graph) -- so this rename is likely a no-op for this call
+# site either way, but kept faithful to the upstream rename rather than dropped.
+pbkdf2 = { version = "0.13", features = ["phc"] }
+sha2 = "0.11"
+hex.workspace = true
+
+# UUID generation
+uuid.workspace = true
+
+# Unix system calls (for madvise, mlock)
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Optional: io_uring support (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { version = "0.5", optional = true }
+
+[features]
+default = []
+# Full-text search over RDF literals via Tantivy. NOT in default: Tantivy pulls
+# C `zstd-sys` (tantivy → tantivy-sstable → zstd → zstd-sys), which violates the
+# COOLJAPAN Pure Rust default policy. Enable explicitly to gain text search.
+full-text-search = ["dep:tantivy"]
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+# Use scirs2-core::random instead of rand (see CLAUDE.md)
+
+[[bench]]
+name = "bloom_filter_benchmark"
+harness = false
+
+# Future benchmarks
+# [[bench]]
+# name = "btree_bench"
+# harness = false
+#
+# [[bench]]
+# name = "index_bench"
+# harness = false
+#
+# [[bench]]
+# name = "query_bench"
+# harness = false
+
+[[bench]]
+name = "storage_bench"
+harness = false

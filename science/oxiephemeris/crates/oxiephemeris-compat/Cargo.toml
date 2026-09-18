@@ -1,0 +1,41 @@
+[package]
+name = "oxiephemeris-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: Swiss-Ephemeris-compatible calculation surface (SE-compatible API shape, clean-room implementation)"
+keywords = ["ephemeris", "astronomy", "astrology", "swisseph"]
+categories = ["science", "no-std"]
+
+[features]
+default = []
+# Enables `std`-only conveniences (e.g. `std::error::Error` for `CompatError`
+# and the transitive `std` features of the crates below).
+std = [
+    "oxiephemeris-core/std",
+    "oxiephemeris-de/std",
+    "oxiephemeris-bodies/std",
+    "oxiephemeris-astro/std",
+]
+
+[dependencies]
+libm.workspace = true
+oxiephemeris-core.workspace = true
+oxiephemeris-de.workspace = true
+oxiephemeris-bodies.workspace = true
+oxiephemeris-astro.workspace = true
+
+[dev-dependencies]
+oxiephemeris-de = { path = "../oxiephemeris-de", features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

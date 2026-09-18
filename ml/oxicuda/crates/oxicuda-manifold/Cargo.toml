@@ -1,0 +1,31 @@
+[package]
+name = "oxicuda-manifold"
+description = "OxiCUDA: Manifold Learning, Dimensionality Reduction, and Riemannian Geometry"
+categories = ["science", "algorithms", "mathematics"]
+keywords = ["manifold-learning", "tsne", "umap", "riemannian", "gpu"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[features]
+gpu-tests = []
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "manifold_ops"
+harness = false

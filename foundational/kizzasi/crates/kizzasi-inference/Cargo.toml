@@ -1,0 +1,105 @@
+[package]
+name = "kizzasi-inference"
+description = "Unified autoregressive inference engine for Kizzasi AGSP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["inference", "autoregressive", "sampling", "prediction", "streaming"]
+categories = ["algorithms", "asynchronous"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi-inference"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[features]
+default = ["std", "mamba"]
+std = []
+# GPU acceleration (optional, off by default). Forwards candle's Metal
+# backend through `kizzasi-core/metal`, which is live on Apple targets and
+# inert -- but still buildable -- everywhere else, so `--all-features` works on
+# every host; the `kizzasi-metal` crate explains how that target gating is
+# done. There is no `cuda` counterpart -- see kizzasi-core's `[features]` for
+# why a CUDA flag cannot be offered without breaking every non-CUDA build.
+metal = ["kizzasi-core/metal", "kizzasi-model/metal", "kizzasi-tokenizer/metal"]
+# Async and streaming
+async = ["dep:tokio", "dep:tokio-stream", "dep:futures", "dep:async-stream"]
+streaming = ["async"]
+msgpack = ["dep:rmp-serde"]
+# Forwards to kizzasi-model's own (default-on) `mamba` feature so the
+# registry's Mamba/Mamba2 branches are reachable by default, matching the
+# top-level README's description of Mamba2 as the default architecture, and
+# so that `default-features = false, features = ["mamba"]` compiles even
+# against a `default-features = false` kizzasi-model.
+mamba = ["kizzasi-model/mamba"]
+# Network adapters
+websocket = ["streaming", "dep:tokio-tungstenite", "dep:bytes"]
+mqtt = ["streaming", "dep:rumqttc", "dep:bytes"]
+grpc = ["streaming", "dep:tonic", "dep:prost", "dep:bytes", "dep:http", "dep:http-body", "dep:tower-service"]
+# `rest` needs `streaming` for `StreamingEngine`, the same engine-hosting type
+# `websocket`/`mqtt`/`grpc` already build on: `POST /infer` runs real
+# inference through it instead of being a hardcoded mock.
+rest = ["streaming", "dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
+network = ["websocket", "mqtt", "grpc"]
+
+[dependencies]
+# Internal crates
+kizzasi-core.workspace = true
+# `registry.rs` builds RWKV (v6/v5), S4 and Transformer models unconditionally,
+# so those architecture features are required here rather than assumed from
+# kizzasi-model's defaults; `mamba` stays behind this crate's own `mamba`
+# feature, which does gate code in `registry.rs`.
+kizzasi-model = { workspace = true, features = ["rwkv", "s4", "transformer"] }
+kizzasi-tokenizer.workspace = true
+kizzasi-logic.workspace = true
+
+# COOLJAPAN Ecosystem
+scirs2-core.workspace = true
+
+# Core dependencies
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+chrono.workspace = true
+
+# Serialization (optional)
+rmp-serde = { workspace = true, optional = true }
+
+# Async support (optional)
+tokio = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+
+# Network adapters (optional)
+tokio-tungstenite = { workspace = true, optional = true }
+rumqttc = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+tower-service = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "advanced_features"
+harness = false
+required-features = ["streaming"]
+
+[[bench]]
+name = "state_compression_bench"
+harness = false

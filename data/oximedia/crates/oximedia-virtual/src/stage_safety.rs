@@ -1,0 +1,702 @@
+//! Stage safety module for virtual production: tracking safe zones and
+//! collision/proximity alerts.
+//!
+//! Defines safety exclusion zones, talent safe zones, cable/equipment keep-out
+//! areas, and movement envelopes.  Provides real-time checks against tracked
+//! positions and generates alerts when thresholds are breached.
+
+use crate::{Result, VirtualProductionError};
+use serde::{Deserialize, Serialize};
+
+/// A 3D axis-aligned bounding box (AABB) defining a zone.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Aabb {
+    /// Minimum corner [x, y, z].
+    pub min: [f64; 3],
+    /// Maximum corner [x, y, z].
+    pub max: [f64; 3],
+}
+
+impl Aabb {
+    /// Create an AABB from center + half-extents.
+    #[must_use]
+    pub fn from_center_extents(center: [f64; 3], half_extents: [f64; 3]) -> Self {
+        Self {
+            min: [
+                center[0] - half_extents[0],
+                center[1] - half_extents[1],
+                center[2] - half_extents[2],
+            ],
+            max: [
+                center[0] + half_extents[0],
+                center[1] + half_extents[1],
+                center[2] + half_extents[2],
+            ],
+        }
+    }
+
+    /// Create an AABB from explicit min/max corners.
+    #[must_use]
+    pub fn from_min_max(min: [f64; 3], max: [f64; 3]) -> Self {
+        Self { min, max }
+    }
+
+    /// Test whether a point lies within this AABB (inclusive).
+    #[must_use]
+    pub fn contains(&self, point: &[f64; 3]) -> bool {
+        point[0] >= self.min[0]
+            && point[0] <= self.max[0]
+            && point[1] >= self.min[1]
+            && point[1] <= self.max[1]
+            && point[2] >= self.min[2]
+            && point[2] <= self.max[2]
+    }
+
+    /// Compute the minimum distance from a point to the surface of this AABB.
+    /// Returns 0.0 if the point is inside.
+    #[must_use]
+    pub fn surface_distance(&self, point: &[f64; 3]) -> f64 {
+        let mut max_dist = f64::MIN;
+        for i in 0..3 {
+            let d = (point[i] - self.min[i]).min(self.max[i] - point[i]);
+            max_dist = max_dist.max(d);
+        }
+        // If inside, max_dist > 0 (closest wall); if outside, max_dist <= 0
+        if max_dist >= 0.0 {
+            0.0 // inside
+        } else {
+            // Outside: compute actual Euclidean distance to nearest surface
+            let mut sq = 0.0f64;
+            for i in 0..3 {
+                let d = if point[i] < self.min[i] {
+                    self.min[i] - point[i]
+                } else if point[i] > self.max[i] {
+                    point[i] - self.max[i]
+                } else {
+                    0.0
+                };
+                sq += d * d;
+            }
+            sq.sqrt()
+        }
+    }
+
+    /// Volume of the AABB.
+    #[must_use]
+    pub fn volume(&self) -> f64 {
+        (self.max[0] - self.min[0]).max(0.0)
+            * (self.max[1] - self.min[1]).max(0.0)
+            * (self.max[2] - self.min[2]).max(0.0)
+    }
+
+    /// Centre of the AABB.
+    #[must_use]
+    pub fn center(&self) -> [f64; 3] {
+        [
+            (self.min[0] + self.max[0]) / 2.0,
+            (self.min[1] + self.max[1]) / 2.0,
+            (self.min[2] + self.max[2]) / 2.0,
+        ]
+    }
+}
+
+/// A circular/cylindrical safety zone (for LED wall proximity checks).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CylinderZone {
+    /// Centre of the cylinder base on the floor [x, z] (XZ plane).
+    pub center_xz: [f64; 2],
+    /// Radius in meters.
+    pub radius: f64,
+    /// Minimum Y (floor height).
+    pub y_min: f64,
+    /// Maximum Y (ceiling height).
+    pub y_max: f64,
+}
+
+impl CylinderZone {
+    /// Create a new cylinder zone.
+    #[must_use]
+    pub fn new(cx: f64, cz: f64, radius: f64, y_min: f64, y_max: f64) -> Self {
+        Self {
+            center_xz: [cx, cz],
+            radius,
+            y_min,
+            y_max,
+        }
+    }
+
+    /// Test whether a 3D point lies within this cylinder.
+    #[must_use]
+    pub fn contains(&self, point: &[f64; 3]) -> bool {
+        let dx = point[0] - self.center_xz[0];
+        let dz = point[2] - self.center_xz[1];
+        let r2 = dx * dx + dz * dz;
+        r2 <= self.radius * self.radius && point[1] >= self.y_min && point[1] <= self.y_max
+    }
+
+    /// Horizontal distance from the cylinder axis.
+    #[must_use]
+    pub fn horizontal_distance(&self, point: &[f64; 3]) -> f64 {
+        let dx = point[0] - self.center_xz[0];
+        let dz = point[2] - self.center_xz[1];
+        (dx * dx + dz * dz).sqrt()
+    }
+}
+
+/// Severity of a safety alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AlertSeverity {
+    /// Informational only.
+    Info,
+    /// Approaching a boundary (within warning margin).
+    Warning,
+    /// Zone is breached.
+    Critical,
+}
+
+/// A safety alert generated by the monitoring system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyAlert {
+    /// Severity level.
+    pub severity: AlertSeverity,
+    /// Human-readable message.
+    pub message: String,
+    /// Which zone triggered the alert.
+    pub zone_name: String,
+    /// Distance to boundary in meters (0 = inside zone).
+    pub distance_m: f64,
+    /// Timestamp in nanoseconds.
+    pub timestamp_ns: u64,
+}
+
+/// Zone type classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZoneType {
+    /// Where talent is allowed to move.
+    TalentSafe,
+    /// Exclusion zone: talent must not enter.
+    Exclusion,
+    /// Cable/equipment keep-out.
+    EquipmentKeepOut,
+    /// LED wall proximity alert zone.
+    LedWallProximity,
+    /// Emergency stop zone (triggers immediate halt).
+    EmergencyStop,
+}
+
+/// A named safety zone with geometry and type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyZone {
+    /// Zone name.
+    pub name: String,
+    /// Zone type.
+    pub zone_type: ZoneType,
+    /// Whether this zone is active.
+    pub active: bool,
+    /// Minimum distance before a warning is issued (meters).
+    pub warning_margin_m: f64,
+    /// AABB geometry (optional).
+    pub aabb: Option<Aabb>,
+    /// Cylinder geometry (optional).
+    pub cylinder: Option<CylinderZone>,
+}
+
+impl SafetyZone {
+    /// Create a zone with AABB geometry.
+    #[must_use]
+    pub fn from_aabb(name: &str, zone_type: ZoneType, aabb: Aabb) -> Self {
+        Self {
+            name: name.to_string(),
+            zone_type,
+            active: true,
+            warning_margin_m: 0.5,
+            aabb: Some(aabb),
+            cylinder: None,
+        }
+    }
+
+    /// Create a zone with cylinder geometry.
+    #[must_use]
+    pub fn from_cylinder(name: &str, zone_type: ZoneType, cylinder: CylinderZone) -> Self {
+        Self {
+            name: name.to_string(),
+            zone_type,
+            active: true,
+            warning_margin_m: 0.5,
+            aabb: None,
+            cylinder: Some(cylinder),
+        }
+    }
+
+    /// Set warning margin.
+    #[must_use]
+    pub fn with_warning_margin(mut self, margin_m: f64) -> Self {
+        self.warning_margin_m = margin_m.max(0.0);
+        self
+    }
+
+    /// Check whether a point is inside the zone geometry.
+    #[must_use]
+    pub fn contains(&self, point: &[f64; 3]) -> bool {
+        if let Some(aabb) = &self.aabb {
+            return aabb.contains(point);
+        }
+        if let Some(cyl) = &self.cylinder {
+            return cyl.contains(point);
+        }
+        false
+    }
+
+    /// Compute the distance from a point to the zone boundary (0 if inside).
+    #[must_use]
+    pub fn distance_to_boundary(&self, point: &[f64; 3]) -> f64 {
+        if let Some(aabb) = &self.aabb {
+            return aabb.surface_distance(point);
+        }
+        if let Some(cyl) = &self.cylinder {
+            let horiz = cyl.horizontal_distance(point);
+            let d = (horiz - cyl.radius).max(0.0);
+            return d;
+        }
+        f64::INFINITY
+    }
+}
+
+/// A tracked object (person, equipment) with a current position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackedObject {
+    /// Unique identifier.
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// Current world position [x, y, z].
+    pub position: [f64; 3],
+    /// Timestamp of the last update.
+    pub timestamp_ns: u64,
+    /// Whether this object is a person (vs. equipment).
+    pub is_person: bool,
+}
+
+impl TrackedObject {
+    /// Create a new tracked object.
+    #[must_use]
+    pub fn new(id: &str, label: &str, position: [f64; 3], is_person: bool) -> Self {
+        Self {
+            id: id.to_string(),
+            label: label.to_string(),
+            position,
+            timestamp_ns: 0,
+            is_person,
+        }
+    }
+
+    /// Update position and timestamp.
+    pub fn update(&mut self, position: [f64; 3], timestamp_ns: u64) {
+        self.position = position;
+        self.timestamp_ns = timestamp_ns;
+    }
+}
+
+/// Main stage safety monitor.
+pub struct StageSafety {
+    zones: Vec<SafetyZone>,
+    tracked_objects: Vec<TrackedObject>,
+    alert_history: Vec<SafetyAlert>,
+    max_history: usize,
+}
+
+impl StageSafety {
+    /// Create a new stage safety monitor.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            zones: Vec::new(),
+            tracked_objects: Vec::new(),
+            alert_history: Vec::new(),
+            max_history: 1000,
+        }
+    }
+
+    /// Add a safety zone.
+    pub fn add_zone(&mut self, zone: SafetyZone) {
+        self.zones.push(zone);
+    }
+
+    /// Remove zone by name.
+    pub fn remove_zone(&mut self, name: &str) {
+        self.zones.retain(|z| z.name != name);
+    }
+
+    /// Register a tracked object.
+    pub fn add_tracked_object(&mut self, obj: TrackedObject) {
+        self.tracked_objects.push(obj);
+    }
+
+    /// Update position of a tracked object.
+    pub fn update_position(
+        &mut self,
+        id: &str,
+        position: [f64; 3],
+        timestamp_ns: u64,
+    ) -> Result<()> {
+        let obj = self
+            .tracked_objects
+            .iter_mut()
+            .find(|o| o.id == id)
+            .ok_or_else(|| {
+                VirtualProductionError::CameraTracking(format!("Object '{id}' not found"))
+            })?;
+        obj.update(position, timestamp_ns);
+        Ok(())
+    }
+
+    /// Run safety checks: evaluate all tracked objects against all zones.
+    ///
+    /// Returns a list of new alerts generated this frame.
+    pub fn check(&mut self, timestamp_ns: u64) -> Vec<SafetyAlert> {
+        let mut new_alerts = Vec::new();
+
+        for obj in &self.tracked_objects {
+            for zone in self.zones.iter().filter(|z| z.active) {
+                let is_inside = zone.contains(&obj.position);
+                let dist = zone.distance_to_boundary(&obj.position);
+
+                let alert = match zone.zone_type {
+                    ZoneType::TalentSafe => {
+                        // Alert if talent leaves the safe zone
+                        if obj.is_person && !is_inside {
+                            Some(SafetyAlert {
+                                severity: if dist > 2.0 {
+                                    AlertSeverity::Critical
+                                } else {
+                                    AlertSeverity::Warning
+                                },
+                                message: format!(
+                                    "{} left safe zone '{}' (dist: {:.2}m)",
+                                    obj.label, zone.name, dist
+                                ),
+                                zone_name: zone.name.clone(),
+                                distance_m: dist,
+                                timestamp_ns,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    ZoneType::Exclusion
+                    | ZoneType::EquipmentKeepOut
+                    | ZoneType::LedWallProximity => {
+                        if is_inside {
+                            Some(SafetyAlert {
+                                severity: AlertSeverity::Critical,
+                                message: format!(
+                                    "{} inside exclusion zone '{}'",
+                                    obj.label, zone.name
+                                ),
+                                zone_name: zone.name.clone(),
+                                distance_m: 0.0,
+                                timestamp_ns,
+                            })
+                        } else if dist < zone.warning_margin_m {
+                            Some(SafetyAlert {
+                                severity: AlertSeverity::Warning,
+                                message: format!(
+                                    "{} approaching '{}' (dist: {:.2}m)",
+                                    obj.label, zone.name, dist
+                                ),
+                                zone_name: zone.name.clone(),
+                                distance_m: dist,
+                                timestamp_ns,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    ZoneType::EmergencyStop => {
+                        if is_inside {
+                            Some(SafetyAlert {
+                                severity: AlertSeverity::Critical,
+                                message: format!(
+                                    "EMERGENCY: {} in emergency stop zone '{}'",
+                                    obj.label, zone.name
+                                ),
+                                zone_name: zone.name.clone(),
+                                distance_m: 0.0,
+                                timestamp_ns,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some(alert) = alert {
+                    new_alerts.push(alert.clone());
+                    self.alert_history.push(alert);
+                    // Trim history
+                    while self.alert_history.len() > self.max_history {
+                        self.alert_history.remove(0);
+                    }
+                }
+            }
+        }
+
+        new_alerts
+    }
+
+    /// Number of registered zones.
+    #[must_use]
+    pub fn zone_count(&self) -> usize {
+        self.zones.len()
+    }
+
+    /// Number of tracked objects.
+    #[must_use]
+    pub fn tracked_count(&self) -> usize {
+        self.tracked_objects.len()
+    }
+
+    /// Alert history.
+    #[must_use]
+    pub fn alert_history(&self) -> &[SafetyAlert] {
+        &self.alert_history
+    }
+
+    /// Clear alert history.
+    pub fn clear_alerts(&mut self) {
+        self.alert_history.clear();
+    }
+
+    /// Get a zone by name.
+    #[must_use]
+    pub fn find_zone(&self, name: &str) -> Option<&SafetyZone> {
+        self.zones.iter().find(|z| z.name == name)
+    }
+}
+
+impl Default for StageSafety {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_talent_safe_zone() -> SafetyZone {
+        SafetyZone::from_aabb(
+            "talent_safe",
+            ZoneType::TalentSafe,
+            Aabb::from_min_max([-5.0, 0.0, -5.0], [5.0, 3.0, 5.0]),
+        )
+    }
+
+    fn make_exclusion_zone() -> SafetyZone {
+        SafetyZone::from_aabb(
+            "led_exclusion",
+            ZoneType::Exclusion,
+            Aabb::from_min_max([-8.0, 0.0, -0.5], [8.0, 5.0, 0.5]),
+        )
+        .with_warning_margin(1.0)
+    }
+
+    #[test]
+    fn test_stage_safety_creation() {
+        let safety = StageSafety::new();
+        assert_eq!(safety.zone_count(), 0);
+        assert_eq!(safety.tracked_count(), 0);
+    }
+
+    #[test]
+    fn test_add_remove_zone() {
+        let mut safety = StageSafety::new();
+        safety.add_zone(make_talent_safe_zone());
+        assert_eq!(safety.zone_count(), 1);
+        safety.remove_zone("talent_safe");
+        assert_eq!(safety.zone_count(), 0);
+    }
+
+    #[test]
+    fn test_add_tracked_object() {
+        let mut safety = StageSafety::new();
+        safety.add_tracked_object(TrackedObject::new("t1", "Actor A", [0.0, 0.0, 0.0], true));
+        assert_eq!(safety.tracked_count(), 1);
+    }
+
+    #[test]
+    fn test_update_position_ok() {
+        let mut safety = StageSafety::new();
+        safety.add_tracked_object(TrackedObject::new("t1", "A", [0.0, 0.0, 0.0], true));
+        let result = safety.update_position("t1", [1.0, 0.0, 1.0], 1000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_update_position_missing_object() {
+        let mut safety = StageSafety::new();
+        let result = safety.update_position("missing", [0.0, 0.0, 0.0], 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_no_alerts_when_safe() {
+        let mut safety = StageSafety::new();
+        safety.add_zone(make_talent_safe_zone());
+        safety.add_tracked_object(TrackedObject::new("t1", "Actor", [0.0, 1.0, 0.0], true));
+
+        let alerts = safety.check(0);
+        assert!(
+            alerts.is_empty(),
+            "no alerts expected when inside safe zone"
+        );
+    }
+
+    #[test]
+    fn test_alert_when_outside_safe_zone() {
+        let mut safety = StageSafety::new();
+        safety.add_zone(make_talent_safe_zone());
+        safety.add_tracked_object(TrackedObject::new(
+            "t1",
+            "Actor",
+            [10.0, 1.0, 0.0], // outside [-5,5]
+            true,
+        ));
+
+        let alerts = safety.check(0);
+        assert!(!alerts.is_empty(), "should alert when outside safe zone");
+        assert!(alerts[0].severity >= AlertSeverity::Warning);
+    }
+
+    #[test]
+    fn test_alert_inside_exclusion_zone() {
+        let mut safety = StageSafety::new();
+        safety.add_zone(make_exclusion_zone());
+        safety.add_tracked_object(TrackedObject::new("t1", "Actor", [0.0, 1.0, 0.0], true));
+
+        let alerts = safety.check(0);
+        assert!(
+            !alerts.is_empty(),
+            "should alert when inside exclusion zone"
+        );
+        assert_eq!(alerts[0].severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn test_warning_when_approaching_exclusion() {
+        let mut safety = StageSafety::new();
+        safety.add_zone(make_exclusion_zone());
+        // Exclusion zone: z ∈ [-0.5, 0.5], warning_margin = 1.0
+        // Place actor at z = 1.2 → distance = 0.7m < 1.0m → warning
+        safety.add_tracked_object(TrackedObject::new("t1", "Actor", [0.0, 1.0, 1.2], true));
+
+        let alerts = safety.check(0);
+        assert!(!alerts.is_empty(), "should warn when approaching exclusion");
+        let warning = alerts.iter().find(|a| a.severity == AlertSeverity::Warning);
+        assert!(warning.is_some(), "expected warning alert");
+    }
+
+    #[test]
+    fn test_alert_history_accumulates() {
+        let mut safety = StageSafety::new();
+        safety.add_zone(make_talent_safe_zone());
+        safety.add_tracked_object(TrackedObject::new("t1", "Actor", [10.0, 1.0, 0.0], true));
+
+        safety.check(0);
+        safety.check(1000);
+        safety.check(2000);
+
+        assert!(safety.alert_history().len() >= 3);
+    }
+
+    #[test]
+    fn test_clear_alerts() {
+        let mut safety = StageSafety::new();
+        safety.add_zone(make_talent_safe_zone());
+        safety.add_tracked_object(TrackedObject::new("t1", "A", [10.0, 1.0, 0.0], true));
+        safety.check(0);
+        assert!(!safety.alert_history().is_empty());
+        safety.clear_alerts();
+        assert!(safety.alert_history().is_empty());
+    }
+
+    #[test]
+    fn test_aabb_contains() {
+        let aabb = Aabb::from_min_max([-1.0, 0.0, -1.0], [1.0, 2.0, 1.0]);
+        assert!(aabb.contains(&[0.0, 1.0, 0.0]));
+        assert!(!aabb.contains(&[2.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn test_aabb_volume() {
+        let aabb = Aabb::from_center_extents([0.0, 1.0, 0.0], [1.0, 1.0, 1.0]);
+        assert!((aabb.volume() - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_aabb_center() {
+        let aabb = Aabb::from_min_max([0.0, 0.0, 0.0], [2.0, 4.0, 6.0]);
+        let c = aabb.center();
+        assert!((c[0] - 1.0).abs() < 1e-9);
+        assert!((c[1] - 2.0).abs() < 1e-9);
+        assert!((c[2] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cylinder_contains() {
+        let cyl = CylinderZone::new(0.0, 0.0, 2.0, 0.0, 3.0);
+        assert!(cyl.contains(&[1.0, 1.0, 0.0]));
+        assert!(!cyl.contains(&[3.0, 1.0, 0.0]));
+        assert!(!cyl.contains(&[0.0, 4.0, 0.0])); // above
+    }
+
+    #[test]
+    fn test_cylinder_zone_in_safety_system() {
+        let mut safety = StageSafety::new();
+        let zone = SafetyZone::from_cylinder(
+            "led_wall",
+            ZoneType::LedWallProximity,
+            CylinderZone::new(0.0, -4.0, 0.5, 0.0, 4.0),
+        );
+        safety.add_zone(zone);
+        // Object inside cylinder → critical alert
+        safety.add_tracked_object(TrackedObject::new("t1", "A", [0.0, 1.0, -4.0], true));
+        let alerts = safety.check(0);
+        assert!(alerts.iter().any(|a| a.severity == AlertSeverity::Critical));
+    }
+
+    #[test]
+    fn test_emergency_stop_zone() {
+        let mut safety = StageSafety::new();
+        let zone = SafetyZone::from_aabb(
+            "emg",
+            ZoneType::EmergencyStop,
+            Aabb::from_min_max([-1.0, 0.0, -1.0], [1.0, 2.0, 1.0]),
+        );
+        safety.add_zone(zone);
+        safety.add_tracked_object(TrackedObject::new("t1", "A", [0.0, 1.0, 0.0], true));
+        let alerts = safety.check(0);
+        assert!(!alerts.is_empty());
+        assert_eq!(alerts[0].severity, AlertSeverity::Critical);
+        assert!(alerts[0].message.contains("EMERGENCY"));
+    }
+
+    #[test]
+    fn test_inactive_zone_ignored() {
+        let mut safety = StageSafety::new();
+        let mut zone = make_exclusion_zone();
+        zone.active = false;
+        safety.add_zone(zone);
+        safety.add_tracked_object(TrackedObject::new("t1", "A", [0.0, 1.0, 0.0], true));
+        let alerts = safety.check(0);
+        assert!(alerts.is_empty(), "inactive zone should not trigger alerts");
+    }
+
+    #[test]
+    fn test_find_zone() {
+        let mut safety = StageSafety::new();
+        safety.add_zone(make_talent_safe_zone());
+        assert!(safety.find_zone("talent_safe").is_some());
+        assert!(safety.find_zone("nonexistent").is_none());
+    }
+}

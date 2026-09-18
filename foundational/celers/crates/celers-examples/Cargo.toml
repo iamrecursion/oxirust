@@ -1,0 +1,84 @@
+## `celers-examples` is a full workspace member again (see the comment on
+## `members` in the root `Cargo.toml`). It carries `publish = false`, so it
+## never ships to crates.io, but `cargo build/check/clippy/fmt --workspace`
+## from the repo root now covers it — which is the point: while it lived
+## outside the workspace it silently stopped compiling against the APIs it
+## demonstrates, and every dependency version here was a hand-copied literal
+## with nothing to keep it in step with the root manifest.
+##
+## Note that `cargo build --workspace` still does not compile example or
+## bench targets; use `--all-targets` (or `cargo check -p celers-examples
+## --all-targets`) to exercise them.
+[package]
+name = "celers-examples"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Facade (re-exports everything)
+celers = { workspace = true }
+
+# Core & Protocol
+celers-core = { workspace = true }
+celers-protocol = { workspace = true }
+
+# Messaging Layer
+celers-kombu = { workspace = true }
+celers-broker-redis = { workspace = true }
+celers-broker-postgres = { workspace = true }
+celers-broker-amqp = { workspace = true }
+celers-broker-sqs = { workspace = true }
+celers-broker-sql = { workspace = true }
+
+# Result Backend
+celers-backend-redis = { workspace = true }
+
+# Runtime & Workflow
+celers-worker = { workspace = true }
+celers-canvas = { workspace = true }
+celers-beat = { workspace = true }
+
+# Utilities
+celers-macros = { workspace = true }
+celers-metrics = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+oxicode = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+redis = { workspace = true }
+futures-util = { workspace = true }
+
+[[example]]
+name = "prometheus_metrics"
+required-features = ["metrics"]
+
+[features]
+default = []
+metrics = ["celers-worker/metrics", "celers-broker-redis/metrics"]
+workflows = ["celers-worker/workflows", "celers-canvas/backend-redis"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "serialization"
+harness = false
+
+[[bench]]
+name = "queue_operations"
+harness = false
+
+[[bench]]
+name = "batch_operations"
+harness = false

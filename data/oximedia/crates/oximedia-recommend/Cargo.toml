@@ -1,0 +1,48 @@
+[package]
+name = "oximedia-recommend"
+description = "Content recommendation engine for media libraries"
+keywords = ["machine-learning", "ai", "multimedia", "neural", "inference"]
+categories = ["multimedia", "science"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[features]
+default = []
+## Opt-in ML-assisted embedding-based content similarity via the Pure-Rust
+## `oximedia-ml` pipeline. Enabling `onnx` pulls in `oximedia-ml` with its
+## `onnx` feature so callers can actually load an embedding ONNX model and
+## produce L2-normalised [`ml::ContentEmbedding`] vectors.
+onnx = [
+    "dep:oximedia-ml",
+    "oximedia-ml/onnx",
+]
+## Enable CUDA dispatch for the ML-assisted embedding extractor.
+cuda = ["onnx", "oximedia-ml/cuda"]
+## Optional thin re-export of the ArcFace-compatible face embedder pipeline
+## from `oximedia-ml` for face-based content similarity.  Implies `onnx`.
+face-embedder-sim = ["onnx", "oximedia-ml/face-embedder"]
+
+[dependencies]
+# Workspace dependencies
+oximedia-core = { workspace = true }
+oximedia-search = { workspace = true }
+oximedia-ml = { workspace = true, optional = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rayon = { workspace = true }
+chrono = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

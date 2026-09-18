@@ -1,0 +1,45 @@
+[package]
+name = "oximedia-gaming"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Game streaming and screen capture optimization for OxiMedia"
+readme = "README.md"
+homepage.workspace = true
+repository.workspace = true
+keywords = ["game", "streaming", "capture", "screen", "recording"]
+categories = ["multimedia", "game-engines"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+## Enable VP9 codec support (forwarded from oximedia-codec)
+vp9 = ["oximedia-codec/vp9"]
+## Enable AV1 codec support (forwarded from oximedia-codec)
+av1 = ["oximedia-codec/av1"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-codec = { workspace = true, default-features = true }
+oximedia-audio = { workspace = true }
+oximedia-graph = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+# Process enumeration for GameCapture::auto_detect. Pure Rust (no build.rs,
+# no C compiler needed) but its process-listing backend is only meaningful
+# on desktop OSes, so it is scoped out of wasm32 like tokio above.
+sysinfo = { workspace = true }
+
+[dev-dependencies]
+
+[lib]
+name = "oximedia_gaming"
+path = "src/lib.rs"

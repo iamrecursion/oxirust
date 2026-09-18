@@ -1,0 +1,132 @@
+[package]
+name = "oxixml-xml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XML 1.0/1.1 pull parser and writer (quick-xml 0.41-compatible; replaces quick-xml)."
+keywords = ["xml", "parser", "writer", "quick-xml", "sax"]
+categories = ["parsing", "parser-implementations", "encoding", "text-processing"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+arbitrary = { workspace = true, optional = true, features = ["derive"] }
+oxixml-encoding = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["rt", "macros", "io-util"] }
+
+[features]
+default = []
+
+## Implements [`arbitrary::Arbitrary`] for the event types (`BytesStart`,
+## `BytesEnd`, `BytesText`, `BytesCData`, `BytesDecl`, `BytesPI`, `BytesRef`
+## and `Event`), mirroring quick-xml 0.41's optional `arbitrary` dependency so
+## fuzz harnesses can generate an `Event` directly from raw fuzzer bytes
+## instead of hand-rolling a generator. Off by default, so the crate stays
+## dependency-free in its default configuration.
+##
+## [`arbitrary::Arbitrary`]: https://docs.rs/arbitrary/latest/arbitrary/trait.Arbitrary.html
+arbitrary = ["dep:arbitrary"]
+
+## Enables support for asynchronous reading and writing from `tokio`'s IO-Traits,
+## mirroring quick-xml 0.41's `async-tokio` feature: `Reader::read_event_into_async`,
+## `Reader::read_to_end_into_async`, `NsReader::read_event_into_async` /
+## `read_resolved_event_into_async`, and `Writer::write_event_async` plus the
+## async `ElementWriter` content methods.
+async-tokio = ["dep:tokio"]
+
+## Enables support of non-UTF-8 encoded documents. The encoding is inferred from
+## the XML declaration if it is present, otherwise UTF-8 is assumed. Backed by the
+## Pure-Rust `oxixml-encoding` crate (replaces `encoding_rs`).
+encoding = ["dep:oxixml-encoding"]
+
+## Enables support for recognizing all HTML 5 entities in the [`unescape`] function.
+##
+## [`unescape`]: crate::escape::unescape
+escape-html = []
+
+## Enables buffering of elements that overlap a sequence being deserialized, so
+## that lists of elements do not have to be contiguous in the document. Requires
+## the `serialize` feature to have any effect.
+overlapped-lists = []
+
+## Enables serialization of some `oxixml-xml` types using [`serde`]. This feature
+## is rarely needed and does NOT provide an XML (de)serializer.
+serde-types = ["serde/derive"]
+
+## Enables support for [`serde`] (de)serialization of XML through the [`de`] and
+## [`se`] modules.
+##
+## [`de`]: crate::de
+## [`se`]: crate::se
+serialize = ["dep:serde"]
+
+[[test]]
+name = "serde-de"
+required-features = ["serialize"]
+path = "tests/serde-de.rs"
+
+[[test]]
+name = "serde-de-enum"
+required-features = ["serialize"]
+path = "tests/serde-de-enum.rs"
+
+[[test]]
+name = "serde-de-seq"
+required-features = ["serialize"]
+path = "tests/serde-de-seq.rs"
+
+[[test]]
+name = "serde-de-xsi"
+required-features = ["serialize"]
+path = "tests/serde-de-xsi.rs"
+
+[[test]]
+name = "serde-helpers"
+required-features = ["serialize", "serde-types"]
+path = "tests/serde-helpers.rs"
+
+[[test]]
+name = "serde-se"
+required-features = ["serialize"]
+path = "tests/serde-se.rs"
+
+[[test]]
+name = "serde-se-roundtrip"
+required-features = ["serialize"]
+path = "tests/serde-se-roundtrip.rs"
+
+[[test]]
+name = "arbitrary"
+required-features = ["arbitrary"]
+path = "tests/arbitrary.rs"
+
+[[test]]
+name = "reader_async"
+required-features = ["async-tokio"]
+path = "tests/reader_async.rs"
+
+[[test]]
+name = "xmlts"
+required-features = ["encoding"]
+path = "tests/xmlts.rs"
+
+[[test]]
+name = "writer_async"
+required-features = ["async-tokio"]
+path = "tests/writer_async.rs"
+
+[lints]
+workspace = true

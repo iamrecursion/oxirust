@@ -1,0 +1,46 @@
+[package]
+name = "oximedia-jobs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Job queue and worker management for OxiMedia video transcoding"
+keywords = ["workflow", "batch", "processing", "multimedia", "pipeline"]
+categories = ["multimedia", "algorithms"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+# Database
+oxisql-core = { workspace = true }
+oxisql-sqlite-compat = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time handling
+chrono = { workspace = true }
+
+# UUID generation
+uuid = { workspace = true }
+
+# Cryptography (for webhook HMAC-SHA256 signing)
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
+# Workspace crates
+oximedia-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,38 @@
+[package]
+name = "oxicuda-tda"
+description = "Topological Data Analysis for OxiCUDA — persistent homology, Vietoris-Rips/Čech/alpha filtrations, barcode, persistence diagram, Mapper algorithm, witness complex, Betti numbers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+license.workspace = true
+homepage = "https://github.com/cool-japan/oxicuda"
+repository.workspace = true
+keywords = ["gpu", "topology", "persistent-homology", "tda", "pure-rust"]
+categories = ["science", "algorithms"]
+
+[lints]
+workspace = true
+
+[features]
+# On-device GPU validation harness for the hand-written PTX kernels.
+# Enables `src/gpu_tests.rs`, which JIT-loads each kernel on the live CUDA
+# device and compares results against CPU oracles.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name = "tda_ops"
+harness = false
+
+[[bench]]
+name = "algo_bench"
+harness = false

@@ -1,0 +1,39 @@
+[package]
+name        = "oxihuman-morph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage    = "https://github.com/cool-japan/oxihuman"
+documentation = "https://docs.rs/oxihuman-morph"
+description = "Parametric morphology engine for human body generation — targets, blendshapes, FACS"
+readme      = "README.md"
+keywords    = ["human", "morphing", "blendshape", "makehuman", "body"]
+categories  = ["science", "simulation", "algorithms"]
+exclude     = ["target/", "tests/fixtures/", "*.wasm", "benches/data/"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+simd    = ["dep:wide"]
+
+[dependencies]
+anyhow.workspace      = true
+thiserror.workspace   = true
+serde       = { workspace = true, features = ["derive"] }
+serde_json.workspace  = true
+oxihuman-core.workspace = true
+rayon.workspace       = true
+wide        = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace            = true
+criterion.workspace           = true
+oxihuman-test-utils = { path = "../oxihuman-test-utils" }
+
+[[bench]]
+name    = "morph_bench"
+harness = false

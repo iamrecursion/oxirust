@@ -1,0 +1,66 @@
+{
+  "name": "oxigeo-cog-viewer",
+  "version": "0.2.5",
+  "description": "Advanced COG (Cloud Optimized GeoTIFF) viewer powered by OxiGeo WebAssembly",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8080",
+    "serve": "http-server -p 8080 -c-1",
+    "build:wasm": "cd ../../crates/oxigeo-wasm && wasm-pack build --target web --out-dir ../../demo/pkg",
+    "build:wasm:release": "cd ../../crates/oxigeo-wasm && wasm-pack build --target web --release --out-dir ../../demo/pkg",
+    "optimize": "./optimize-wasm.sh",
+    "build": "npm run build:wasm:release && npm run optimize",
+    "dev": "npm run build:wasm && npm run serve",
+    "deploy:netlify": "npm run build && netlify deploy --prod",
+    "deploy:vercel": "npm run build && vercel --prod",
+    "test:local": "./verify.sh",
+    "analyze": "du -sh ../pkg && ls -lh ../pkg/*.wasm",
+    "clean": "rm -rf ../pkg"
+  },
+  "keywords": [
+    "cog",
+    "geotiff",
+    "webassembly",
+    "wasm",
+    "gdal",
+    "geospatial",
+    "gis",
+    "leaflet",
+    "cloud-optimized",
+    "rust",
+    "oxigeo",
+    "cooljapan",
+    "pure-rust"
+  ],
+  "author": "COOLJAPAN OU (Team Kitasan)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cool-japan/oxigeo.git",
+    "directory": "demo/cog-viewer"
+  },
+  "bugs": {
+    "url": "https://github.com/cool-japan/oxigeo/issues"
+  },
+  "homepage": "https://github.com/cool-japan/oxigeo#readme",
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "browserslist": [
+    "Chrome >= 90",
+    "Firefox >= 88",
+    "Safari >= 14",
+    "Edge >= 90"
+  ],
+  "files": [
+    "index.html",
+    "main.js",
+    "style.css",
+    "README.md"
+  ]
+}

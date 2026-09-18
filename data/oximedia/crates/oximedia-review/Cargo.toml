@@ -1,0 +1,38 @@
+[package]
+name = "oximedia-review"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Collaborative review and approval workflow for OxiMedia"
+keywords = ["collaboration", "review", "approval", "video", "multimedia"]
+categories = ["multimedia", "network-programming"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-timecode = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+
+# Persistence for the review/comment/task/version/change/notification store
+# (crates/oximedia-review/src/store/). Pure-Rust SQLite via the OxiSQL
+# ecosystem -- no libsqlite3/C dependency.
+oxisql-core = { workspace = true }
+oxisql-sqlite-compat = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tokio-test.workspace = true

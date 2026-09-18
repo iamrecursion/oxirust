@@ -1,0 +1,44 @@
+[package]
+name = "oxitext-icu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "ICU4X-backed CLDR segmentation and locale-aware collation for OxiText"
+keywords = ["text", "icu", "segmentation", "collation", "oxitext"]
+categories = ["text-processing", "internationalization"]
+
+[features]
+default = []
+## Enable locale-aware font family resolution via `oxifont-db`.
+##
+## When this feature is active, the `font_select` module exposes
+## `LocaleFontSelector` which maps BCP-47 locale tags to concrete font family
+## names drawn from the system font catalog.  Requires `oxifont` ≥ 0.1 with
+## the `db` sub-feature.
+fonts = ["dep:oxifont"]
+
+[dependencies]
+icu_segmenter   = { workspace = true }
+icu_collator    = { workspace = true }
+icu_casemap     = { workspace = true }
+icu_properties  = { workspace = true }
+icu_locale_core = { workspace = true }
+icu_normalizer  = { workspace = true }
+icu_decimal     = { workspace = true }
+icu_list        = { workspace = true }
+icu_plurals     = { workspace = true }
+icu_datetime    = { workspace = true }
+fixed_decimal   = { workspace = true }
+oxitext-core    = { workspace = true }
+
+[dependencies.oxifont]
+workspace = true
+optional = true
+features  = ["db"]
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["oxitext-core"]

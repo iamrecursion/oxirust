@@ -1,0 +1,142 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxigaf-flame",
+    "crates/oxigaf-diffusion",
+    "crates/oxigaf-render",
+    "crates/oxigaf-trainer",
+    "crates/oxigaf",
+    "crates/oxigaf-cli",
+    "crates/oxigaf-bridge",
+]
+
+[workspace.package]
+version = "0.1.3"
+edition = "2021"
+rust-version = "1.87"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxigaf"
+homepage = "https://github.com/cool-japan/oxigaf"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+
+[workspace.dependencies]
+# Linear Algebra
+nalgebra = "0.35"
+glam = "0.33"
+
+# AI / Deep Learning (Pure Rust)
+# oxicandle-* is the COOLJAPAN fork of huggingface/candle 0.11.0: it selects
+# fancy-regex instead of the C Oniguruma (onig/onig_sys) that upstream pulls
+# in through tokenizers. Dependency keys stay `candle-core`/`candle-nn`, so
+# source code is unchanged. default-features = false is a no-op today
+# (oxicandle-core's own `default = []` already excludes cuda/metal/mkl/
+# accelerate) but is kept explicit so this workspace stays CPU-only by
+# default even if that upstream default ever changes.
+candle-core = { package = "oxicandle-core", version = "0.11.0", default-features = false }
+candle-nn = { package = "oxicandle-nn", version = "0.11.0", default-features = false }
+safetensors = "0.8"
+
+# GPU Graphics & Compute
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Image & Video
+image = { version = "0.25", features = ["exr"] }
+
+# Async & Utilities
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+indicatif = "0.18"
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4.6"
+
+# Numerical
+ndarray = "0.17"
+ndarray-npy = "0.10"
+rand = "0.10"
+
+# Parallelism & Async
+rayon = "1.12"
+pollster = "1"
+
+# Testing
+approx = "0.5"
+proptest = "1.11"
+assert_cmd = "2"
+predicates = "3"
+criterion = { version = "0.8", features = ["html_reports"] }
+serial_test = "3"
+tempfile = "3"
+
+# CLI UX
+owo-colors = "4"
+oxiarc-archive = "0.4.2"
+dirs = "6"
+crossterm = "0.29"
+
+# HTTP downloads (oxigaf-cli/src/assets.rs) — Pure Rust TLS stack.
+# ureq's `rustls-no-provider` + `rustls-webpki-roots` features give rustls
+# without ring (C/asm) and compiled-in Mozilla roots (webpki-roots, pure
+# Rust); no gzip feature keeps flate2 out. The process-wide CryptoProvider
+# is installed at runtime from oxitls-rustcrypto-provider (COOLJAPAN fork of
+# rustls-rustcrypto: pure RustCrypto primitives, RUSTSEC-2026-0104 fixed).
+# rustls itself is a direct dep only for the CryptoProvider::install_default
+# call; default-features = false avoids its aws-lc-rs default provider.
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+oxitls-rustcrypto-provider = "0.3"
+
+# Cryptography
+sha2 = "0.11"
+
+# Time & Date
+chrono = "0.4"
+
+# File patterns
+glob = "0.3"
+
+# Spatial data structures
+kiddo = "5"
+
+# Half-precision floating point
+half = "2.7"
+
+# LRU caching (oxigaf-flame video sequences)
+lru = "0.18"
+
+# ToRSh interop (Pure Rust, feature-gated; oxigaf-bridge only)
+torsh-tensor = "0.2.0"
+torsh-nn = "0.2.0"
+
+# Internal crates (version required so member crates stay publishable)
+oxigaf-flame = { path = "crates/oxigaf-flame", version = "0.1.3" }
+oxigaf-diffusion = { path = "crates/oxigaf-diffusion", version = "0.1.3" }
+oxigaf-render = { path = "crates/oxigaf-render", version = "0.1.3" }
+oxigaf-trainer = { path = "crates/oxigaf-trainer", version = "0.1.3" }
+oxigaf = { path = "crates/oxigaf", version = "0.1.3" }
+oxigaf-bridge = { path = "crates/oxigaf-bridge", version = "0.1.3" }
+
+# Performance optimization profiles
+[profile.release]
+opt-level = 3              # Maximum optimization
+lto = "thin"               # Link-time optimization (thin is faster to compile than "fat")
+codegen-units = 1          # Better optimization at cost of slower compile time
+strip = true               # Remove debug symbols to reduce binary size
+panic = "abort"            # Smaller binary size and faster panics (no unwinding)
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true               # Include debug info for profiling while keeping release optimizations
+strip = false              # Override release's strip=true, otherwise debug info above is discarded
+
+[profile.bench]
+inherits = "release"
+debug = true               # Include debug info for Criterion benchmarks
+strip = false              # Override release's strip=true, otherwise Criterion loses symbols

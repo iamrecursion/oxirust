@@ -1,0 +1,1930 @@
+//! GPU acceleration module for scirs2-core
+//!
+//! This module provides hardware acceleration support across different GPU backends.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
+
+pub mod async_execution;
+pub mod async_transfer;
+pub mod auto_tuning;
+pub mod backends;
+pub mod benchmarks;
+mod cpu_ops;
+pub mod device_info;
+pub mod heterogeneous;
+pub mod kernels;
+pub mod memory_management;
+pub mod stream_allocator;
+pub mod tensor_cores;
+
+pub use async_transfer::{
+    AsyncTransferError, AsyncTransferPipeline, TransferDirection, TransferHandle,
+};
+pub use device_info::GpuDeviceInfo;
+pub use memory_management::unified_memory::{SyncState, UnifiedAllocator, UnifiedBuffer};
+pub use stream_allocator::{StreamAllocator, StreamId};
+
+/// GPU backend type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GpuBackend {
+    /// NVIDIA CUDA backend
+    Cuda,
+    /// AMD ROCm backend
+    Rocm,
+    /// WebGPU backend
+    Wgpu,
+    /// Apple Metal backend
+    Metal,
+    /// OpenCL backend
+    OpenCL,
+    /// CPU fallback
+    Cpu,
+}
+
+impl Default for GpuBackend {
+    fn default() -> Self {
+        Self::preferred()
+    }
+}
+
+impl GpuBackend {
+    /// Get the preferred GPU backend for the current system
+    pub fn preferred() -> Self {
+        // Use the backend detection system to find the optimal backend
+        // This will properly detect available GPUs and fall back to CPU if needed
+        match backends::initialize_optimal_backend() {
+            Ok(backend) => {
+                // If we get a non-CPU backend, verify it's actually usable
+                if backend != GpuBackend::Cpu {
+                    // Check if we can actually create a context with this backend
+                    // For now, since implementations are stubs, fall back to CPU
+                    #[cfg(not(test))]
+                    {
+                        // In non-test environments, we don't have real GPU implementations yet
+                        return GpuBackend::Cpu;
+                    }
+                    #[cfg(test)]
+                    {
+                        // In tests, we can pretend the backend works
+                        return backend;
+                    }
+                }
+                backend
+            }
+            Err(_) => {
+                // If detection fails entirely, use CPU
+                GpuBackend::Cpu
+            }
+        }
+    }
+
+    /// Check if this backend is available on the current system
+    pub fn is_available(&self) -> bool {
+        match self {
+            // Check runtime availability for GPU backends
+            GpuBackend::Cuda => false, // CUDA backend retired from scirs2-core in 0.6.x — use oxicuda-* crates
+            GpuBackend::Rocm => cfg!(feature = "rocm"), // Would use ROCm runtime check
+            GpuBackend::Wgpu => {
+                #[cfg(feature = "wgpu")]
+                {
+                    use crate::gpu::backends::wgpu::WebGPUContext;
+                    WebGPUContext::is_available()
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    false
+                }
+            }
+            GpuBackend::Metal => {
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                {
+                    // Metal is always available on macOS if the feature is enabled
+                    true
+                }
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                {
+                    false
+                }
+            }
+            GpuBackend::OpenCL => {
+                #[cfg(feature = "opencl")]
+                {
+                    use crate::gpu::backends::opencl::OpenCLContext;
+                    OpenCLContext::is_available()
+                }
+                #[cfg(not(feature = "opencl"))]
+                {
+                    false
+                }
+            }
+            GpuBackend::Cpu => true,
+        }
+    }
+}
+
+impl fmt::Display for GpuBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GpuBackend::Cuda => write!(f, "CUDA"),
+            GpuBackend::Rocm => write!(f, "ROCm"),
+            GpuBackend::Wgpu => write!(f, "WebGPU"),
+            GpuBackend::Metal => write!(f, "Metal"),
+            GpuBackend::OpenCL => write!(f, "OpenCL"),
+            GpuBackend::Cpu => write!(f, "CPU"),
+        }
+    }
+}
+
+use crate::error::{CoreError, ErrorContext, ErrorLocation};
+
+/// Error type for GPU operations
+#[derive(Debug, thiserror::Error)]
+pub enum GpuError {
+    /// Backend is not available
+    #[error("GPU backend {0} is not available")]
+    BackendNotAvailable(String),
+
+    /// Backend is not supported
+    #[error("GPU backend {0} is not supported")]
+    UnsupportedBackend(GpuBackend),
+
+    /// Backend is not supported for a kernel
+    #[error("GPU backend {0:?} is not supported for this kernel")]
+    BackendNotSupported(GpuBackend),
+
+    /// Backend is not implemented yet
+    #[error("GPU backend {0} is not implemented yet")]
+    BackendNotImplemented(GpuBackend),
+
+    /// Out of memory
+    #[error("GPU out of memory: {0}")]
+    OutOfMemory(String),
+
+    /// Kernel compilation error
+    #[error("Kernel compilation error: {0}")]
+    KernelCompilationError(String),
+
+    /// Kernel execution error
+    #[error("Kernel execution error: {0}")]
+    KernelExecutionError(String),
+
+    /// Invalid parameter
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+
+    /// Kernel not found
+    #[error("Kernel not found: {0}")]
+    KernelNotFound(String),
+
+    /// Specialization not supported
+    #[error("Kernel specialization not supported")]
+    SpecializationNotSupported,
+
+    /// Unsupported data type
+    #[error("Unsupported data type: {0:?}")]
+    UnsupportedDataType(kernels::DataType),
+
+    /// Other error
+    #[error("{0}")]
+    Other(String),
+}
+
+/// GPU device abstraction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuDevice {
+    backend: GpuBackend,
+    device_id: usize,
+}
+
+impl GpuDevice {
+    /// Create a new GPU device
+    pub fn new(backend: GpuBackend, device_id: usize) -> Self {
+        Self { backend, device_id }
+    }
+
+    /// Get the backend type
+    pub fn backend(&self) -> GpuBackend {
+        self.backend
+    }
+
+    /// Get the device ID
+    pub fn device_id(&self) -> usize {
+        self.device_id
+    }
+
+    /// Compile a kernel from source
+    pub fn compile_kernel(&self, _source: &str, entrypoint: &str) -> Result<GpuKernel, GpuError> {
+        // Placeholder implementation
+        Ok(GpuKernel {
+            backend: self.backend,
+            entry_point: entrypoint.to_string(),
+        })
+    }
+
+    /// Query the capabilities of this device.
+    ///
+    /// Returns a [`GpuDeviceInfo`] describing the device name, type, memory,
+    /// work-group limits and supported floating-point precisions. The values are
+    /// derived deterministically from this device's [`backend`](Self::backend).
+    ///
+    /// In the default Pure-Rust build no GPU SDK is linked, so the values for
+    /// hardware backends are conservative placeholders (see
+    /// [`GpuDeviceInfo`]); the method itself never fails in that configuration.
+    /// The `Result` return type reserves the ability to surface real adapter
+    /// query failures once live introspection is wired in.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok`. Reserved for future backends that perform
+    /// a fallible live adapter query.
+    pub fn get_info(&self) -> Result<GpuDeviceInfo, GpuError> {
+        Ok(GpuDeviceInfo::for_backend(self.backend))
+    }
+}
+
+/// GPU kernel abstraction
+pub struct GpuKernel {
+    backend: GpuBackend,
+    entry_point: String,
+}
+
+impl GpuKernel {
+    /// Get the backend type
+    pub fn backend(&self) -> GpuBackend {
+        self.backend
+    }
+
+    /// Get the entry point name
+    pub fn entry_point(&self) -> &str {
+        &self.entry_point
+    }
+}
+
+/// Convert GPU errors to core errors with semantic preservation
+impl From<GpuError> for CoreError {
+    fn from(err: GpuError) -> Self {
+        match err {
+            GpuError::BackendNotAvailable(backend) => CoreError::ComputationError(
+                ErrorContext::new(format!("GPU backend {backend} is not available"))
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::UnsupportedBackend(backend) => CoreError::NotImplementedError(
+                ErrorContext::new(format!("GPU backend {backend} is not supported"))
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::BackendNotSupported(backend) => CoreError::NotImplementedError(
+                ErrorContext::new(format!(
+                    "GPU backend {backend:?} is not supported for this kernel"
+                ))
+                .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::BackendNotImplemented(backend) => CoreError::NotImplementedError(
+                ErrorContext::new(format!("GPU backend {backend} is not implemented yet"))
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::OutOfMemory(details) => CoreError::MemoryError(
+                ErrorContext::new(details.to_string())
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::KernelCompilationError(msg) => CoreError::ComputationError(
+                ErrorContext::new(msg.to_string())
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::KernelExecutionError(msg) => CoreError::ComputationError(
+                ErrorContext::new(msg.to_string())
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::InvalidParameter(msg) => CoreError::InvalidArgument(
+                ErrorContext::new(msg.to_string())
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::KernelNotFound(name) => CoreError::ComputationError(
+                ErrorContext::new(name.to_string())
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::SpecializationNotSupported => CoreError::NotImplementedError(
+                ErrorContext::new("Kernel specialization not supported".to_string())
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::UnsupportedDataType(dtype) => CoreError::TypeError(
+                ErrorContext::new(format!("{dtype:?}"))
+                    .with_location(ErrorLocation::new(file!(), line!())),
+            ),
+            GpuError::Other(msg) => CoreError::ComputationError(
+                ErrorContext::new(msg).with_location(ErrorLocation::new(file!(), line!())),
+            ),
+        }
+    }
+}
+
+/// Trait for types that can be used with GPU operations
+pub trait GpuDataType: Copy + Send + Sync + 'static {}
+
+/// GPU memory pointer abstraction
+#[derive(Debug)]
+pub struct GpuPtr<T: GpuDataType> {
+    ptr: u64,
+    size: usize,
+    phantom: PhantomData<T>,
+}
+
+impl<T: GpuDataType> GpuPtr<T> {
+    /// Allocate GPU memory
+    pub fn allocate(size: usize) -> Result<Self, GpuError> {
+        Ok(GpuPtr {
+            ptr: 0x1000_0000, // Placeholder address
+            size,
+            phantom: PhantomData,
+        })
+    }
+
+    /// Get the raw pointer value
+    pub fn as_ptr(&self) -> u64 {
+        self.ptr
+    }
+
+    /// Get the size in elements
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Check if the pointer is empty (size is 0)
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+}
+
+/// Kernel argument types for GPU kernel execution
+#[derive(Debug, Clone)]
+pub enum KernelArg<'a, T: GpuDataType> {
+    /// Buffer argument
+    Buffer(&'a GpuPtr<T>),
+    /// Scalar argument
+    Scalar(T),
+}
+
+/// Non-generic kernel argument for mixed-type kernel calls
+#[derive(Debug, Clone)]
+pub enum DynamicKernelArg {
+    /// Buffer argument (type-erased)
+    Buffer(u64), // Raw pointer
+    /// f32 scalar
+    F32(f32),
+    /// f64 scalar
+    F64(f64),
+    /// i32 scalar
+    I32(i32),
+    /// u32 scalar
+    U32(u32),
+    /// usize scalar
+    Usize(usize),
+}
+
+/// GPU communication channel for multi-GPU operations
+pub struct GpuChannel {
+    #[allow(dead_code)]
+    source_device: usize,
+    #[allow(dead_code)]
+    target_device: usize,
+    #[allow(dead_code)]
+    bandwidth: f64, // GB/s
+}
+
+// Implement for common types
+impl GpuDataType for f32 {}
+impl GpuDataType for f64 {}
+impl GpuDataType for i32 {}
+impl GpuDataType for u32 {}
+impl GpuDataType for u8 {}
+impl GpuDataType for i8 {}
+impl GpuDataType for u16 {}
+impl GpuDataType for i16 {}
+impl GpuDataType for u64 {}
+impl GpuDataType for i64 {}
+impl GpuDataType for usize {}
+impl GpuDataType for isize {}
+
+/// GPU buffer
+pub struct GpuBuffer<T: GpuDataType> {
+    inner: Arc<dyn GpuBufferImpl>,
+    size: usize,
+    phantom: PhantomData<T>,
+}
+
+impl<T: GpuDataType> GpuBuffer<T> {
+    /// Create a new buffer with the given size
+    pub(crate) fn new(inner: Arc<dyn GpuBufferImpl>, size: usize) -> Self {
+        Self {
+            inner,
+            size,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Get the size of the buffer in elements
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Check if the buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Copy data from the host to the device
+    pub fn copy_from_host(&self, data: &[T]) -> Result<(), GpuError> {
+        if data.len() > self.size {
+            return Err(GpuError::InvalidParameter(
+                "Data size exceeds buffer size".to_string(),
+            ));
+        }
+        unsafe {
+            self.inner
+                .copy_from_host(data.as_ptr() as *const u8, std::mem::size_of_val(data));
+        }
+        Ok(())
+    }
+
+    /// Copy data from the device to the host
+    pub fn copy_to_host(&self, data: &mut [T]) -> Result<(), GpuError> {
+        if data.len() > self.size {
+            return Err(GpuError::InvalidParameter(
+                "Data size exceeds buffer size".to_string(),
+            ));
+        }
+        unsafe {
+            self.inner
+                .copy_to_host(data.as_mut_ptr() as *mut u8, std::mem::size_of_val(data));
+        }
+        Ok(())
+    }
+
+    /// Convert the buffer contents to a vector
+    pub fn to_vec(&self) -> Vec<T> {
+        let mut result = vec![unsafe { std::mem::zeroed() }; self.size];
+        let _ = self.copy_to_host(&mut result);
+        result
+    }
+}
+
+impl<T: GpuDataType> fmt::Debug for GpuBuffer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuBuffer")
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+impl<T: GpuDataType> Clone for GpuBuffer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            size: self.size,
+            phantom: PhantomData,
+        }
+    }
+}
+
+/// GPU kernel handle
+#[derive(Clone)]
+pub struct GpuKernelHandle {
+    inner: Arc<dyn GpuKernelImpl>,
+}
+
+impl GpuKernelHandle {
+    /// Create a new kernel handle
+    pub(crate) fn new(inner: Arc<dyn GpuKernelImpl>) -> Self {
+        Self { inner }
+    }
+
+    /// Set a buffer parameter
+    pub fn set_buffer<T: GpuDataType>(&self, name: &str, buffer: &GpuBuffer<T>) {
+        self.inner.set_buffer(name, &buffer.inner);
+    }
+
+    /// Set a u32 parameter
+    pub fn set_u32(&self, name: &str, value: u32) {
+        self.inner.set_u32(name, value);
+    }
+
+    /// Set an i32 parameter
+    pub fn set_i32(&self, name: &str, value: i32) {
+        self.inner.set_i32(name, value);
+    }
+
+    /// Set an f32 parameter
+    pub fn set_f32(&self, name: &str, value: f32) {
+        self.inner.set_f32(name, value);
+    }
+
+    /// Set an f64 parameter
+    pub fn set_f64(&self, name: &str, value: f64) {
+        self.inner.set_f64(name, value);
+    }
+
+    /// Dispatch the kernel with the given work group counts.
+    ///
+    /// If batch mode is active (see [`GpuContext::begin_batch`]), the
+    /// dispatch is encoded into the shared command buffer instead of
+    /// submitting immediately.
+    pub fn dispatch(&self, workgroups: [u32; 3]) {
+        if !self.inner.try_batch_dispatch(workgroups) {
+            self.inner.dispatch(workgroups);
+        }
+    }
+
+    /// Dispatch the kernel without waiting for GPU completion.
+    ///
+    /// This submits work to the GPU command queue but returns immediately.
+    /// Use [`GpuContext::gpu_sync()`] to wait for all pending dispatches.
+    pub fn dispatch_no_wait(&self, workgroups: [u32; 3]) {
+        self.inner.dispatch_no_wait(workgroups);
+    }
+}
+
+/// GPU compiler for dynamic kernels
+pub struct GpuCompiler {
+    inner: Arc<dyn GpuCompilerImpl>,
+}
+
+impl GpuCompiler {
+    /// Create a new compiler
+    pub(crate) fn new(inner: Arc<dyn GpuCompilerImpl>) -> Self {
+        Self { inner }
+    }
+
+    /// Compile a kernel from source
+    pub fn compile(&self, source: &str) -> Result<GpuKernelHandle, GpuError> {
+        let kernel = self.inner.compile(source)?;
+        Ok(GpuKernelHandle::new(kernel))
+    }
+
+    /// Compile a kernel for the specified input and output types.
+    ///
+    /// Unlike [`Self::compile`], this has no source to compile — it can
+    /// only succeed for the small set of kernels a backend genuinely knows
+    /// how to generate for the requested `name`/types (currently a real
+    /// `f32` `vector_add` on every backend; see each backend's
+    /// `compile_typed` for details). For anything else this returns
+    /// `Err(GpuError::KernelCompilationError)` rather than a handle that
+    /// would silently no-op on every dispatch.
+    pub fn compile_kernel<I: GpuDataType, O: GpuDataType>(
+        &self,
+        name: &str,
+    ) -> Result<GpuKernelHandle, GpuError> {
+        let kernel = self.inner.compile_typed(
+            name,
+            std::any::TypeId::of::<I>(),
+            std::any::TypeId::of::<O>(),
+        )?;
+        Ok(GpuKernelHandle::new(kernel))
+    }
+}
+
+/// GPU context for managing GPU resources and operations
+pub struct GpuContext {
+    inner: Arc<dyn GpuContextImpl>,
+    backend: GpuBackend,
+    kernel_registry: kernels::KernelRegistry,
+}
+
+impl GpuContext {
+    /// Create a new GPU context with the specified backend
+    pub fn new(backend: GpuBackend) -> Result<Self, GpuError> {
+        // CUDA was retired from scirs2-core in 0.6.x (moved to the per-crate oxicuda-*
+        // backends). Intercept it before the generic availability checks so callers
+        // receive explicit migration guidance instead of a bare "not available".
+        if backend == GpuBackend::Cuda {
+            return Err(GpuError::BackendNotAvailable(
+                "CUDA backend was removed from scirs2-core in 0.6.x; use the oxicuda-* crates directly (per-crate `cuda` feature). See SCIRS2_POLICY.md".to_string(),
+            ));
+        }
+
+        // First check if the backend is available at compile time
+        if !backend.is_available() {
+            return Err(GpuError::BackendNotAvailable(backend.to_string()));
+        }
+
+        // For non-CPU backends, also check runtime availability
+        if backend != GpuBackend::Cpu {
+            let detection_result = backends::detect_gpu_backends();
+            let backend_available = detection_result
+                .devices
+                .iter()
+                .any(|d| d.backend == backend && d.backend != GpuBackend::Cpu);
+
+            if !backend_available {
+                return Err(GpuError::BackendNotAvailable(format!(
+                    "{backend} (no devices detected at runtime)"
+                )));
+            }
+        }
+
+        let inner = match backend {
+            GpuBackend::Cuda => {
+                return Err(GpuError::BackendNotAvailable(
+                    "CUDA backend was removed from scirs2-core in 0.6.x; use the oxicuda-* crates directly (per-crate `cuda` feature). See SCIRS2_POLICY.md".to_string(),
+                ));
+            }
+            GpuBackend::Rocm => {
+                #[cfg(feature = "rocm")]
+                {
+                    // This is just a stub - in a real implementation, we would use the hip-sys crate
+                    // to create a ROCm context and return it
+                    #[cfg(test)]
+                    {
+                        // For testing, we can use a mock implementation
+                        Arc::new(CpuContext::new()) as Arc<dyn GpuContextImpl>
+                    }
+                    #[cfg(not(test))]
+                    {
+                        return Err(GpuError::BackendNotImplemented(backend));
+                    }
+                }
+                #[cfg(not(feature = "rocm"))]
+                {
+                    return Err(GpuError::UnsupportedBackend(backend));
+                }
+            }
+            GpuBackend::Wgpu => {
+                #[cfg(feature = "wgpu")]
+                {
+                    use crate::gpu::backends::wgpu::WebGPUContext;
+                    match WebGPUContext::new() {
+                        Ok(ctx) => Arc::new(ctx) as Arc<dyn GpuContextImpl>,
+                        Err(e) => return Err(e),
+                    }
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    return Err(GpuError::UnsupportedBackend(backend));
+                }
+            }
+            GpuBackend::Metal => {
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                {
+                    use crate::gpu::backends::metal::MetalContext;
+                    match MetalContext::new() {
+                        Ok(ctx) => Arc::new(ctx) as Arc<dyn GpuContextImpl>,
+                        Err(e) => return Err(e),
+                    }
+                }
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                {
+                    return Err(GpuError::UnsupportedBackend(backend));
+                }
+            }
+            GpuBackend::OpenCL => {
+                #[cfg(feature = "opencl")]
+                {
+                    use crate::gpu::backends::opencl::OpenCLContext;
+                    match OpenCLContext::new() {
+                        Ok(ctx) => Arc::new(ctx) as Arc<dyn GpuContextImpl>,
+                        Err(e) => return Err(e),
+                    }
+                }
+                #[cfg(not(feature = "opencl"))]
+                {
+                    return Err(GpuError::UnsupportedBackend(backend));
+                }
+            }
+            GpuBackend::Cpu => Arc::new(CpuContext::new()) as Arc<dyn GpuContextImpl>,
+        };
+
+        Ok(Self {
+            inner,
+            backend,
+            kernel_registry: kernels::KernelRegistry::with_default_kernels(),
+        })
+    }
+
+    /// Get the backend type
+    pub fn backend(&self) -> GpuBackend {
+        self.backend
+    }
+
+    /// Get the backend name
+    pub fn backend_name(&self) -> &str {
+        match self.backend {
+            GpuBackend::Cuda => "CUDA",
+            GpuBackend::Rocm => "ROCm",
+            GpuBackend::Wgpu => "WebGPU",
+            GpuBackend::Metal => "Metal",
+            GpuBackend::OpenCL => "OpenCL",
+            GpuBackend::Cpu => "CPU",
+        }
+    }
+
+    /// Wait for all pending GPU dispatches to complete.
+    ///
+    /// After calling [`GpuKernelHandle::dispatch_no_wait()`], results are
+    /// not guaranteed to be available until this method returns.
+    pub fn gpu_sync(&self) -> Result<(), GpuError> {
+        self.inner.gpu_sync()
+    }
+
+    /// Begin batch dispatch mode.
+    ///
+    /// While active, kernel dispatches are encoded into a shared command
+    /// buffer instead of creating individual ones.  Call [`end_batch`](Self::end_batch)
+    /// to submit all encoded work and wait for completion.
+    pub fn begin_batch(&self) -> Result<(), GpuError> {
+        self.inner.begin_batch()
+    }
+
+    /// End batch dispatch mode.
+    ///
+    /// Submits the shared command buffer containing all dispatches that
+    /// were encoded since [`begin_batch`](Self::begin_batch), then waits
+    /// for the GPU to finish.
+    pub fn end_batch(&self) -> Result<(), GpuError> {
+        self.inner.end_batch()
+    }
+
+    pub fn create_buffer<T: GpuDataType>(&self, size: usize) -> GpuBuffer<T> {
+        let byte_size = size.saturating_mul(std::mem::size_of::<T>());
+        let inner = self.inner.create_buffer(byte_size);
+        GpuBuffer::new(inner, size)
+    }
+
+    /// Create a buffer from a slice
+    pub fn create_buffer_from_slice<T: GpuDataType>(&self, data: &[T]) -> GpuBuffer<T> {
+        let buffer = self.create_buffer::<T>(data.len());
+        let _ = buffer.copy_from_host(data);
+        buffer
+    }
+
+    /// Execute a function with a compiler
+    pub fn execute<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&GpuCompiler) -> R,
+    {
+        let compiler = GpuCompiler::new(self.inner.create_compiler());
+        f(&compiler)
+    }
+
+    /// Get a kernel from the registry
+    pub fn get_kernel(&self, name: &str) -> Result<GpuKernelHandle, GpuError> {
+        let kernel = self
+            .kernel_registry
+            .get(name)
+            .ok_or_else(|| GpuError::KernelNotFound(name.to_string()))?;
+
+        let kernel_source = kernel.source_for_backend(self.backend)?;
+        let metadata = kernel.metadata();
+
+        let handle = self.compile_kernel_with_metadata(&kernel_source, &metadata)?;
+        Ok(handle)
+    }
+
+    /// Get a specialized kernel from the registry
+    pub fn get_specialized_kernel(
+        &self,
+        name: &str,
+        params: &kernels::KernelParams,
+    ) -> Result<GpuKernelHandle, GpuError> {
+        let specialized = self.kernel_registry.get_specialized(name, params)?;
+        let kernel_source = specialized.source_for_backend(self.backend)?;
+        let metadata = specialized.metadata();
+
+        let handle = self.compile_kernel_with_metadata(&kernel_source, &metadata)?;
+        Ok(handle)
+    }
+
+    /// Compile a kernel with metadata
+    fn compile_kernel_with_metadata(
+        &self,
+        source: &str,
+        _metadata: &kernels::KernelMetadata,
+    ) -> Result<GpuKernelHandle, GpuError> {
+        self.execute(|compiler| compiler.compile(source))
+    }
+
+    /// Get available memory on the device
+    pub fn get_available_memory(&self) -> Option<usize> {
+        // In a real implementation, this would query the device
+        // For now, return a placeholder value
+        Some(1024 * 1024 * 1024) // 1GB
+    }
+
+    /// Get total memory on the device
+    pub fn get_total_memory(&self) -> Option<usize> {
+        // In a real implementation, this would query the device
+        // For now, return a placeholder value
+        #[cfg(target_arch = "wasm32")]
+        return Some(512 * 1024 * 1024); // 512MB for WASM32
+
+        #[cfg(not(target_arch = "wasm32"))]
+        Some((4u64 * 1024 * 1024 * 1024) as usize) // 4GB for native
+    }
+
+    /// Launch a kernel with the given parameters
+    pub fn launch_kernel(
+        &self,
+        kernel_name: &str,
+        grid_size: (usize, usize, usize),
+        block_size: (usize, usize, usize),
+        args: &[DynamicKernelArg],
+    ) -> Result<(), GpuError> {
+        // Placeholder implementation
+        let _ = (kernel_name, grid_size, block_size, args);
+        Ok(())
+    }
+
+    /// Transfer data from host to device asynchronously
+    pub fn transfer_async_host_to_device<T: GpuDataType>(
+        &self,
+        ptr: &GpuPtr<T>,
+        data: &[T],
+    ) -> Result<(), GpuError> {
+        // Placeholder implementation
+        let _ = (ptr, data);
+        Ok(())
+    }
+
+    /// Transfer data from host to device synchronously
+    pub fn transfer_host_to_device<T: GpuDataType>(
+        &self,
+        ptr: &GpuPtr<T>,
+        data: &[T],
+    ) -> Result<(), GpuError> {
+        // Placeholder implementation
+        let _ = (ptr, data);
+        Ok(())
+    }
+
+    /// Transfer data from device to host asynchronously
+    pub fn transfer_async_device_to_host<T: GpuDataType>(
+        &self,
+        ptr: &GpuPtr<T>,
+        data: &mut [T],
+    ) -> Result<(), GpuError> {
+        // Placeholder implementation
+        let _ = (ptr, data);
+        Ok(())
+    }
+
+    /// Transfer data from device to host synchronously
+    pub fn transfer_device_to_host<T: GpuDataType>(
+        &self,
+        ptr: &GpuPtr<T>,
+        data: &mut [T],
+    ) -> Result<(), GpuError> {
+        // Placeholder implementation
+        let _ = (ptr, data);
+        Ok(())
+    }
+
+    /// Execute a kernel with dynamic compilation and parameter passing
+    /// This method is expected by scirs2-vision for GPU operations
+    pub fn execute_kernel(
+        &self,
+        source: &str,
+        buffers: &[GpuBuffer<f32>],
+        work_groups: (u32, u32, u32),
+        int_params: &[u32],
+        float_params: &[f32],
+    ) -> Result<(), GpuError> {
+        // For now, provide a basic implementation that logs the execution
+        // In a real implementation, this would compile and execute the kernel
+        eprintln!(
+            "GPU kernel execution (source length: {}, buffers: {}, workgroups: {:?})",
+            source.len(),
+            buffers.len(),
+            work_groups
+        );
+        eprintln!("Int params: {int_params:?}");
+        eprintln!("Float params: {float_params:?}");
+        Ok(())
+    }
+
+    /// Read data from a GPU buffer
+    /// This method is expected by scirs2-vision for reading GPU results
+    pub fn read_buffer<T: GpuDataType>(&self, buffer: &GpuBuffer<T>) -> Result<Vec<T>, GpuError> {
+        Ok(buffer.to_vec())
+    }
+
+    /// Global sum reduction
+    pub fn sum_all<T: GpuDataType>(&self, buffer: &GpuBuffer<T>) -> Result<GpuBuffer<T>, GpuError> {
+        self.sum_all_cpu_fallback(buffer)
+    }
+
+    /// Global mean reduction
+    pub fn mean_all<T: GpuDataType>(
+        &self,
+        buffer: &GpuBuffer<T>,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.mean_all_cpu_fallback(buffer)
+    }
+
+    /// Global max reduction
+    pub fn max_all<T: GpuDataType>(&self, buffer: &GpuBuffer<T>) -> Result<GpuBuffer<T>, GpuError> {
+        self.max_all_cpu_fallback(buffer)
+    }
+
+    /// Global min reduction
+    pub fn min_all<T: GpuDataType>(&self, buffer: &GpuBuffer<T>) -> Result<GpuBuffer<T>, GpuError> {
+        self.min_all_cpu_fallback(buffer)
+    }
+
+    /// Sum reduction along an axis
+    pub fn sum_axis<T: GpuDataType>(
+        &self,
+        buffer: &GpuBuffer<T>,
+        shape: &[usize],
+        axis: usize,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.sum_axis_cpu_fallback(buffer, shape, axis)
+    }
+
+    /// Mean reduction along an axis
+    pub fn mean_axis<T: GpuDataType>(
+        &self,
+        buffer: &GpuBuffer<T>,
+        shape: &[usize],
+        axis: usize,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.mean_axis_cpu_fallback(buffer, shape, axis)
+    }
+
+    /// Max reduction along an axis
+    pub fn max_axis<T: GpuDataType>(
+        &self,
+        buffer: &GpuBuffer<T>,
+        shape: &[usize],
+        axis: usize,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.max_axis_cpu_fallback(buffer, shape, axis)
+    }
+
+    /// Min reduction along an axis
+    pub fn min_axis<T: GpuDataType>(
+        &self,
+        buffer: &GpuBuffer<T>,
+        shape: &[usize],
+        axis: usize,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.min_axis_cpu_fallback(buffer, shape, axis)
+    }
+
+    /// Broadcast a buffer to a different shape
+    pub fn broadcast<T: GpuDataType>(
+        &self,
+        buffer: &GpuBuffer<T>,
+        from_shape: &[usize],
+        to_shape: &[usize],
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.broadcast_cpu_fallback(buffer, from_shape, to_shape)
+    }
+
+    /// Scale a buffer by a scalar value
+    pub fn scale<T: GpuDataType>(
+        &self,
+        buffer: &GpuBuffer<T>,
+        scalar: T,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.scale_cpu_fallback(buffer, scalar)
+    }
+
+    /// General matrix multiplication: C = A @ B
+    pub fn gemm<T: GpuDataType>(
+        &self,
+        a: &GpuBuffer<T>,
+        b: &GpuBuffer<T>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.gemm_cpu_fallback(a, b, m, k, n)
+    }
+
+    /// GEMM with transposed B: C = A @ B^T
+    pub fn gemm_transpose_b<T: GpuDataType>(
+        &self,
+        a: &GpuBuffer<T>,
+        b: &GpuBuffer<T>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.gemm_transpose_b_cpu_fallback(a, b, m, k, n)
+    }
+
+    /// GEMM with transposed A: C = A^T @ B
+    pub fn gemm_transpose_a<T: GpuDataType>(
+        &self,
+        a: &GpuBuffer<T>,
+        b: &GpuBuffer<T>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.gemm_transpose_a_cpu_fallback(a, b, m, k, n)
+    }
+
+    /// ReLU activation forward pass
+    pub fn relu<T: GpuDataType>(&self, input: &GpuBuffer<T>) -> Result<GpuBuffer<T>, GpuError> {
+        self.relu_cpu_fallback(input)
+    }
+
+    /// ReLU backward pass
+    pub fn relu_backward<T: GpuDataType>(
+        &self,
+        grad_output: &GpuBuffer<T>,
+        input: &GpuBuffer<T>,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.relu_backward_cpu_fallback(grad_output, input)
+    }
+
+    /// Sigmoid activation forward pass
+    pub fn sigmoid<T: GpuDataType>(&self, input: &GpuBuffer<T>) -> Result<GpuBuffer<T>, GpuError> {
+        self.sigmoid_cpu_fallback(input)
+    }
+
+    /// Sigmoid backward pass
+    pub fn sigmoid_backward<T: GpuDataType>(
+        &self,
+        grad_output: &GpuBuffer<T>,
+        input: &GpuBuffer<T>,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.sigmoid_backward_cpu_fallback(grad_output, input)
+    }
+
+    /// Tanh activation forward pass
+    pub fn tanh<T: GpuDataType>(&self, input: &GpuBuffer<T>) -> Result<GpuBuffer<T>, GpuError> {
+        self.tanh_cpu_fallback(input)
+    }
+
+    /// Tanh backward pass
+    pub fn tanh_backward<T: GpuDataType>(
+        &self,
+        grad_output: &GpuBuffer<T>,
+        input: &GpuBuffer<T>,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.tanh_backward_cpu_fallback(grad_output, input)
+    }
+
+    /// GELU activation forward pass
+    pub fn gelu<T: GpuDataType>(&self, input: &GpuBuffer<T>) -> Result<GpuBuffer<T>, GpuError> {
+        self.gelu_cpu_fallback(input)
+    }
+
+    /// GELU backward pass
+    pub fn gelu_backward<T: GpuDataType>(
+        &self,
+        grad_output: &GpuBuffer<T>,
+        input: &GpuBuffer<T>,
+    ) -> Result<GpuBuffer<T>, GpuError> {
+        self.gelu_backward_cpu_fallback(grad_output, input)
+    }
+}
+
+impl fmt::Debug for GpuContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuContext")
+            .field("backend", &self.backend)
+            .finish()
+    }
+}
+
+// The following trait definitions would be implemented by backend-specific
+// code in a real implementation
+
+/// GPU buffer implementation trait
+pub(crate) trait GpuBufferImpl: Send + Sync {
+    /// Copy data from host to device
+    unsafe fn copy_from_host(&self, data: *const u8, size: usize);
+
+    /// Copy data from device to host
+    unsafe fn copy_to_host(&self, data: *mut u8, size: usize);
+
+    /// Get a reference to self as Any for downcasting
+    #[allow(dead_code)]
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Get the size of the buffer in bytes
+    #[allow(dead_code)]
+    fn size(&self) -> usize {
+        0 // Default implementation for backward compatibility
+    }
+
+    /// Get the device pointer (for backends that use device pointers)
+    #[allow(dead_code)]
+    fn device_ptr(&self) -> u64 {
+        0 // Default implementation for backward compatibility
+    }
+}
+
+/// GPU kernel implementation trait
+pub(crate) trait GpuKernelImpl: Send + Sync {
+    /// Set a buffer parameter
+    fn set_buffer(&self, name: &str, buffer: &Arc<dyn GpuBufferImpl>);
+
+    /// Set a u32 parameter
+    fn set_u32(&self, name: &str, value: u32);
+
+    /// Set an i32 parameter
+    fn set_i32(&self, name: &str, value: i32);
+
+    /// Set an f32 parameter
+    fn set_f32(&self, name: &str, value: f32);
+
+    /// Set an f64 parameter
+    fn set_f64(&self, name: &str, value: f64);
+
+    /// Dispatch the kernel
+    fn dispatch(&self, workgroups: [u32; 3]);
+
+    /// Dispatch the kernel without waiting for completion.
+    /// The GPU work is submitted and will execute asynchronously.
+    /// Call `gpu_sync()` on the context to wait for all pending work.
+    fn dispatch_no_wait(&self, workgroups: [u32; 3]) {
+        // Default: fall back to synchronous dispatch
+        self.dispatch(workgroups);
+    }
+
+    /// Try to encode a dispatch into the active batch (if any).
+    ///
+    /// Returns `true` if the dispatch was batched, `false` if no batch is
+    /// active and the caller should use the normal `dispatch()` path.
+    fn try_batch_dispatch(&self, _workgroups: [u32; 3]) -> bool {
+        false
+    }
+}
+
+/// GPU compiler implementation trait
+pub(crate) trait GpuCompilerImpl: Send + Sync {
+    /// Compile a kernel from source
+    fn compile(&self, source: &str) -> Result<Arc<dyn GpuKernelImpl>, GpuError>;
+
+    /// Compile a typed kernel by name (no source provided).
+    ///
+    /// Implementors must return `Err` rather than a handle that silently
+    /// does nothing on dispatch when they cannot genuinely resolve `name`
+    /// (with the given types) to real, executable kernel logic.
+    fn compile_typed(
+        &self,
+        name: &str,
+        input_type: std::any::TypeId,
+        output_type: std::any::TypeId,
+    ) -> Result<Arc<dyn GpuKernelImpl>, GpuError>;
+}
+
+/// GPU context implementation trait
+pub(crate) trait GpuContextImpl: Send + Sync {
+    /// Create a buffer
+    fn create_buffer(&self, size: usize) -> Arc<dyn GpuBufferImpl>;
+
+    /// Create a compiler
+    fn create_compiler(&self) -> Arc<dyn GpuCompilerImpl>;
+
+    /// Wait for all pending GPU operations to complete.
+    fn gpu_sync(&self) -> Result<(), GpuError> {
+        Ok(()) // Default: no-op (synchronous backends already block)
+    }
+
+    /// Begin batch dispatch mode.
+    ///
+    /// While active, kernel dispatches are encoded into a shared command
+    /// buffer instead of creating individual ones.
+    fn begin_batch(&self) -> Result<(), GpuError> {
+        Ok(()) // Default: no-op (backends without batch support)
+    }
+
+    /// End batch dispatch mode.
+    ///
+    /// Submits the shared command buffer and waits for all encoded
+    /// dispatches to complete on the GPU.
+    fn end_batch(&self) -> Result<(), GpuError> {
+        Ok(()) // Default: no-op
+    }
+
+    /// Support dynamic downcasting of concrete context implementations
+    fn as_any(&self) -> &dyn std::any::Any
+    where
+        Self: 'static + Sized,
+    {
+        self
+    }
+}
+
+// CPU fallback implementation
+
+/// CPU context implementation
+struct CpuContext;
+
+impl CpuContext {
+    /// Create a new CPU context
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl GpuContextImpl for CpuContext {
+    fn create_buffer(&self, size: usize) -> Arc<dyn GpuBufferImpl> {
+        Arc::new(CpuBuffer::new(size))
+    }
+
+    fn create_compiler(&self) -> Arc<dyn GpuCompilerImpl> {
+        Arc::new(CpuCompiler)
+    }
+}
+
+/// CPU buffer implementation
+struct CpuBuffer {
+    data: Vec<u8>,
+}
+
+impl CpuBuffer {
+    /// Create a new CPU buffer
+    fn new(size: usize) -> Self {
+        Self {
+            data: vec![0; size],
+        }
+    }
+}
+
+impl GpuBufferImpl for CpuBuffer {
+    unsafe fn copy_from_host(&self, data: *const u8, size: usize) {
+        let mut_self = self as *const Self as *mut Self;
+        let data_ptr = (*mut_self).data.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(data, data_ptr, size);
+    }
+
+    unsafe fn copy_to_host(&self, data: *mut u8, size: usize) {
+        let data_ptr = self.data.as_ptr();
+        std::ptr::copy_nonoverlapping(data_ptr, data, size);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn size(&self) -> usize {
+        self.data.len()
+    }
+
+    fn device_ptr(&self) -> u64 {
+        self.data.as_ptr() as u64
+    }
+}
+
+/// CPU compiler implementation
+struct CpuCompiler;
+
+impl GpuCompilerImpl for CpuCompiler {
+    fn compile(&self, source: &str) -> Result<Arc<dyn GpuKernelImpl>, GpuError> {
+        // In a real implementation, we would parse and execute the kernel
+        // For now, just return a dummy implementation
+        Ok(Arc::new(CpuKernel))
+    }
+
+    fn compile_typed(
+        &self,
+        name: &str,
+        input_type: std::any::TypeId,
+        output_type: std::any::TypeId,
+    ) -> Result<Arc<dyn GpuKernelImpl>, GpuError> {
+        // There is no source to compile here, only a name and a pair of
+        // types, so this can only genuinely succeed for the small set of
+        // kernels this backend actually implements in real Rust. Right now
+        // that is a real elementwise `f32` `vector_add` (see
+        // `CpuVectorAddKernel`); anything else honestly fails rather than
+        // handing back a handle whose `dispatch` silently does nothing.
+        let is_f32 = input_type == std::any::TypeId::of::<f32>()
+            && output_type == std::any::TypeId::of::<f32>();
+        if name == "vector_add" && is_f32 {
+            return Ok(Arc::new(CpuVectorAddKernel::new()));
+        }
+
+        Err(GpuError::KernelCompilationError(format!(
+            "no CPU fallback implementation is registered for kernel '{name}' with the \
+             requested types; only a real f32 'vector_add' kernel is available on the \
+             pure-Rust CPU backend without a compiled GPU shader. Use GpuCompiler::compile \
+             with real kernel source for other kernels."
+        )))
+    }
+}
+
+/// CPU kernel implementation
+struct CpuKernel;
+
+impl GpuKernelImpl for CpuKernel {
+    fn set_buffer(&self, _name: &str, buffer: &Arc<dyn GpuBufferImpl>) {
+        // In a real implementation, we would store the buffer
+    }
+
+    fn set_u32(&self, _name: &str, value: u32) {
+        // In a real implementation, we would store the value
+    }
+
+    fn set_i32(&self, _name: &str, value: i32) {
+        // In a real implementation, we would store the value
+    }
+
+    fn set_f32(&self, _name: &str, value: f32) {
+        // In a real implementation, we would store the value
+    }
+
+    fn set_f64(&self, _name: &str, value: f64) {
+        // In a real implementation, we would store the value
+    }
+
+    fn dispatch(&self, workgroups: [u32; 3]) {
+        // In a real implementation, we would execute the kernel
+    }
+}
+
+/// A genuinely-executed CPU `vector_add` kernel: `result[i] = a[i] + b[i]`.
+///
+/// This is the one kernel [`CpuCompiler::compile_typed`] can produce for
+/// real without any GPU hardware or a compiled shader — it just does the
+/// addition directly on the buffers' host-side bytes, which is exactly
+/// what the CPU backend's [`CpuBuffer`] already stores.
+struct CpuVectorAddKernel {
+    buffers: Mutex<HashMap<String, Arc<dyn GpuBufferImpl>>>,
+}
+
+impl CpuVectorAddKernel {
+    fn new() -> Self {
+        Self {
+            buffers: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl GpuKernelImpl for CpuVectorAddKernel {
+    fn set_buffer(&self, name: &str, buffer: &Arc<dyn GpuBufferImpl>) {
+        if let Ok(mut buffers) = self.buffers.lock() {
+            buffers.insert(name.to_string(), Arc::clone(buffer));
+        }
+    }
+
+    fn set_u32(&self, _name: &str, _value: u32) {}
+    fn set_i32(&self, _name: &str, _value: i32) {}
+    fn set_f32(&self, _name: &str, _value: f32) {}
+    fn set_f64(&self, _name: &str, _value: f64) {}
+
+    fn dispatch(&self, _workgroups: [u32; 3]) {
+        let Ok(buffers) = self.buffers.lock() else {
+            eprintln!("Warning: CPU vector_add dispatch: buffer registry lock poisoned");
+            return;
+        };
+        let (Some(a), Some(b), Some(result)) =
+            (buffers.get("a"), buffers.get("b"), buffers.get("result"))
+        else {
+            eprintln!(
+                "Warning: CPU vector_add dispatch requires buffers named 'a', 'b', and \
+                 'result' (set via set_buffer); dispatch skipped"
+            );
+            return;
+        };
+
+        let byte_len = result.size();
+        if a.size() < byte_len || b.size() < byte_len {
+            eprintln!(
+                "Warning: CPU vector_add dispatch: input buffers ({}, {} bytes) are smaller \
+                 than the output buffer ({byte_len} bytes); dispatch skipped",
+                a.size(),
+                b.size()
+            );
+            return;
+        }
+
+        let mut a_bytes = vec![0u8; byte_len];
+        let mut b_bytes = vec![0u8; byte_len];
+        // SAFETY: `byte_len` does not exceed either source buffer's own
+        // reported size (checked above), and both destination `Vec`s are
+        // freshly allocated with exactly `byte_len` bytes.
+        unsafe {
+            a.copy_to_host(a_bytes.as_mut_ptr(), byte_len);
+            b.copy_to_host(b_bytes.as_mut_ptr(), byte_len);
+        }
+
+        let read_f32 = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let a_vals = read_f32(&a_bytes);
+        let b_vals = read_f32(&b_bytes);
+
+        let result_bytes: Vec<u8> = a_vals
+            .iter()
+            .zip(b_vals.iter())
+            .flat_map(|(x, y)| (x + y).to_le_bytes())
+            .collect();
+
+        // SAFETY: `result_bytes.len() <= byte_len == result.size()`.
+        unsafe {
+            result.copy_from_host(result_bytes.as_ptr(), result_bytes.len());
+        }
+    }
+}
+
+// In a real implementation, we would have implementations for other backends
+// such as CUDA, WebGPU, Metal, and OpenCL.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gpu_backend_preferred() {
+        let backend = GpuBackend::preferred();
+        // Should return a valid backend
+        match backend {
+            GpuBackend::Cuda
+            | GpuBackend::Rocm
+            | GpuBackend::Wgpu
+            | GpuBackend::Metal
+            | GpuBackend::OpenCL
+            | GpuBackend::Cpu => {}
+        }
+    }
+
+    #[test]
+    fn test_gpu_backend_default() {
+        let backend = GpuBackend::default();
+        assert_eq!(backend, GpuBackend::preferred());
+    }
+
+    #[test]
+    fn test_gpu_backend_is_available() {
+        let backend = GpuBackend::Cpu;
+        assert!(backend.is_available());
+
+        // Test other backends - availability depends on runtime, not just feature flags
+        // CUDA backend was retired from scirs2-core in 0.6.x — always unavailable now.
+        assert!(!GpuBackend::Cuda.is_available());
+
+        #[cfg(feature = "rocm")]
+        {
+            // ROCm feature enabled doesn't guarantee runtime availability
+            let _ = GpuBackend::Rocm.is_available(); // Just check without asserting
+        }
+        #[cfg(not(feature = "rocm"))]
+        assert!(!GpuBackend::Rocm.is_available());
+
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        assert!(GpuBackend::Metal.is_available());
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        assert!(!GpuBackend::Metal.is_available());
+    }
+
+    #[test]
+    fn test_gpu_backend_display() {
+        assert_eq!(GpuBackend::Cuda.to_string(), "CUDA");
+        assert_eq!(GpuBackend::Rocm.to_string(), "ROCm");
+        assert_eq!(GpuBackend::Wgpu.to_string(), "WebGPU");
+        assert_eq!(GpuBackend::Metal.to_string(), "Metal");
+        assert_eq!(GpuBackend::OpenCL.to_string(), "OpenCL");
+        assert_eq!(GpuBackend::Cpu.to_string(), "CPU");
+    }
+
+    #[test]
+    fn test_gpuerror_from_conversion() {
+        let gpuerror = GpuError::BackendNotAvailable("CUDA".to_string());
+        let coreerror: CoreError = gpuerror.into();
+        match coreerror {
+            CoreError::ComputationError(_) => {}
+            _ => panic!("Expected ComputationError"),
+        }
+
+        let gpuerror = GpuError::OutOfMemory("8GB required".to_string());
+        let coreerror: CoreError = gpuerror.into();
+        match coreerror {
+            CoreError::MemoryError(_) => {}
+            _ => panic!("Expected MemoryError"),
+        }
+
+        let gpuerror = GpuError::InvalidParameter("batch_size must be > 0".to_string());
+        let coreerror: CoreError = gpuerror.into();
+        match coreerror {
+            CoreError::InvalidArgument(_) => {}
+            _ => panic!("Expected InvalidArgument"),
+        }
+
+        let gpuerror = GpuError::UnsupportedDataType(kernels::DataType::Float16);
+        let coreerror: CoreError = gpuerror.into();
+        match coreerror {
+            CoreError::TypeError(_) => {}
+            _ => panic!("Expected TypeError"),
+        }
+    }
+
+    #[test]
+    fn test_gpu_datatype_trait() {
+        // Test that various types implement GpuDataType
+        fn assert_gpu_datatype<T: GpuDataType>() {}
+
+        assert_gpu_datatype::<f32>();
+        assert_gpu_datatype::<f64>();
+        assert_gpu_datatype::<i32>();
+        assert_gpu_datatype::<u32>();
+        assert_gpu_datatype::<u8>();
+        assert_gpu_datatype::<i8>();
+        assert_gpu_datatype::<u16>();
+        assert_gpu_datatype::<i16>();
+        assert_gpu_datatype::<u64>();
+        assert_gpu_datatype::<i64>();
+    }
+
+    #[test]
+    fn test_gpu_buffer_creation() {
+        let inner = Arc::new(CpuBuffer::new(100));
+        let buffer = GpuBuffer::<f32>::new(inner, 25);
+
+        assert_eq!(buffer.len(), 25);
+        assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn test_gpu_buffer_empty() {
+        let inner = Arc::new(CpuBuffer::new(0));
+        let buffer = GpuBuffer::<f32>::new(inner, 0);
+
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_gpu_buffer_copy_operations() {
+        let inner = Arc::new(CpuBuffer::new(16));
+        let buffer = GpuBuffer::<f32>::new(inner, 4);
+
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let _ = buffer.copy_from_host(&data);
+
+        let mut result = vec![0.0f32; 4];
+        let _ = buffer.copy_to_host(&mut result);
+
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_gpu_buffer_to_vec() {
+        let inner = Arc::new(CpuBuffer::new(12));
+        let buffer = GpuBuffer::<f32>::new(inner, 3);
+
+        let data = vec![5.0f32, 6.0, 7.0];
+        let _ = buffer.copy_from_host(&data);
+
+        let result = buffer.to_vec();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    #[should_panic(expected = "Data size exceeds buffer size")]
+    fn test_gpu_buffer_copy_from_host_overflow() {
+        let inner = Arc::new(CpuBuffer::new(8));
+        let buffer = GpuBuffer::<f32>::new(inner, 2);
+
+        let data = vec![1.0f32, 2.0, 3.0]; // 3 elements > 2 buffer size
+        buffer.copy_from_host(&data).expect("Operation failed");
+    }
+
+    #[test]
+    #[should_panic(expected = "Data size exceeds buffer size")]
+    fn test_gpu_buffer_copy_to_host_overflow() {
+        let inner = Arc::new(CpuBuffer::new(8));
+        let buffer = GpuBuffer::<f32>::new(inner, 2);
+
+        let mut data = vec![0.0f32; 3]; // 3 elements > 2 buffer size
+        buffer.copy_to_host(&mut data).expect("Operation failed");
+    }
+
+    #[test]
+    fn test_gpu_kernel_handle() {
+        let kernel = Arc::new(CpuKernel);
+        let handle = GpuKernelHandle::new(kernel);
+
+        // Test setting various parameter types
+        let buffer = GpuBuffer::<f32>::new(Arc::new(CpuBuffer::new(16)), 4);
+        handle.set_buffer("input", &buffer);
+        handle.set_u32("size", 100);
+        handle.set_i32("offset", -5);
+        handle.set_f32("scale", 2.5);
+        handle.set_f64("precision", 0.0001);
+
+        // Test dispatch
+        handle.dispatch([16, 8, 1]);
+    }
+
+    #[test]
+    fn test_gpu_context_cpu_backend() {
+        let context = GpuContext::new(GpuBackend::Cpu).expect("Operation failed");
+        assert_eq!(context.backend(), GpuBackend::Cpu);
+        assert_eq!(context.backend_name(), "CPU");
+
+        // Test memory query methods
+        assert_eq!(context.get_available_memory(), Some(1024 * 1024 * 1024));
+        assert_eq!(context.get_total_memory(), Some(4 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_gpu_context_buffer_creation() {
+        let context = GpuContext::new(GpuBackend::Cpu).expect("Operation failed");
+
+        let buffer = context.create_buffer::<f32>(100);
+        assert_eq!(buffer.len(), 100);
+
+        let data = vec![1.0f32; 50];
+        let buffer_from_slice = context.create_buffer_from_slice(&data);
+        assert_eq!(buffer_from_slice.len(), 50);
+
+        let result = buffer_from_slice.to_vec();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_gpu_context_unsupported_backend() {
+        // CUDA was retired from scirs2-core in 0.6.x; constructing a context for it
+        // must fail with explicit oxicuda migration guidance.
+        let result = GpuContext::new(GpuBackend::Cuda);
+        match result {
+            Err(GpuError::BackendNotAvailable(msg)) => {
+                assert!(
+                    msg.contains("oxicuda"),
+                    "expected oxicuda guidance, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected BackendNotAvailable for retired CUDA backend, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_gpu_compiler() {
+        let compiler_impl = Arc::new(CpuCompiler);
+        let compiler = GpuCompiler::new(compiler_impl);
+
+        // Test compiling from source
+        let kernel = compiler
+            .compile("dummy kernel source")
+            .expect("Operation failed");
+        kernel.dispatch([1, 1, 1]);
+    }
+
+    /// Regression test: `compile_kernel::<f32, f32>("vector_add")` must
+    /// perform a *real* computation, not silently no-op. Previously this
+    /// always returned a stub `CpuKernel` whose `dispatch` did nothing, so
+    /// `result` would have stayed all-zero regardless of the inputs; the
+    /// old test never inspected the output buffer and so never caught it.
+    #[test]
+    fn test_gpu_compiler_typed_vector_add_computes_real_result() {
+        let compiler = GpuCompiler::new(Arc::new(CpuCompiler));
+        let context = GpuContext::new(GpuBackend::Cpu).expect("Operation failed");
+
+        let a_data = [1.0f32, 2.0, 3.0, 4.0];
+        let b_data = [10.0f32, 20.0, 30.0, 40.0];
+        let a = context.create_buffer_from_slice(&a_data);
+        let b = context.create_buffer_from_slice(&b_data);
+        let result = context.create_buffer::<f32>(a_data.len());
+
+        let typed_kernel = compiler
+            .compile_kernel::<f32, f32>("vector_add")
+            .expect("a real f32 vector_add kernel should compile on the CPU backend");
+        typed_kernel.set_buffer("a", &a);
+        typed_kernel.set_buffer("b", &b);
+        typed_kernel.set_buffer("result", &result);
+        typed_kernel.dispatch([1, 1, 1]);
+
+        let computed = result.to_vec();
+        assert_eq!(
+            computed,
+            vec![11.0, 22.0, 33.0, 44.0],
+            "vector_add must actually compute a + b, not leave the output untouched"
+        );
+    }
+
+    /// A kernel name/type combination this backend cannot genuinely
+    /// compile must fail loudly, never hand back a silently-no-op handle.
+    #[test]
+    fn test_gpu_compiler_typed_unknown_kernel_returns_honest_error() {
+        let compiler = GpuCompiler::new(Arc::new(CpuCompiler));
+        let result = compiler.compile_kernel::<f32, f32>("totally_unknown_kernel_name");
+        assert!(
+            result.is_err(),
+            "an unrecognized kernel name must return an error, not a fabricated success"
+        );
+    }
+
+    #[test]
+    fn test_gpu_context_execute() {
+        let context = GpuContext::new(GpuBackend::Cpu).expect("Operation failed");
+
+        let result = context.execute(|compiler| compiler.compile("test kernel").is_ok());
+
+        assert!(result);
+    }
+
+    #[test]
+    fn test_gpu_context_kernel_registry() {
+        let context = GpuContext::new(GpuBackend::Cpu).expect("Operation failed");
+
+        // Test getting a non-existent kernel
+        let result = context.get_kernel("non_existent_kernel");
+        assert!(result.is_err());
+        match result {
+            Err(GpuError::KernelNotFound(_)) => {}
+            _ => panic!("Expected KernelNotFound error"),
+        }
+    }
+
+    #[test]
+    fn test_cpu_buffer_implementation() {
+        let buffer = CpuBuffer::new(256);
+        assert_eq!(buffer.data.len(), 256);
+
+        // Test that initial data is zeroed
+        assert!(buffer.data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_gpuerror_display() {
+        let error = GpuError::BackendNotAvailable("CUDA".to_string());
+        assert_eq!(error.to_string(), "GPU backend CUDA is not available");
+
+        let error = GpuError::OutOfMemory("allocation failed".to_string());
+        assert_eq!(error.to_string(), "GPU out of memory: allocation failed");
+
+        let error = GpuError::KernelCompilationError("syntax error".to_string());
+        assert_eq!(error.to_string(), "Kernel compilation error: syntax error");
+
+        let error = GpuError::KernelNotFound("gemm".to_string());
+        assert_eq!(error.to_string(), "Kernel not found: gemm");
+    }
+
+    #[test]
+    fn test_backend_equality() {
+        assert_eq!(GpuBackend::Cuda, GpuBackend::Cuda);
+        assert_ne!(GpuBackend::Cuda, GpuBackend::Rocm);
+
+        // Test Clone and Copy
+        let backend = GpuBackend::Metal;
+        let cloned = backend;
+        let copied = backend;
+        assert_eq!(backend, cloned);
+        assert_eq!(backend, copied);
+    }
+
+    #[test]
+    fn test_backend_hash() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(GpuBackend::Cuda);
+        set.insert(GpuBackend::Rocm);
+        set.insert(GpuBackend::Cuda); // Duplicate
+
+        assert_eq!(set.len(), 2); // Should only have 2 unique entries
+        assert!(set.contains(&GpuBackend::Cuda));
+        assert!(set.contains(&GpuBackend::Rocm));
+    }
+
+    #[test]
+    fn test_gpu_buffer_debug_clone() {
+        let inner = Arc::new(CpuBuffer::new(16));
+        let buffer = GpuBuffer::<f32>::new(inner, 4);
+
+        // Test Debug implementation
+        let debug_str = format!("{:?}", buffer);
+        assert!(debug_str.contains("GpuBuffer"));
+        assert!(debug_str.contains("size"));
+
+        // Test Clone implementation
+        let cloned = buffer.clone();
+        assert_eq!(cloned.len(), buffer.len());
+        assert_eq!(cloned.len(), 4);
+
+        // Verify the clone is independent (shares the same Arc)
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let _ = buffer.copy_from_host(&data);
+
+        let mut result = vec![0.0f32; 4];
+        let _ = cloned.copy_to_host(&mut result);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_gpu_context_debug() {
+        let context = GpuContext::new(GpuBackend::Cpu).expect("Failed to create context");
+
+        // Test Debug implementation
+        let debug_str = format!("{:?}", context);
+        assert!(debug_str.contains("GpuContext"));
+        assert!(debug_str.contains("backend"));
+        assert!(debug_str.contains("Cpu"));
+    }
+
+    #[test]
+    fn test_gpu_context_batch_dispatch() {
+        // Create context with CPU backend (always available)
+        let context = GpuContext::new(GpuBackend::Cpu).expect("Failed to create CPU context");
+
+        // Begin batch mode
+        let begin_result = context.begin_batch();
+        assert!(
+            begin_result.is_ok(),
+            "begin_batch should succeed on CPU backend"
+        );
+
+        // Compile a kernel and dispatch it inside the batch
+        let dispatch_result = context.execute(|compiler| {
+            compiler.compile("dummy kernel source").map(|kernel| {
+                kernel.dispatch([4, 1, 1]);
+            })
+        });
+        assert!(
+            dispatch_result.is_ok(),
+            "kernel dispatch inside batch should succeed"
+        );
+
+        // End batch — submits and waits
+        let end_result = context.end_batch();
+        assert!(
+            end_result.is_ok(),
+            "end_batch should succeed on CPU backend"
+        );
+    }
+
+    #[test]
+    fn test_gpu_context_gpu_sync() {
+        // Create context with CPU backend
+        let context = GpuContext::new(GpuBackend::Cpu).expect("Failed to create CPU context");
+
+        // gpu_sync should complete without error on CPU backend
+        let result = context.gpu_sync();
+        assert!(result.is_ok(), "gpu_sync should return Ok on CPU backend");
+    }
+
+    #[test]
+    fn test_gpu_kernel_dispatch_no_wait() {
+        // Create a kernel handle backed by CpuKernel
+        let kernel = Arc::new(CpuKernel);
+        let handle = GpuKernelHandle::new(kernel);
+
+        // Bind a buffer and scalar so the kernel has state
+        let buffer = GpuBuffer::<f32>::new(Arc::new(CpuBuffer::new(16)), 4);
+        handle.set_buffer("input", &buffer);
+        handle.set_u32("size", 4);
+
+        // dispatch_no_wait returns () — just verify no panic
+        handle.dispatch_no_wait([4, 1, 1]);
+    }
+
+    #[test]
+    fn test_gpu_device_get_info_cpu() {
+        let device = GpuDevice::new(GpuBackend::Cpu, 0);
+        let info = device
+            .get_info()
+            .expect("get_info should succeed for the CPU backend");
+
+        // Backend and basic identity must round-trip.
+        assert_eq!(info.backend, GpuBackend::Cpu);
+        assert_eq!(info.device_name, "CPU");
+        assert_eq!(info.device_type, "CPU");
+
+        // The struct must be well-formed: non-empty descriptors and a valid
+        // work-group size. The CPU fallback emulates both precisions.
+        assert!(!info.device_name.is_empty());
+        assert!(!info.compute_capability.is_empty());
+        assert!(info.max_work_group_size >= 1);
+        assert!(info.supports_fp64);
+        assert!(info.supports_fp16);
+    }
+
+    #[test]
+    fn test_gpu_device_info_is_deterministic_per_backend() {
+        // Every backend must yield a well-formed, non-empty, deterministic info.
+        for backend in [
+            GpuBackend::Cpu,
+            GpuBackend::Cuda,
+            GpuBackend::Rocm,
+            GpuBackend::Wgpu,
+            GpuBackend::Metal,
+            GpuBackend::OpenCL,
+        ] {
+            let device = GpuDevice::new(backend, 0);
+            let info = device.get_info().expect("get_info should not fail");
+            let info_again = device.get_info().expect("get_info should not fail");
+
+            assert_eq!(info.backend, backend);
+            assert!(!info.device_name.is_empty());
+            assert!(!info.device_type.is_empty());
+            assert!(!info.compute_capability.is_empty());
+            assert!(info.max_work_group_size >= 1);
+
+            // Deterministic: two queries produce identical descriptors.
+            assert_eq!(info.device_name, info_again.device_name);
+            assert_eq!(info.max_work_group_size, info_again.max_work_group_size);
+            assert_eq!(info.supports_fp64, info_again.supports_fp64);
+        }
+    }
+}

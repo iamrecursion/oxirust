@@ -1,0 +1,1250 @@
+// Copyright 2026 COOLJAPAN OU (Team KitaSan)
+// SPDX-License-Identifier: Apache-2.0
+
+//! Geophysical fluid dynamics via Lattice Boltzmann Method.
+//!
+//! This module provides:
+//! - [`RotatingFrameLbm`]: D2Q9 LBM in rotating frame with Coriolis forcing.
+//! - [`ShallowWaterLbm`]: Lattice Boltzmann shallow-water equations (Zhou 2004).
+//! - [`RossbyWaveSim`]: Rossby wave simulation on beta-plane.
+//! - [`MantelConvection`]: Rayleigh-Benard (Boussinesq) convection in Earth's mantle.
+//! - [`ThermohalineCirculation`]: Double-diffusive oceanic circulation.
+//! - [`AtmosphericBoundaryLayer`]: Neutral ABL with Smagorinsky LES and a log-law wall model.
+//! - [`GravityCurrent`]: Density-driven gravity current front tracking.
+//! - [`TidalSimulation`]: Tidal forcing with bottom friction.
+//! - [`GeostrophicAdjustment`]: Geostrophic balance and adjustment process.
+//! - [`PlanetaryWave`]: Two-layer rotating shallow-water model with barotropic
+//!   and baroclinic planetary and gravity waves.
+
+use std::f64::consts::PI;
+
+mod boundary_layer;
+mod convection;
+mod planetary_wave;
+#[cfg(test)]
+mod regression_tests;
+mod shallow_water;
+
+pub use boundary_layer::AtmosphericBoundaryLayer;
+pub use convection::{MantelConvection, ThermohalineCirculation};
+pub use planetary_wave::PlanetaryWave;
+pub use shallow_water::ShallowWaterLbm;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D2Q9 lattice constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NQ: usize = 9;
+const CX: [f64; NQ] = [0.0, 1.0, 0.0, -1.0, 0.0, 1.0, -1.0, -1.0, 1.0];
+const CY: [f64; NQ] = [0.0, 0.0, 1.0, 0.0, -1.0, 1.0, 1.0, -1.0, -1.0];
+const W: [f64; NQ] = [
+    4.0 / 9.0,
+    1.0 / 9.0,
+    1.0 / 9.0,
+    1.0 / 9.0,
+    1.0 / 9.0,
+    1.0 / 36.0,
+    1.0 / 36.0,
+    1.0 / 36.0,
+    1.0 / 36.0,
+];
+const CS2: f64 = 1.0 / 3.0;
+
+/// Opposite direction index for bounce-back boundary.
+const OPP: [usize; NQ] = [0, 3, 4, 1, 2, 7, 8, 5, 6];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Math helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[inline]
+fn feq(rho: f64, ux: f64, uy: f64) -> [f64; NQ] {
+    let mut f = [0.0f64; NQ];
+    let u2 = ux * ux + uy * uy;
+    for q in 0..NQ {
+        let cu = CX[q] * ux + CY[q] * uy;
+        f[q] = W[q] * rho * (1.0 + cu / CS2 + cu * cu / (2.0 * CS2 * CS2) - u2 / (2.0 * CS2));
+    }
+    f
+}
+
+#[inline]
+fn macroscopic(f: &[f64; NQ]) -> (f64, f64, f64) {
+    let rho = f.iter().sum::<f64>();
+    if rho < 1e-300 {
+        return (0.0, 0.0, 0.0);
+    }
+    let ux = f.iter().enumerate().map(|(q, &v)| CX[q] * v).sum::<f64>() / rho;
+    let uy = f.iter().enumerate().map(|(q, &v)| CY[q] * v).sum::<f64>() / rho;
+    (rho, ux, uy)
+}
+
+#[inline]
+fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        lo
+    } else if x > hi {
+        hi
+    } else {
+        x
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BGK collision with body force (Guo scheme)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply Guo body-force correction to distribution after BGK collision.
+///
+/// `f_post` is updated in-place.
+fn guo_force(f_post: &mut [f64; NQ], fx: f64, fy: f64, ux: f64, uy: f64, omega: f64) {
+    for q in 0..NQ {
+        let cu = CX[q] * ux + CY[q] * uy;
+        let cf = CX[q] * fx + CY[q] * fy;
+        let correction = W[q]
+            * (1.0 - 0.5 * omega)
+            * (cf / CS2 + (cu * cf) / (CS2 * CS2) - (ux * fx + uy * fy) / CS2);
+        f_post[q] += correction;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Periodic streaming helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn stream_periodic(f: &[Vec<[f64; NQ]>], nx: usize, ny: usize) -> Vec<Vec<[f64; NQ]>> {
+    let mut f_new = vec![vec![[0.0f64; NQ]; ny]; nx];
+    for (ix, row) in f_new.iter_mut().enumerate() {
+        for (iy, cell) in row.iter_mut().enumerate() {
+            for (q, val) in cell.iter_mut().enumerate() {
+                let cx = CX[q] as isize;
+                let cy = CY[q] as isize;
+                let sx = ((ix as isize - cx).rem_euclid(nx as isize)) as usize;
+                let sy = ((iy as isize - cy).rem_euclid(ny as isize)) as usize;
+                *val = f[sx][sy][q];
+            }
+        }
+    }
+    f_new
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Advection–diffusion equilibrium and walled streaming
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Direction with the vertical velocity component reversed,
+/// `(c_x, c_y) → (c_x, −c_y)`; used for free-slip (specular) walls.
+const MIRROR_Y: [usize; NQ] = [0, 1, 4, 3, 2, 8, 7, 6, 5];
+
+/// Equilibrium of a passive scalar `t` advected with the velocity
+/// `(ux, uy)`: `g_q = w_q t (1 + c_q·u / cs²)`.
+///
+/// It is linear in the velocity, so the second moment is `t cs² δ_ab` and the
+/// scalar obeys the advection–diffusion equation with diffusivity
+/// `cs² (τ − 1/2)`; the zeroth moment is `t` and the first moment `t u`.
+#[inline]
+fn geq_linear(t: f64, ux: f64, uy: f64) -> [f64; NQ] {
+    let mut g = [0.0f64; NQ];
+    for q in 0..NQ {
+        g[q] = W[q] * t * (1.0 + (CX[q] * ux + CY[q] * uy) / CS2);
+    }
+    g
+}
+
+/// Streaming periodic in x with half-way reflecting walls at the planes
+/// `y = −1/2` and `y = ny − 1/2`.
+///
+/// A link that would leave the domain through a wall is replaced by the
+/// reflected population of the node it started from: the population that left
+/// in direction `reflect[q]` re-enters as direction `q`.  With `reflect =`
+/// [`OPP`] this is half-way bounce-back (no-slip for momentum, no-flux for
+/// scalars); with [`MIRROR_Y`] it is specular reflection (free-slip), where the
+/// reflected population lands one cell further along the wall by the
+/// tangential velocity component.  Mass is conserved exactly.
+fn stream_walled_y(
+    f: &[Vec<[f64; NQ]>],
+    nx: usize,
+    ny: usize,
+    reflect: &[usize; NQ],
+) -> Vec<Vec<[f64; NQ]>> {
+    let mut f_new = vec![vec![[0.0f64; NQ]; ny]; nx];
+    for (ix, row) in f_new.iter_mut().enumerate() {
+        for (iy, cell) in row.iter_mut().enumerate() {
+            for (q, val) in cell.iter_mut().enumerate() {
+                let sy = iy as isize - CY[q] as isize;
+                if (0..ny as isize).contains(&sy) {
+                    let sx = (ix as isize - CX[q] as isize).rem_euclid(nx as isize) as usize;
+                    *val = f[sx][sy as usize][q];
+                } else {
+                    let rq = reflect[q];
+                    let shift = (0.5 * (CX[q] + CX[rq])) as isize;
+                    let sx = (ix as isize - shift).rem_euclid(nx as isize) as usize;
+                    *val = f[sx][iy][rq];
+                }
+            }
+        }
+    }
+    f_new
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Periodic stream function (FFT Poisson solve)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wavenumbers of FFT bin `index` on an `n`-point periodic axis of unit
+/// spacing: `(k, k_derivative)`.
+///
+/// `k = 2π m / n` with the signed mode number `m`.  `k_derivative` is the
+/// wavenumber to use when differentiating a real field: it vanishes for the
+/// Nyquist mode of an even-length axis, whose derivative is not representable
+/// by a real field.
+fn fft_wavenumbers(index: usize, n: usize) -> (f64, f64) {
+    let signed = if index <= n / 2 {
+        index as f64
+    } else {
+        index as f64 - n as f64
+    };
+    let k = 2.0 * PI * signed / n as f64;
+    let k_derivative = if n.is_multiple_of(2) && index == n / 2 {
+        0.0
+    } else {
+        k
+    };
+    (k, k_derivative)
+}
+
+/// Stream function `ψ` of a doubly periodic velocity field.
+///
+/// `ux` and `uy` hold the velocity components on an `nx × ny` grid of unit
+/// spacing in row-major order (`ix * ny + iy`).  The returned `ψ` (same
+/// layout, zero mean) follows the convention `u_x = −∂ψ/∂y`, `u_y = ∂ψ/∂x`,
+/// so that `∇²ψ = ζ` with `ζ = ∂u_y/∂x − ∂u_x/∂y`.
+///
+/// The vorticity is formed with spectral derivatives and `∇²ψ = ζ` is solved
+/// in Fourier space, `ψ̂ = −ζ̂ / k²` (the `k = 0` mode is dropped), so the
+/// result is exact for every Fourier mode that fits on the grid; a purely
+/// divergent part of the field does not contribute.
+fn streamfunction_periodic(ux: &[f64], uy: &[f64], nx: usize, ny: usize) -> Vec<f64> {
+    let n = nx * ny;
+    let zeros = vec![0.0f64; n];
+    // Row-major with `nx` rows (index ix) of `ny` columns (index iy).
+    let (ux_re, ux_im) = oxifft::fft2d_split::<f64>(ux, &zeros, nx, ny);
+    let (uy_re, uy_im) = oxifft::fft2d_split::<f64>(uy, &zeros, nx, ny);
+    let mut psi_re = vec![0.0f64; n];
+    let mut psi_im = vec![0.0f64; n];
+    for ix in 0..nx {
+        let (kx, kx_d) = fft_wavenumbers(ix, nx);
+        for iy in 0..ny {
+            let (ky, ky_d) = fft_wavenumbers(iy, ny);
+            let k2 = kx * kx + ky * ky;
+            if k2 == 0.0 {
+                continue;
+            }
+            let idx = ix * ny + iy;
+            // ζ̂ = i kx û_y − i ky û_x
+            let zeta_re = -kx_d * uy_im[idx] + ky_d * ux_im[idx];
+            let zeta_im = kx_d * uy_re[idx] - ky_d * ux_re[idx];
+            psi_re[idx] = -zeta_re / k2;
+            psi_im[idx] = -zeta_im / k2;
+        }
+    }
+    oxifft::ifft2d_split::<f64>(&psi_re, &psi_im, nx, ny).0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. RotatingFrameLbm — D2Q9 with Coriolis forcing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// D2Q9 Lattice Boltzmann simulation in a rotating reference frame.
+///
+/// Implements Coriolis force `F = -2Ω × u` via the Guo body-force scheme,
+/// enabling simulation of rotating geophysical flows such as inertial
+/// oscillations and rotating Rayleigh-Bénard convection.
+pub struct RotatingFrameLbm {
+    /// Grid width (number of cells in x direction).
+    pub nx: usize,
+    /// Grid height (number of cells in y direction).
+    pub ny: usize,
+    /// BGK relaxation parameter (ω = 1/τ).
+    pub omega: f64,
+    /// Rotation rate (Coriolis parameter) in lattice units.
+    pub rotation_rate: f64,
+    /// Distribution functions (outer: x, inner: y).
+    pub f: Vec<Vec<[f64; NQ]>>,
+    /// Solid mask: true = solid (bounce-back) cell.
+    pub solid: Vec<Vec<bool>>,
+}
+
+impl RotatingFrameLbm {
+    /// Create a new rotating-frame LBM grid.
+    ///
+    /// # Arguments
+    /// * `nx` — width in lattice cells.
+    /// * `ny` — height in lattice cells.
+    /// * `omega` — BGK relaxation frequency (0 < ω < 2).
+    /// * `rotation_rate` — Coriolis parameter f (rad/step in lattice units).
+    pub fn new(nx: usize, ny: usize, omega: f64, rotation_rate: f64) -> Self {
+        let f = vec![vec![feq(1.0, 0.0, 0.0); ny]; nx];
+        let solid = vec![vec![false; ny]; nx];
+        Self {
+            nx,
+            ny,
+            omega,
+            rotation_rate,
+            f,
+            solid,
+        }
+    }
+
+    /// Set velocity initial condition for all fluid cells.
+    pub fn set_velocity_ic(&mut self, ux0: f64, uy0: f64) {
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                self.f[ix][iy] = feq(1.0, ux0, uy0);
+            }
+        }
+    }
+
+    /// Perform one LBM step: collision → Coriolis forcing → streaming.
+    pub fn step(&mut self) {
+        let omega = self.omega;
+        let rot = self.rotation_rate;
+        // Collision + Coriolis
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                if self.solid[ix][iy] {
+                    continue;
+                }
+                let (rho, ux, uy) = macroscopic(&self.f[ix][iy]);
+                let feq_arr = feq(rho, ux, uy);
+                let mut f_coll = self.f[ix][iy];
+                for q in 0..NQ {
+                    f_coll[q] += omega * (feq_arr[q] - f_coll[q]);
+                }
+                // Coriolis: F_x = +2Ω*uy, F_y = -2Ω*ux  (f-plane)
+                let fx = 2.0 * rot * uy;
+                let fy = -2.0 * rot * ux;
+                guo_force(&mut f_coll, fx, fy, ux, uy, omega);
+                self.f[ix][iy] = f_coll;
+            }
+        }
+        // Streaming with periodic BC
+        let f_new = stream_periodic(&self.f, self.nx, self.ny);
+        // Bounce-back for solid cells
+        for (ix, (f_row, (solid_row, f_new_row))) in self
+            .f
+            .iter_mut()
+            .zip(self.solid.iter().zip(f_new.iter()))
+            .enumerate()
+        {
+            for (iy, (cell, (is_solid, new_cell))) in f_row
+                .iter_mut()
+                .zip(solid_row.iter().zip(f_new_row.iter()))
+                .enumerate()
+            {
+                let _ = (ix, iy);
+                if *is_solid {
+                    let old = *cell;
+                    for (q, f_q) in cell.iter_mut().enumerate() {
+                        *f_q = old[OPP[q]];
+                    }
+                } else {
+                    *cell = *new_cell;
+                }
+            }
+        }
+    }
+
+    /// Compute bulk kinetic energy (lattice units).
+    pub fn kinetic_energy(&self) -> f64 {
+        let mut ke = 0.0;
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                let (rho, ux, uy) = macroscopic(&self.f[ix][iy]);
+                ke += 0.5 * rho * (ux * ux + uy * uy);
+            }
+        }
+        ke / (self.nx * self.ny) as f64
+    }
+
+    /// Extract macroscopic velocity field as flat (ux, uy) pairs.
+    pub fn velocity_field(&self) -> Vec<(f64, f64)> {
+        let mut out = Vec::with_capacity(self.nx * self.ny);
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                let (_rho, ux, uy) = macroscopic(&self.f[ix][iy]);
+                out.push((ux, uy));
+            }
+        }
+        out
+    }
+
+    /// Out-of-plane vorticity `ζ = ∂u_y/∂x − ∂u_x/∂y` at cell `(ix, iy)`.
+    ///
+    /// Second-order central differences with periodic wrap-around, in lattice
+    /// units (the derivative is taken per lattice spacing).  Rigid rotation
+    /// with angular velocity `Ω` has `ζ = 2Ω`.
+    pub fn vorticity_at(&self, ix: usize, iy: usize) -> f64 {
+        let nx = self.nx;
+        let ny = self.ny;
+        let ixp = (ix + 1) % nx;
+        let ixm = (ix + nx - 1) % nx;
+        let iyp = (iy + 1) % ny;
+        let iym = (iy + ny - 1) % ny;
+        // ∂u_y/∂x: the y-velocity at the x-neighbours of the cell.
+        let (_, _, uy_east) = macroscopic(&self.f[ixp][iy]);
+        let (_, _, uy_west) = macroscopic(&self.f[ixm][iy]);
+        // ∂u_x/∂y: the x-velocity at the y-neighbours of the cell.
+        let (_, ux_north, _) = macroscopic(&self.f[ix][iyp]);
+        let (_, ux_south, _) = macroscopic(&self.f[ix][iym]);
+        let duy_dx = (uy_east - uy_west) * 0.5;
+        let dux_dy = (ux_north - ux_south) * 0.5;
+        duy_dx - dux_dy
+    }
+
+    /// Mean enstrophy `⟨ζ²/2⟩` (the domain average of half the squared
+    /// vorticity, see [`vorticity_at`](Self::vorticity_at)).
+    pub fn enstrophy(&self) -> f64 {
+        let mut ens = 0.0;
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                let vort = self.vorticity_at(ix, iy);
+                ens += 0.5 * vort * vort;
+            }
+        }
+        ens / (self.nx * self.ny) as f64
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. RossbyWaveSim — Rossby wave on beta-plane
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Rossby wave simulation using beta-plane approximation.
+///
+/// The Coriolis parameter varies linearly with latitude: `f(y) = f0 + β·y`.
+/// This produces westward-propagating Rossby waves characteristic of
+/// planetary-scale atmospheric and oceanic dynamics.
+pub struct RossbyWaveSim {
+    /// Grid width.
+    pub nx: usize,
+    /// Grid height.
+    pub ny: usize,
+    /// BGK relaxation frequency.
+    pub omega: f64,
+    /// Reference Coriolis parameter at domain centre.
+    pub f0: f64,
+    /// Beta-plane gradient df/dy.
+    pub beta: f64,
+    /// Lattice spacing (physical length per cell).
+    pub dy: f64,
+    /// Distribution functions.
+    pub f: Vec<Vec<[f64; NQ]>>,
+    /// Stream function `ψ[ix][iy]` of the velocity field, in lattice units
+    /// (`cell² · step⁻¹`).
+    ///
+    /// Convention of [`wave_ic`](Self::wave_ic): `u_x = −∂ψ/∂y`,
+    /// `u_y = ∂ψ/∂x`, i.e. `∇²ψ = ζ` with the vorticity
+    /// `ζ = ∂u_y/∂x − ∂u_x/∂y`.  It is the periodic solution of that Poisson
+    /// equation with zero mean, refreshed by [`wave_ic`](Self::wave_ic) and
+    /// by every [`step`](Self::step).
+    pub psi: Vec<Vec<f64>>,
+}
+
+impl RossbyWaveSim {
+    /// Construct a new beta-plane Rossby wave simulation.
+    pub fn new(nx: usize, ny: usize, omega: f64, f0: f64, beta: f64, dy: f64) -> Self {
+        let f = vec![vec![feq(1.0, 0.0, 0.0); ny]; nx];
+        let psi = vec![vec![0.0f64; ny]; nx];
+        Self {
+            nx,
+            ny,
+            omega,
+            f0,
+            beta,
+            dy,
+            f,
+            psi,
+        }
+    }
+
+    /// Set a single Rossby wave initial condition with wavenumbers (kx, ky).
+    pub fn wave_ic(&mut self, kx: f64, ky: f64, amplitude: f64) {
+        let nx = self.nx as f64;
+        let ny = self.ny as f64;
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                let x = ix as f64 / nx;
+                let y = iy as f64 / ny;
+                let ux = -amplitude * ky * (2.0 * PI * (kx * x + ky * y)).cos();
+                let uy = amplitude * kx * (2.0 * PI * (kx * x + ky * y)).cos();
+                self.f[ix][iy] = feq(1.0, ux, uy);
+            }
+        }
+        self.update_streamfunction();
+    }
+
+    /// Local Coriolis parameter `f = f0 + β (iy − ny/2) Δy` at lattice row
+    /// `iy`: `f0` is the value at the domain centre row `iy = ny/2`.
+    #[inline]
+    pub fn coriolis_at(&self, iy: usize) -> f64 {
+        let y = (iy as f64 - 0.5 * self.ny as f64) * self.dy;
+        self.f0 + self.beta * y
+    }
+
+    /// Advance one step with spatially varying Coriolis.
+    pub fn step(&mut self) {
+        let omega = self.omega;
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                let (rho, ux, uy) = macroscopic(&self.f[ix][iy]);
+                let feq_arr = feq(rho, ux, uy);
+                let fc = self.coriolis_at(iy);
+                let fx = fc * uy;
+                let fy = -fc * ux;
+                for (f_q, feq_q) in self.f[ix][iy].iter_mut().zip(feq_arr.iter()) {
+                    *f_q += omega * (*feq_q - *f_q);
+                }
+                let mut tmp = self.f[ix][iy];
+                guo_force(&mut tmp, fx, fy, ux, uy, omega);
+                self.f[ix][iy] = tmp;
+            }
+        }
+        self.f = stream_periodic(&self.f, self.nx, self.ny);
+        self.update_streamfunction();
+    }
+
+    /// Recompute [`psi`](Self::psi) from the current velocity field by
+    /// solving `∇²ψ = ζ` on the periodic grid with a 2-D FFT.
+    fn update_streamfunction(&mut self) {
+        let (nx, ny) = (self.nx, self.ny);
+        if nx == 0 || ny == 0 {
+            return;
+        }
+        let mut ux = vec![0.0f64; nx * ny];
+        let mut uy = vec![0.0f64; nx * ny];
+        for ix in 0..nx {
+            for iy in 0..ny {
+                let (_, u, v) = macroscopic(&self.f[ix][iy]);
+                ux[ix * ny + iy] = u;
+                uy[ix * ny + iy] = v;
+            }
+        }
+        let psi = streamfunction_periodic(&ux, &uy, nx, ny);
+        for ix in 0..nx {
+            for iy in 0..ny {
+                self.psi[ix][iy] = psi[ix * ny + iy];
+            }
+        }
+    }
+
+    /// Compute Rossby wave phase speed (theoretical) for wavenumber (kx, ky).
+    ///
+    /// `c_x = -β / (kx² + ky²)` (non-dimensional).
+    pub fn theoretical_phase_speed(&self, kx: f64, ky: f64) -> f64 {
+        let k2 = kx * kx + ky * ky;
+        if k2 < 1e-14 {
+            return 0.0;
+        }
+        -self.beta / k2
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. GravityCurrent — density-driven gravity current
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Density-driven gravity current simulation.
+///
+/// A heavy fluid (density `ρ_h`) intrudes along the bottom beneath a lighter
+/// ambient fluid (`ρ_l`).  The front speed obeys Froude's law.
+pub struct GravityCurrent {
+    /// Grid width.
+    pub nx: usize,
+    /// Grid height.
+    pub ny: usize,
+    /// Relaxation frequency.
+    pub omega: f64,
+    /// Heavy fluid density.
+    pub rho_heavy: f64,
+    /// Light fluid density.
+    pub rho_light: f64,
+    /// Gravitational acceleration.
+    pub gravity: f64,
+    /// Distribution functions.
+    pub f: Vec<Vec<[f64; NQ]>>,
+    /// Density field (scalar).
+    pub rho_field: Vec<Vec<f64>>,
+}
+
+impl GravityCurrent {
+    /// Create a gravity current domain with initial lock-release.
+    ///
+    /// Heavy fluid occupies the left half of the bottom quarter.
+    pub fn new(
+        nx: usize,
+        ny: usize,
+        omega: f64,
+        rho_heavy: f64,
+        rho_light: f64,
+        gravity: f64,
+    ) -> Self {
+        let mut f = vec![vec![feq(rho_light, 0.0, 0.0); ny]; nx];
+        let mut rho_field = vec![vec![rho_light; ny]; nx];
+        // Lock release: left half, bottom quarter
+        for ix in 0..nx / 2 {
+            for iy in 0..ny / 4 {
+                f[ix][iy] = feq(rho_heavy, 0.0, 0.0);
+                rho_field[ix][iy] = rho_heavy;
+            }
+        }
+        Self {
+            nx,
+            ny,
+            omega,
+            rho_heavy,
+            rho_light,
+            gravity,
+            f,
+            rho_field,
+        }
+    }
+
+    /// Advance one timestep with buoyancy force.
+    pub fn step(&mut self) {
+        let omega = self.omega;
+        let g = self.gravity;
+        let rho_l = self.rho_light;
+        for (ix, (f_row, rho_row)) in self.f.iter_mut().zip(self.rho_field.iter_mut()).enumerate() {
+            for (iy, (cell, rho_cell)) in f_row.iter_mut().zip(rho_row.iter_mut()).enumerate() {
+                let _ = iy;
+                let (rho, ux, uy) = macroscopic(cell);
+                *rho_cell = rho;
+                let feq_arr = feq(rho, ux, uy);
+                let delta_rho = rho - rho_l;
+                let fy = -g * delta_rho / rho.max(1e-6);
+                for (f_q, feq_q) in cell.iter_mut().zip(feq_arr.iter()) {
+                    *f_q += omega * (*feq_q - *f_q);
+                }
+                let mut tmp = *cell;
+                guo_force(&mut tmp, 0.0, fy, ux, uy, omega);
+                *cell = tmp;
+            }
+            let _ = ix;
+        }
+        // Bottom and top bounce-back
+        let ny = self.ny;
+        for f_row in self.f.iter_mut() {
+            let old_bot = f_row[0];
+            for (q, f_q) in f_row[0].iter_mut().enumerate() {
+                *f_q = old_bot[OPP[q]];
+            }
+            let old_top = f_row[ny - 1];
+            for (q, f_q) in f_row[ny - 1].iter_mut().enumerate() {
+                *f_q = old_top[OPP[q]];
+            }
+        }
+        self.f = stream_periodic(&self.f, self.nx, self.ny);
+    }
+
+    /// Locate the front position (rightmost cell with rho > midpoint).
+    pub fn front_position(&self) -> usize {
+        let rho_mid = (self.rho_heavy + self.rho_light) * 0.5;
+        for ix in (0..self.nx).rev() {
+            let avg: f64 = (0..self.ny / 4)
+                .map(|iy| self.rho_field[ix][iy])
+                .sum::<f64>()
+                / (self.ny / 4).max(1) as f64;
+            if avg > rho_mid {
+                return ix;
+            }
+        }
+        0
+    }
+
+    /// Theoretical Froude front speed.
+    pub fn froude_speed(&self) -> f64 {
+        let g_prime = self.gravity * (self.rho_heavy - self.rho_light) / self.rho_light.max(1e-14);
+        let h = self.ny as f64 / 4.0;
+        0.5 * (g_prime * h).sqrt()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. TidalSimulation — tidal forcing with bottom friction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tidal simulation with astronomical forcing and bottom friction.
+///
+/// Implements the M2 tidal constituent as a harmonic body force, with bottom
+/// friction by the quadratic drag law `τ_b/ρ = Cd |u| u`.  The momentum
+/// equation of the depth-averaged flow is divided by the local depth `H`, so
+/// the deceleration is `Cd |u| u / H`: shallow water (a continental shelf)
+/// is braked harder than deep water.  The drag is integrated in the
+/// Crank–Nicolson form through the force-corrected velocity; its rate
+/// `Cd |u| / H` is limited to 2 per step, which brings the flow to rest within
+/// one step, so even a (nearly) dry cell can neither reverse nor amplify the
+/// flow.
+pub struct TidalSimulation {
+    /// Grid width.
+    pub nx: usize,
+    /// Grid height.
+    pub ny: usize,
+    /// Relaxation frequency.
+    pub omega: f64,
+    /// Tidal forcing amplitude.
+    pub tidal_amplitude: f64,
+    /// Tidal angular frequency (M2 period = 44712 s; scaled to lattice units).
+    pub tidal_omega: f64,
+    /// Bottom drag coefficient Cd.
+    pub drag_coeff: f64,
+    /// Current time (in lattice steps).
+    pub time: usize,
+    /// Distribution functions.
+    pub f: Vec<Vec<[f64; NQ]>>,
+    /// Bathymetry: still-water depth `H(ix, iy)`, which divides the bottom drag.
+    /// Cells with a depth below [`MIN_TIDAL_DEPTH`] (dry or invalid) are treated
+    /// as having that depth.
+    pub depth: Vec<Vec<f64>>,
+}
+
+/// Smallest depth that enters the bottom drag of [`TidalSimulation`].
+const MIN_TIDAL_DEPTH: f64 = 1e-6;
+
+/// Largest bottom-drag rate `Cd |u| / H` per time step of [`TidalSimulation`]:
+/// the Crank–Nicolson drag stops the flow exactly at a rate of 2.
+const MAX_TIDAL_DRAG_RATE: f64 = 2.0;
+
+impl TidalSimulation {
+    /// Create a new tidal simulation.
+    pub fn new(
+        nx: usize,
+        ny: usize,
+        omega: f64,
+        tidal_amplitude: f64,
+        tidal_omega: f64,
+        drag_coeff: f64,
+    ) -> Self {
+        let f = vec![vec![feq(1.0, 0.0, 0.0); ny]; nx];
+        let depth = vec![vec![1.0f64; ny]; nx];
+        Self {
+            nx,
+            ny,
+            omega,
+            tidal_amplitude,
+            tidal_omega,
+            drag_coeff,
+            time: 0,
+            f,
+            depth,
+        }
+    }
+
+    /// Set a shelf-break bathymetry: shallow shelf then deep ocean.
+    pub fn shelf_bathymetry(&mut self, shelf_depth: f64, ocean_depth: f64, shelf_x: usize) {
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                self.depth[ix][iy] = if ix < shelf_x {
+                    shelf_depth
+                } else {
+                    ocean_depth
+                };
+            }
+        }
+    }
+
+    /// Advance one timestep: BGK collision with the tidal body force and the
+    /// depth-dependent quadratic bottom drag `−Cd |u| u / H`, then periodic
+    /// streaming.
+    pub fn step(&mut self) {
+        let omega = self.omega;
+        let a = self.tidal_amplitude;
+        let w = self.tidal_omega;
+        let t = self.time as f64;
+        let fx_tidal = a * w * (w * t).cos();
+        let cd = self.drag_coeff;
+        for (f_row, depth_row) in self.f.iter_mut().zip(self.depth.iter()) {
+            for (cell, &depth) in f_row.iter_mut().zip(depth_row.iter()) {
+                let (rho, ux0, uy0) = macroscopic(cell);
+                // Drag rate r = Cd |u| / H, so that the acceleration is
+                // a_x = a_tide − r u_x and a_y = −r u_y.  The force-corrected
+                // velocity u = u0 + a/2 is then solved in closed form.
+                let rate = (cd * (ux0 * ux0 + uy0 * uy0).sqrt() / depth.max(MIN_TIDAL_DEPTH))
+                    .min(MAX_TIDAL_DRAG_RATE);
+                let damping = 1.0 + 0.5 * rate;
+                let ux = (ux0 + 0.5 * fx_tidal) / damping;
+                let uy = uy0 / damping;
+                // Guo force density = ρ × acceleration.
+                let fx = rho * (fx_tidal - rate * ux);
+                let fy = -rho * rate * uy;
+                let feq_arr = feq(rho, ux, uy);
+                for (f_q, feq_q) in cell.iter_mut().zip(feq_arr.iter()) {
+                    *f_q += omega * (*feq_q - *f_q);
+                }
+                guo_force(cell, fx, fy, ux, uy, omega);
+            }
+        }
+        self.f = stream_periodic(&self.f, self.nx, self.ny);
+        self.time += 1;
+    }
+
+    /// Compute tidal ellipse parameters (semi-major, semi-minor axes) at (ix, iy).
+    pub fn tidal_ellipse(&self, ix: usize, iy: usize) -> (f64, f64) {
+        let (_rho, ux, uy) = macroscopic(&self.f[ix][iy]);
+        let major = (ux * ux + uy * uy).sqrt();
+        let minor = (ux * uy).abs() / major.max(1e-14);
+        (major, minor)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. GeostrophicAdjustment — geostrophic balance and adjustment
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Geostrophic adjustment process simulation.
+///
+/// Tracks how an unbalanced initial state adjusts to geostrophic balance
+/// `f × u = -∇p/ρ`.  The Rossby radius of deformation `L_R = NH/f`
+/// controls the adjustment length scale.
+pub struct GeostrophicAdjustment {
+    /// Grid width.
+    pub nx: usize,
+    /// Grid height.
+    pub ny: usize,
+    /// Relaxation frequency.
+    pub omega: f64,
+    /// Coriolis parameter.
+    pub f_coriolis: f64,
+    /// Distribution functions.
+    pub f: Vec<Vec<[f64; NQ]>>,
+    /// Pressure field (diagnosed).
+    pub pressure: Vec<Vec<f64>>,
+    /// Geostrophic imbalance history.
+    pub imbalance_history: Vec<f64>,
+}
+
+impl GeostrophicAdjustment {
+    /// Construct a geostrophic adjustment simulation.
+    pub fn new(nx: usize, ny: usize, omega: f64, f_coriolis: f64) -> Self {
+        let f = vec![vec![feq(1.0, 0.0, 0.0); ny]; nx];
+        let pressure = vec![vec![CS2; ny]; nx];
+        Self {
+            nx,
+            ny,
+            omega,
+            f_coriolis,
+            f,
+            pressure,
+            imbalance_history: Vec::new(),
+        }
+    }
+
+    /// Set a jet initial condition: zonal flow with Gaussian profile.
+    pub fn jet_ic(&mut self, u_jet: f64, width: f64) {
+        let cy = self.ny as f64 * 0.5;
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                let y = iy as f64 - cy;
+                let ux = u_jet * (-y * y / (2.0 * width * width)).exp();
+                self.f[ix][iy] = feq(1.0, ux, 0.0);
+            }
+        }
+    }
+
+    /// Update pressure from density (ideal gas in lattice units).
+    fn update_pressure(&mut self) {
+        for ix in 0..self.nx {
+            for iy in 0..self.ny {
+                let (rho, _ux, _uy) = macroscopic(&self.f[ix][iy]);
+                self.pressure[ix][iy] = CS2 * rho;
+            }
+        }
+    }
+
+    /// Compute geostrophic imbalance: `|f × u + ∇p/ρ|` domain mean.
+    pub fn geostrophic_imbalance(&self) -> f64 {
+        let nx = self.nx;
+        let ny = self.ny;
+        let fc = self.f_coriolis;
+        let mut total = 0.0;
+        let n = (nx * ny) as f64;
+        for ix in 0..nx {
+            for iy in 0..ny {
+                let (rho, ux, uy) = macroscopic(&self.f[ix][iy]);
+                let ixp = (ix + 1) % nx;
+                let ixm = (ix + nx - 1) % nx;
+                let iyp = (iy + 1) % ny;
+                let iym = (iy + ny - 1) % ny;
+                let dpdx = 0.5 * (self.pressure[ixp][iy] - self.pressure[ixm][iy]);
+                let dpdy = 0.5 * (self.pressure[ix][iyp] - self.pressure[ix][iym]);
+                let ag_x = fc * uy + dpdx / rho.max(1e-14);
+                let ag_y = -fc * ux + dpdy / rho.max(1e-14);
+                total += (ag_x * ag_x + ag_y * ag_y).sqrt();
+            }
+        }
+        total / n
+    }
+
+    /// Advance one timestep.
+    pub fn step(&mut self) {
+        let omega = self.omega;
+        let fc = self.f_coriolis;
+        for f_row in self.f.iter_mut() {
+            for cell in f_row.iter_mut() {
+                let (rho, ux, uy) = macroscopic(cell);
+                let feq_arr = feq(rho, ux, uy);
+                let fx = fc * uy;
+                let fy = -fc * ux;
+                for (f_q, feq_q) in cell.iter_mut().zip(feq_arr.iter()) {
+                    *f_q += omega * (*feq_q - *f_q);
+                }
+                let mut tmp = *cell;
+                guo_force(&mut tmp, fx, fy, ux, uy, omega);
+                *cell = tmp;
+            }
+        }
+        self.f = stream_periodic(&self.f, self.nx, self.ny);
+        self.update_pressure();
+        let imbal = self.geostrophic_imbalance();
+        self.imbalance_history.push(imbal);
+    }
+
+    /// Compute Rossby radius of deformation.
+    pub fn rossby_radius(&self, brunt_vaisala_freq: f64, layer_depth: f64) -> f64 {
+        if self.f_coriolis.abs() < 1e-14 {
+            return f64::INFINITY;
+        }
+        brunt_vaisala_freq * layer_depth / self.f_coriolis.abs()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional utility functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute the Froude number `Fr = U / sqrt(g H)`.
+pub fn froude_number(u: f64, g: f64, h: f64) -> f64 {
+    let c = (g * h).sqrt().max(1e-14);
+    u / c
+}
+
+/// Compute the Rossby number `Ro = U / (f L)`.
+pub fn rossby_number(u: f64, f_coriolis: f64, length: f64) -> f64 {
+    let denom = f_coriolis.abs() * length;
+    if denom < 1e-14 {
+        return f64::INFINITY;
+    }
+    u / denom
+}
+
+/// Compute the Richardson number `Ri = N² / (dU/dz)²`.
+pub fn richardson_number(brunt_vaisala_sq: f64, shear_sq: f64) -> f64 {
+    if shear_sq < 1e-14 {
+        return f64::INFINITY;
+    }
+    brunt_vaisala_sq / shear_sq
+}
+
+/// Brunt-Väisälä frequency squared from density gradient.
+///
+/// `N² = -(g/ρ₀)(dρ/dz)` (positive for stable stratification).
+pub fn brunt_vaisala_sq(g: f64, rho0: f64, drho_dz: f64) -> f64 {
+    -(g / rho0.max(1e-14)) * drho_dz
+}
+
+/// Ekman depth `d_E = sqrt(2ν / f)`.
+pub fn ekman_depth(kinematic_viscosity: f64, f_coriolis: f64) -> f64 {
+    if f_coriolis.abs() < 1e-14 {
+        return f64::INFINITY;
+    }
+    (2.0 * kinematic_viscosity / f_coriolis.abs()).sqrt()
+}
+
+/// Tidal period in seconds from angular frequency.
+pub fn tidal_period(angular_freq: f64) -> f64 {
+    if angular_freq.abs() < 1e-14 {
+        return f64::INFINITY;
+    }
+    2.0 * PI / angular_freq.abs()
+}
+
+/// Geostrophic velocity from pressure gradient and Coriolis parameter.
+///
+/// Returns (u_g, v_g).
+pub fn geostrophic_velocity(dpdx: f64, dpdy: f64, rho: f64, f_cor: f64) -> (f64, f64) {
+    if f_cor.abs() < 1e-14 {
+        return (0.0, 0.0);
+    }
+    let u_g = -dpdy / (rho * f_cor);
+    let v_g = dpdx / (rho * f_cor);
+    (u_g, v_g)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Utilities ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_feq_sums_to_rho() {
+        let rho = 1.2;
+        let f = feq(rho, 0.05, 0.03);
+        let sum: f64 = f.iter().sum();
+        assert!((sum - rho).abs() < 1e-12, "feq sum = {sum}, expected {rho}");
+    }
+
+    #[test]
+    fn test_feq_zero_velocity() {
+        let f = feq(1.0, 0.0, 0.0);
+        for (q, &fq) in f.iter().enumerate() {
+            assert!((fq - W[q]).abs() < 1e-12, "q={q}: f={fq}, W={}", W[q]);
+        }
+    }
+
+    #[test]
+    fn test_macroscopic_roundtrip() {
+        let rho0 = 1.1;
+        let ux0 = 0.05;
+        let uy0 = -0.03;
+        let f = feq(rho0, ux0, uy0);
+        let (rho, ux, uy) = macroscopic(&f);
+        assert!((rho - rho0).abs() < 1e-12);
+        assert!((ux - ux0).abs() < 1e-12);
+        assert!((uy - uy0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_froude_number() {
+        let fr = froude_number(1.0, 9.81, 1.0);
+        let expected = 1.0 / 9.81_f64.sqrt();
+        assert!((fr - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rossby_number() {
+        let ro = rossby_number(1.0, 1e-4, 1e6);
+        assert!((ro - 0.01).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_richardson_number() {
+        let ri = richardson_number(1e-4, 1e-4);
+        assert!((ri - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_richardson_number_unstable() {
+        let ri = richardson_number(-0.01, 1.0);
+        assert!(ri < 0.0, "unstable stratification should give Ri < 0");
+    }
+
+    #[test]
+    fn test_brunt_vaisala_stable() {
+        let n2 = brunt_vaisala_sq(9.81, 1025.0, -0.1);
+        assert!(n2 > 0.0, "stable stratification: N² > 0");
+    }
+
+    #[test]
+    fn test_ekman_depth() {
+        let d = ekman_depth(1e-6, 1e-4);
+        let expected = (2e-6 / 1e-4_f64).sqrt();
+        assert!((d - expected).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_tidal_period() {
+        let period = tidal_period(2.0 * PI / 44712.0);
+        assert!((period - 44712.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_geostrophic_velocity() {
+        let (ug, vg) = geostrophic_velocity(0.01, 0.02, 1025.0, 1e-4);
+        assert!(ug.is_finite() && vg.is_finite());
+    }
+
+    // ── RotatingFrameLbm ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rotating_lbm_construction() {
+        let lbm = RotatingFrameLbm::new(16, 16, 1.0, 0.001);
+        assert_eq!(lbm.nx, 16);
+        assert_eq!(lbm.ny, 16);
+    }
+
+    #[test]
+    fn test_rotating_lbm_mass_conservation() {
+        let mut lbm = RotatingFrameLbm::new(16, 16, 1.0, 0.001);
+        let mass_before: f64 = lbm.f.iter().flatten().map(|f| f.iter().sum::<f64>()).sum();
+        for _ in 0..5 {
+            lbm.step();
+        }
+        let mass_after: f64 = lbm.f.iter().flatten().map(|f| f.iter().sum::<f64>()).sum();
+        assert!(
+            (mass_before - mass_after).abs() < 1e-8,
+            "mass not conserved: {mass_before} vs {mass_after}"
+        );
+    }
+
+    #[test]
+    fn test_rotating_lbm_kinetic_energy() {
+        let mut lbm = RotatingFrameLbm::new(16, 16, 1.0, 0.001);
+        lbm.set_velocity_ic(0.05, 0.0);
+        let ke = lbm.kinetic_energy();
+        assert!(ke > 0.0);
+    }
+
+    #[test]
+    fn test_rotating_lbm_enstrophy_nonneg() {
+        let mut lbm = RotatingFrameLbm::new(16, 16, 1.0, 0.001);
+        lbm.set_velocity_ic(0.05, 0.01);
+        let ens = lbm.enstrophy();
+        assert!(ens >= 0.0);
+    }
+
+    #[test]
+    fn test_rotating_lbm_velocity_field_size() {
+        let lbm = RotatingFrameLbm::new(8, 10, 1.0, 0.0);
+        let vf = lbm.velocity_field();
+        assert_eq!(vf.len(), 8 * 10);
+    }
+
+    // ── RossbyWaveSim ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rossby_wave_construction() {
+        let rw = RossbyWaveSim::new(16, 16, 1.0, 1e-4, 1.6e-11, 1.0);
+        assert_eq!(rw.nx, 16);
+    }
+
+    #[test]
+    fn test_rossby_phase_speed_negative() {
+        let rw = RossbyWaveSim::new(16, 16, 1.0, 1e-4, 1.6e-11, 1.0);
+        let cp = rw.theoretical_phase_speed(1.0, 0.0);
+        assert!(cp < 0.0, "Rossby phase speed should be westward (negative)");
+    }
+
+    #[test]
+    fn test_rossby_coriolis_at() {
+        let rw = RossbyWaveSim::new(16, 16, 1.0, 1e-4, 1.6e-11, 1e5);
+        let fc0 = rw.coriolis_at(0);
+        let fc1 = rw.coriolis_at(1);
+        assert!(fc1 > fc0, "beta-plane: f increases with y");
+    }
+
+    #[test]
+    fn test_rossby_step_finite() {
+        let mut rw = RossbyWaveSim::new(16, 16, 1.0, 1e-4, 1e-5, 1.0);
+        rw.wave_ic(1.0, 1.0, 0.01);
+        for _ in 0..5 {
+            rw.step();
+        }
+        for ix in 0..rw.nx {
+            for iy in 0..rw.ny {
+                for q in 0..NQ {
+                    assert!(rw.f[ix][iy][q].is_finite());
+                }
+            }
+        }
+    }
+
+    // ── GravityCurrent ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_gravity_current_construction() {
+        let gc = GravityCurrent::new(32, 16, 1.0, 1.1, 1.0, 0.01);
+        assert!(gc.rho_heavy > gc.rho_light);
+    }
+
+    #[test]
+    fn test_gravity_current_froude_speed() {
+        let gc = GravityCurrent::new(32, 16, 1.0, 1.1, 1.0, 0.01);
+        let spd = gc.froude_speed();
+        assert!(spd > 0.0 && spd.is_finite());
+    }
+
+    #[test]
+    fn test_gravity_current_front_initial() {
+        let gc = GravityCurrent::new(32, 16, 1.0, 1.1, 1.0, 0.01);
+        let fp = gc.front_position();
+        assert!(fp < 32, "front should be within domain");
+    }
+
+    #[test]
+    fn test_gravity_current_step_runs() {
+        let mut gc = GravityCurrent::new(16, 8, 1.0, 1.1, 1.0, 0.001);
+        for _ in 0..3 {
+            gc.step();
+        }
+        assert!(gc.rho_field.iter().flatten().all(|&v| v.is_finite()));
+    }
+
+    // ── TidalSimulation ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tidal_construction() {
+        let ts = TidalSimulation::new(16, 16, 1.0, 0.001, 0.0001, 0.002);
+        assert_eq!(ts.nx, 16);
+    }
+
+    #[test]
+    fn test_tidal_step_advances_time() {
+        let mut ts = TidalSimulation::new(8, 8, 1.0, 0.001, 0.0001, 0.002);
+        ts.step();
+        assert_eq!(ts.time, 1);
+    }
+
+    #[test]
+    fn test_tidal_ellipse_finite() {
+        let ts = TidalSimulation::new(8, 8, 1.0, 0.001, 0.0001, 0.002);
+        let (a, b) = ts.tidal_ellipse(4, 4);
+        assert!(a.is_finite() && b.is_finite());
+    }
+
+    #[test]
+    fn test_tidal_shelf_bathymetry() {
+        let mut ts = TidalSimulation::new(16, 8, 1.0, 0.001, 0.0001, 0.002);
+        ts.shelf_bathymetry(0.5, 2.0, 8);
+        assert!((ts.depth[0][0] - 0.5).abs() < 1e-12);
+        assert!((ts.depth[15][0] - 2.0).abs() < 1e-12);
+    }
+
+    // ── GeostrophicAdjustment ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_geostrophic_construction() {
+        let ga = GeostrophicAdjustment::new(16, 16, 1.0, 1e-4);
+        assert_eq!(ga.nx, 16);
+    }
+
+    #[test]
+    fn test_geostrophic_jet_ic() {
+        let mut ga = GeostrophicAdjustment::new(16, 16, 1.0, 1e-4);
+        ga.jet_ic(0.1, 4.0);
+        let (_rho, ux, _uy) = macroscopic(&ga.f[0][8]);
+        assert!(ux > 0.0, "jet centre should have positive zonal flow");
+    }
+
+    #[test]
+    fn test_geostrophic_rossby_radius() {
+        let ga = GeostrophicAdjustment::new(16, 16, 1.0, 1e-4);
+        let lr = ga.rossby_radius(0.01, 1000.0);
+        assert!(lr > 0.0 && lr.is_finite());
+    }
+
+    #[test]
+    fn test_geostrophic_imbalance_decreases() {
+        let mut ga = GeostrophicAdjustment::new(16, 16, 1.2, 1e-3);
+        ga.jet_ic(0.05, 4.0);
+        for _ in 0..20 {
+            ga.step();
+        }
+        assert!(!ga.imbalance_history.is_empty());
+        assert!(ga.imbalance_history.iter().all(|&v| v.is_finite()));
+    }
+}

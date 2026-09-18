@@ -1,0 +1,35 @@
+[package]
+name = "tenrso-decomp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Tensor decompositions: CP-ALS, Tucker-HOOI, TT-SVD"
+categories = ["algorithms", "mathematics", "science"]
+keywords = ["tenrso", "tensor-decomposition", "cp-als", "tucker", "tensor-train"]
+
+[dependencies]
+tenrso-core.workspace = true
+tenrso-kernels.workspace = true
+tenrso-sparse = { workspace = true, optional = true }
+anyhow.workspace = true
+thiserror.workspace = true
+# SciRS2-core is MANDATORY (see SCIRS2_INTEGRATION_POLICY.md)
+# NEVER use ndarray, num-traits directly - always through scirs2-core
+scirs2-core.workspace = true
+scirs2-linalg.workspace = true
+
+[features]
+default = ["parallel"]
+parallel = ["tenrso-kernels/parallel"]
+sparse = ["dep:tenrso-sparse", "tenrso-kernels/sparse"]
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "decompositions"
+harness = false

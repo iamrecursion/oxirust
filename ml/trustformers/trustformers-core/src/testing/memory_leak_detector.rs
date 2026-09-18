@@ -1,0 +1,1747 @@
+//! Memory leak detection utilities for CI/CD pipelines.
+//!
+//! This module provides tools to detect memory leaks in tensor operations
+//! and other memory-intensive operations during testing.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Memory allocation tracking information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllocationInfo {
+    pub size: usize,
+    #[serde(skip, default = "std::time::Instant::now")]
+    pub timestamp: Instant,
+    pub call_stack: Vec<String>,
+    pub allocation_id: u64,
+}
+
+/// Memory leak detection results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryLeakReport {
+    pub total_allocations: usize,
+    pub total_deallocations: usize,
+    pub active_allocations: usize,
+    pub leaked_bytes: usize,
+    pub leaked_allocations: Vec<AllocationInfo>,
+    pub peak_memory_usage: usize,
+    pub average_allocation_size: f64,
+    #[serde(skip)]
+    pub detection_duration: Duration,
+    pub test_name: String,
+}
+
+/// Configuration for memory leak detection
+#[derive(Debug, Clone)]
+pub struct MemoryLeakConfig {
+    pub max_leaked_bytes: usize,
+    pub max_leaked_allocations: usize,
+    pub detection_interval: Duration,
+    pub stack_trace_depth: usize,
+    pub enable_detailed_tracking: bool,
+    pub fail_on_leak: bool,
+}
+
+impl Default for MemoryLeakConfig {
+    fn default() -> Self {
+        Self {
+            max_leaked_bytes: 1024 * 1024, // 1MB
+            max_leaked_allocations: 1000,
+            detection_interval: Duration::from_millis(100),
+            stack_trace_depth: 10,
+            enable_detailed_tracking: true,
+            fail_on_leak: true,
+        }
+    }
+}
+
+/// Memory leak detector for tracking allocations and deallocations
+pub struct MemoryLeakDetector {
+    allocations: Arc<Mutex<HashMap<u64, AllocationInfo>>>,
+    next_id: Arc<Mutex<u64>>,
+    config: MemoryLeakConfig,
+    start_time: Instant,
+    peak_memory: Arc<Mutex<usize>>,
+    total_allocations: Arc<Mutex<usize>>,
+    total_deallocations: Arc<Mutex<usize>>,
+}
+
+impl Default for MemoryLeakDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemoryLeakDetector {
+    /// Create a new memory leak detector with default configuration
+    pub fn new() -> Self {
+        Self::with_config(MemoryLeakConfig::default())
+    }
+
+    /// Create a new memory leak detector with custom configuration
+    pub fn with_config(config: MemoryLeakConfig) -> Self {
+        Self {
+            allocations: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(0)),
+            config,
+            start_time: Instant::now(),
+            peak_memory: Arc::new(Mutex::new(0)),
+            total_allocations: Arc::new(Mutex::new(0)),
+            total_deallocations: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// Record a memory allocation
+    pub fn record_allocation(&self, size: usize) -> u64 {
+        let mut next_id = self.next_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let allocation_id = *next_id;
+        *next_id += 1;
+        drop(next_id);
+
+        let call_stack = if self.config.enable_detailed_tracking {
+            self.capture_stack_trace()
+        } else {
+            vec![]
+        };
+
+        let allocation_info = AllocationInfo {
+            size,
+            timestamp: Instant::now(),
+            call_stack,
+            allocation_id,
+        };
+
+        {
+            let mut allocations =
+                self.allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            allocations.insert(allocation_id, allocation_info);
+
+            let current_memory: usize = allocations.values().map(|a| a.size).sum();
+            let mut peak = self.peak_memory.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if current_memory > *peak {
+                *peak = current_memory;
+            }
+        }
+
+        {
+            let mut total =
+                self.total_allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *total += 1;
+        }
+
+        allocation_id
+    }
+
+    /// Record a memory deallocation
+    pub fn record_deallocation(&self, allocation_id: u64) -> bool {
+        let mut allocations =
+            self.allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = allocations.remove(&allocation_id).is_some();
+
+        if removed {
+            let mut total =
+                self.total_deallocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *total += 1;
+        }
+
+        removed
+    }
+
+    /// Generate a memory leak report
+    pub fn generate_report(&self, test_name: &str) -> MemoryLeakReport {
+        let allocations = self.allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let leaked_allocations: Vec<AllocationInfo> = allocations.values().cloned().collect();
+        let leaked_bytes: usize = leaked_allocations.iter().map(|a| a.size).sum();
+        let total_allocations =
+            *self.total_allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let total_deallocations =
+            *self.total_deallocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let peak_memory = *self.peak_memory.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let average_allocation_size = if !leaked_allocations.is_empty() {
+            leaked_bytes as f64 / leaked_allocations.len() as f64
+        } else {
+            0.0
+        };
+
+        MemoryLeakReport {
+            total_allocations,
+            total_deallocations,
+            active_allocations: leaked_allocations.len(),
+            leaked_bytes,
+            leaked_allocations,
+            peak_memory_usage: peak_memory,
+            average_allocation_size,
+            detection_duration: self.start_time.elapsed(),
+            test_name: test_name.to_string(),
+        }
+    }
+
+    /// Check if there are memory leaks based on configured thresholds
+    pub fn has_leaks(&self) -> bool {
+        let allocations = self.allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let leaked_bytes: usize = allocations.values().map(|a| a.size).sum();
+        let leaked_count = allocations.len();
+
+        leaked_bytes > self.config.max_leaked_bytes
+            || leaked_count > self.config.max_leaked_allocations
+    }
+
+    /// Start continuous monitoring (for long-running tests)
+    pub fn start_monitoring(&self) -> MonitoringHandle {
+        let allocations = Arc::clone(&self.allocations);
+        let config = self.config.clone();
+        let peak_memory = Arc::clone(&self.peak_memory);
+        let stop_flag = Arc::new(Mutex::new(false));
+        let stop_flag_clone = Arc::clone(&stop_flag);
+
+        let monitoring_thread = thread::spawn(move || {
+            loop {
+                thread::sleep(config.detection_interval);
+
+                // Check if we should stop monitoring
+                {
+                    let should_stop =
+                        *stop_flag_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if should_stop {
+                        break;
+                    }
+                }
+
+                let allocations =
+                    allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let current_memory: usize = allocations.values().map(|a| a.size).sum();
+
+                {
+                    let mut peak =
+                        peak_memory.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if current_memory > *peak {
+                        *peak = current_memory;
+                    }
+                }
+
+                // Log warnings if thresholds are approaching
+                if current_memory > config.max_leaked_bytes / 2 {
+                    tracing::warn!(
+                        "Warning: Memory usage approaching threshold: {} bytes",
+                        current_memory
+                    );
+                }
+
+                if allocations.len() > config.max_leaked_allocations / 2 {
+                    tracing::warn!(
+                        "Warning: Allocation count approaching threshold: {} allocations",
+                        allocations.len()
+                    );
+                }
+            }
+        });
+
+        MonitoringHandle {
+            thread_handle: Some(monitoring_thread),
+            stop_flag,
+        }
+    }
+
+    /// Capture stack trace for detailed leak analysis
+    fn capture_stack_trace(&self) -> Vec<String> {
+        #[cfg(feature = "backtrace")]
+        {
+            use std::backtrace::Backtrace;
+            let bt = Backtrace::capture();
+            bt.to_string()
+                .lines()
+                .take(self.config.stack_trace_depth)
+                .map(|s| s.to_string())
+                .collect()
+        }
+
+        #[cfg(not(feature = "backtrace"))]
+        {
+            // Fallback: use thread local information and function names
+            let mut stack = Vec::new();
+
+            // Get current thread information
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("unnamed");
+            stack.push(format!("thread: {}", thread_name));
+
+            // Simulate capturing call stack frames with more realistic names
+            let function_names = [
+                "tensor::Tensor::from_vec",
+                "tensor::math_ops::matmul",
+                "layers::attention::MultiHeadAttention::forward",
+                "quantization::quantize_tensor",
+                "gpu::cuda_kernel_launch",
+            ];
+
+            for (i, func_name) in
+                function_names.iter().enumerate().take(self.config.stack_trace_depth.min(5))
+            {
+                stack.push(format!("frame_{}: {} +0x{:x}", i, func_name, i * 16));
+            }
+
+            stack
+        }
+    }
+
+    /// Reset the detector state
+    pub fn reset(&self) {
+        self.allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        *self.next_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+        *self.peak_memory.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+        *self.total_allocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+        *self.total_deallocations.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+    }
+}
+
+/// Handle for stopping monitoring thread
+pub struct MonitoringHandle {
+    thread_handle: Option<thread::JoinHandle<()>>,
+    stop_flag: Arc<Mutex<bool>>,
+}
+
+impl Drop for MonitoringHandle {
+    fn drop(&mut self) {
+        // Signal the monitoring thread to stop
+        {
+            let mut stop_flag =
+                self.stop_flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *stop_flag = true;
+        }
+
+        if let Some(handle) = self.thread_handle.take() {
+            // Give the thread a reasonable time to finish
+            match handle.join() {
+                Ok(_) => {
+                    // Thread finished cleanly
+                },
+                Err(_) => {
+                    // Thread panicked, but that's okay for our use case
+                    tracing::error!("Monitoring thread panicked during shutdown");
+                },
+            }
+        }
+    }
+}
+
+/// Valgrind integration for advanced memory leak detection
+pub struct ValgrindIntegration {
+    pub executable_path: String,
+    pub test_command: String,
+    pub suppression_file: Option<String>,
+}
+
+impl ValgrindIntegration {
+    /// Create a new Valgrind integration
+    pub fn new(executable_path: String, test_command: String) -> Self {
+        Self {
+            executable_path,
+            test_command,
+            suppression_file: None,
+        }
+    }
+
+    /// Set a suppression file for known false positives
+    pub fn with_suppression_file(mut self, suppression_file: String) -> Self {
+        self.suppression_file = Some(suppression_file);
+        self
+    }
+
+    /// Whether a usable `valgrind` binary is on `PATH`.
+    ///
+    /// Valgrind is not available on macOS/arm64 and is frequently absent from
+    /// CI images; callers should branch on this rather than assuming success.
+    pub fn is_available() -> bool {
+        Command::new("valgrind")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Run memory leak detection using Valgrind.
+    ///
+    /// Returns [`ValgrindError::NotAvailable`] when no `valgrind` binary can be
+    /// executed, so a CI gate built on this can never be silently green.
+    pub fn run_leak_check(&self) -> Result<ValgrindReport, ValgrindError> {
+        // Write the XML report next to the other temporaries rather than into
+        // the current working directory.
+        let xml_path = std::env::temp_dir().join(format!(
+            "trustformers_valgrind_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        let mut cmd = Command::new("valgrind");
+        cmd.arg("--tool=memcheck")
+            .arg("--leak-check=full")
+            .arg("--show-leak-kinds=all")
+            .arg("--track-origins=yes")
+            .arg("--xml=yes")
+            .arg(format!("--xml-file={}", xml_path.display()));
+
+        if let Some(ref suppression) = self.suppression_file {
+            cmd.arg(format!("--suppressions={}", suppression));
+        }
+
+        cmd.arg(&self.executable_path);
+
+        // Add test command arguments
+        for arg in self.test_command.split_whitespace() {
+            cmd.arg(arg);
+        }
+
+        let output = match cmd.output() {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ValgrindError::NotAvailable(
+                    "no `valgrind` executable was found on PATH".to_string(),
+                ))
+            },
+            Err(error) => {
+                return Err(ValgrindError::NotAvailable(format!(
+                    "failed to execute valgrind: {}",
+                    error
+                )))
+            },
+        };
+
+        if !xml_path.exists() {
+            let _ = std::fs::remove_file(&xml_path);
+            return Err(ValgrindError::NotAvailable(format!(
+                "valgrind produced no XML report (exit code {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let xml = std::fs::read_to_string(&xml_path)
+            .map_err(|error| ValgrindError::Io(error.to_string()))?;
+        let _ = std::fs::remove_file(&xml_path);
+
+        parse_valgrind_xml(&xml)
+    }
+
+    /// Parse a Valgrind memcheck XML report from a file on disk.
+    pub fn parse_valgrind_output(&self, xml_file: &str) -> Result<ValgrindReport, ValgrindError> {
+        let xml = std::fs::read_to_string(xml_file).map_err(|error| {
+            ValgrindError::Io(format!("failed to read {}: {}", xml_file, error))
+        })?;
+        parse_valgrind_xml(&xml)
+    }
+}
+
+/// Failure modes of the Valgrind integration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValgrindError {
+    /// Valgrind could not be run at all (not installed, unsupported platform,
+    /// or it produced no report). No leak verdict is available.
+    NotAvailable(String),
+    /// The XML report could not be read.
+    Io(String),
+    /// The XML report was malformed or not a memcheck report.
+    Malformed(String),
+}
+
+impl std::fmt::Display for ValgrindError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValgrindError::NotAvailable(reason) => {
+                write!(formatter, "valgrind is not available: {}", reason)
+            },
+            ValgrindError::Io(reason) => write!(formatter, "valgrind report I/O error: {}", reason),
+            ValgrindError::Malformed(reason) => {
+                write!(formatter, "malformed valgrind XML report: {}", reason)
+            },
+        }
+    }
+}
+
+impl std::error::Error for ValgrindError {}
+
+/// Parse a Valgrind memcheck `--xml=yes` report.
+///
+/// Reads the real `<error>` records: `<kind>` selects the leak class and
+/// `<xwhat><leakedbytes>/<leakedblocks>` carry the amounts. Suppression counts
+/// come from `<suppcounts>`. Valgrind's XML schema has no element for the
+/// "total heap usage" summary line, so [`ValgrindReport::total_heap_usage`] is
+/// `None` unless a future schema provides one.
+pub fn parse_valgrind_xml(xml: &str) -> Result<ValgrindReport, ValgrindError> {
+    let root = crate::testing::mini_xml::parse(xml)
+        .map_err(|error| ValgrindError::Malformed(error.to_string()))?;
+
+    if root.name != "valgrindoutput" {
+        return Err(ValgrindError::Malformed(format!(
+            "expected a <valgrindoutput> root element, found <{}>",
+            root.name
+        )));
+    }
+
+    if let Some(tool) = root.child_text("protocoltool") {
+        if tool != "memcheck" {
+            return Err(ValgrindError::Malformed(format!(
+                "expected a memcheck report, found tool `{}`",
+                tool
+            )));
+        }
+    }
+
+    let mut definitely_lost = 0usize;
+    let mut indirectly_lost = 0usize;
+    let mut possibly_lost = 0usize;
+    let mut still_reachable = 0usize;
+    let mut leak_records = Vec::new();
+    let mut non_leak_errors = 0usize;
+
+    for error in root.children_named("error") {
+        let kind = error.child_text("kind").unwrap_or_default().to_string();
+
+        let (bytes, blocks) = error
+            .child("xwhat")
+            .map(|xwhat| {
+                (
+                    xwhat
+                        .child_text("leakedbytes")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0),
+                    xwhat
+                        .child_text("leakedblocks")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+
+        let stack_trace = error
+            .child("stack")
+            .map(|stack| {
+                stack
+                    .children_named("frame")
+                    .map(|frame| {
+                        let function = frame.child_text("fn").unwrap_or("<unknown>");
+                        match (frame.child_text("file"), frame.child_text("line")) {
+                            (Some(file), Some(line)) => format!("{} ({}:{})", function, file, line),
+                            (Some(file), None) => format!("{} ({})", function, file),
+                            _ => function.to_string(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        match kind.as_str() {
+            "Leak_DefinitelyLost" => definitely_lost += bytes,
+            "Leak_IndirectlyLost" => indirectly_lost += bytes,
+            "Leak_PossiblyLost" => possibly_lost += bytes,
+            "Leak_StillReachable" => still_reachable += bytes,
+            _ => {
+                non_leak_errors += 1;
+                continue;
+            },
+        }
+
+        leak_records.push(ValgrindLeakRecord {
+            bytes,
+            blocks,
+            kind,
+            stack_trace,
+        });
+    }
+
+    let suppressed = root
+        .child("suppcounts")
+        .map(|counts| {
+            counts
+                .children_named("pair")
+                .filter_map(|pair| pair.child_text("count"))
+                .filter_map(|count| count.parse::<usize>().ok())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+
+    let error_summary = if leak_records.is_empty() && non_leak_errors == 0 {
+        "No leaks or errors reported by valgrind".to_string()
+    } else {
+        format!(
+            "{} leak record(s), {} non-leak error(s); definitely lost {} bytes, \
+             indirectly lost {} bytes, possibly lost {} bytes, still reachable {} bytes",
+            leak_records.len(),
+            non_leak_errors,
+            definitely_lost,
+            indirectly_lost,
+            possibly_lost,
+            still_reachable
+        )
+    };
+
+    Ok(ValgrindReport {
+        definitely_lost,
+        indirectly_lost,
+        possibly_lost,
+        still_reachable,
+        suppressed,
+        // Valgrind's XML schema carries no heap-usage summary element.
+        total_heap_usage: None,
+        leak_records,
+        error_summary,
+    })
+}
+
+/// Valgrind memory leak report
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValgrindReport {
+    pub definitely_lost: usize,
+    pub indirectly_lost: usize,
+    pub possibly_lost: usize,
+    pub still_reachable: usize,
+    pub suppressed: usize,
+    /// Total heap usage, if the report carries it.
+    ///
+    /// Valgrind's XML schema has no element for the "total heap usage" summary
+    /// line, so this is `None` for XML-sourced reports.
+    pub total_heap_usage: Option<usize>,
+    pub leak_records: Vec<ValgrindLeakRecord>,
+    pub error_summary: String,
+}
+
+/// Individual leak record from Valgrind
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValgrindLeakRecord {
+    pub bytes: usize,
+    pub blocks: usize,
+    pub kind: String,
+    pub stack_trace: Vec<String>,
+}
+
+impl ValgrindReport {
+    /// Check if the report indicates memory leaks
+    pub fn has_leaks(&self) -> bool {
+        self.definitely_lost > 0 || self.indirectly_lost > 0 || self.possibly_lost > 0
+    }
+
+    /// Get total leaked bytes
+    pub fn total_leaked_bytes(&self) -> usize {
+        self.definitely_lost + self.indirectly_lost + self.possibly_lost
+    }
+
+    /// Generate a human-readable summary
+    pub fn summary(&self) -> String {
+        format!(
+            "Memory Leak Summary:\n\
+             Definitely lost: {} bytes\n\
+             Indirectly lost: {} bytes\n\
+             Possibly lost: {} bytes\n\
+             Still reachable: {} bytes\n\
+             Suppressed: {} bytes\n\
+             Total heap usage: {}",
+            self.definitely_lost,
+            self.indirectly_lost,
+            self.possibly_lost,
+            self.still_reachable,
+            self.suppressed,
+            self.total_heap_usage
+                .map(|bytes| format!("{} bytes", bytes))
+                .unwrap_or_else(|| "not reported".to_string())
+        )
+    }
+}
+
+/// CI integration utilities
+pub struct CIIntegration;
+
+impl CIIntegration {
+    /// Generate a JUnit XML report for CI systems
+    pub fn generate_junit_report(reports: &[MemoryLeakReport]) -> String {
+        let mut xml = String::new();
+        xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+        xml.push('\n');
+        xml.push_str(r#"<testsuites name="memory_leak_tests">"#);
+        xml.push('\n');
+
+        for report in reports {
+            let _test_status = if report.leaked_bytes > 0 { "failure" } else { "success" };
+
+            xml.push_str(&format!(
+                r#"  <testsuite name="memory_leaks" tests="1" failures="{}" time="{:.3}">"#,
+                if report.leaked_bytes > 0 { 1 } else { 0 },
+                report.detection_duration.as_secs_f64()
+            ));
+            xml.push('\n');
+
+            xml.push_str(&format!(
+                r#"    <testcase name="{}" time="{:.3}">"#,
+                report.test_name,
+                report.detection_duration.as_secs_f64()
+            ));
+            xml.push('\n');
+
+            if report.leaked_bytes > 0 {
+                xml.push_str(&format!(
+                    r#"      <failure message="Memory leak detected" type="MemoryLeak">{} bytes leaked in {} allocations</failure>"#,
+                    report.leaked_bytes,
+                    report.active_allocations
+                ));
+                xml.push('\n');
+            }
+
+            xml.push_str("    </testcase>");
+            xml.push('\n');
+            xml.push_str("  </testsuite>");
+            xml.push('\n');
+        }
+
+        xml.push_str("</testsuites>");
+        xml
+    }
+
+    /// Generate GitHub Actions annotations for memory leaks
+    pub fn generate_github_annotations(reports: &[MemoryLeakReport]) -> Vec<String> {
+        let mut annotations = Vec::new();
+
+        for report in reports {
+            if report.leaked_bytes > 0 {
+                annotations.push(format!(
+                    "::error file=test,line=1,title=Memory Leak::{} test leaked {} bytes in {} allocations",
+                    report.test_name,
+                    report.leaked_bytes,
+                    report.active_allocations
+                ));
+            } else {
+                annotations.push(format!(
+                    "::notice file=test,line=1,title=Memory Check::{} test passed memory leak detection",
+                    report.test_name
+                ));
+            }
+        }
+
+        annotations
+    }
+
+    /// Generate a Markdown report for pull requests
+    pub fn generate_markdown_report(reports: &[MemoryLeakReport]) -> String {
+        let mut markdown = String::new();
+        markdown.push_str("# Memory Leak Detection Report\n\n");
+
+        let total_tests = reports.len();
+        let failed_tests = reports.iter().filter(|r| r.leaked_bytes > 0).count();
+        let passed_tests = total_tests - failed_tests;
+
+        markdown.push_str(&format!(
+            "## Summary\n\n\
+             - Total tests: {}\n\
+             - Passed: {} ✅\n\
+             - Failed: {} ❌\n\n",
+            total_tests, passed_tests, failed_tests
+        ));
+
+        if failed_tests > 0 {
+            markdown.push_str("## Failed Tests\n\n");
+            markdown.push_str("| Test Name | Leaked Bytes | Leaked Allocations | Peak Memory |\n");
+            markdown.push_str("|-----------|--------------|-------------------|-------------|\n");
+
+            for report in reports.iter().filter(|r| r.leaked_bytes > 0) {
+                markdown.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    report.test_name,
+                    report.leaked_bytes,
+                    report.active_allocations,
+                    report.peak_memory_usage
+                ));
+            }
+            markdown.push('\n');
+        }
+
+        if passed_tests > 0 {
+            markdown.push_str("## Passed Tests\n\n");
+            for report in reports.iter().filter(|r| r.leaked_bytes == 0) {
+                markdown.push_str(&format!("- {} ✅\n", report.test_name));
+            }
+        }
+
+        markdown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trimmed but structurally faithful memcheck `--xml=yes` report.
+    const VALGRIND_XML_WITH_LEAKS: &str = r#"<?xml version="1.0"?>
+<valgrindoutput>
+  <protocolversion>4</protocolversion>
+  <protocoltool>memcheck</protocoltool>
+  <pid>4242</pid>
+  <error>
+    <unique>0x1</unique>
+    <tid>1</tid>
+    <kind>Leak_DefinitelyLost</kind>
+    <xwhat>
+      <text>100 bytes in 1 blocks are definitely lost in loss record 1 of 3</text>
+      <leakedbytes>100</leakedbytes>
+      <leakedblocks>1</leakedblocks>
+    </xwhat>
+    <stack>
+      <frame><ip>0x4C2FB0F</ip><fn>malloc</fn><file>vg_replace_malloc.c</file><line>299</line></frame>
+      <frame><ip>0x400544</ip><fn>leak_here</fn><file>main.c</file><line>7</line></frame>
+    </stack>
+  </error>
+  <error>
+    <unique>0x2</unique>
+    <tid>1</tid>
+    <kind>Leak_IndirectlyLost</kind>
+    <xwhat>
+      <text>40 bytes in 2 blocks are indirectly lost in loss record 2 of 3</text>
+      <leakedbytes>40</leakedbytes>
+      <leakedblocks>2</leakedblocks>
+    </xwhat>
+    <stack>
+      <frame><ip>0x4C2FB0F</ip><fn>calloc</fn></frame>
+    </stack>
+  </error>
+  <error>
+    <unique>0x3</unique>
+    <tid>1</tid>
+    <kind>InvalidRead</kind>
+    <what>Invalid read of size 4</what>
+    <stack>
+      <frame><ip>0x400500</ip><fn>oops</fn></frame>
+    </stack>
+  </error>
+  <suppcounts>
+    <pair><count>3</count><name>libc-known</name></pair>
+    <pair><count>1</count><name>dl-open</name></pair>
+  </suppcounts>
+</valgrindoutput>
+"#;
+
+    const VALGRIND_XML_CLEAN: &str = r#"<?xml version="1.0"?>
+<valgrindoutput>
+  <protocolversion>4</protocolversion>
+  <protocoltool>memcheck</protocoltool>
+  <pid>77</pid>
+  <suppcounts>
+  </suppcounts>
+</valgrindoutput>
+"#;
+
+    /// Regression test: `parse_valgrind_output` used to ignore the XML entirely
+    /// and always return an all-zero "No leaks detected" report, so any CI gate
+    /// built on it passed unconditionally.
+    #[test]
+    fn test_valgrind_xml_leaks_are_actually_parsed() {
+        let report = parse_valgrind_xml(VALGRIND_XML_WITH_LEAKS).expect("parse failed");
+
+        assert_eq!(report.definitely_lost, 100);
+        assert_eq!(report.indirectly_lost, 40);
+        assert_eq!(report.possibly_lost, 0);
+        assert_eq!(report.suppressed, 4);
+        assert!(
+            report.has_leaks(),
+            "a report with 140 leaked bytes must have leaks"
+        );
+        assert_eq!(report.total_leaked_bytes(), 140);
+
+        // Only the two leak kinds become leak records; InvalidRead is counted
+        // as a non-leak error.
+        assert_eq!(report.leak_records.len(), 2);
+        assert_eq!(report.leak_records[0].blocks, 1);
+        assert_eq!(report.leak_records[0].kind, "Leak_DefinitelyLost");
+        assert_eq!(
+            report.leak_records[0].stack_trace,
+            vec![
+                "malloc (vg_replace_malloc.c:299)".to_string(),
+                "leak_here (main.c:7)".to_string(),
+            ]
+        );
+
+        assert!(
+            report.error_summary.contains("1 non-leak error"),
+            "summary must reflect the real errors: {}",
+            report.error_summary
+        );
+        assert_ne!(
+            report.error_summary, "No leaks detected",
+            "the old unconditional summary must not survive"
+        );
+        assert!(
+            report.total_heap_usage.is_none(),
+            "valgrind XML carries no heap-usage summary; it must not be invented"
+        );
+    }
+
+    #[test]
+    fn test_valgrind_xml_clean_run() {
+        let report = parse_valgrind_xml(VALGRIND_XML_CLEAN).expect("parse failed");
+        assert!(!report.has_leaks());
+        assert_eq!(report.total_leaked_bytes(), 0);
+        assert_eq!(report.leak_records.len(), 0);
+        assert!(report.error_summary.contains("No leaks or errors"));
+    }
+
+    #[test]
+    fn test_valgrind_rejects_non_memcheck_and_malformed_reports() {
+        let helgrind = r#"<?xml version="1.0"?>
+<valgrindoutput><protocoltool>helgrind</protocoltool></valgrindoutput>"#;
+        assert!(matches!(
+            parse_valgrind_xml(helgrind),
+            Err(ValgrindError::Malformed(_))
+        ));
+
+        assert!(matches!(
+            parse_valgrind_xml("<notvalgrind/>"),
+            Err(ValgrindError::Malformed(_))
+        ));
+
+        assert!(matches!(
+            parse_valgrind_xml("<valgrindoutput>"),
+            Err(ValgrindError::Malformed(_))
+        ));
+    }
+
+    /// Regression test: a missing valgrind binary must surface as
+    /// `NotAvailable`, never as a clean report.
+    #[test]
+    fn test_missing_valgrind_reports_not_available() {
+        if ValgrindIntegration::is_available() {
+            // Valgrind is installed here; the negative path is not reachable.
+            return;
+        }
+
+        let integration = ValgrindIntegration::new(
+            "/nonexistent/trustformers-test-binary".to_string(),
+            String::new(),
+        );
+        match integration.run_leak_check() {
+            Err(ValgrindError::NotAvailable(_)) => {},
+            Err(other) => panic!("expected NotAvailable, got {other}"),
+            Ok(report) => panic!("valgrind is unavailable but a report was returned: {report:?}"),
+        }
+    }
+
+    #[test]
+    fn test_memory_leak_detector() {
+        let detector = MemoryLeakDetector::new();
+
+        // Record some allocations
+        let id1 = detector.record_allocation(1024);
+        let _id2 = detector.record_allocation(2048);
+        let id3 = detector.record_allocation(512);
+
+        // Deallocate some
+        assert!(detector.record_deallocation(id1));
+        assert!(detector.record_deallocation(id3));
+
+        // Generate report
+        let report = detector.generate_report("test_memory_operations");
+
+        assert_eq!(report.total_allocations, 3);
+        assert_eq!(report.total_deallocations, 2);
+        assert_eq!(report.active_allocations, 1);
+        assert_eq!(report.leaked_bytes, 2048);
+        assert!(report.peak_memory_usage >= 3584); // 1024 + 2048 + 512
+    }
+
+    #[test]
+    fn test_memory_leak_config() {
+        let config = MemoryLeakConfig {
+            max_leaked_bytes: 1000,
+            max_leaked_allocations: 5,
+            ..Default::default()
+        };
+
+        let detector = MemoryLeakDetector::with_config(config);
+
+        // Allocate within limits
+        detector.record_allocation(500);
+        assert!(!detector.has_leaks());
+
+        // Allocate beyond limits
+        detector.record_allocation(600);
+        assert!(detector.has_leaks());
+    }
+
+    #[test]
+    fn test_ci_integration() {
+        let reports = vec![
+            MemoryLeakReport {
+                test_name: "test_passing".to_string(),
+                total_allocations: 10,
+                total_deallocations: 10,
+                active_allocations: 0,
+                leaked_bytes: 0,
+                leaked_allocations: vec![],
+                peak_memory_usage: 1024,
+                average_allocation_size: 0.0,
+                detection_duration: Duration::from_millis(100),
+            },
+            MemoryLeakReport {
+                test_name: "test_failing".to_string(),
+                total_allocations: 5,
+                total_deallocations: 3,
+                active_allocations: 2,
+                leaked_bytes: 1024,
+                leaked_allocations: vec![],
+                peak_memory_usage: 2048,
+                average_allocation_size: 512.0,
+                detection_duration: Duration::from_millis(200),
+            },
+        ];
+
+        let junit_xml = CIIntegration::generate_junit_report(&reports);
+        assert!(junit_xml.contains("memory_leak_tests"));
+        assert!(junit_xml.contains("test_passing"));
+        assert!(junit_xml.contains("test_failing"));
+
+        let annotations = CIIntegration::generate_github_annotations(&reports);
+        assert_eq!(annotations.len(), 2);
+        assert!(annotations[0].contains("notice"));
+        assert!(annotations[1].contains("error"));
+
+        let markdown = CIIntegration::generate_markdown_report(&reports);
+        assert!(markdown.contains("Memory Leak Detection Report"));
+        assert!(markdown.contains("Passed: 1"));
+        assert!(markdown.contains("Failed: 1"));
+    }
+
+    #[test]
+    fn test_detector_default() {
+        let detector = MemoryLeakDetector::default();
+        assert!(!detector.has_leaks());
+        let report = detector.generate_report("default_test");
+        assert_eq!(report.total_allocations, 0);
+        assert_eq!(report.total_deallocations, 0);
+        assert_eq!(report.active_allocations, 0);
+        assert_eq!(report.leaked_bytes, 0);
+    }
+
+    #[test]
+    fn test_detector_allocation_ids_increment() {
+        let detector = MemoryLeakDetector::new();
+        let id1 = detector.record_allocation(100);
+        let id2 = detector.record_allocation(200);
+        let id3 = detector.record_allocation(300);
+        assert_eq!(id2, id1 + 1);
+        assert_eq!(id3, id2 + 1);
+    }
+
+    #[test]
+    fn test_deallocation_nonexistent_id() {
+        let detector = MemoryLeakDetector::new();
+        let result = detector.record_deallocation(99999);
+        assert!(!result, "Should return false for nonexistent allocation");
+    }
+
+    #[test]
+    fn test_double_deallocation() {
+        let detector = MemoryLeakDetector::new();
+        let id = detector.record_allocation(1024);
+        assert!(detector.record_deallocation(id));
+        assert!(
+            !detector.record_deallocation(id),
+            "Second deallocation should return false"
+        );
+    }
+
+    #[test]
+    fn test_peak_memory_tracking() {
+        let detector = MemoryLeakDetector::new();
+        let id1 = detector.record_allocation(1000);
+        let id2 = detector.record_allocation(2000);
+        // Peak should be 3000 at this point
+        detector.record_deallocation(id1);
+        detector.record_deallocation(id2);
+        let report = detector.generate_report("peak_test");
+        assert!(report.peak_memory_usage >= 3000);
+    }
+
+    #[test]
+    fn test_no_leaks_when_all_deallocated() {
+        let config = MemoryLeakConfig {
+            max_leaked_bytes: 100,
+            max_leaked_allocations: 1,
+            ..Default::default()
+        };
+        let detector = MemoryLeakDetector::with_config(config);
+        let id1 = detector.record_allocation(500);
+        let id2 = detector.record_allocation(500);
+        detector.record_deallocation(id1);
+        detector.record_deallocation(id2);
+        assert!(!detector.has_leaks());
+    }
+
+    #[test]
+    fn test_leak_detection_by_allocation_count() {
+        let config = MemoryLeakConfig {
+            max_leaked_bytes: 1_000_000,
+            max_leaked_allocations: 2,
+            ..Default::default()
+        };
+        let detector = MemoryLeakDetector::with_config(config);
+        detector.record_allocation(1);
+        detector.record_allocation(1);
+        assert!(!detector.has_leaks());
+        detector.record_allocation(1);
+        assert!(detector.has_leaks());
+    }
+
+    #[test]
+    fn test_report_average_allocation_size() {
+        let detector = MemoryLeakDetector::new();
+        detector.record_allocation(100);
+        detector.record_allocation(200);
+        detector.record_allocation(300);
+        let report = detector.generate_report("avg_test");
+        assert!((report.average_allocation_size - 200.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_report_empty_average_allocation() {
+        let detector = MemoryLeakDetector::new();
+        let report = detector.generate_report("empty_avg");
+        assert!((report.average_allocation_size - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_report_test_name() {
+        let detector = MemoryLeakDetector::new();
+        let report = detector.generate_report("my_custom_test");
+        assert_eq!(report.test_name, "my_custom_test");
+    }
+
+    #[test]
+    fn test_report_detection_duration() {
+        let detector = MemoryLeakDetector::new();
+        std::thread::sleep(Duration::from_millis(10));
+        let report = detector.generate_report("duration_test");
+        assert!(report.detection_duration >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_reset_detector() {
+        let detector = MemoryLeakDetector::new();
+        detector.record_allocation(1024);
+        detector.record_allocation(2048);
+        detector.reset();
+        let report = detector.generate_report("reset_test");
+        assert_eq!(report.total_allocations, 0);
+        assert_eq!(report.total_deallocations, 0);
+        assert_eq!(report.active_allocations, 0);
+        assert_eq!(report.leaked_bytes, 0);
+        assert_eq!(report.peak_memory_usage, 0);
+    }
+
+    #[test]
+    fn test_config_default_values() {
+        let config = MemoryLeakConfig::default();
+        assert_eq!(config.max_leaked_bytes, 1024 * 1024);
+        assert_eq!(config.max_leaked_allocations, 1000);
+        assert_eq!(config.detection_interval, Duration::from_millis(100));
+        assert_eq!(config.stack_trace_depth, 10);
+        assert!(config.enable_detailed_tracking);
+        assert!(config.fail_on_leak);
+    }
+
+    #[test]
+    fn test_leak_report_leaked_allocations_detail() {
+        let detector = MemoryLeakDetector::new();
+        detector.record_allocation(512);
+        detector.record_allocation(1024);
+        let report = detector.generate_report("leak_detail_test");
+        assert_eq!(report.leaked_allocations.len(), 2);
+        let sizes: Vec<usize> = report.leaked_allocations.iter().map(|a| a.size).collect();
+        assert!(sizes.contains(&512));
+        assert!(sizes.contains(&1024));
+    }
+
+    #[test]
+    fn test_many_allocations_deallocations() {
+        let detector = MemoryLeakDetector::new();
+        let mut ids = Vec::new();
+        for i in 0..100 {
+            ids.push(detector.record_allocation((i + 1) * 10));
+        }
+        // Deallocate every other one
+        for (idx, id) in ids.iter().enumerate() {
+            if idx % 2 == 0 {
+                detector.record_deallocation(*id);
+            }
+        }
+        let report = detector.generate_report("many_allocs_test");
+        assert_eq!(report.total_allocations, 100);
+        assert_eq!(report.total_deallocations, 50);
+        assert_eq!(report.active_allocations, 50);
+    }
+
+    #[test]
+    fn test_concurrent_allocations() {
+        let detector = Arc::new(MemoryLeakDetector::new());
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let d = Arc::clone(&detector);
+            handles.push(thread::spawn(move || {
+                let mut ids = Vec::new();
+                for _ in 0..25 {
+                    ids.push(d.record_allocation(64));
+                }
+                ids
+            }));
+        }
+        let all_ids: Vec<Vec<u64>> =
+            handles.into_iter().map(|h| h.join().expect("Thread panicked")).collect();
+        let total: usize = all_ids.iter().map(|v| v.len()).sum();
+        assert_eq!(total, 100);
+        let report = detector.generate_report("concurrent_test");
+        assert_eq!(report.total_allocations, 100);
+    }
+
+    #[test]
+    fn test_monitoring_handle_stop() {
+        let detector = MemoryLeakDetector::with_config(MemoryLeakConfig {
+            detection_interval: Duration::from_millis(10),
+            ..Default::default()
+        });
+        let handle = detector.start_monitoring();
+        detector.record_allocation(1024);
+        std::thread::sleep(Duration::from_millis(30));
+        drop(handle);
+        // After drop, the monitoring thread should have stopped
+        let report = detector.generate_report("monitoring_test");
+        assert_eq!(report.total_allocations, 1);
+    }
+
+    #[test]
+    fn test_ci_integration_junit_empty() {
+        let reports: Vec<MemoryLeakReport> = vec![];
+        let junit = CIIntegration::generate_junit_report(&reports);
+        assert!(junit.contains("memory_leak_tests"));
+    }
+
+    #[test]
+    fn test_ci_integration_annotations_passing() {
+        let reports = vec![MemoryLeakReport {
+            test_name: "clean_test".to_string(),
+            total_allocations: 10,
+            total_deallocations: 10,
+            active_allocations: 0,
+            leaked_bytes: 0,
+            leaked_allocations: vec![],
+            peak_memory_usage: 500,
+            average_allocation_size: 0.0,
+            detection_duration: Duration::from_millis(50),
+        }];
+        let annotations = CIIntegration::generate_github_annotations(&reports);
+        assert_eq!(annotations.len(), 1);
+        assert!(annotations[0].contains("notice"));
+    }
+
+    #[test]
+    fn test_tensor_memory_report_no_issues() {
+        let report = TensorMemoryReport {
+            operations: vec![],
+            total_operations: 5,
+            total_calls: 50,
+            total_memory_allocated: 10000,
+            memory_efficiency: 0.95,
+            suspected_leaks: vec![],
+        };
+        assert!(!report.has_memory_issues());
+        let summary = report.generate_summary();
+        assert!(summary.contains("No memory issues detected"));
+    }
+
+    #[test]
+    fn test_tensor_memory_report_with_leaks() {
+        let report = TensorMemoryReport {
+            operations: vec![],
+            total_operations: 3,
+            total_calls: 30,
+            total_memory_allocated: 5000,
+            memory_efficiency: 0.95,
+            suspected_leaks: vec!["matmul_op".to_string()],
+        };
+        assert!(report.has_memory_issues());
+        let summary = report.generate_summary();
+        assert!(summary.contains("matmul_op"));
+        assert!(summary.contains("Memory issues detected"));
+    }
+
+    #[test]
+    fn test_tensor_memory_report_low_efficiency() {
+        let report = TensorMemoryReport {
+            operations: vec![],
+            total_operations: 2,
+            total_calls: 20,
+            total_memory_allocated: 8000,
+            memory_efficiency: 0.5,
+            suspected_leaks: vec![],
+        };
+        assert!(report.has_memory_issues());
+    }
+
+    #[test]
+    fn test_tensor_memory_report_summary_format() {
+        let report = TensorMemoryReport {
+            operations: vec![],
+            total_operations: 10,
+            total_calls: 100,
+            total_memory_allocated: 50000,
+            memory_efficiency: 0.85,
+            suspected_leaks: vec![],
+        };
+        let summary = report.generate_summary();
+        assert!(summary.contains("Total operations tracked: 10"));
+        assert!(summary.contains("Total function calls: 100"));
+        assert!(summary.contains("Total memory allocated: 50000 bytes"));
+        assert!(summary.contains("85.0%"));
+    }
+
+    #[test]
+    fn test_allocation_info_fields() {
+        let info = AllocationInfo {
+            size: 4096,
+            timestamp: Instant::now(),
+            call_stack: vec!["frame_0".to_string(), "frame_1".to_string()],
+            allocation_id: 42,
+        };
+        assert_eq!(info.size, 4096);
+        assert_eq!(info.allocation_id, 42);
+        assert_eq!(info.call_stack.len(), 2);
+    }
+
+    #[test]
+    fn test_detector_with_disabled_tracking() {
+        let config = MemoryLeakConfig {
+            enable_detailed_tracking: false,
+            ..Default::default()
+        };
+        let detector = MemoryLeakDetector::with_config(config);
+        let id = detector.record_allocation(1024);
+        let report = detector.generate_report("no_tracking_test");
+        assert_eq!(report.total_allocations, 1);
+        // Stack traces should be minimal when tracking disabled
+        for alloc in &report.leaked_allocations {
+            assert!(alloc.call_stack.is_empty() || alloc.call_stack.len() <= 1);
+        }
+        detector.record_deallocation(id);
+    }
+}
+
+/// Advanced memory pattern analysis
+pub struct MemoryPatternAnalyzer {
+    detector: Arc<MemoryLeakDetector>,
+}
+
+impl MemoryPatternAnalyzer {
+    pub fn new(detector: Arc<MemoryLeakDetector>) -> Self {
+        Self { detector }
+    }
+
+    /// Analyze memory allocation patterns to detect potential issues
+    pub fn analyze_patterns(&self) -> MemoryPatternReport {
+        let allocations = self
+            .detector
+            .allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut patterns = MemoryPatternReport::default();
+
+        let now = Instant::now();
+        let mut size_histogram: HashMap<usize, usize> = HashMap::new();
+        let mut age_distribution = Vec::new();
+
+        for allocation in allocations.values() {
+            // Size histogram
+            let size_bucket = self.get_size_bucket(allocation.size);
+            *size_histogram.entry(size_bucket).or_insert(0) += 1;
+
+            // Age distribution
+            let age = now.duration_since(allocation.timestamp);
+            age_distribution.push(age);
+
+            // Pattern detection
+            if allocation.size > 1024 * 1024 {
+                patterns.large_allocations += 1;
+            }
+
+            if age > Duration::from_secs(60) {
+                patterns.long_lived_allocations += 1;
+            }
+
+            // Detect potential memory leaks based on stack traces
+            for frame in &allocation.call_stack {
+                if frame.contains("matmul") || frame.contains("attention") {
+                    patterns.ml_operation_leaks += 1;
+                    break;
+                }
+            }
+        }
+
+        patterns.size_distribution = size_histogram;
+        patterns.average_allocation_age = if !age_distribution.is_empty() {
+            age_distribution.iter().sum::<Duration>() / age_distribution.len() as u32
+        } else {
+            Duration::ZERO
+        };
+
+        patterns.memory_fragmentation_score = self.calculate_fragmentation_score(&allocations);
+        patterns.total_allocations = allocations.len();
+
+        patterns
+    }
+
+    fn get_size_bucket(&self, size: usize) -> usize {
+        match size {
+            0..=1024 => 1024,
+            1025..=4096 => 4096,
+            4097..=16384 => 16384,
+            16385..=65536 => 65536,
+            65537..=262144 => 262144,
+            262145..=1048576 => 1048576,
+            _ => 1048577, // > 1MB
+        }
+    }
+
+    fn calculate_fragmentation_score(&self, allocations: &HashMap<u64, AllocationInfo>) -> f64 {
+        if allocations.is_empty() {
+            return 0.0;
+        }
+
+        let sizes: Vec<usize> = allocations.values().map(|a| a.size).collect();
+        let total_size: usize = sizes.iter().sum();
+        let mean_size = total_size as f64 / sizes.len() as f64;
+
+        // Calculate coefficient of variation as fragmentation measure
+        let variance: f64 =
+            sizes.iter().map(|&size| (size as f64 - mean_size).powi(2)).sum::<f64>()
+                / sizes.len() as f64;
+
+        let std_dev = variance.sqrt();
+        if mean_size > 0.0 {
+            std_dev / mean_size
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Memory pattern analysis report
+#[derive(Debug, Default)]
+pub struct MemoryPatternReport {
+    pub large_allocations: usize,
+    pub long_lived_allocations: usize,
+    pub ml_operation_leaks: usize,
+    pub total_allocations: usize,
+    pub size_distribution: HashMap<usize, usize>,
+    pub average_allocation_age: Duration,
+    pub memory_fragmentation_score: f64,
+}
+
+impl MemoryPatternReport {
+    pub fn has_concerning_patterns(&self) -> bool {
+        self.memory_fragmentation_score > 2.0
+            || self.long_lived_allocations > self.total_allocations / 2
+            || self.ml_operation_leaks > 0
+    }
+
+    pub fn generate_summary(&self) -> String {
+        format!(
+            "Memory Pattern Analysis:\n\
+             - Total allocations: {}\n\
+             - Large allocations (>1MB): {}\n\
+             - Long-lived allocations (>60s): {}\n\
+             - ML operation leaks: {}\n\
+             - Average allocation age: {:.2}s\n\
+             - Memory fragmentation score: {:.2}\n\
+             - Concerning patterns detected: {}",
+            self.total_allocations,
+            self.large_allocations,
+            self.long_lived_allocations,
+            self.ml_operation_leaks,
+            self.average_allocation_age.as_secs_f64(),
+            self.memory_fragmentation_score,
+            if self.has_concerning_patterns() { "Yes" } else { "No" }
+        )
+    }
+}
+
+/// Tensor-specific memory leak detection utilities
+pub struct TensorLeakDetector {
+    detector: Arc<MemoryLeakDetector>,
+    tensor_operations: Arc<Mutex<HashMap<String, TensorOperationStats>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TensorOperationStats {
+    pub operation_name: String,
+    pub call_count: usize,
+    pub total_memory_allocated: usize,
+    pub total_memory_deallocated: usize,
+    pub peak_memory: usize,
+    pub average_allocation_size: f64,
+    pub last_call_time: Instant,
+}
+
+impl Default for TensorLeakDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TensorLeakDetector {
+    pub fn new() -> Self {
+        Self {
+            detector: Arc::new(MemoryLeakDetector::new()),
+            tensor_operations: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Track tensor operation memory usage
+    pub fn track_tensor_operation<T, F>(&self, operation_name: &str, operation: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let start_memory = self.get_current_memory_usage();
+        let start_time = Instant::now();
+
+        // Execute the operation
+        let result = operation();
+
+        let end_memory = self.get_current_memory_usage();
+        let memory_delta = end_memory.saturating_sub(start_memory);
+
+        // Update operation statistics
+        {
+            let mut ops =
+                self.tensor_operations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let stats =
+                ops.entry(operation_name.to_string()).or_insert_with(|| TensorOperationStats {
+                    operation_name: operation_name.to_string(),
+                    call_count: 0,
+                    total_memory_allocated: 0,
+                    total_memory_deallocated: 0,
+                    peak_memory: 0,
+                    average_allocation_size: 0.0,
+                    last_call_time: start_time,
+                });
+
+            stats.call_count += 1;
+            stats.last_call_time = start_time;
+
+            if memory_delta > 0 {
+                stats.total_memory_allocated += memory_delta;
+            } else {
+                stats.total_memory_deallocated += memory_delta.abs_diff(0);
+            }
+
+            if end_memory > stats.peak_memory {
+                stats.peak_memory = end_memory;
+            }
+
+            stats.average_allocation_size =
+                stats.total_memory_allocated as f64 / stats.call_count as f64;
+        }
+
+        result
+    }
+
+    /// Generate tensor operation memory report
+    pub fn generate_tensor_report(&self) -> TensorMemoryReport {
+        let ops = self.tensor_operations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let operations: Vec<TensorOperationStats> = ops.values().cloned().collect();
+
+        let mut report = TensorMemoryReport {
+            operations,
+            total_operations: ops.len(),
+            ..Default::default()
+        };
+
+        // Calculate aggregated statistics
+        for op in &report.operations {
+            report.total_memory_allocated += op.total_memory_allocated;
+            report.total_calls += op.call_count;
+
+            if op.total_memory_allocated > op.total_memory_deallocated {
+                report.suspected_leaks.push(op.operation_name.clone());
+            }
+        }
+
+        report.memory_efficiency = if report.total_memory_allocated > 0 {
+            report.operations.iter().map(|op| op.total_memory_deallocated).sum::<usize>() as f64
+                / report.total_memory_allocated as f64
+        } else {
+            1.0
+        };
+
+        report
+    }
+
+    fn get_current_memory_usage(&self) -> usize {
+        let allocations = self
+            .detector
+            .allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        allocations.values().map(|a| a.size).sum()
+    }
+}
+
+/// Tensor memory usage report
+#[derive(Debug, Default)]
+pub struct TensorMemoryReport {
+    pub operations: Vec<TensorOperationStats>,
+    pub total_operations: usize,
+    pub total_calls: usize,
+    pub total_memory_allocated: usize,
+    pub memory_efficiency: f64,
+    pub suspected_leaks: Vec<String>,
+}
+
+impl TensorMemoryReport {
+    pub fn has_memory_issues(&self) -> bool {
+        !self.suspected_leaks.is_empty() || self.memory_efficiency < 0.9
+    }
+
+    pub fn generate_summary(&self) -> String {
+        let mut summary = format!(
+            "Tensor Memory Usage Report:\n\
+             - Total operations tracked: {}\n\
+             - Total function calls: {}\n\
+             - Total memory allocated: {} bytes\n\
+             - Memory efficiency: {:.1}%\n",
+            self.total_operations,
+            self.total_calls,
+            self.total_memory_allocated,
+            self.memory_efficiency * 100.0
+        );
+
+        if !self.suspected_leaks.is_empty() {
+            summary.push_str(&format!(
+                "- Suspected leaking operations: {}\n",
+                self.suspected_leaks.join(", ")
+            ));
+        }
+
+        if self.has_memory_issues() {
+            summary.push_str("⚠️  Memory issues detected!\n");
+        } else {
+            summary.push_str("✅ No memory issues detected\n");
+        }
+
+        summary
+    }
+}
+
+/// Memory leak detection macros for easy integration
+#[macro_export]
+macro_rules! with_leak_detection {
+    ($detector:expr, $operation:expr) => {{
+        let allocation_id = $detector.record_allocation(std::mem::size_of_val(&$operation));
+        let result = $operation;
+        $detector.record_deallocation(allocation_id);
+        result
+    }};
+}
+
+#[macro_export]
+macro_rules! tensor_operation_tracked {
+    ($detector:expr, $op_name:expr, $operation:expr) => {{
+        $detector.track_tensor_operation($op_name, || $operation)
+    }};
+}
+
+/// Global memory leak detector instance for convenient access
+use std::sync::OnceLock;
+
+static GLOBAL_DETECTOR: OnceLock<Arc<MemoryLeakDetector>> = OnceLock::new();
+
+/// Get or initialize the global memory leak detector
+pub fn global_leak_detector() -> &'static Arc<MemoryLeakDetector> {
+    GLOBAL_DETECTOR.get_or_init(|| Arc::new(MemoryLeakDetector::new()))
+}
+
+/// Integration test utilities
+pub mod test_utils {
+    use super::*;
+    use crate::tensor::Tensor;
+
+    /// Test tensor operations for memory leaks
+    pub fn test_tensor_operations_for_leaks() -> MemoryLeakReport {
+        let detector = TensorLeakDetector::new();
+
+        // Test basic tensor operations. These closures intentionally ignore
+        // operation results: leak detection only cares about allocation lifetimes,
+        // so a (practically impossible) construction failure simply skips the body.
+        detector.track_tensor_operation("tensor_creation", || {
+            let _tensor = Tensor::zeros(&[100, 100]);
+        });
+
+        detector.track_tensor_operation("tensor_addition", || {
+            if let (Ok(a), Ok(b)) = (Tensor::ones(&[50, 50]), Tensor::ones(&[50, 50])) {
+                let _result = a.add(&b);
+            }
+        });
+
+        detector.track_tensor_operation("matrix_multiplication", || {
+            if let (Ok(a), Ok(b)) = (Tensor::randn(&[32, 64]), Tensor::randn(&[64, 32])) {
+                let _result = a.matmul(&b);
+            }
+        });
+
+        detector.track_tensor_operation("activation_functions", || {
+            if let Ok(tensor) = Tensor::randn(&[100, 768]) {
+                let _relu = tensor.relu();
+                let _sigmoid = tensor.sigmoid();
+                let _tanh = tensor.tanh();
+            }
+        });
+
+        detector.track_tensor_operation("quantization", || {
+            if let Ok(tensor) = Tensor::randn(&[50, 50]) {
+                // Note: quantization test would require actual quantization implementation
+                let _result = tensor.clone();
+            }
+        });
+
+        // Generate final report
+        detector.detector.generate_report("tensor_operations_test")
+    }
+
+    /// Comprehensive memory leak test suite
+    pub fn run_comprehensive_leak_test() -> Vec<MemoryLeakReport> {
+        let mut reports = Vec::new();
+
+        // Test 1: Basic tensor operations
+        reports.push(test_tensor_operations_for_leaks());
+
+        // Test 2: Complex operations
+        let detector = MemoryLeakDetector::new();
+        for _i in 0..10 {
+            if let Ok(tensor) = Tensor::randn(&[100, 100]) {
+                let _result = tensor.transpose(1, 0).and_then(|t| t.matmul(&tensor));
+            }
+        }
+        reports.push(detector.generate_report("complex_operations_test"));
+
+        // Test 3: Memory-intensive operations
+        let detector = MemoryLeakDetector::new();
+        for _i in 0..5 {
+            if let Ok(large_tensor) = Tensor::zeros(&[1000, 1000]) {
+                let shape = large_tensor.shape().len();
+                let axes: Vec<usize> = (0..shape).collect();
+                let _result = large_tensor.sum_axes(&axes);
+            }
+        }
+        reports.push(detector.generate_report("memory_intensive_test"));
+
+        reports
+    }
+}

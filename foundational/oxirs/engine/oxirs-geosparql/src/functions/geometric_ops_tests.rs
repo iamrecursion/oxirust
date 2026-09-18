@@ -1,0 +1,810 @@
+//! Tests for geometric operations (2D/3D distance, buffer, set operations, etc.)
+
+#[cfg(test)]
+mod tests {
+    use crate::functions::geometric_operations::{
+        buffer, buffer_3d, convex_hull, difference, distance, distance_3d, envelope, intersection,
+        sym_difference, union,
+    };
+
+    use crate::geometry::Geometry;
+    use geo_types::{Coord, Geometry as GeoGeometry, LineString, Point};
+
+    #[test]
+    fn test_distance() {
+        let p1 = Geometry::new(GeoGeometry::Point(Point::new(0.0, 0.0)));
+        let p2 = Geometry::new(GeoGeometry::Point(Point::new(3.0, 4.0)));
+
+        let dist = distance(&p1, &p2).expect("should succeed");
+        assert!((dist - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_convex_hull() {
+        let mp = Geometry::new(GeoGeometry::MultiPoint(geo_types::MultiPoint::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(1.0, 0.0),
+            Point::new(0.5, 1.0),
+        ])));
+
+        let hull = convex_hull(&mp);
+        assert!(hull.is_ok());
+        assert_eq!(hull.expect("should succeed").geometry_type(), "Polygon");
+    }
+
+    #[test]
+    fn test_envelope() {
+        let ls = Geometry::new(GeoGeometry::LineString(LineString::new(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 5.0, y: 5.0 },
+        ])));
+
+        let env = envelope(&ls);
+        assert!(env.is_ok());
+    }
+
+    #[test]
+    fn test_intersection_polygons() {
+        use geo_types::Polygon;
+
+        // Create two overlapping polygons
+        let poly1 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 4.0, y: 0.0 },
+                Coord { x: 4.0, y: 4.0 },
+                Coord { x: 0.0, y: 4.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )));
+
+        let poly2 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 2.0, y: 2.0 },
+                Coord { x: 6.0, y: 2.0 },
+                Coord { x: 6.0, y: 6.0 },
+                Coord { x: 2.0, y: 6.0 },
+                Coord { x: 2.0, y: 2.0 },
+            ]),
+            vec![],
+        )));
+
+        let result = intersection(&poly1, &poly2).expect("should succeed");
+        assert!(result.is_some());
+        let intersection_geom = result.expect("should succeed");
+        assert_eq!(intersection_geom.geometry_type(), "MultiPolygon");
+    }
+
+    #[test]
+    fn test_intersection_no_overlap() {
+        use geo_types::Polygon;
+
+        // Create two non-overlapping polygons
+        let poly1 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 2.0, y: 0.0 },
+                Coord { x: 2.0, y: 2.0 },
+                Coord { x: 0.0, y: 2.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )));
+
+        let poly2 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 12.0, y: 10.0 },
+                Coord { x: 12.0, y: 12.0 },
+                Coord { x: 10.0, y: 12.0 },
+                Coord { x: 10.0, y: 10.0 },
+            ]),
+            vec![],
+        )));
+
+        let result = intersection(&poly1, &poly2).expect("should succeed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_union_polygons() {
+        use geo_types::Polygon;
+
+        let poly1 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 4.0, y: 0.0 },
+                Coord { x: 4.0, y: 4.0 },
+                Coord { x: 0.0, y: 4.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )));
+
+        let poly2 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 2.0, y: 2.0 },
+                Coord { x: 6.0, y: 2.0 },
+                Coord { x: 6.0, y: 6.0 },
+                Coord { x: 2.0, y: 6.0 },
+                Coord { x: 2.0, y: 2.0 },
+            ]),
+            vec![],
+        )));
+
+        let result = union(&poly1, &poly2);
+        assert!(result.is_ok());
+        let union_geom = result.expect("should succeed");
+        assert_eq!(union_geom.geometry_type(), "MultiPolygon");
+    }
+
+    #[test]
+    fn test_difference_polygons() {
+        use geo_types::Polygon;
+
+        let poly1 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 4.0, y: 0.0 },
+                Coord { x: 4.0, y: 4.0 },
+                Coord { x: 0.0, y: 4.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )));
+
+        let poly2 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 2.0, y: 2.0 },
+                Coord { x: 6.0, y: 2.0 },
+                Coord { x: 6.0, y: 6.0 },
+                Coord { x: 2.0, y: 6.0 },
+                Coord { x: 2.0, y: 2.0 },
+            ]),
+            vec![],
+        )));
+
+        let result = difference(&poly1, &poly2);
+        assert!(result.is_ok());
+        let diff_geom = result.expect("should succeed");
+        assert_eq!(diff_geom.geometry_type(), "MultiPolygon");
+    }
+
+    #[test]
+    fn test_sym_difference_polygons() {
+        use geo_types::Polygon;
+
+        let poly1 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 4.0, y: 0.0 },
+                Coord { x: 4.0, y: 4.0 },
+                Coord { x: 0.0, y: 4.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )));
+
+        let poly2 = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 2.0, y: 2.0 },
+                Coord { x: 6.0, y: 2.0 },
+                Coord { x: 6.0, y: 6.0 },
+                Coord { x: 2.0, y: 6.0 },
+                Coord { x: 2.0, y: 2.0 },
+            ]),
+            vec![],
+        )));
+
+        let result = sym_difference(&poly1, &poly2);
+        assert!(result.is_ok());
+        let xor_geom = result.expect("should succeed");
+        assert_eq!(xor_geom.geometry_type(), "MultiPolygon");
+    }
+
+    #[test]
+    fn test_crs_compatibility_check() {
+        use crate::geometry::Crs;
+        use geo_types::Polygon;
+
+        let poly1 = Geometry::with_crs(
+            GeoGeometry::Polygon(Polygon::new(
+                LineString::new(vec![
+                    Coord { x: 0.0, y: 0.0 },
+                    Coord { x: 4.0, y: 0.0 },
+                    Coord { x: 4.0, y: 4.0 },
+                    Coord { x: 0.0, y: 4.0 },
+                    Coord { x: 0.0, y: 0.0 },
+                ]),
+                vec![],
+            )),
+            Crs::epsg(4326),
+        );
+
+        let poly2 = Geometry::with_crs(
+            GeoGeometry::Polygon(Polygon::new(
+                LineString::new(vec![
+                    Coord { x: 2.0, y: 2.0 },
+                    Coord { x: 6.0, y: 2.0 },
+                    Coord { x: 6.0, y: 6.0 },
+                    Coord { x: 2.0, y: 6.0 },
+                    Coord { x: 2.0, y: 2.0 },
+                ]),
+                vec![],
+            )),
+            Crs::epsg(3857),
+        );
+
+        // Should fail due to CRS mismatch
+        let result = intersection(&poly1, &poly2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_buffer_point() {
+        use geo::Area;
+
+        let point = Geometry::new(GeoGeometry::Point(Point::new(0.0, 0.0)));
+
+        // Point buffering used to require GEOS; geo::algorithm::buffer handles it.
+        let buffered = buffer(&point, 1.0).expect("point buffer should succeed");
+        assert_eq!(buffered.geometry_type(), "MultiPolygon");
+
+        // A unit-radius disc, within the tolerance of a segmented approximation.
+        if let GeoGeometry::MultiPolygon(mp) = buffered.geom {
+            let area = mp.unsigned_area();
+            assert!(
+                (area - std::f64::consts::PI).abs() < 0.05,
+                "buffered point area {area} should approximate PI"
+            );
+        }
+    }
+
+    #[test]
+    fn test_buffer_with_cap_and_join_styles() {
+        use crate::functions::geometric_operations::{
+            buffer_with_params, BufferParams, CapStyle, JoinStyle,
+        };
+
+        let ls = Geometry::new(GeoGeometry::LineString(LineString::new(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 5.0, y: 0.0 },
+            Coord { x: 5.0, y: 5.0 },
+        ])));
+
+        for cap in [CapStyle::Round, CapStyle::Flat, CapStyle::Square] {
+            for join in [JoinStyle::Round, JoinStyle::Mitre, JoinStyle::Bevel] {
+                let params = BufferParams {
+                    cap_style: cap,
+                    join_style: join,
+                    ..BufferParams::default()
+                };
+                let buffered = buffer_with_params(&ls, 1.0, &params)
+                    .unwrap_or_else(|e| panic!("buffer with {cap:?}/{join:?} failed: {e}"));
+                assert_eq!(buffered.geometry_type(), "MultiPolygon");
+            }
+        }
+    }
+
+    #[test]
+    fn test_buffer_rejects_invalid_params() {
+        use crate::functions::geometric_operations::{buffer_with_params, BufferParams};
+
+        let point = Geometry::new(GeoGeometry::Point(Point::new(0.0, 0.0)));
+
+        let bad_segments = BufferParams {
+            quadrant_segments: 0,
+            ..BufferParams::default()
+        };
+        assert!(buffer_with_params(&point, 1.0, &bad_segments).is_err());
+
+        let bad_mitre = BufferParams {
+            mitre_limit: 0.5,
+            ..BufferParams::default()
+        };
+        assert!(buffer_with_params(&point, 1.0, &bad_mitre).is_err());
+    }
+
+    #[test]
+    fn test_boundary_linestring() {
+        use crate::functions::geometric_operations::boundary;
+
+        let ls = Geometry::new(GeoGeometry::LineString(LineString::new(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 5.0, y: 5.0 },
+        ])));
+
+        // The facade boundary() used to require GEOS; it now forwards to the
+        // Pure-Rust OGC SFA implementation, whose LineString boundary is the
+        // pair of endpoints.
+        let bound = boundary(&ls).expect("boundary should succeed");
+        assert_eq!(bound.geometry_type(), "MultiPoint");
+    }
+
+    #[test]
+    fn test_buffer_rust_polygon() {
+        use geo_types::Polygon;
+
+        let poly = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 10.0, y: 0.0 },
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 0.0, y: 10.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )));
+
+        // Positive buffer (expansion)
+        let expanded = buffer(&poly, 1.0).expect("should succeed");
+        assert_eq!(expanded.geometry_type(), "MultiPolygon");
+
+        // Negative buffer (erosion)
+        let shrunk = buffer(&poly, -1.0).expect("should succeed");
+        assert_eq!(shrunk.geometry_type(), "MultiPolygon");
+    }
+
+    #[test]
+    fn test_buffer_rust_multipolygon() {
+        use geo_types::{MultiPolygon, Polygon};
+
+        let poly1 = Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 5.0, y: 0.0 },
+                Coord { x: 5.0, y: 5.0 },
+                Coord { x: 0.0, y: 5.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        );
+
+        let poly2 = Polygon::new(
+            LineString::new(vec![
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 15.0, y: 10.0 },
+                Coord { x: 15.0, y: 15.0 },
+                Coord { x: 10.0, y: 15.0 },
+                Coord { x: 10.0, y: 10.0 },
+            ]),
+            vec![],
+        );
+
+        let mpoly = Geometry::new(GeoGeometry::MultiPolygon(MultiPolygon::new(vec![
+            poly1, poly2,
+        ])));
+
+        let buffered = buffer(&mpoly, 1.0).expect("should succeed");
+        assert_eq!(buffered.geometry_type(), "MultiPolygon");
+    }
+
+    #[test]
+    fn test_buffer_rust_polygon_with_hole() {
+        use geo_types::Polygon;
+
+        // Polygon with a hole (donut shape)
+        let exterior = LineString::new(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 20.0, y: 0.0 },
+            Coord { x: 20.0, y: 20.0 },
+            Coord { x: 0.0, y: 20.0 },
+            Coord { x: 0.0, y: 0.0 },
+        ]);
+
+        let interior = LineString::new(vec![
+            Coord { x: 5.0, y: 5.0 },
+            Coord { x: 15.0, y: 5.0 },
+            Coord { x: 15.0, y: 15.0 },
+            Coord { x: 5.0, y: 15.0 },
+            Coord { x: 5.0, y: 5.0 },
+        ]);
+
+        let poly = Geometry::new(GeoGeometry::Polygon(Polygon::new(exterior, vec![interior])));
+
+        let buffered = buffer(&poly, 1.0).expect("should succeed");
+        assert_eq!(buffered.geometry_type(), "MultiPolygon");
+    }
+
+    #[test]
+    fn test_buffer_every_geometry_type() {
+        // The old straight-skeleton buffer rejected everything but Polygon and
+        // MultiPolygon; geo::algorithm::buffer covers the full set.
+        for wkt in [
+            "POINT(0 0)",
+            "LINESTRING(0 0, 5 0, 5 5)",
+            "MULTIPOINT((0 0), (10 10))",
+            "MULTILINESTRING((0 0, 5 0), (0 5, 5 5))",
+            "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))",
+            "MULTIPOLYGON(((0 0, 4 0, 4 4, 0 4, 0 0)))",
+        ] {
+            let geom = Geometry::from_wkt(wkt).expect("valid WKT");
+            let buffered = buffer(&geom, 1.0)
+                .unwrap_or_else(|e| panic!("buffering {wkt} should succeed, got {e}"));
+            assert_eq!(buffered.geometry_type(), "MultiPolygon");
+        }
+    }
+
+    #[test]
+    fn test_buffer_hybrid_polygon_uses_rust() {
+        use geo_types::Polygon;
+
+        let poly = Geometry::new(GeoGeometry::Polygon(Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 10.0, y: 0.0 },
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 0.0, y: 10.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )));
+
+        // Polygon should use the Pure-Rust rust-buffer path
+        let buffered = buffer(&poly, 1.0).expect("should succeed");
+        assert_eq!(buffered.geometry_type(), "MultiPolygon");
+    }
+
+    #[test]
+    fn test_buffer_negative_distance_erodes_polygon() {
+        use geo::Area;
+
+        let poly = Geometry::from_wkt("POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))").expect("valid");
+        let eroded = buffer(&poly, -1.0).expect("negative buffer should succeed");
+
+        if let GeoGeometry::MultiPolygon(mp) = eroded.geom {
+            // A 10x10 square eroded by 1 leaves an 8x8 square.
+            assert!((mp.unsigned_area() - 64.0).abs() < 0.5);
+        } else {
+            panic!("buffer must return a MultiPolygon");
+        }
+    }
+
+    // === 3D Distance Tests ===
+
+    #[test]
+    fn test_distance_3d_point_to_point() {
+        // Classic 3-4-5 right triangle in 3D: 3-4-12 -> distance = 13
+        let p1 = Geometry::from_wkt("POINT Z(0 0 0)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT Z(3 4 12)").expect("should succeed");
+
+        let dist = distance_3d(&p1, &p2).expect("should succeed");
+        assert!((dist - 13.0).abs() < 0.001, "Expected ~13.0, got {}", dist);
+    }
+
+    #[test]
+    fn test_distance_3d_pythagorean_triple() {
+        // Another Pythagorean triple: 5-12-13 in 3D
+        let p1 = Geometry::from_wkt("POINT Z(0 0 0)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT Z(5 12 13)").expect("should succeed");
+
+        let dist = distance_3d(&p1, &p2).expect("should succeed");
+        // √(5² + 12² + 13²) = √(25 + 144 + 169) = √338 ≈ 18.385
+        assert!(
+            (dist - 18.385).abs() < 0.01,
+            "Expected ~18.385, got {}",
+            dist
+        );
+    }
+
+    #[test]
+    fn test_distance_3d_same_xy_different_z() {
+        // Points with same X,Y but different Z
+        let p1 = Geometry::from_wkt("POINT Z(1 2 0)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT Z(1 2 10)").expect("should succeed");
+
+        let dist = distance_3d(&p1, &p2).expect("should succeed");
+        assert!((dist - 10.0).abs() < 0.001, "Expected 10.0, got {}", dist);
+    }
+
+    #[test]
+    fn test_distance_3d_negative_coordinates() {
+        // Test with negative coordinates
+        let p1 = Geometry::from_wkt("POINT Z(-1 -2 -3)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT Z(1 2 3)").expect("should succeed");
+
+        // Distance = √((2)² + (4)² + (6)²) = √(4 + 16 + 36) = √56 ≈ 7.483
+        let dist = distance_3d(&p1, &p2).expect("should succeed");
+        assert!((dist - 7.483).abs() < 0.01, "Expected ~7.483, got {}", dist);
+    }
+
+    #[test]
+    fn test_distance_3d_zero_distance() {
+        // Same point should have zero distance
+        let p1 = Geometry::from_wkt("POINT Z(1 2 3)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT Z(1 2 3)").expect("should succeed");
+
+        let dist = distance_3d(&p1, &p2).expect("should succeed");
+        assert!(dist.abs() < 0.001, "Expected 0.0, got {}", dist);
+    }
+
+    #[test]
+    fn test_distance_3d_fallback_to_2d() {
+        // If one geometry is 2D, should fall back to 2D distance
+        let p1 = Geometry::from_wkt("POINT(0 0)").expect("should succeed"); // 2D
+        let p2 = Geometry::from_wkt("POINT Z(3 4 100)").expect("should succeed"); // 3D with Z=100
+
+        let dist_3d = distance_3d(&p1, &p2).expect("should succeed");
+        let dist_2d = distance(&p1, &p2).expect("should succeed");
+
+        // Should be same as 2D distance (Z ignored)
+        assert!((dist_3d - dist_2d).abs() < 0.001);
+        assert!((dist_3d - 5.0).abs() < 0.001); // √(3² + 4²) = 5
+    }
+
+    #[test]
+    fn test_distance_3d_both_2d_uses_2d() {
+        // Both 2D should use standard 2D distance
+        let p1 = Geometry::from_wkt("POINT(0 0)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT(3 4)").expect("should succeed");
+
+        let dist_3d = distance_3d(&p1, &p2).expect("should succeed");
+        let dist_2d = distance(&p1, &p2).expect("should succeed");
+
+        assert!((dist_3d - dist_2d).abs() < 0.001);
+        assert!((dist_3d - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_distance_3d_fractional_coordinates() {
+        // Test with fractional coordinates
+        let p1 = Geometry::from_wkt("POINT Z(1.5 2.5 3.5)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT Z(4.5 6.5 7.5)").expect("should succeed");
+
+        // Δx=3, Δy=4, Δz=4 -> √(9 + 16 + 16) = √41 ≈ 6.403
+        let dist = distance_3d(&p1, &p2).expect("should succeed");
+        assert!((dist - 6.403).abs() < 0.01, "Expected ~6.403, got {}", dist);
+    }
+
+    #[test]
+    fn test_distance_3d_crs_compatibility() {
+        // Different CRS should fail
+        let p1 = Geometry::from_wkt("<http://www.opengis.net/def/crs/EPSG/0/4326> POINT Z(0 0 0)")
+            .expect("should succeed");
+        let p2 = Geometry::from_wkt("<http://www.opengis.net/def/crs/EPSG/0/3857> POINT Z(1 1 1)")
+            .expect("should succeed");
+
+        let result = distance_3d(&p1, &p2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_distance_3d_with_m_coordinate() {
+        // POINT ZM should work (M coordinate ignored in distance calculation)
+        let p1 = Geometry::from_wkt("POINT ZM(0 0 0 100)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT ZM(3 4 12 200)").expect("should succeed");
+
+        let dist = distance_3d(&p1, &p2).expect("should succeed");
+        assert!((dist - 13.0).abs() < 0.001); // M coordinate should be ignored
+    }
+
+    #[test]
+    fn test_distance_2d_vs_3d_comparison() {
+        // Same 2D projection but different Z should give different distances
+        let p1_3d = Geometry::from_wkt("POINT Z(0 0 0)").expect("should succeed");
+        let p2_3d = Geometry::from_wkt("POINT Z(3 4 12)").expect("should succeed");
+
+        let p1_2d = Geometry::from_wkt("POINT(0 0)").expect("should succeed");
+        let p2_2d = Geometry::from_wkt("POINT(3 4)").expect("should succeed");
+
+        let dist_3d = distance_3d(&p1_3d, &p2_3d).expect("should succeed");
+        let dist_2d = distance(&p1_2d, &p2_2d).expect("should succeed");
+
+        // 3D distance should be greater due to Z component
+        assert!(dist_3d > dist_2d);
+        assert!((dist_2d - 5.0).abs() < 0.001); // 2D: √(3² + 4²) = 5
+        assert!((dist_3d - 13.0).abs() < 0.001); // 3D: √(3² + 4² + 12²) = 13
+    }
+
+    #[test]
+    fn test_distance_3d_point_to_linestring() {
+        // Point above a horizontal line segment
+        let point = Geometry::from_wkt("POINT Z(5 5 10)").expect("should succeed");
+        let line = Geometry::from_wkt("LINESTRING Z(0 0 0, 10 0 0)").expect("should succeed");
+
+        let dist = distance_3d(&point, &line).expect("should succeed");
+
+        // Closest point on line is (5, 0, 0), distance = √(0² + 5² + 10²) = √125 ≈ 11.18
+        assert!((dist - 11.180).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_distance_3d_linestring_to_linestring() {
+        // Two parallel vertical lines at different heights
+        let ls1 = Geometry::from_wkt("LINESTRING Z(0 0 0, 0 0 10)").expect("should succeed");
+        let ls2 = Geometry::from_wkt("LINESTRING Z(3 4 0, 3 4 10)").expect("should succeed");
+
+        let dist = distance_3d(&ls1, &ls2).expect("should succeed");
+
+        // Lines are parallel, distance is constant at √(3² + 4²) = 5
+        assert!((dist - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_distance_3d_linestring_to_linestring_skew() {
+        // Two skew lines in 3D (don't intersect and aren't parallel)
+        let ls1 = Geometry::from_wkt("LINESTRING Z(0 0 0, 10 0 0)").expect("should succeed");
+        let ls2 = Geometry::from_wkt("LINESTRING Z(0 10 10, 10 10 10)").expect("should succeed");
+
+        let dist = distance_3d(&ls1, &ls2).expect("should succeed");
+
+        // These are parallel horizontal lines
+        // Line 1 at Y=0, Z=0
+        // Line 2 at Y=10, Z=10
+        // Distance = √(10² + 10²) = √200 ≈ 14.14
+        assert!((dist - 14.14).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_distance_3d_point_to_polygon() {
+        // Point above a square polygon
+        let point = Geometry::from_wkt("POINT Z(5 5 10)").expect("should succeed");
+        let poly = Geometry::from_wkt("POLYGON Z((0 0 0, 10 0 0, 10 10 0, 0 10 0, 0 0 0))")
+            .expect("should succeed");
+
+        let dist = distance_3d(&point, &poly).expect("should succeed");
+
+        // Point is directly above center of polygon at height 10
+        // But distance is to the boundary, not the interior
+        // Closest boundary point would be an edge, giving distance > 10
+        assert!(dist > 9.5); // Should be close to 10 (vertical distance component)
+    }
+
+    #[test]
+    fn test_distance_3d_multipoint() {
+        // MultiPoint to Point distance
+        let mp = Geometry::from_wkt("MULTIPOINT Z((0 0 0), (10 0 0), (0 10 0))")
+            .expect("should succeed");
+        let p = Geometry::from_wkt("POINT Z(0 0 5)").expect("should succeed");
+
+        let dist = distance_3d(&mp, &p).expect("should succeed");
+
+        // Closest point in MultiPoint is (0, 0, 0), distance = 5
+        assert!((dist - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_distance_3d_same_geometry() {
+        // LineString to itself should have zero distance
+        let ls = Geometry::from_wkt("LINESTRING Z(0 0 0, 10 10 10)").expect("should succeed");
+
+        let dist = distance_3d(&ls, &ls).expect("should succeed");
+
+        assert!(dist.abs() < 0.001);
+    }
+
+    #[test]
+    fn test_distance_3d_point_on_linestring() {
+        // Point that lies exactly on a line segment
+        let point = Geometry::from_wkt("POINT Z(5 0 5)").expect("should succeed");
+        let line = Geometry::from_wkt("LINESTRING Z(0 0 0, 10 0 10)").expect("should succeed");
+
+        let dist = distance_3d(&point, &line).expect("should succeed");
+
+        // Point (5, 0, 5) is exactly on the line from (0, 0, 0) to (10, 0, 10)
+        assert!(dist < 0.01); // Should be very close to zero
+    }
+
+    #[test]
+    fn test_distance_3d_vertical_separation() {
+        // Two geometries with same X,Y but different Z
+        let p1 = Geometry::from_wkt("POINT Z(1 2 0)").expect("should succeed");
+        let p2 = Geometry::from_wkt("POINT Z(1 2 100)").expect("should succeed");
+
+        let dist = distance_3d(&p1, &p2).expect("should succeed");
+
+        assert!((dist - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_distance_3d_diagonal_linestring() {
+        // Point to a diagonal line in 3D space
+        let point = Geometry::from_wkt("POINT Z(0 0 0)").expect("should succeed");
+        let line = Geometry::from_wkt("LINESTRING Z(10 10 10, 20 20 20)").expect("should succeed");
+
+        let dist = distance_3d(&point, &line).expect("should succeed");
+
+        // Closest point on line segment is (10, 10, 10)
+        // Distance = √(10² + 10² + 10²) = √300 ≈ 17.32
+        assert!((dist - 17.32).abs() < 0.1);
+    }
+
+    // ========================================================================
+    // 3D Buffer Tests
+    // ========================================================================
+
+    // 3D buffering routes through the 2D `buffer()`, which is Pure Rust for every
+    // geometry type, so Point/LineString cases work here alongside Polygon and
+    // MultiPolygon. `buffer_3d` -> `buffer()` handles the XY step for
+    // polygons.
+
+    #[test]
+    fn test_buffer_3d_polygon() {
+        let poly = Geometry::from_wkt("POLYGON Z((0 0 5, 10 0 5, 10 10 5, 0 10 5, 0 0 5))")
+            .expect("should succeed");
+        let buffered = buffer_3d(&poly, 1.0).expect("should succeed");
+
+        // Should be 3D
+        assert!(buffered.is_3d());
+
+        // Should have larger area after buffering
+        use geo::Area;
+        let original_area = poly.geom.unsigned_area();
+        let buffered_area = buffered.geom.unsigned_area();
+        assert!(buffered_area > original_area);
+    }
+
+    #[test]
+    fn test_buffer_3d_z_range_extension() {
+        // Test that Z coordinates are extended by the buffer distance
+        let poly = Geometry::from_wkt("POLYGON Z((0 0 10, 5 0 10, 5 5 10, 0 5 10, 0 0 10))")
+            .expect("should succeed");
+
+        // Original Z range: [10, 10]
+        let original_z_min = 10.0;
+        let buffer_distance = 2.0;
+
+        let buffered = buffer_3d(&poly, buffer_distance).expect("should succeed");
+
+        // After buffering with distance=2, Z should be extended
+        // New Z range should be approximately [8, 12] but we use average
+        // So all Z values should be around 10.0
+        if let Some(ref z_coords) = buffered.coord3d.z_coords {
+            for &z in &z_coords.values {
+                // The average of [10-2, 10+2] = 10.0
+                assert!((z - original_z_min).abs() < 0.1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_buffer_3d_requires_z_coordinates() {
+        let point = Geometry::from_wkt("POINT(0 0)").expect("should succeed"); // 2D point
+
+        let result = buffer_3d(&point, 1.0);
+
+        // Should return error for 2D geometry
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must have Z coordinates"));
+    }
+
+    #[test]
+    fn test_buffer_3d_negative_distance() {
+        // Negative buffer (erosion) in 3D
+        let poly = Geometry::from_wkt("POLYGON Z((0 0 10, 20 0 10, 20 20 10, 0 20 10, 0 0 10))")
+            .expect("should succeed");
+
+        let buffered = buffer_3d(&poly, -2.0).expect("should succeed");
+
+        // Should still be 3D
+        assert!(buffered.is_3d());
+
+        // Area should be smaller after negative buffer
+        use geo::Area;
+        let original_area = poly.geom.unsigned_area();
+        let buffered_area = buffered.geom.unsigned_area();
+        assert!(buffered_area < original_area);
+    }
+
+    #[test]
+    fn test_buffer_3d_multipolygon() {
+        let mpoly = Geometry::from_wkt(
+            "MULTIPOLYGON Z(((0 0 5, 5 0 5, 5 5 5, 0 5 5, 0 0 5)), \
+             ((10 10 10, 15 10 10, 15 15 10, 10 15 10, 10 10 10)))",
+        )
+        .expect("should succeed");
+
+        let buffered = buffer_3d(&mpoly, 1.0).expect("should succeed");
+
+        // Should be 3D
+        assert!(buffered.is_3d());
+
+        // Should have larger area
+        use geo::Area;
+        assert!(buffered.geom.unsigned_area() > mpoly.geom.unsigned_area());
+    }
+}

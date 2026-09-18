@@ -1,0 +1,61 @@
+[package]
+name = "optirs-tpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "OptiRS TPU coordination and pod management"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["tpu", "coordination", "xla", "pod", "distributed"]
+categories = ["science", "algorithms", "hardware-support"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Core dependencies
+optirs-core = { workspace = true }
+scirs2-core = { workspace = true }  # Required for SciRS2 policy compliance
+
+# ❌ FORBIDDEN DEPENDENCIES REMOVED - Use SciRS2-Core abstractions instead
+# ndarray - Use scirs2_core::ndarray
+# num-traits - Use scirs2_core::numeric
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+# Async and networking
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+num_cpus = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+
+# No optional Cargo features: `coordination`, `xla`, and `profiling` used to
+# be declared here but gated zero `cfg(feature = ...)` code anywhere in the
+# crate (every module they were named after — coordination, xla, profiling —
+# was always compiled regardless of which flags were passed). A feature flag
+# that changes nothing is a lie about what a caller can opt in or out of, so
+# rather than retrofit real (and, for `coordination`/`xla`, highly invasive —
+# both underpin nearly every other module) conditional compilation onto
+# already-unconditional core functionality, the dead flags are removed. If
+# genuine optionality is wanted later, add a feature and real `cfg(feature =
+# ...)` gates together, in the same change.
+[features]

@@ -1,0 +1,10 @@
+{
+  "name": "patent_dts",
+  "args": ["-i", "in.mkv", "-c:a", "dts", "out.mkv"],
+  "expect": {
+    "contains_diagnostic_kinds": ["PatentCodecSubstituted"],
+    "contains_diagnostic_messages": ["dts", "flac"],
+    "jobs": 1,
+    "audio_codec": "flac"
+  }
+}

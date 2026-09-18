@@ -1,0 +1,30 @@
+[package]
+name = "oximedia-cdn"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "CDN edge management, cache invalidation, and origin failover for OxiMedia"
+readme = "README.md"
+keywords = ["cdn", "edge", "cache-invalidation", "failover", "multimedia"]
+categories = ["multimedia", "network-programming", "web-programming"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+parking_lot.workspace = true
+rstar.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

@@ -1,0 +1,49 @@
+[package]
+name = "oxillama-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Python bindings for OxiLLaMa LLM inference engine"
+keywords = ["llm", "inference", "python", "llama", "gguf"]
+categories = ["science", "api-bindings"]
+readme = "README.md"
+
+[lib]
+name = "oxillama_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# NOTE: `extension-module` is NOT listed here so that `cargo test` links
+# against the system Python automatically.  Maturin adds it via pyproject.toml
+# (`features = ["pyo3/extension-module"]`) during wheel builds only.
+pyo3 = { workspace = true }
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"] }
+# Same reasoning as oxillama-cli: the Python bindings load whatever GGUF the
+# caller passes, so the full architecture set is named explicitly rather than
+# inherited (the workspace table pins `default-features = false`).
+oxillama-arch = { workspace = true, features = ["all-architectures"] }
+oxillama-gguf = { workspace = true, features = ["mmap"] }
+numpy = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+# Renders `hub pull` / `Engine.from_hub()` download progress. Optional and
+# gated behind `hub` (same as `hf-hub` itself) — mirrors `oxillama-cli`, which
+# has depended on `indicatif` since v0.1.3; oxillama-py lost its progress bar
+# in the hf-hub 1.0 migration (v0.1.4) because it never had this dependency.
+# See `src/hub.rs`'s `PullProgress` and TODO.md's Known Gaps.
+indicatif = { workspace = true, optional = true }
+tempfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Only needed for error.rs tests that reference quant error variants.
+oxillama-quant = { path = "../oxillama-quant", default-features = false, features = ["parallel"] }
+
+[features]
+default = []
+numpy = ["dep:numpy"]
+hub = ["dep:hf-hub", "dep:indicatif"]

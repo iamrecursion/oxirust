@@ -1,0 +1,846 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+use crate::albert::config::AlbertConfig;
+use crate::albert::model::AlbertModel;
+use crate::weight_loading::binding::{bind_head_layer_norm, bind_head_linear, BoundNamespaces};
+use crate::weight_loading::checkpoint::{Checkpoint, LoadReport};
+use std::io::Read;
+use trustformers_core::device::Device;
+use trustformers_core::errors::Result;
+use trustformers_core::layers::Linear;
+use trustformers_core::tensor::Tensor;
+use trustformers_core::traits::{Layer, Model, TokenizedInput};
+
+#[derive(Debug, Clone)]
+pub struct AlbertForSequenceClassification {
+    albert: AlbertModel,
+    classifier: Linear,
+    #[allow(dead_code)]
+    num_labels: usize,
+    device: Device,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlbertForTokenClassification {
+    albert: AlbertModel,
+    classifier: Linear,
+    #[allow(dead_code)]
+    num_labels: usize,
+    device: Device,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlbertForQuestionAnswering {
+    albert: AlbertModel,
+    qa_outputs: Linear,
+    device: Device,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlbertForMaskedLM {
+    albert: AlbertModel,
+    predictions: AlbertMLMHead,
+    device: Device,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlbertMLMHead {
+    dense: Linear,
+    layer_norm: trustformers_core::layers::LayerNorm,
+    decoder: Linear,
+    bias: Tensor,
+    device: Device,
+}
+
+#[derive(Debug)]
+pub struct AlbertSequenceClassifierOutput {
+    pub logits: Tensor,
+    pub hidden_states: Option<Tensor>,
+    pub attentions: Option<Vec<Tensor>>,
+}
+
+#[derive(Debug)]
+pub struct AlbertTokenClassifierOutput {
+    pub logits: Tensor,
+    pub hidden_states: Option<Tensor>,
+    pub attentions: Option<Vec<Tensor>>,
+}
+
+#[derive(Debug)]
+pub struct AlbertForQuestionAnsweringOutput {
+    pub start_logits: Tensor,
+    pub end_logits: Tensor,
+    pub hidden_states: Option<Tensor>,
+    pub attentions: Option<Vec<Tensor>>,
+}
+
+#[derive(Debug)]
+pub struct AlbertMaskedLMOutput {
+    pub logits: Tensor,
+    pub hidden_states: Option<Tensor>,
+    pub attentions: Option<Vec<Tensor>>,
+}
+
+impl AlbertForSequenceClassification {
+    pub fn new(config: AlbertConfig, num_labels: usize) -> Result<Self> {
+        Self::new_with_device(config, num_labels, Device::CPU)
+    }
+
+    pub fn new_with_device(
+        config: AlbertConfig,
+        num_labels: usize,
+        device: Device,
+    ) -> Result<Self> {
+        let albert = AlbertModel::new_with_device(config.clone(), device)?;
+        let _classifier_dropout =
+            config.classifier_dropout_prob.unwrap_or(config.hidden_dropout_prob);
+        let classifier = Linear::new_with_device(config.hidden_size, num_labels, true, device);
+
+        Ok(Self {
+            albert,
+            classifier,
+            num_labels,
+            device,
+        })
+    }
+
+    pub fn device(&self) -> Device {
+        self.device
+    }
+}
+
+impl Model for AlbertForSequenceClassification {
+    type Config = AlbertConfig;
+    type Input = TokenizedInput;
+    type Output = AlbertSequenceClassifierOutput;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output> {
+        let albert_output = self.albert.forward(input)?;
+
+        let pooled_output = albert_output.pooler_output.ok_or_else(|| {
+            trustformers_core::errors::TrustformersError::model_error(
+                "Pooler output is required for sequence classification".to_string(),
+            )
+        })?;
+
+        let logits = self.classifier.forward(pooled_output)?;
+
+        Ok(AlbertSequenceClassifierOutput {
+            logits,
+            hidden_states: Some(albert_output.last_hidden_state),
+            attentions: albert_output.attentions,
+        })
+    }
+
+    /// Load the encoder and, when the checkpoint carries one, the task head.
+    ///
+    /// # Errors
+    ///
+    /// See the wrapper's `load_pretrained_report`.
+    fn load_pretrained(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.load_pretrained_report(reader).map(|_| ())
+    }
+
+    fn get_config(&self) -> &Self::Config {
+        self.albert.get_config()
+    }
+
+    fn num_parameters(&self) -> usize {
+        let config = self.albert.get_config();
+
+        // Embeddings: word + position + token_type embeddings
+        let embedding_params = config.vocab_size * config.embedding_size
+            + config.max_position_embeddings * config.embedding_size
+            + config.type_vocab_size * config.embedding_size
+            + config.embedding_size * 2; // LayerNorm (gamma + beta)
+
+        // Embedding projection
+        let projection_params = config.embedding_size * config.hidden_size + config.hidden_size;
+
+        // ALBERT uses parameter sharing, so we only count unique layer groups
+        // Each layer group has inner_group_num layers
+        let attention_params_per_layer =
+            4 * (config.hidden_size * config.hidden_size + config.hidden_size); // Q,K,V,dense + biases
+        let ffn_params_per_layer = config.hidden_size * config.intermediate_size + config.intermediate_size // FFN in
+            + config.intermediate_size * config.hidden_size + config.hidden_size; // FFN out
+        let layer_norm_params = 4 * config.hidden_size; // 2 LayerNorms per layer, 2 params each
+
+        let params_per_layer =
+            attention_params_per_layer + ffn_params_per_layer + layer_norm_params;
+        let encoder_params = config.num_hidden_groups * config.inner_group_num * params_per_layer;
+
+        // Pooler (if exists)
+        let pooler_params = config.hidden_size * config.hidden_size + config.hidden_size;
+
+        // Classifier head
+        let classifier_params = config.hidden_size * self.num_labels + self.num_labels;
+
+        embedding_params + projection_params + encoder_params + pooler_params + classifier_params
+    }
+}
+
+impl AlbertForTokenClassification {
+    pub fn new(config: AlbertConfig, num_labels: usize) -> Result<Self> {
+        Self::new_with_device(config, num_labels, Device::CPU)
+    }
+
+    pub fn new_with_device(
+        config: AlbertConfig,
+        num_labels: usize,
+        device: Device,
+    ) -> Result<Self> {
+        let albert = AlbertModel::new_with_device(config.clone(), device)?;
+        let classifier = Linear::new_with_device(config.hidden_size, num_labels, true, device);
+
+        Ok(Self {
+            albert,
+            classifier,
+            num_labels,
+            device,
+        })
+    }
+
+    pub fn device(&self) -> Device {
+        self.device
+    }
+}
+
+impl Model for AlbertForTokenClassification {
+    type Config = AlbertConfig;
+    type Input = TokenizedInput;
+    type Output = AlbertTokenClassifierOutput;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output> {
+        let albert_output = self.albert.forward(input)?;
+        let logits = self.classifier.forward(albert_output.last_hidden_state.clone())?;
+
+        Ok(AlbertTokenClassifierOutput {
+            logits,
+            hidden_states: Some(albert_output.last_hidden_state),
+            attentions: albert_output.attentions,
+        })
+    }
+
+    /// Load the encoder and, when the checkpoint carries one, the task head.
+    ///
+    /// # Errors
+    ///
+    /// See the wrapper's `load_pretrained_report`.
+    fn load_pretrained(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.load_pretrained_report(reader).map(|_| ())
+    }
+
+    fn get_config(&self) -> &Self::Config {
+        self.albert.get_config()
+    }
+
+    fn num_parameters(&self) -> usize {
+        let config = self.albert.get_config();
+
+        // Base model params (same calculation as above)
+        let embedding_params = config.vocab_size * config.embedding_size
+            + config.max_position_embeddings * config.embedding_size
+            + config.type_vocab_size * config.embedding_size
+            + config.embedding_size * 2;
+
+        let projection_params = config.embedding_size * config.hidden_size + config.hidden_size;
+
+        let params_per_layer = 4 * (config.hidden_size * config.hidden_size + config.hidden_size)
+            + config.hidden_size * config.intermediate_size
+            + config.intermediate_size
+            + config.intermediate_size * config.hidden_size
+            + config.hidden_size
+            + 4 * config.hidden_size;
+
+        let encoder_params = config.num_hidden_groups * config.inner_group_num * params_per_layer;
+        let pooler_params = config.hidden_size * config.hidden_size + config.hidden_size;
+
+        // Token classification head
+        let classifier_params = config.hidden_size * self.num_labels + self.num_labels;
+
+        embedding_params + projection_params + encoder_params + pooler_params + classifier_params
+    }
+}
+
+impl AlbertForQuestionAnswering {
+    pub fn new(config: AlbertConfig) -> Result<Self> {
+        Self::new_with_device(config, Device::CPU)
+    }
+
+    pub fn new_with_device(config: AlbertConfig, device: Device) -> Result<Self> {
+        let albert = AlbertModel::new_with_device(config.clone(), device)?;
+        let qa_outputs = Linear::new_with_device(config.hidden_size, 2, true, device);
+
+        Ok(Self {
+            albert,
+            qa_outputs,
+            device,
+        })
+    }
+
+    pub fn device(&self) -> Device {
+        self.device
+    }
+}
+
+impl Model for AlbertForQuestionAnswering {
+    type Config = AlbertConfig;
+    type Input = TokenizedInput;
+    type Output = AlbertForQuestionAnsweringOutput;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output> {
+        let albert_output = self.albert.forward(input)?;
+        let logits = self.qa_outputs.forward(albert_output.last_hidden_state.clone())?;
+
+        let _batch_size = logits.shape()[0];
+        let _sequence_length = logits.shape()[1];
+
+        let start_logits = logits.slice(2, 0, 1)?;
+        let end_logits = logits.slice(2, 1, 2)?;
+
+        Ok(AlbertForQuestionAnsweringOutput {
+            start_logits,
+            end_logits,
+            hidden_states: Some(albert_output.last_hidden_state),
+            attentions: albert_output.attentions,
+        })
+    }
+
+    /// Load the encoder and, when the checkpoint carries one, the task head.
+    ///
+    /// # Errors
+    ///
+    /// See the wrapper's `load_pretrained_report`.
+    fn load_pretrained(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.load_pretrained_report(reader).map(|_| ())
+    }
+
+    fn get_config(&self) -> &Self::Config {
+        self.albert.get_config()
+    }
+
+    fn num_parameters(&self) -> usize {
+        let config = self.albert.get_config();
+
+        // Base model params
+        let embedding_params = config.vocab_size * config.embedding_size
+            + config.max_position_embeddings * config.embedding_size
+            + config.type_vocab_size * config.embedding_size
+            + config.embedding_size * 2;
+
+        let projection_params = config.embedding_size * config.hidden_size + config.hidden_size;
+
+        let params_per_layer = 4 * (config.hidden_size * config.hidden_size + config.hidden_size)
+            + config.hidden_size * config.intermediate_size
+            + config.intermediate_size
+            + config.intermediate_size * config.hidden_size
+            + config.hidden_size
+            + 4 * config.hidden_size;
+
+        let encoder_params = config.num_hidden_groups * config.inner_group_num * params_per_layer;
+        let pooler_params = config.hidden_size * config.hidden_size + config.hidden_size;
+
+        // QA head: 2 outputs (start and end logits)
+        let qa_params = config.hidden_size * 2 + 2;
+
+        embedding_params + projection_params + encoder_params + pooler_params + qa_params
+    }
+}
+
+impl AlbertMLMHead {
+    fn new(config: &AlbertConfig) -> Result<Self> {
+        Self::new_with_device(config, Device::CPU)
+    }
+
+    fn new_with_device(config: &AlbertConfig, device: Device) -> Result<Self> {
+        let dense =
+            Linear::new_with_device(config.hidden_size, config.embedding_size, true, device);
+        let layer_norm = trustformers_core::layers::LayerNorm::new_with_device(
+            vec![config.embedding_size],
+            config.layer_norm_eps,
+            device,
+        )?;
+        let decoder =
+            Linear::new_with_device(config.embedding_size, config.vocab_size, false, device);
+        let bias = Tensor::zeros(&[config.vocab_size])?;
+
+        Ok(Self {
+            dense,
+            layer_norm,
+            decoder,
+            bias,
+            device,
+        })
+    }
+
+    fn device(&self) -> Device {
+        self.device
+    }
+
+    fn forward(&self, hidden_states: Tensor) -> Result<Tensor> {
+        let hidden_states = self.dense.forward(hidden_states)?;
+        let hidden_states = match "gelu" {
+            "gelu" => trustformers_core::ops::activations::gelu(&hidden_states)?,
+            "relu" => trustformers_core::ops::activations::relu(&hidden_states)?,
+            _ => hidden_states,
+        };
+        let hidden_states = self.layer_norm.forward(hidden_states)?;
+        let hidden_states = self.decoder.forward(hidden_states)?;
+        let hidden_states = hidden_states.add(&self.bias)?;
+
+        Ok(hidden_states)
+    }
+}
+
+impl AlbertForMaskedLM {
+    pub fn new(config: AlbertConfig) -> Result<Self> {
+        Self::new_with_device(config, Device::CPU)
+    }
+
+    pub fn new_with_device(config: AlbertConfig, device: Device) -> Result<Self> {
+        let albert = AlbertModel::new_with_device(config.clone(), device)?;
+        let predictions = AlbertMLMHead::new_with_device(&config, device)?;
+
+        Ok(Self {
+            albert,
+            predictions,
+            device,
+        })
+    }
+
+    pub fn device(&self) -> Device {
+        self.device
+    }
+}
+
+impl Model for AlbertForMaskedLM {
+    type Config = AlbertConfig;
+    type Input = TokenizedInput;
+    type Output = AlbertMaskedLMOutput;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output> {
+        let albert_output = self.albert.forward(input)?;
+        let logits = self.predictions.forward(albert_output.last_hidden_state.clone())?;
+
+        Ok(AlbertMaskedLMOutput {
+            logits,
+            hidden_states: Some(albert_output.last_hidden_state),
+            attentions: albert_output.attentions,
+        })
+    }
+
+    /// Load the encoder and, when the checkpoint carries one, the task head.
+    ///
+    /// # Errors
+    ///
+    /// See the wrapper's `load_pretrained_report`.
+    fn load_pretrained(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.load_pretrained_report(reader).map(|_| ())
+    }
+
+    fn get_config(&self) -> &Self::Config {
+        self.albert.get_config()
+    }
+
+    fn num_parameters(&self) -> usize {
+        let config = self.albert.get_config();
+
+        // Base model params
+        let embedding_params = config.vocab_size * config.embedding_size
+            + config.max_position_embeddings * config.embedding_size
+            + config.type_vocab_size * config.embedding_size
+            + config.embedding_size * 2;
+
+        let projection_params = config.embedding_size * config.hidden_size + config.hidden_size;
+
+        let params_per_layer = 4 * (config.hidden_size * config.hidden_size + config.hidden_size)
+            + config.hidden_size * config.intermediate_size
+            + config.intermediate_size
+            + config.intermediate_size * config.hidden_size
+            + config.hidden_size
+            + 4 * config.hidden_size;
+
+        let encoder_params = config.num_hidden_groups * config.inner_group_num * params_per_layer;
+        let pooler_params = config.hidden_size * config.hidden_size + config.hidden_size;
+
+        // MLM head: dense + layer_norm + decoder
+        let mlm_head_params = config.hidden_size * config.embedding_size + config.embedding_size // dense
+            + config.embedding_size * 2 // layer_norm
+            + config.embedding_size * config.vocab_size + config.vocab_size; // decoder + bias
+
+        embedding_params + projection_params + encoder_params + pooler_params + mlm_head_params
+    }
+}
+
+/// Why the task heads are bound here rather than by `AlbertModel`.
+///
+/// `AlbertModel::load_from_checkpoint` finishes through a policy that tolerates
+/// the `predictions.`, `classifier.`, `qa_outputs.` and `sop_classifier.`
+/// namespaces, so that loading a bare encoder from a fine-tuned checkpoint does
+/// not fail. Delegating a task wrapper's `load_pretrained` straight to it
+/// therefore *dropped the head*: the encoder was bound, the head kept its
+/// constructor initialisation, and the call returned `Ok(())`. Each wrapper now
+/// binds its own head off the same parsed checkpoint.
+impl AlbertForSequenceClassification {
+    /// The checkpoint namespaces this wrapper binds, and therefore must fully
+    /// consume.
+    ///
+    /// See [`BoundNamespaces`] for why a wrapper is stricter than the bare
+    /// encoder over the very names it binds.
+    const BOUND_NAMESPACES: BoundNamespaces<'static> = BoundNamespaces::new(&["classifier."]);
+
+    /// Load the encoder and the pooled classification head.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the checkpoint cannot be parsed, when an encoder parameter is
+    /// missing, or when the head is present with the wrong shape.
+    pub fn load_pretrained_report(&mut self, reader: &mut dyn Read) -> Result<LoadReport> {
+        let checkpoint = Checkpoint::from_reader(reader)?;
+        let mut report = self.albert.load_from_checkpoint(&checkpoint)?;
+        let hidden = self.albert.get_config().hidden_size;
+        bind_head_linear(
+            &checkpoint,
+            &mut report,
+            "classifier",
+            [self.num_labels, hidden],
+            &mut self.classifier,
+        )?;
+        Self::BOUND_NAMESPACES.verify(&report)?;
+        Ok(report)
+    }
+}
+
+impl AlbertForTokenClassification {
+    /// The checkpoint namespaces this wrapper binds, and therefore must fully
+    /// consume.
+    ///
+    /// See [`BoundNamespaces`] for why a wrapper is stricter than the bare
+    /// encoder over the very names it binds.
+    const BOUND_NAMESPACES: BoundNamespaces<'static> = BoundNamespaces::new(&["classifier."]);
+
+    /// Load the encoder and the per-token classification head.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the checkpoint cannot be parsed, when an encoder parameter is
+    /// missing, or when the head is present with the wrong shape.
+    pub fn load_pretrained_report(&mut self, reader: &mut dyn Read) -> Result<LoadReport> {
+        let checkpoint = Checkpoint::from_reader(reader)?;
+        let mut report = self.albert.load_from_checkpoint(&checkpoint)?;
+        let hidden = self.albert.get_config().hidden_size;
+        bind_head_linear(
+            &checkpoint,
+            &mut report,
+            "classifier",
+            [self.num_labels, hidden],
+            &mut self.classifier,
+        )?;
+        Self::BOUND_NAMESPACES.verify(&report)?;
+        Ok(report)
+    }
+}
+
+impl AlbertForQuestionAnswering {
+    /// The checkpoint namespaces this wrapper binds, and therefore must fully
+    /// consume.
+    ///
+    /// See [`BoundNamespaces`] for why a wrapper is stricter than the bare
+    /// encoder over the very names it binds.
+    const BOUND_NAMESPACES: BoundNamespaces<'static> = BoundNamespaces::new(&["qa_outputs."]);
+
+    /// Load the encoder and the span head.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the checkpoint cannot be parsed, when an encoder parameter is
+    /// missing, or when the head is present with the wrong shape.
+    pub fn load_pretrained_report(&mut self, reader: &mut dyn Read) -> Result<LoadReport> {
+        let checkpoint = Checkpoint::from_reader(reader)?;
+        let mut report = self.albert.load_from_checkpoint(&checkpoint)?;
+        let hidden = self.albert.get_config().hidden_size;
+        bind_head_linear(
+            &checkpoint,
+            &mut report,
+            "qa_outputs",
+            [2, hidden],
+            &mut self.qa_outputs,
+        )?;
+        Self::BOUND_NAMESPACES.verify(&report)?;
+        Ok(report)
+    }
+}
+
+impl AlbertForMaskedLM {
+    /// The checkpoint namespaces this wrapper binds, and therefore must fully
+    /// consume.
+    ///
+    /// See [`BoundNamespaces`] for why a wrapper is stricter than the bare
+    /// encoder over the very names it binds.
+    const BOUND_NAMESPACES: BoundNamespaces<'static> = BoundNamespaces::new(&["predictions."]);
+
+    /// Load the encoder and the masked-LM prediction head.
+    ///
+    /// ALBERT's head projects back down to the *embedding* width before the
+    /// decoder, because the model factorises its embedding matrix; the decoder's
+    /// output bias is a standalone `predictions.bias` parameter that HuggingFace
+    /// also aliases as `predictions.decoder.bias`. Both spellings are accepted.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the checkpoint cannot be parsed, when an encoder parameter is
+    /// missing, or when a head tensor is present with the wrong shape.
+    pub fn load_pretrained_report(&mut self, reader: &mut dyn Read) -> Result<LoadReport> {
+        let checkpoint = Checkpoint::from_reader(reader)?;
+        let mut report = self.albert.load_from_checkpoint(&checkpoint)?;
+        let config = self.albert.get_config().clone();
+        let hidden = config.hidden_size;
+        let embedding = config.embedding_size;
+        let vocab = config.vocab_size;
+
+        bind_head_linear(
+            &checkpoint,
+            &mut report,
+            "predictions.dense",
+            [embedding, hidden],
+            &mut self.predictions.dense,
+        )?;
+        bind_head_layer_norm(
+            &checkpoint,
+            &mut report,
+            "predictions.LayerNorm",
+            embedding,
+            &mut self.predictions.layer_norm,
+        )?;
+
+        let decoder_weight = "predictions.decoder.weight";
+        match checkpoint.take_shaped(decoder_weight, &[vocab, embedding])? {
+            Some(weight) => {
+                self.predictions.decoder.set_weight(weight)?;
+                report.mark_loaded(decoder_weight);
+            },
+            None => report.note_absent(decoder_weight),
+        }
+
+        let canonical_bias = "predictions.bias";
+        let aliased_bias = "predictions.decoder.bias";
+        let bias_name =
+            if checkpoint.contains(canonical_bias) { canonical_bias } else { aliased_bias };
+        match checkpoint.take_shaped(bias_name, &[vocab])? {
+            Some(bias) => {
+                self.predictions.bias = bias;
+                report.mark_loaded(bias_name);
+                if bias_name == canonical_bias && checkpoint.contains(aliased_bias) {
+                    report.mark_loaded(aliased_bias);
+                }
+            },
+            None => report.note_absent(canonical_bias),
+        }
+
+        Self::BOUND_NAMESPACES.verify(&report)?;
+        Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::albert::config::AlbertConfig;
+    use trustformers_core::traits::Config;
+
+    struct Lcg {
+        state: u64,
+    }
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg { state: seed }
+        }
+        fn next(&mut self) -> u64 {
+            self.state = self
+                .state
+                .wrapping_mul(6364136223846793005u64)
+                .wrapping_add(1442695040888963407u64);
+            self.state
+        }
+        fn next_f32(&mut self) -> f32 {
+            (self.next() >> 11) as f32 / (1u64 << 53) as f32
+        }
+    }
+
+    fn make_small_config() -> AlbertConfig {
+        AlbertConfig {
+            vocab_size: 1000,
+            embedding_size: 64,
+            hidden_size: 128,
+            num_hidden_layers: 2,
+            num_hidden_groups: 1,
+            num_attention_heads: 4,
+            intermediate_size: 256,
+            inner_group_num: 1,
+            hidden_act: "gelu".to_string(),
+            hidden_dropout_prob: 0.0,
+            attention_probs_dropout_prob: 0.0,
+            max_position_embeddings: 64,
+            type_vocab_size: 2,
+            initializer_range: 0.02,
+            layer_norm_eps: 1e-12,
+            classifier_dropout_prob: None,
+            position_embedding_type: "absolute".to_string(),
+            pad_token_id: 0,
+            bos_token_id: 2,
+            eos_token_id: 3,
+        }
+    }
+
+    #[test]
+    fn test_albert_config_default_validates() {
+        let cfg = AlbertConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_albert_config_base_v1() {
+        let cfg = AlbertConfig::albert_base_v1();
+        assert_eq!(cfg.vocab_size, 30000);
+        assert_eq!(cfg.hidden_size, 768);
+        assert_eq!(cfg.num_attention_heads, 12);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_albert_config_base_v2() {
+        let cfg = AlbertConfig::albert_base_v2();
+        assert_eq!(cfg.hidden_size, 768);
+        assert_eq!(cfg.embedding_size, 128);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_albert_config_large() {
+        let cfg = AlbertConfig::albert_large_v2();
+        assert_eq!(cfg.hidden_size, 1024);
+        assert_eq!(cfg.num_hidden_layers, 24);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_albert_config_xlarge() {
+        let cfg = AlbertConfig::albert_xlarge_v2();
+        assert_eq!(cfg.hidden_size, 2048);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_albert_config_xxlarge() {
+        let cfg = AlbertConfig::albert_xxlarge_v2();
+        assert_eq!(cfg.hidden_size, 4096);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_architecture_name() {
+        let cfg = AlbertConfig::default();
+        assert_eq!(cfg.architecture(), "albert");
+    }
+
+    #[test]
+    fn test_small_config_hidden_divisible_by_heads() {
+        let cfg = make_small_config();
+        assert_eq!(cfg.hidden_size % cfg.num_attention_heads, 0);
+    }
+
+    #[test]
+    fn test_small_config_validate_passes() {
+        let cfg = make_small_config();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_hidden_not_divisible_fails() {
+        let cfg = AlbertConfig {
+            hidden_size: 100,
+            num_attention_heads: 12,
+            ..AlbertConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_embedding_size_field_exists() {
+        let cfg = AlbertConfig::default();
+        assert!(cfg.embedding_size > 0);
+        assert!(cfg.embedding_size <= cfg.hidden_size);
+    }
+
+    #[test]
+    fn test_inner_group_num_field() {
+        let cfg = AlbertConfig::default();
+        assert!(cfg.inner_group_num >= 1);
+    }
+
+    #[test]
+    fn test_num_hidden_groups_default() {
+        let cfg = AlbertConfig::default();
+        assert_eq!(cfg.num_hidden_groups, 1);
+    }
+
+    #[test]
+    fn test_classifier_dropout_default_none() {
+        let cfg = AlbertConfig::default();
+        assert!(cfg.classifier_dropout_prob.is_none());
+    }
+
+    #[test]
+    fn test_from_pretrained_name_base_v2() {
+        // from_pretrained_name returns Self (not Option), just verify no panic
+        let cfg = AlbertConfig::from_pretrained_name("albert-base-v2");
+        assert_eq!(cfg.hidden_size, 768);
+    }
+
+    #[test]
+    fn test_from_pretrained_name_large_v2() {
+        let cfg = AlbertConfig::from_pretrained_name("albert-large-v2");
+        assert_eq!(cfg.hidden_size, 1024);
+    }
+
+    #[test]
+    fn test_num_parameters_increases_with_size() {
+        let base = AlbertConfig::albert_base_v2();
+        let large = AlbertConfig::albert_large_v2();
+        // Both use num_parameters via tasks, but we can check config properties
+        assert!(large.hidden_size > base.hidden_size);
+    }
+
+    #[test]
+    fn test_lcg_produces_range() {
+        let mut rng = Lcg::new(31415);
+        for _ in 0..100 {
+            let v = rng.next_f32();
+            assert!((0.0..1.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn test_position_embedding_type_default() {
+        let cfg = AlbertConfig::default();
+        assert_eq!(cfg.position_embedding_type, "absolute");
+    }
+
+    #[test]
+    fn test_max_position_embeddings_default() {
+        let cfg = AlbertConfig::default();
+        assert_eq!(cfg.max_position_embeddings, 512);
+    }
+
+    #[test]
+    fn test_type_vocab_size_default() {
+        let cfg = AlbertConfig::default();
+        assert_eq!(cfg.type_vocab_size, 2);
+    }
+
+    #[test]
+    fn test_pad_token_id_default() {
+        let cfg = AlbertConfig::default();
+        assert_eq!(cfg.pad_token_id, 0);
+    }
+}

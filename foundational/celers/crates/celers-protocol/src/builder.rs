@@ -1,0 +1,955 @@
+//! Fluent message builder API
+//!
+//! This module provides a builder pattern for constructing Celery protocol
+//! messages with a clean, fluent API.
+//!
+//! # Example
+//!
+//! ```
+//! use celers_protocol::builder::MessageBuilder;
+//! use serde_json::json;
+//!
+//! let message = MessageBuilder::new("tasks.add")
+//!     .args(vec![json!(1), json!(2)])
+//!     .priority(5)
+//!     .queue("high-priority")
+//!     .build()
+//!     .unwrap();
+//!
+//! assert_eq!(message.task_name(), "tasks.add");
+//! ```
+
+use crate::compat::{python_args_repr, python_kwargs_repr};
+use crate::embed::{CallbackSignature, EmbedOptions, EmbeddedBody};
+use crate::{
+    ContentType, DeliveryInfo, Message, MessageHeaders, MessageProperties, DEFAULT_CELERY_QUEUE,
+};
+use chrono::{DateTime, Duration, Utc};
+use serde_json::Value;
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// Error type for message building
+#[derive(Debug, Clone)]
+pub enum BuilderError {
+    /// Task name is required
+    MissingTaskName,
+    /// Serialization failed
+    SerializationError(String),
+    /// Validation failed
+    ValidationError(String),
+}
+
+impl std::fmt::Display for BuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuilderError::MissingTaskName => write!(f, "Task name is required"),
+            BuilderError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            BuilderError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for BuilderError {}
+
+impl From<crate::ValidationError> for BuilderError {
+    fn from(err: crate::ValidationError) -> Self {
+        BuilderError::ValidationError(err.to_string())
+    }
+}
+
+/// Result type for message building
+pub type BuilderResult<T> = Result<T, BuilderError>;
+
+/// Header key under which [`MessageBuilder::queue`] stores the target queue
+/// name.
+///
+/// The Celery protocol has no dedicated "queue" header field on the message
+/// envelope itself (queue selection is normally an AMQP-level publish-time
+/// concern), so `MessageBuilder` mirrors it into `headers.extra` under this
+/// key rather than silently discarding it, matching the workspace's existing
+/// convention of custom `*_HEADER` constants (see [`crate::v5`]).
+pub const QUEUE_HEADER: &str = "queue";
+
+/// Header key under which [`MessageBuilder::routing_key`] stores the AMQP
+/// routing key, mirroring Celery's `delivery_info.routing_key`.
+pub const ROUTING_KEY_HEADER: &str = "routing_key";
+
+/// Header key under which [`MessageBuilder::max_retries`] stores the
+/// configured retry ceiling for the task.
+pub const MAX_RETRIES_HEADER: &str = "max_retries";
+
+/// Fluent builder for creating Celery messages
+#[derive(Debug, Clone)]
+pub struct MessageBuilder {
+    /// Task name
+    task: String,
+    /// Task ID (auto-generated if not set)
+    task_id: Option<Uuid>,
+    /// Positional arguments
+    args: Vec<Value>,
+    /// Keyword arguments
+    kwargs: HashMap<String, Value>,
+    /// Task priority (0-9)
+    priority: Option<u8>,
+    /// Queue name
+    queue: Option<String>,
+    /// Routing key
+    routing_key: Option<String>,
+    /// ETA (scheduled execution time)
+    eta: Option<DateTime<Utc>>,
+    /// Countdown (delay in seconds)
+    countdown: Option<i64>,
+    /// Expiration time
+    expires: Option<DateTime<Utc>>,
+    /// Maximum retries
+    max_retries: Option<u32>,
+    /// Current retry count
+    retries: Option<u32>,
+    /// Parent task ID
+    parent_id: Option<Uuid>,
+    /// Root task ID
+    root_id: Option<Uuid>,
+    /// Group ID
+    group_id: Option<Uuid>,
+    /// Callbacks (on success)
+    callbacks: Vec<CallbackSignature>,
+    /// Errbacks (on failure)
+    errbacks: Vec<CallbackSignature>,
+    /// Chain of tasks
+    chain: Vec<CallbackSignature>,
+    /// Chord callback
+    chord: Option<CallbackSignature>,
+    /// Content type
+    content_type: ContentType,
+    /// Delivery mode (persistent by default)
+    persistent: bool,
+    /// Reply-to queue
+    reply_to: Option<String>,
+    /// Extra headers
+    extra_headers: HashMap<String, Value>,
+}
+
+impl MessageBuilder {
+    /// Create a new message builder with the given task name
+    pub fn new(task: impl Into<String>) -> Self {
+        Self {
+            task: task.into(),
+            task_id: None,
+            args: Vec::new(),
+            kwargs: HashMap::new(),
+            priority: None,
+            queue: None,
+            routing_key: None,
+            eta: None,
+            countdown: None,
+            expires: None,
+            max_retries: None,
+            retries: None,
+            parent_id: None,
+            root_id: None,
+            group_id: None,
+            callbacks: Vec::new(),
+            errbacks: Vec::new(),
+            chain: Vec::new(),
+            chord: None,
+            content_type: ContentType::Json,
+            persistent: true,
+            reply_to: None,
+            extra_headers: HashMap::new(),
+        }
+    }
+
+    /// Set the task ID
+    #[must_use]
+    pub fn id(mut self, id: Uuid) -> Self {
+        self.task_id = Some(id);
+        self
+    }
+
+    /// Set positional arguments
+    #[must_use]
+    pub fn args(mut self, args: Vec<Value>) -> Self {
+        self.args = args;
+        self
+    }
+
+    /// Add a positional argument
+    #[must_use]
+    pub fn arg(mut self, arg: Value) -> Self {
+        self.args.push(arg);
+        self
+    }
+
+    /// Set keyword arguments
+    #[must_use]
+    pub fn kwargs(mut self, kwargs: HashMap<String, Value>) -> Self {
+        self.kwargs = kwargs;
+        self
+    }
+
+    /// Add a keyword argument
+    #[must_use]
+    pub fn kwarg(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.kwargs.insert(key.into(), value);
+        self
+    }
+
+    /// Set task priority (0-9, higher = more urgent)
+    #[must_use]
+    pub fn priority(mut self, priority: u8) -> Self {
+        self.priority = Some(priority.min(9));
+        self
+    }
+
+    /// Set the queue name
+    #[must_use]
+    pub fn queue(mut self, queue: impl Into<String>) -> Self {
+        self.queue = Some(queue.into());
+        self
+    }
+
+    /// Set the routing key
+    #[must_use]
+    pub fn routing_key(mut self, key: impl Into<String>) -> Self {
+        self.routing_key = Some(key.into());
+        self
+    }
+
+    /// Set ETA (scheduled execution time)
+    #[must_use]
+    pub fn eta(mut self, eta: DateTime<Utc>) -> Self {
+        self.eta = Some(eta);
+        self.countdown = None; // ETA takes precedence
+        self
+    }
+
+    /// Set countdown (delay in seconds)
+    #[must_use]
+    pub fn countdown(mut self, seconds: i64) -> Self {
+        self.countdown = Some(seconds);
+        self.eta = None; // Countdown takes precedence
+        self
+    }
+
+    /// Set expiration time
+    #[must_use]
+    pub fn expires(mut self, expires: DateTime<Utc>) -> Self {
+        self.expires = Some(expires);
+        self
+    }
+
+    /// Set expiration as duration from now
+    #[must_use]
+    pub fn expires_in(mut self, duration: Duration) -> Self {
+        self.expires = Some(Utc::now() + duration);
+        self
+    }
+
+    /// Set maximum retries
+    #[must_use]
+    pub fn max_retries(mut self, max: u32) -> Self {
+        self.max_retries = Some(max);
+        self
+    }
+
+    /// Set current retry count
+    #[must_use]
+    pub fn retries(mut self, count: u32) -> Self {
+        self.retries = Some(count);
+        self
+    }
+
+    /// Set parent task ID
+    #[must_use]
+    pub fn parent(mut self, parent_id: Uuid) -> Self {
+        self.parent_id = Some(parent_id);
+        self
+    }
+
+    /// Set root task ID
+    #[must_use]
+    pub fn root(mut self, root_id: Uuid) -> Self {
+        self.root_id = Some(root_id);
+        self
+    }
+
+    /// Set group ID
+    #[must_use]
+    pub fn group(mut self, group_id: Uuid) -> Self {
+        self.group_id = Some(group_id);
+        self
+    }
+
+    /// Add a success callback (link)
+    #[must_use]
+    pub fn link(mut self, task: impl Into<String>) -> Self {
+        self.callbacks.push(CallbackSignature::new(task));
+        self
+    }
+
+    /// Add a success callback with full signature
+    #[must_use]
+    pub fn link_signature(mut self, callback: CallbackSignature) -> Self {
+        self.callbacks.push(callback);
+        self
+    }
+
+    /// Add an error callback (errback)
+    #[must_use]
+    pub fn link_error(mut self, task: impl Into<String>) -> Self {
+        self.errbacks.push(CallbackSignature::new(task));
+        self
+    }
+
+    /// Add an error callback with full signature
+    #[must_use]
+    pub fn link_error_signature(mut self, errback: CallbackSignature) -> Self {
+        self.errbacks.push(errback);
+        self
+    }
+
+    /// Add a chain task
+    #[must_use]
+    pub fn chain_task(mut self, task: impl Into<String>) -> Self {
+        self.chain.push(CallbackSignature::new(task));
+        self
+    }
+
+    /// Set chord callback
+    #[must_use]
+    pub fn chord(mut self, callback: impl Into<String>) -> Self {
+        self.chord = Some(CallbackSignature::new(callback));
+        self
+    }
+
+    /// Set content type
+    #[must_use]
+    pub fn content_type(mut self, ct: ContentType) -> Self {
+        self.content_type = ct;
+        self
+    }
+
+    /// Set message persistence
+    #[must_use]
+    pub fn persistent(mut self, persistent: bool) -> Self {
+        self.persistent = persistent;
+        self
+    }
+
+    /// Set reply-to queue
+    #[must_use]
+    pub fn reply_to(mut self, queue: impl Into<String>) -> Self {
+        self.reply_to = Some(queue.into());
+        self
+    }
+
+    /// Add extra header
+    #[must_use]
+    pub fn header(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra_headers.insert(key.into(), value);
+        self
+    }
+
+    /// Build the message
+    pub fn build(self) -> BuilderResult<Message> {
+        // Generate task ID if not set
+        let task_id = self.task_id.unwrap_or_else(Uuid::new_v4);
+
+        // Calculate ETA from countdown if set
+        let eta = match (self.eta, self.countdown) {
+            (Some(eta), _) => Some(eta),
+            (None, Some(seconds)) => Some(Utc::now() + Duration::seconds(seconds)),
+            _ => None,
+        };
+
+        // Build embed options
+        let mut embed = EmbedOptions::new();
+        for cb in self.callbacks {
+            embed = embed.with_callback(cb);
+        }
+        for eb in self.errbacks {
+            embed = embed.with_errback(eb);
+        }
+        for chain_task in self.chain {
+            embed = embed.with_chain_task(chain_task);
+        }
+        if let Some(chord) = self.chord {
+            embed = embed.with_chord(chord);
+        }
+        if let Some(group_id) = self.group_id {
+            embed = embed.with_group(group_id);
+        }
+        if let Some(parent_id) = self.parent_id {
+            embed = embed.with_parent(parent_id);
+        }
+        if let Some(root_id) = self.root_id {
+            embed = embed.with_root(root_id);
+        }
+
+        // Render the observability headers before the args and kwargs are
+        // moved into the body.
+        let argsrepr = python_args_repr(&self.args);
+        let kwargsrepr = python_kwargs_repr(&Value::Object(
+            self.kwargs
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ));
+
+        // Build embedded body
+        let embedded_body = EmbeddedBody::new()
+            .with_args(self.args)
+            .with_kwargs(self.kwargs)
+            .with_embed(embed);
+
+        // Serialize body
+        let body = embedded_body
+            .encode()
+            .map_err(|e| BuilderError::SerializationError(e.to_string()))?;
+
+        // Build headers.
+        //
+        // `argsrepr` / `kwargsrepr` are rendered from the *same* args and
+        // kwargs that went into the body above, as Python literals -- see
+        // `compat::python_args_repr`. Without them Flower, `celery events` and
+        // `celery inspect` show a blank argument list for every task this
+        // builder publishes, because those tools read the headers and never
+        // deserialize the body.
+        let mut headers = MessageHeaders::new(self.task.clone(), task_id)
+            .with_argsrepr(argsrepr)
+            .with_kwargsrepr(kwargsrepr);
+        headers.eta = eta;
+        headers.expires = self.expires;
+        headers.retries = self.retries;
+        headers.parent_id = self.parent_id;
+        headers.root_id = self.root_id;
+        headers.group = self.group_id;
+
+        // Carry queue / routing key / max retries through as headers so
+        // `.queue(...)`, `.routing_key(...)` and `.max_retries(...)` are not
+        // silently discarded. These have no dedicated envelope field (see
+        // `QUEUE_HEADER` / `ROUTING_KEY_HEADER` / `MAX_RETRIES_HEADER`), so
+        // they are inserted first and the caller's own `.header(...)` extras
+        // are applied afterward, letting an explicit extra header win over
+        // the typed setter if both are used for the same key.
+        if let Some(queue) = &self.queue {
+            headers
+                .extra
+                .insert(QUEUE_HEADER.to_string(), Value::String(queue.clone()));
+        }
+        if let Some(routing_key) = &self.routing_key {
+            headers.extra.insert(
+                ROUTING_KEY_HEADER.to_string(),
+                Value::String(routing_key.clone()),
+            );
+        }
+        if let Some(max_retries) = self.max_retries {
+            headers
+                .extra
+                .insert(MAX_RETRIES_HEADER.to_string(), Value::from(max_retries));
+        }
+
+        // Add extra headers
+        for (key, value) in self.extra_headers {
+            headers.extra.insert(key, value);
+        }
+
+        // Build properties.
+        //
+        // `delivery_info.routing_key` names where the message is actually
+        // going, so a worker's retry and `link` re-publishes come back to the
+        // same queue. An explicit `.routing_key(...)` wins over `.queue(...)`;
+        // with neither, the message is on Celery's default queue and says so.
+        // `delivery_tag` comes from `MessageProperties::default`, which mints a
+        // fresh one per message the way kombu's producer does.
+        let routing_key = self
+            .routing_key
+            .clone()
+            .or_else(|| self.queue.clone())
+            .unwrap_or_else(|| DEFAULT_CELERY_QUEUE.to_string());
+        let properties = MessageProperties {
+            priority: self.priority,
+            delivery_mode: if self.persistent { 2 } else { 1 },
+            correlation_id: Some(task_id.to_string()),
+            reply_to: self.reply_to,
+            delivery_info: DeliveryInfo::new(routing_key),
+            ..MessageProperties::default()
+        };
+
+        // Build message. Content encoding follows content type via
+        // `ContentType::default_content_encoding`, shared with
+        // `build_v5_message` (see `v5.rs`) so the two message-construction
+        // paths cannot independently drift on this mapping.
+        let content_encoding = self.content_type.default_content_encoding();
+
+        let message = Message {
+            headers,
+            properties,
+            body,
+            content_type: self.content_type.as_str().to_string(),
+            content_encoding: content_encoding.as_str().to_string(),
+        };
+
+        Ok(message)
+    }
+
+    /// Build and validate the message
+    pub fn build_validated(self) -> BuilderResult<Message> {
+        let message = self.build()?;
+        message.validate().map_err(BuilderError::from)?;
+        Ok(message)
+    }
+}
+
+/// Create a simple task message
+pub fn task(name: impl Into<String>) -> MessageBuilder {
+    MessageBuilder::new(name)
+}
+
+/// Create a task message with args
+pub fn task_with_args(name: impl Into<String>, args: Vec<Value>) -> MessageBuilder {
+    MessageBuilder::new(name).args(args)
+}
+
+/// Create a delayed task message
+pub fn delayed_task(name: impl Into<String>, countdown_seconds: i64) -> MessageBuilder {
+    MessageBuilder::new(name).countdown(countdown_seconds)
+}
+
+/// Create a scheduled task message
+pub fn scheduled_task(name: impl Into<String>, eta: DateTime<Utc>) -> MessageBuilder {
+    MessageBuilder::new(name).eta(eta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_basic_message_builder() {
+        let message = MessageBuilder::new("tasks.add")
+            .args(vec![json!(1), json!(2)])
+            .build()
+            .unwrap();
+
+        assert_eq!(message.task_name(), "tasks.add");
+        assert!(!message.body.is_empty());
+    }
+
+    #[test]
+    fn test_message_builder_with_id() {
+        let id = Uuid::new_v4();
+        let message = MessageBuilder::new("tasks.test").id(id).build().unwrap();
+
+        assert_eq!(message.task_id(), id);
+    }
+
+    #[test]
+    fn test_message_builder_with_priority() {
+        let message = MessageBuilder::new("tasks.test")
+            .priority(9)
+            .build()
+            .unwrap();
+
+        assert_eq!(message.properties.priority, Some(9));
+    }
+
+    #[test]
+    fn test_message_builder_with_priority_capped() {
+        let message = MessageBuilder::new("tasks.test")
+            .priority(100)
+            .build()
+            .unwrap();
+
+        assert_eq!(message.properties.priority, Some(9));
+    }
+
+    #[test]
+    fn test_message_builder_with_countdown() {
+        let message = MessageBuilder::new("tasks.test")
+            .countdown(60)
+            .build()
+            .unwrap();
+
+        assert!(message.has_eta());
+    }
+
+    #[test]
+    fn test_message_builder_with_eta() {
+        let eta = Utc::now() + Duration::hours(1);
+        let message = MessageBuilder::new("tasks.test").eta(eta).build().unwrap();
+
+        assert!(message.has_eta());
+        assert_eq!(message.headers.eta, Some(eta));
+    }
+
+    #[test]
+    fn test_message_builder_with_expires() {
+        let expires = Utc::now() + Duration::days(1);
+        let message = MessageBuilder::new("tasks.test")
+            .expires(expires)
+            .build()
+            .unwrap();
+
+        assert!(message.has_expires());
+    }
+
+    #[test]
+    fn test_message_builder_with_expires_in() {
+        let message = MessageBuilder::new("tasks.test")
+            .expires_in(Duration::hours(2))
+            .build()
+            .unwrap();
+
+        assert!(message.has_expires());
+    }
+
+    #[test]
+    fn test_message_builder_with_kwargs() {
+        let mut kwargs = HashMap::new();
+        kwargs.insert("x".to_string(), json!(10));
+
+        let message = MessageBuilder::new("tasks.test")
+            .kwargs(kwargs)
+            .kwarg("y", json!(20))
+            .build()
+            .unwrap();
+
+        assert!(!message.body.is_empty());
+    }
+
+    #[test]
+    fn test_message_builder_with_link() {
+        let message = MessageBuilder::new("tasks.first")
+            .link("tasks.second")
+            .link_error("tasks.on_error")
+            .build()
+            .unwrap();
+
+        assert!(!message.body.is_empty());
+    }
+
+    #[test]
+    fn test_message_builder_with_chain() {
+        let message = MessageBuilder::new("tasks.step1")
+            .chain_task("tasks.step2")
+            .chain_task("tasks.step3")
+            .build()
+            .unwrap();
+
+        assert!(!message.body.is_empty());
+    }
+
+    #[test]
+    fn test_message_builder_with_workflow_ids() {
+        let parent_id = Uuid::new_v4();
+        let root_id = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+
+        let message = MessageBuilder::new("tasks.test")
+            .parent(parent_id)
+            .root(root_id)
+            .group(group_id)
+            .build()
+            .unwrap();
+
+        assert_eq!(message.headers.parent_id, Some(parent_id));
+        assert_eq!(message.headers.root_id, Some(root_id));
+        assert_eq!(message.headers.group, Some(group_id));
+    }
+
+    #[test]
+    fn test_message_builder_non_persistent() {
+        let message = MessageBuilder::new("tasks.test")
+            .persistent(false)
+            .build()
+            .unwrap();
+
+        assert_eq!(message.properties.delivery_mode, 1);
+    }
+
+    #[test]
+    fn test_message_builder_with_reply_to() {
+        let message = MessageBuilder::new("tasks.test")
+            .reply_to("results-queue")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            message.properties.reply_to,
+            Some("results-queue".to_string())
+        );
+    }
+
+    #[test]
+    fn test_message_builder_with_extra_header() {
+        let message = MessageBuilder::new("tasks.test")
+            .header("custom", json!("value"))
+            .build()
+            .unwrap();
+
+        assert_eq!(message.headers.extra.get("custom"), Some(&json!("value")));
+    }
+
+    #[test]
+    fn test_task_helper() {
+        let message = task("tasks.add")
+            .arg(json!(1))
+            .arg(json!(2))
+            .build()
+            .unwrap();
+        assert_eq!(message.task_name(), "tasks.add");
+    }
+
+    #[test]
+    fn test_task_with_args_helper() {
+        let message = task_with_args("tasks.add", vec![json!(1), json!(2)])
+            .build()
+            .unwrap();
+        assert_eq!(message.task_name(), "tasks.add");
+    }
+
+    #[test]
+    fn test_delayed_task_helper() {
+        let message = delayed_task("tasks.later", 300).build().unwrap();
+        assert!(message.has_eta());
+    }
+
+    #[test]
+    fn test_scheduled_task_helper() {
+        let eta = Utc::now() + Duration::hours(1);
+        let message = scheduled_task("tasks.scheduled", eta).build().unwrap();
+        assert!(message.has_eta());
+    }
+
+    #[test]
+    fn test_build_validated() {
+        let message = MessageBuilder::new("tasks.test")
+            .args(vec![json!(1)])
+            .build_validated()
+            .unwrap();
+
+        assert_eq!(message.task_name(), "tasks.test");
+    }
+
+    #[test]
+    fn test_message_builder_applies_queue_routing_key_and_max_retries() {
+        // Regression: queue(), routing_key() and max_retries() must not be
+        // silently discarded by build().
+        let message = MessageBuilder::new("tasks.test")
+            .queue("high-priority")
+            .routing_key("tasks.high_priority")
+            .max_retries(5)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            message.headers.extra.get(QUEUE_HEADER),
+            Some(&json!("high-priority"))
+        );
+        assert_eq!(
+            message.headers.extra.get(ROUTING_KEY_HEADER),
+            Some(&json!("tasks.high_priority"))
+        );
+        assert_eq!(
+            message.headers.extra.get(MAX_RETRIES_HEADER),
+            Some(&json!(5))
+        );
+    }
+
+    #[test]
+    fn test_message_builder_without_queue_omits_queue_headers() {
+        // A builder that never calls .queue()/.routing_key()/.max_retries()
+        // must not fabricate those headers.
+        let message = MessageBuilder::new("tasks.test").build().unwrap();
+
+        assert!(!message.headers.extra.contains_key(QUEUE_HEADER));
+        assert!(!message.headers.extra.contains_key(ROUTING_KEY_HEADER));
+        assert!(!message.headers.extra.contains_key(MAX_RETRIES_HEADER));
+    }
+
+    #[test]
+    fn test_message_builder_explicit_header_overrides_queue_setter() {
+        // An explicit `.header(...)` call for the same key applied after
+        // `.queue(...)` wins, since extra headers are merged in afterward.
+        let message = MessageBuilder::new("tasks.test")
+            .queue("default")
+            .header(QUEUE_HEADER, json!("override"))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            message.headers.extra.get(QUEUE_HEADER),
+            Some(&json!("override"))
+        );
+    }
+
+    #[test]
+    fn test_message_builder_json_content_encoding_is_utf8() {
+        let message = MessageBuilder::new("tasks.test")
+            .content_type(ContentType::Json)
+            .build()
+            .unwrap();
+
+        assert_eq!(message.content_encoding, "utf-8");
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_message_builder_msgpack_content_encoding_is_binary() {
+        // Regression: a msgpack-typed built message must not declare
+        // content-encoding: utf-8 for what is actually a binary body.
+        let message = MessageBuilder::new("tasks.test")
+            .content_type(ContentType::MessagePack)
+            .build()
+            .unwrap();
+
+        assert_eq!(message.content_encoding, "binary");
+    }
+
+    #[test]
+    fn test_message_builder_custom_content_type_encoding_is_binary() {
+        let message = MessageBuilder::new("tasks.test")
+            .content_type(ContentType::Custom("application/x-custom".to_string()))
+            .build()
+            .unwrap();
+
+        assert_eq!(message.content_encoding, "binary");
+    }
+
+    /// Regression: a `MessageBuilder` envelope used to omit `delivery_tag` and
+    /// `delivery_info`, the two properties
+    /// `kombu.transport.virtual.base.Message.__init__` indexes without a
+    /// default -- so every message the ordinary CeleRS producer path published
+    /// raised `KeyError` inside a Celery worker's consumer callback and took
+    /// the worker's event loop down with it.
+    ///
+    /// `tests/python-compat/test_celers_to_python.py` proves the same thing
+    /// against a live worker; this pins it without one.
+    #[test]
+    fn test_built_envelope_carries_the_properties_kombu_indexes() {
+        let message = MessageBuilder::new("tasks.add")
+            .args(vec![json!(4), json!(5)])
+            .build()
+            .unwrap();
+
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert!(
+            value["properties"]["delivery_tag"].is_string(),
+            "kombu indexes properties['delivery_tag'] directly"
+        );
+        assert_eq!(
+            value["properties"]["delivery_info"],
+            json!({"exchange": "", "routing_key": "celery"})
+        );
+
+        // The structural verifier agrees, which is what the interop suite and
+        // every other producer path lean on.
+        crate::compat::verify_message_format(&message).expect("a deliverable v2 envelope");
+    }
+
+    /// Two built messages are two deliveries: sharing a tag would make one
+    /// acknowledgement drop the other message from a consumer's unacked table.
+    #[test]
+    fn test_each_built_message_gets_its_own_delivery_tag() {
+        let first = MessageBuilder::new("tasks.add").build().unwrap();
+        let second = MessageBuilder::new("tasks.add").build().unwrap();
+
+        assert_ne!(
+            first.properties.delivery_tag,
+            second.properties.delivery_tag
+        );
+    }
+
+    /// The routing key must name the queue the message is actually on: a
+    /// Celery worker re-publishes retries and `link` callbacks with
+    /// `self.request.delivery_info`, so a wrong one sends a task's retries to a
+    /// queue nobody consumes.
+    #[test]
+    fn test_built_envelope_routing_key_names_the_queue() {
+        let queued = MessageBuilder::new("tasks.add")
+            .queue("payments")
+            .build()
+            .unwrap();
+        assert_eq!(queued.properties.routing_key(), "payments");
+
+        // An explicit routing key wins over the queue name, matching Celery's
+        // own `apply_async(queue=..., routing_key=...)`.
+        let routed = MessageBuilder::new("tasks.add")
+            .queue("payments")
+            .routing_key("payments.high")
+            .build()
+            .unwrap();
+        assert_eq!(routed.properties.routing_key(), "payments.high");
+
+        // With neither, the message is on Celery's default queue and says so.
+        let plain = MessageBuilder::new("tasks.add").build().unwrap();
+        assert_eq!(plain.properties.routing_key(), DEFAULT_CELERY_QUEUE);
+        assert_eq!(plain.properties.delivery_info.exchange, "");
+    }
+
+    /// Regression: `build()` never set `argsrepr` / `kwargsrepr`, so every task
+    /// published through the ordinary producer path showed a blank argument
+    /// list in Flower, `celery events` and `celery inspect` -- all of which
+    /// read those headers rather than deserializing the body.
+    #[test]
+    fn test_built_envelope_carries_python_arg_reprs() {
+        let message = MessageBuilder::new("tasks.greet")
+            .args(vec![json!("Ada")])
+            .kwarg("loud", json!(true))
+            .build()
+            .unwrap();
+
+        // Python literals, not Rust `Debug`: a one-element tuple keeps its
+        // comma and `true` renders as `True`.
+        assert_eq!(message.headers.argsrepr(), Some("('Ada',)"));
+        assert_eq!(message.headers.kwargsrepr(), Some("{'loud': True}"));
+
+        let empty = MessageBuilder::new("tasks.noop").build().unwrap();
+        assert_eq!(empty.headers.argsrepr(), Some("()"));
+        assert_eq!(empty.headers.kwargsrepr(), Some("{}"));
+    }
+
+    /// The reprs describe the body that was actually encoded, so a monitor
+    /// never shows arguments the worker did not receive.
+    #[test]
+    fn test_built_arg_reprs_describe_the_encoded_body() {
+        let message = MessageBuilder::new("tasks.add")
+            .args(vec![json!(4), json!(5)])
+            .build()
+            .unwrap();
+
+        let body = crate::embed::EmbeddedBody::decode(&message.body).expect("decode body");
+        assert_eq!(
+            message.headers.argsrepr(),
+            Some(crate::compat::python_args_repr(&body.args).as_str())
+        );
+    }
+
+    /// An explicit `.header("argsrepr", ...)` still wins, since caller extras
+    /// are merged after the computed headers.
+    #[test]
+    fn test_explicit_argsrepr_header_overrides_the_computed_one() {
+        let message = MessageBuilder::new("tasks.add")
+            .args(vec![json!(4)])
+            .header("argsrepr", json!("(redacted)"))
+            .build()
+            .unwrap();
+
+        assert_eq!(message.headers.argsrepr(), Some("(redacted)"));
+    }
+
+    #[test]
+    fn test_builder_error_display() {
+        let err = BuilderError::MissingTaskName;
+        assert_eq!(err.to_string(), "Task name is required");
+
+        let err = BuilderError::SerializationError("test".to_string());
+        assert!(err.to_string().contains("test"));
+
+        let err = BuilderError::ValidationError("invalid".to_string());
+        assert!(err.to_string().contains("invalid"));
+    }
+}

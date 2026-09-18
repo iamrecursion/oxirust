@@ -1,0 +1,103 @@
+[package]
+name = "oxigrid"
+version = "0.1.3"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Pure Rust Energy Systems Simulation & Optimization Library"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+repository = "https://github.com/cool-japan/oxigrid"
+homepage = "https://github.com/cool-japan/oxigrid"
+documentation = "https://docs.rs/oxigrid"
+readme = "README.md"
+keywords = ["power-systems", "energy", "simulation", "grid", "optimization"]
+categories = ["science", "simulation", "algorithms"]
+
+[dependencies]
+petgraph = "0.8.3"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0.18"
+log = "0.4"
+tracing = "0.1"
+nalgebra = "0.35.0"
+sprs = "0.11.4"
+num-complex = { version = "0.4.6", default-features = false, features = ["serde", "libm"] }
+rayon = { version = "1.12", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.11.0"
+approx = "0.5"
+
+[features]
+default = [
+    "std",
+    "powerflow",
+    "stability",
+    "battery",
+    "battery-p2d",
+    "renewable",
+    "optimize",
+    "harmonics",
+    "protection",
+    "powerelectronics",
+]
+std = []
+no_std_compat = []
+powerflow = []
+stability = ["powerflow"]
+battery = []
+battery-p2d = ["battery"]
+renewable = []
+optimize = ["powerflow"]
+harmonics = []
+protection = ["powerflow"]
+powerelectronics = []
+forecast-ml = ["renewable"]
+io-matpower = ["powerflow"]
+io-csv = []
+io-oxirs = []
+simd = []
+parallel = ["std", "dep:rayon"]
+
+[[example]]
+name = "ieee14_powerflow"
+required-features = ["powerflow"]
+
+[[example]]
+name = "battery_cycling"
+required-features = ["battery"]
+
+[[example]]
+name = "microgrid_optimization"
+required-features = ["optimize", "renewable"]
+
+[[example]]
+name = "renewable_forecast"
+required-features = ["renewable"]
+
+[[bench]]
+name = "powerflow_bench"
+required-features = ["powerflow"]
+harness = false
+
+[[bench]]
+name = "battery_bench"
+required-features = ["battery"]
+harness = false
+
+[[bench]]
+name = "opf_bench"
+required-features = ["optimize"]
+harness = false
+
+[[test]]
+name = "kokam_75ah_test"
+path = "tests/battery_validation/kokam_75ah_test.rs"
+required-features = ["battery"]
+
+[[test]]
+name = "lfp_cell_test"
+path = "tests/battery_validation/lfp_cell_test.rs"
+required-features = ["battery"]

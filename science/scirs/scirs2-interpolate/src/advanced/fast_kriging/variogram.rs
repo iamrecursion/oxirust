@@ -1,0 +1,453 @@
+//! Variogram Modeling for Fast Kriging
+//!
+//! This module provides functionality for estimating and modeling variograms,
+//! which describe the spatial correlation structure of a dataset.
+
+use crate::advanced::enhanced_kriging::AnisotropicCovariance;
+use crate::error::InterpolateResult;
+use scirs2_core::ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use scirs2_core::numeric::{Float, FromPrimitive};
+use std::fmt::{Debug, Display};
+use std::ops::{Add, Div, Mul, Sub};
+
+/// Variogram model types for kriging
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VariogramModel {
+    /// Spherical variogram model
+    Spherical,
+
+    /// Exponential variogram model
+    Exponential,
+
+    /// Gaussian variogram model
+    Gaussian,
+
+    /// Matern variogram model with smoothness parameter
+    Matern(f64),
+
+    /// Power variogram model
+    Power(f64),
+}
+
+/// Empirical variogram bin
+#[derive(Debug, Clone)]
+pub struct VariogramBin<F: Float> {
+    /// Distance at center of bin
+    pub distance: F,
+
+    /// Average semivariance in bin
+    pub semivariance: F,
+
+    /// Number of point pairs in bin
+    pub count: usize,
+}
+
+/// Compute empirical variogram from data
+///
+/// This function computes the empirical variogram which describes how the variance
+/// between sample points increases with distance. The variogram is fundamental for
+/// understanding spatial correlation structure.
+///
+/// # Arguments
+///
+/// * `points` - Spatial coordinates of data points (n_points × n_dimensions)
+/// * `values` - Values at each data point (n_points)
+/// * `n_bins` - Number of distance bins to use for the variogram
+/// * `max_distance` - Maximum distance to consider (if None, uses dataset extent)
+///
+/// # Returns
+///
+/// A vector of `VariogramBin` structs containing distance and semivariance values
+///
+/// # Example
+///
+/// ```
+/// use scirs2_core::ndarray::{Array1, Array2};
+/// use scirs2_interpolate::advanced::fast_kriging::variogram::compute_empirical_variogram;
+///
+/// // Create a simple 2D dataset
+/// let points = Array2::from_shape_vec((5, 2), vec![
+///     0.0, 0.0,
+///     1.0, 0.0,
+///     0.0, 1.0,
+///     1.0, 1.0,
+///     0.5, 0.5,
+/// ]).expect("Operation failed");
+///
+/// let values = Array1::from_vec(vec![1.0, 2.0, 2.0, 4.0, 2.5]);
+///
+/// // Compute empirical variogram with 10 bins
+/// let variogram_bins = compute_empirical_variogram(
+///     &points.view(),
+///     &values.view(),
+///     10,
+///     None
+/// ).expect("Operation failed");
+///
+/// // Each bin contains distance, semivariance, and count
+/// for bin in &variogram_bins {
+///     println!("Distance: {:.2}, Semivariance: {:.3}, Count: {}",
+///              bin.distance, bin.semivariance, bin.count);
+/// }
+/// ```
+#[allow(dead_code)]
+pub fn compute_empirical_variogram<F>(
+    points: &ArrayView2<F>,
+    values: &ArrayView1<F>,
+    n_bins: usize,
+    max_distance: Option<F>,
+) -> InterpolateResult<Vec<VariogramBin<F>>>
+where
+    F: Float + FromPrimitive + Debug + Display,
+{
+    let n_points = points.shape()[0];
+    let n_dims = points.shape()[1];
+
+    // Validate inputs
+    if n_points != values.len() {
+        return Err(crate::error::InterpolateError::DimensionMismatch(
+            "Number of points must match number of values".to_string(),
+        ));
+    }
+
+    if n_points < 2 {
+        return Err(crate::error::InterpolateError::InvalidValue(
+            "At least 2 points are required for variogram estimation".to_string(),
+        ));
+    }
+
+    // Calculate maximum _distance if not provided
+    let max_dist = match max_distance {
+        Some(dist) => dist,
+        None => {
+            // Estimate max _distance as the diagonal of the bounding box
+            let mut max_d = F::zero();
+            for i in 0..n_points {
+                for j in (i + 1)..n_points {
+                    let mut dist_sq = F::zero();
+                    for d in 0..n_dims {
+                        let diff = points[[i, d]] - points[[j, d]];
+                        dist_sq = dist_sq + diff * diff;
+                    }
+                    let dist = dist_sq.sqrt();
+                    if dist > max_d {
+                        max_d = dist;
+                    }
+                }
+            }
+            max_d
+        }
+    };
+
+    // Calculate bin width
+    let bin_width = max_dist / F::from_usize(n_bins).expect("Operation failed");
+
+    // Initialize _bins
+    let mut _bins = vec![
+        VariogramBin {
+            _distance: F::zero(),
+            semivariance: F::zero(),
+            count: 0,
+        };
+        n_bins
+    ];
+
+    // For each bin, set the center _distance
+    for i in 0..n_bins {
+        bins[i]._distance = F::from_usize(i).expect("Operation failed") * bin_width + bin_width / F::from(2).expect("Failed to convert constant to float");
+    }
+
+    // Compute empirical variogram by comparing all pairs of points
+    for i in 0..n_points {
+        for j in (i + 1)..n_points {
+            // Calculate _distance between points
+            let mut dist_sq = F::zero();
+            for d in 0..n_dims {
+                let diff = points[[i, d]] - points[[j, d]];
+                dist_sq = dist_sq + diff * diff;
+            }
+            let dist = dist_sq.sqrt();
+
+            // Calculate squared difference in values
+            let value_diff = values[i] - values[j];
+            let semivariogram_value = value_diff * value_diff / F::from(2).expect("Failed to convert constant to float");
+
+            // Find appropriate bin
+            let bin_idx = (dist / bin_width).to_usize().unwrap_or(n_bins - 1);
+            if bin_idx < n_bins {
+                bins[bin_idx].semivariance = bins[bin_idx].semivariance + semivariogram_value;
+                bins[bin_idx].count += 1;
+            }
+        }
+    }
+
+    // Normalize _bins by count
+    for bin in &mut _bins {
+        if bin.count > 0 {
+            bin.semivariance = bin.semivariance / F::from_usize(bin.count).expect("Operation failed");
+        }
+    }
+
+    // Filter out empty _bins
+    let valid_bins: Vec<VariogramBin<F>> = bins.into_iter().filter(|bin| bin.count > 0).collect();
+
+    if valid_bins.is_empty() {
+        return Err(crate::error::InterpolateError::ComputationError(
+            "No valid _bins found for variogram estimation".to_string(),
+        ));
+    }
+
+    Ok(valid_bins)
+}
+
+/// Fit a variogram model to empirical data
+///
+/// This function fits a theoretical variogram model to empirical variogram data
+/// using least squares estimation. The fitted model can then be used for kriging
+/// interpolation.
+///
+/// # Arguments
+///
+/// * `bins` - Empirical variogram bins from `compute_empirical_variogram`
+/// * `model` - Type of variogram model to fit
+///
+/// # Returns
+///
+/// A tuple containing (nugget, sill, range) parameters for the fitted model
+///
+/// # Example
+///
+/// ```
+/// use scirs2_core::ndarray::{Array1, Array2};
+/// use scirs2_interpolate::advanced::fast_kriging::variogram::{
+///     compute_empirical_variogram, fit_variogram_model, VariogramModel
+/// };
+///
+/// // Create sample data
+/// let points = Array2::from_shape_vec((10, 2), vec![
+///     0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0,
+///     0.0, 1.0, 1.0, 1.0, 2.0, 1.0, 3.0, 1.0, 4.0, 1.0,
+/// ]).expect("Operation failed");
+///
+/// let values = Array1::from_vec(vec![
+///     1.0, 1.2, 1.8, 2.1, 2.5,
+///     1.1, 1.4, 1.9, 2.2, 2.6,
+/// ]);
+///
+/// // Compute empirical variogram
+/// let bins = compute_empirical_variogram(
+///     &points.view(),
+///     &values.view(),
+///     8,
+///     None
+/// ).expect("Operation failed");
+///
+/// // Fit spherical variogram model
+/// let (nugget, sill, range) = fit_variogram_model(
+///     &bins,
+///     VariogramModel::Spherical
+/// ).expect("Operation failed");
+///
+/// println!("Fitted parameters: nugget={:.3}, sill={:.3}, range={:.3}",
+///          nugget, sill, range);
+/// ```
+#[allow(dead_code)]
+pub fn fit_variogram_model<F>(
+    bins: &[VariogramBin<F>],
+    model: VariogramModel,
+) -> InterpolateResult<(F, F, F)>
+where
+    F: Float + FromPrimitive + Debug + Display + 'static,
+{
+    if bins.is_empty() {
+        return Err(crate::error::InterpolateError::InvalidValue(
+            "Cannot fit variogram model to empty bins".to_string(),
+        ));
+    }
+
+    #[cfg(feature = "linalg")]
+    {
+        use ndarray_linalg::LeastSquaresSvd;
+
+        // Initial guess for parameters
+        let max_semivariance = bins
+            .iter()
+            .map(|bin| bin.semivariance)
+            .fold(F::zero(), |a, b| if a > b { a } else { b });
+
+        let max_distance =
+            bins.iter()
+                .map(|bin| bin.distance)
+                .fold(F::zero(), |a, b| if a > b { a } else { b });
+
+        // Initial guess for parameters
+        let mut nugget = F::from_f64(0.001).expect("Operation failed") * max_semivariance;
+        let mut sill = max_semivariance - nugget;
+        let mut range = max_distance / F::from_f64(3.0).expect("Operation failed");
+
+        // Create design matrix and right-hand side for least squares
+        let n_bins = bins.len();
+        let mut a = Array2::<f64>::zeros((n_bins, 3));
+        let mut b = Array1::<f64>::zeros(n_bins);
+
+        for i in 0..n_bins {
+            let h = bins[i].distance.to_f64().expect("Operation failed");
+            let gamma = bins[i].semivariance.to_f64().expect("Operation failed");
+
+            a[[i, 0]] = 1.0; // Nugget effect
+
+            // Compute the variogram model value
+            let model_val = match model {
+                VariogramModel::Spherical => {
+                    let range_val = range.to_f64().expect("Operation failed");
+                    if h <= range_val {
+                        1.5 * (h / range_val) - 0.5 * (h / range_val).powi(3)
+                    } else {
+                        1.0
+                    }
+                }
+                VariogramModel::Exponential => {
+                    let range_val = range.to_f64().expect("Operation failed");
+                    1.0 - (-3.0 * h / range_val).exp()
+                }
+                VariogramModel::Gaussian => {
+                    let range_val = range.to_f64().expect("Operation failed");
+                    1.0 - (-3.0 * (h / range_val).powi(2)).exp()
+                }
+                VariogramModel::Matern(nu) => {
+                    let range_val = range.to_f64().expect("Operation failed");
+                    if h <= 1e-6 {
+                        0.0
+                    } else {
+                        // For simplicity, we'll approximate Matern
+                        // In a full implementation, this would use Bessel functions
+                        1.0 - (-3.0 * h / range_val).powf(nu).exp()
+                    }
+                }
+                VariogramModel::Power(exponent) => {
+                    let range_val = range.to_f64().expect("Operation failed");
+                    (h / range_val).powf(exponent)
+                }
+            };
+
+            a[[i, 1]] = model_val; // Sill component
+            a[[i, 2]] = h; // Range component (for optimization)
+            b[i] = gamma;
+        }
+
+        // Solve least squares problem
+        match a.least_squares(&b) {
+            Ok(solution) => {
+                // Update parameters
+                nugget = F::from_f64(solution[0]).expect("Operation failed");
+                sill = F::from_f64(solution[1]).expect("Operation failed");
+                range = F::from_f64(solution[2]).expect("Operation failed");
+
+                // Ensure parameters are sensible
+                if nugget < F::zero() {
+                    nugget = F::from_f64(0.001).expect("Operation failed") * max_semivariance;
+                }
+
+                if sill < F::zero() {
+                    sill = max_semivariance - nugget;
+                }
+
+                if range < F::zero() {
+                    range = max_distance / F::from_f64(3.0).expect("Operation failed");
+                }
+
+                Ok((nugget, sill, range))
+            }
+            Err(_) => {
+                // Fallback to initial values if least squares fails
+                Ok((nugget, sill, range))
+            }
+        }
+    }
+
+    #[cfg(not(feature = "linalg"))]
+    {
+        // Without linalg, use a simple heuristic
+        let max_semivariance = bins
+            .iter()
+            .map(|bin| bin.semivariance)
+            .fold(F::zero(), |a, b| if a > b { a } else { b });
+
+        let max_distance =
+            bins.iter()
+                .map(|bin| bin.distance)
+                .fold(F::zero(), |a, b| if a > b { a } else { b });
+
+        // Estimate nugget as the y-intercept (value at distance near 0)
+        let mut nugget = if !bins.is_empty() {
+            // Find bin with smallest distance
+            let min_dist_bin = bins
+                .iter()
+                .min_by(|a, b| a.distance.partial_cmp(&b.distance).expect("Operation failed"))
+                .expect("Operation failed");
+
+            min_dist_bin.semivariance
+        } else {
+            F::from_f64(0.05).expect("Operation failed") * max_semivariance
+        };
+
+        // Ensure nugget is positive but not too large
+        if nugget <= F::zero() || nugget >= max_semivariance {
+            nugget = F::from_f64(0.05).expect("Operation failed") * max_semivariance;
+        }
+
+        // Estimate sill as maximum semivariance minus nugget
+        let sill = max_semivariance - nugget;
+
+        // Estimate range as 1/3 of maximum distance
+        let range = max_distance / F::from_f64(3.0).expect("Operation failed");
+
+        Ok((nugget, sill, range))
+    }
+}
+
+/// Convert variogram parameters to covariance parameters
+#[allow(dead_code)]
+pub fn variogram_to_covariance<F>(
+    nugget: F,
+    sill: F,
+    range: F,
+    model: VariogramModel,
+) -> AnisotropicCovariance<F>
+where
+    F: Float + FromPrimitive + Debug + Display,
+{
+    use crate::advanced::kriging::CovarianceFunction;
+
+    // Convert variogram model to covariance function
+    let (cov_fn, extra_params) = match model {
+        VariogramModel::Spherical => (CovarianceFunction::Matern52, F::zero()),
+        VariogramModel::Exponential => (CovarianceFunction::Exponential, F::zero()),
+        VariogramModel::Gaussian => (CovarianceFunction::SquaredExponential, F::zero()),
+        VariogramModel::Matern(nu) => {
+            if nu < 1.0 {
+                (CovarianceFunction::Exponential, F::zero())
+            } else if nu < 2.0 {
+                (CovarianceFunction::Matern32, F::zero())
+            } else {
+                (CovarianceFunction::Matern52, F::zero())
+            }
+        }
+        VariogramModel::Power(_) => (
+            CovarianceFunction::RationalQuadratic,
+            F::from_f64(0.5).expect("Operation failed"),
+        ),
+    };
+
+    // Create anisotropic covariance object
+    // For simplicity, we'll use isotropic scaling here
+    let length_scales = vec![range];
+
+    AnisotropicCovariance {
+        cov_fn,
+        length_scales,
+        sigma_sq: sill,
+        nugget,
+        extra_params,
+    }
+}

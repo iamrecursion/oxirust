@@ -1,0 +1,9 @@
+{
+  "name": "filter_eq",
+  "args": ["-i", "in.mkv", "-vf", "eq=brightness=0.06", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_filters": 1
+  }
+}

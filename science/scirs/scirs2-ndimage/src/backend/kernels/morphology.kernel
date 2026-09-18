@@ -1,0 +1,396 @@
+// Enhanced morphological operations kernels for GPU execution
+// Optimized with boundary handling and specialized implementations
+
+// Fast erosion for small square structuring elements
+__kernel void erosion_2d_fast_square(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const int radius
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float min_val = INFINITY;
+    
+    // Optimized square structuring element
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            int ix = clamp(x + dx, 0, width - 1);
+            int iy = clamp(y + dy, 0, height - 1);
+            float val = input[iy * width + ix];
+            min_val = fmin(min_val, val);
+        }
+    }
+    
+    output[y * width + x] = min_val;
+}
+
+// Fast dilation for small square structuring elements
+__kernel void dilation_2d_fast_square(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const int radius
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    float max_val = -INFINITY;
+    
+    // Optimized square structuring element
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            int ix = clamp(x + dx, 0, width - 1);
+            int iy = clamp(y + dy, 0, height - 1);
+            float val = input[iy * width + ix];
+            max_val = fmax(max_val, val);
+        }
+    }
+    
+    output[y * width + x] = max_val;
+}
+
+__kernel void erosion_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    float min_val = INFINITY;
+    bool found_valid = false;
+    
+    // Apply erosion with proper boundary handling
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            // Check if structuring element is active at this position
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                // Calculate input coordinates
+                int ix = x + sx - shalf_w;
+                int iy = y + sy - shalf_h;
+                
+                // Use reflection padding for boundaries
+                if (ix < 0) ix = -ix;
+                if (ix >= width) ix = 2 * width - ix - 2;
+                if (iy < 0) iy = -iy;
+                if (iy >= height) iy = 2 * height - iy - 2;
+                
+                ix = clamp(ix, 0, width - 1);
+                iy = clamp(iy, 0, height - 1);
+                
+                float val = input[iy * width + ix];
+                min_val = fmin(min_val, val);
+                found_valid = true;
+            }
+        }
+    }
+    
+    // If no valid pixels found, keep original value
+    output[y * width + x] = found_valid ? min_val : input[y * width + x];
+}
+
+__kernel void dilation_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    float max_val = -INFINITY;
+    bool found_valid = false;
+    
+    // Apply dilation with proper boundary handling
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            // Check if structuring element is active at this position
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                // Calculate input coordinates (note: we flip the structure)
+                int ix = x - sx + shalf_w;
+                int iy = y - sy + shalf_h;
+                
+                // Use reflection padding for boundaries
+                if (ix < 0) ix = -ix;
+                if (ix >= width) ix = 2 * width - ix - 2;
+                if (iy < 0) iy = -iy;
+                if (iy >= height) iy = 2 * height - iy - 2;
+                
+                ix = clamp(ix, 0, width - 1);
+                iy = clamp(iy, 0, height - 1);
+                
+                float val = input[iy * width + ix];
+                max_val = fmax(max_val, val);
+                found_valid = true;
+            }
+        }
+    }
+    
+    // If no valid pixels found, keep original value
+    output[y * width + x] = found_valid ? max_val : input[y * width + x];
+}
+
+// Opening operation (erosion followed by dilation)
+__kernel void opening_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* temp,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    // First pass: erosion
+    float min_val = INFINITY;
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                int ix = clamp(x + sx - shalf_w, 0, width - 1);
+                int iy = clamp(y + sy - shalf_h, 0, height - 1);
+                min_val = fmin(min_val, input[iy * width + ix]);
+            }
+        }
+    }
+    temp[y * width + x] = min_val;
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    
+    // Second pass: dilation
+    float max_val = -INFINITY;
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                int ix = clamp(x - sx + shalf_w, 0, width - 1);
+                int iy = clamp(y - sy + shalf_h, 0, height - 1);
+                max_val = fmax(max_val, temp[iy * width + ix]);
+            }
+        }
+    }
+    output[y * width + x] = max_val;
+}
+
+// Closing operation (dilation followed by erosion)
+__kernel void closing_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* temp,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    // First pass: dilation
+    float max_val = -INFINITY;
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                int ix = clamp(x - sx + shalf_w, 0, width - 1);
+                int iy = clamp(y - sy + shalf_h, 0, height - 1);
+                max_val = fmax(max_val, input[iy * width + ix]);
+            }
+        }
+    }
+    temp[y * width + x] = max_val;
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    
+    // Second pass: erosion
+    float min_val = INFINITY;
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                int ix = clamp(x + sx - shalf_w, 0, width - 1);
+                int iy = clamp(y + sy - shalf_h, 0, height - 1);
+                min_val = fmin(min_val, temp[iy * width + ix]);
+            }
+        }
+    }
+    output[y * width + x] = min_val;
+}
+
+// Morphological gradient (difference between dilation and erosion)
+__kernel void morphological_gradient_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    // Compute both erosion and dilation
+    float min_val = INFINITY;
+    float max_val = -INFINITY;
+    
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                // Erosion
+                int ix_e = clamp(x + sx - shalf_w, 0, width - 1);
+                int iy_e = clamp(y + sy - shalf_h, 0, height - 1);
+                min_val = fmin(min_val, input[iy_e * width + ix_e]);
+                
+                // Dilation
+                int ix_d = clamp(x - sx + shalf_w, 0, width - 1);
+                int iy_d = clamp(y - sy + shalf_h, 0, height - 1);
+                max_val = fmax(max_val, input[iy_d * width + ix_d]);
+            }
+        }
+    }
+    
+    // Gradient is the difference
+    output[y * width + x] = max_val - min_val;
+}
+
+// Top-hat transform (original - opening)
+__kernel void tophat_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* temp,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    // Compute opening (erosion then dilation)
+    // First: erosion
+    float min_val = INFINITY;
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                int ix = clamp(x + sx - shalf_w, 0, width - 1);
+                int iy = clamp(y + sy - shalf_h, 0, height - 1);
+                min_val = fmin(min_val, input[iy * width + ix]);
+            }
+        }
+    }
+    temp[y * width + x] = min_val;
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    
+    // Second: dilation
+    float max_val = -INFINITY;
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                int ix = clamp(x - sx + shalf_w, 0, width - 1);
+                int iy = clamp(y - sy + shalf_h, 0, height - 1);
+                max_val = fmax(max_val, temp[iy * width + ix]);
+            }
+        }
+    }
+    
+    // Top-hat: original - opening
+    output[y * width + x] = input[y * width + x] - max_val;
+}
+
+// Bottom-hat transform (closing - original) 
+__kernel void bottomhat_2d(
+    __global const float* input,
+    __global const float* structure,
+    __global float* temp,
+    __global float* output,
+    const int height,
+    const int width,
+    const int struct_height,
+    const int struct_width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int shalf_h = struct_height / 2;
+    int shalf_w = struct_width / 2;
+    
+    // Compute closing (dilation then erosion)
+    // First: dilation
+    float max_val = -INFINITY;
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                int ix = clamp(x - sx + shalf_w, 0, width - 1);
+                int iy = clamp(y - sy + shalf_h, 0, height - 1);
+                max_val = fmax(max_val, input[iy * width + ix]);
+            }
+        }
+    }
+    temp[y * width + x] = max_val;
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    
+    // Second: erosion
+    float min_val = INFINITY;
+    for (int sy = 0; sy < struct_height; sy++) {
+        for (int sx = 0; sx < struct_width; sx++) {
+            if (structure[sy * struct_width + sx] > 0.0f) {
+                int ix = clamp(x + sx - shalf_w, 0, width - 1);
+                int iy = clamp(y + sy - shalf_h, 0, height - 1);
+                min_val = fmin(min_val, temp[iy * width + ix]);
+            }
+        }
+    }
+    
+    // Bottom-hat: closing - original
+    output[y * width + x] = min_val - input[y * width + x];
+}

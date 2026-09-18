@@ -1,0 +1,13 @@
+{
+  "name": "combo_filter_codec",
+  "args": ["-i", "in.mkv", "-c:v", "libaom-av1", "-c:a", "libopus", "-vf", "scale=1920:1080", "-af", "loudnorm=I=-23", "-crf", "30", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_codec": "av1",
+    "audio_codec": "opus",
+    "video_filters": 1,
+    "audio_filters": 1,
+    "crf": 30.0
+  }
+}

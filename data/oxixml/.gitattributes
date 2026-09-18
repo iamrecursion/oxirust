@@ -1,0 +1,7 @@
+# Normalize all text files to LF in the index *and* in the working tree.
+# Several tests compare serializer output (always "\n") against raw string
+# literals embedded in the test sources, so a CRLF checkout breaks them.
+* text=auto eol=lf
+
+# Binary fixtures: never touch.
+*.hdt binary

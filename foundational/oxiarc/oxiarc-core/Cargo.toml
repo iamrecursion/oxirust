@@ -1,0 +1,46 @@
+[package]
+name = "oxiarc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+description = "Core components for OxiArc - BitReader/Writer, CRC, traits, and error types"
+keywords = ["archive", "compression", "bitstream", "crc"]
+categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+async-io = ["dep:tokio"]
+# Deprecated no-op; SIMD is now auto-enabled via cfg(target_arch) on x86_64/aarch64.
+# Kept as a backward-compatible alias — will be removed in a future minor version.
+# Any existing `features = ["simd"]` in downstream Cargo.toml files continues to compile.
+simd = []
+# Memory-mapped file support for efficient large file access
+mmap = ["dep:memmap2"]
+# Serde serialization/deserialization support for entry types
+serde = ["dep:serde"]
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "crc_bench"
+harness = false
+
+[lints]
+workspace = true

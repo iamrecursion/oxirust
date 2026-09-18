@@ -1,0 +1,508 @@
+//! Public convolution API.
+//!
+//! High-level functions for convolution operations that automatically select
+//! the optimal algorithm and dispatch to the appropriate kernel engine.
+//! These are the primary entry points for end users of the DNN crate.
+
+use oxicuda_blas::GpuFloat;
+use oxicuda_memory::DeviceBuffer;
+
+use crate::error::{DnnError, DnnResult};
+use crate::handle::DnnHandle;
+use crate::types::{Activation, ConvAlgorithm, ConvolutionDescriptor, TensorDesc, TensorDescMut};
+
+use super::descriptor::ConvProblem;
+use super::dgrad::implicit_gemm::DgradImplicitGemm;
+use super::fft_conv::FftConv2dPlan;
+use super::fprop::direct::{Conv1x1, DepthwiseConv};
+use super::fprop::im2col_gemm::Im2colGemmConv;
+use super::fprop::implicit_gemm::ImplicitGemmConv;
+use super::fprop::winograd::WinogradConv;
+use super::fused::{FusedBnParams, apply_fused_bn_activation};
+use super::wgrad::implicit_gemm::WgradImplicitGemm;
+
+// ---------------------------------------------------------------------------
+// conv_forward
+// ---------------------------------------------------------------------------
+
+/// Performs a forward convolution.
+///
+/// Automatically selects the optimal algorithm based on problem dimensions
+/// and target architecture. The caller may optionally provide a workspace
+/// buffer for algorithms that require one (im2col, Winograd, FFT).
+///
+/// # Arguments
+///
+/// * `handle` — DNN handle providing CUDA context, stream, and BLAS access.
+/// * `input` — Input tensor descriptor `[N, C, H, W]` or `[N, C, D, H, W]`.
+/// * `filter` — Filter tensor descriptor `[K, C/g, R, S]`.
+/// * `output` — Mutable output tensor descriptor `[N, K, P, Q]`.
+/// * `conv_desc` — Convolution parameters (padding, stride, dilation, groups).
+/// * `workspace` — Optional workspace buffer for algorithms that need it.
+///
+/// # Errors
+///
+/// Returns [`DnnError::InvalidDimension`] if tensor shapes are inconsistent.
+/// Returns [`DnnError::WorkspaceRequired`] if the selected algorithm needs
+/// workspace but none (or too small) was provided.
+/// Returns other errors from PTX generation, module loading, or kernel launch.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use oxicuda_dnn::conv::api::conv_forward;
+/// use oxicuda_dnn::types::{ConvolutionDescriptor, TensorDesc, TensorDescMut};
+/// use oxicuda_dnn::handle::DnnHandle;
+/// # fn example(handle: &DnnHandle,
+/// #            input: &TensorDesc<f32>,
+/// #            filter: &TensorDesc<f32>,
+/// #            output: &mut TensorDescMut<f32>) -> Result<(), oxicuda_dnn::error::DnnError> {
+/// let conv_desc = ConvolutionDescriptor::conv2d(1, 1, 1, 1, 1, 1, 1)?;
+/// conv_forward(handle, input, filter, output, &conv_desc, None)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn conv_forward<T: GpuFloat>(
+    handle: &DnnHandle,
+    input: &TensorDesc<T>,
+    filter: &TensorDesc<T>,
+    output: &mut TensorDescMut<T>,
+    conv_desc: &ConvolutionDescriptor,
+    workspace: Option<&mut DeviceBuffer<u8>>,
+) -> DnnResult<()> {
+    let problem = ConvProblem::from_descriptors(input, filter, output, conv_desc)?;
+    problem.validate()?;
+
+    let algo = problem.select_algorithm(handle.sm_version());
+
+    match algo {
+        ConvAlgorithm::Direct if problem.is_1x1() => {
+            let engine = Conv1x1::new(problem, handle.sm_version())?;
+            engine.execute(handle, input, filter, output)
+        }
+        ConvAlgorithm::Direct => {
+            // Depthwise convolution
+            let engine = DepthwiseConv::new(problem, handle.sm_version())?;
+            engine.execute(handle, input, filter, output)
+        }
+        ConvAlgorithm::ImplicitGemm => {
+            let engine = ImplicitGemmConv::new(problem, handle.sm_version());
+            engine.execute(handle, input, filter, None, output)
+        }
+        ConvAlgorithm::Im2colGemm => {
+            let ws = workspace.ok_or(DnnError::WorkspaceRequired(
+                Im2colGemmConv::new(problem.clone(), handle.sm_version())
+                    .workspace_bytes()
+                    .unwrap_or(0),
+            ))?;
+            let engine = Im2colGemmConv::new(problem, handle.sm_version());
+            engine.execute(handle, input, filter, output, ws)
+        }
+        ConvAlgorithm::Winograd => {
+            let ws = workspace.ok_or_else(|| {
+                DnnError::WorkspaceRequired(
+                    WinogradConv::new(problem.clone(), handle.sm_version())
+                        .and_then(|w| w.workspace_bytes())
+                        .unwrap_or(0),
+                )
+            })?;
+            let engine = WinogradConv::new(problem, handle.sm_version())?;
+            engine.execute(handle, input, filter, output, ws)
+        }
+        ConvAlgorithm::FftConv => {
+            // FFT branch: validate FFT plan/workspace sizing, then execute via
+            // an existing spatial kernel engine until full runtime FFT dispatch
+            // is integrated in this API path.
+            if problem.in_dims.len() != 2
+                || problem.filter_dims.len() != 2
+                || problem.padding.len() != 2
+                || problem.stride.len() != 2
+            {
+                let engine = ImplicitGemmConv::new(problem, handle.sm_version());
+                return engine.execute(handle, input, filter, None, output);
+            }
+
+            let sm_num = sm_version_numeric(handle.sm_version());
+            let fft_plan = FftConv2dPlan::new(
+                problem.in_channels,
+                problem.out_channels,
+                problem.filter_dims[0],
+                problem.filter_dims[1],
+                problem.stride[0],
+                problem.stride[1],
+                problem.padding[0],
+                problem.padding[1],
+                sm_num,
+                problem.input_type,
+            );
+
+            let Ok(plan) = fft_plan else {
+                // Unsupported precision/layout for FFT plan: execute with
+                // implicit GEMM to keep functional behavior.
+                let engine = ImplicitGemmConv::new(problem, handle.sm_version());
+                return engine.execute(handle, input, filter, None, output);
+            };
+
+            let required_ws =
+                plan.workspace_bytes(problem.in_dims[0], problem.in_dims[1], problem.batch)?;
+            let ws = workspace.ok_or(DnnError::WorkspaceRequired(required_ws))?;
+            if ws.len() < required_ws {
+                return Err(DnnError::WorkspaceRequired(required_ws));
+            }
+
+            let engine = Im2colGemmConv::new(problem, handle.sm_version());
+            engine.execute(handle, input, filter, output, ws)
+        }
+    }
+}
+
+#[inline]
+fn sm_version_numeric(sm: oxicuda_ptx::arch::SmVersion) -> u32 {
+    match sm {
+        oxicuda_ptx::arch::SmVersion::Sm75 => 75,
+        oxicuda_ptx::arch::SmVersion::Sm80 => 80,
+        oxicuda_ptx::arch::SmVersion::Sm86 => 86,
+        oxicuda_ptx::arch::SmVersion::Sm89 => 89,
+        oxicuda_ptx::arch::SmVersion::Sm90 => 90,
+        oxicuda_ptx::arch::SmVersion::Sm90a => 90,
+        oxicuda_ptx::arch::SmVersion::Sm100 => 100,
+        oxicuda_ptx::arch::SmVersion::Sm120 => 120,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// conv_backward_data
+// ---------------------------------------------------------------------------
+
+/// Computes the gradient of the loss with respect to the input tensor.
+///
+/// This is the backward data pass (dgrad) used during training. It
+/// implements the transposed convolution: for each input position, it
+/// accumulates contributions from all overlapping filter positions in
+/// the gradient output.
+///
+/// # Arguments
+///
+/// * `handle` — DNN handle.
+/// * `filter` — Filter weights `[K, C/g, R, S]`.
+/// * `grad_output` — Gradient from the layer above `[N, K, P, Q]`.
+/// * `grad_input` — Output: gradient w.r.t. the input `[N, C, H, W]`.
+/// * `conv_desc` — Convolution parameters.
+/// * `_workspace` — Reserved for future algorithms.
+///
+/// # Errors
+///
+/// Same as [`conv_forward`].
+pub fn conv_backward_data<T: GpuFloat>(
+    handle: &DnnHandle,
+    filter: &TensorDesc<T>,
+    grad_output: &TensorDesc<T>,
+    grad_input: &mut TensorDescMut<T>,
+    conv_desc: &ConvolutionDescriptor,
+    _workspace: Option<&mut DeviceBuffer<u8>>,
+) -> DnnResult<()> {
+    // Construct the forward problem from the perspective of the dgrad.
+    // grad_input has the shape of the forward input.
+    let problem = build_dgrad_problem::<T>(filter, grad_output, grad_input, conv_desc)?;
+    problem.validate()?;
+
+    let engine = DgradImplicitGemm::new(problem, handle.sm_version());
+    engine.execute(handle, grad_output, filter, grad_input)
+}
+
+// ---------------------------------------------------------------------------
+// conv_backward_filter
+// ---------------------------------------------------------------------------
+
+/// Computes the gradient of the loss with respect to the filter weights.
+///
+/// This is the backward filter pass (wgrad) used during training. It
+/// cross-correlates the input tensor with the gradient output to produce
+/// the filter gradient.
+///
+/// # Arguments
+///
+/// * `handle` — DNN handle.
+/// * `input` — Forward input tensor `[N, C, H, W]`.
+/// * `grad_output` — Gradient from the layer above `[N, K, P, Q]`.
+/// * `grad_filter` — Output: gradient w.r.t. the filter `[K, C/g, R, S]`.
+/// * `conv_desc` — Convolution parameters.
+/// * `_workspace` — Reserved for future algorithms.
+///
+/// # Errors
+///
+/// Same as [`conv_forward`].
+pub fn conv_backward_filter<T: GpuFloat>(
+    handle: &DnnHandle,
+    input: &TensorDesc<T>,
+    grad_output: &TensorDesc<T>,
+    grad_filter: &mut TensorDescMut<T>,
+    conv_desc: &ConvolutionDescriptor,
+    _workspace: Option<&mut DeviceBuffer<u8>>,
+) -> DnnResult<()> {
+    let problem = build_wgrad_problem::<T>(input, grad_output, grad_filter, conv_desc)?;
+    problem.validate()?;
+
+    let engine = WgradImplicitGemm::new(problem, handle.sm_version());
+    engine.execute(handle, input, grad_output, grad_filter)
+}
+
+// ---------------------------------------------------------------------------
+// conv_bn_relu
+// ---------------------------------------------------------------------------
+
+/// Performs fused convolution + batch normalisation + activation.
+///
+/// # Implementation note: decomposed, not single-kernel
+///
+/// The single-kernel implementation of this fusion
+/// ([`FusedConvBnAct`](super::fused::FusedConvBnAct)) is currently a
+/// structural skeleton -- its PTX body emits only step-marker comments and
+/// never actually convolves, loads, or stores anything (see that type's
+/// docs). Calling it would silently return `Ok(())` while leaving `output`
+/// completely untouched, which is unacceptable for a function callers rely
+/// on for a real numeric result.
+///
+/// Until the single-kernel path exists, this function instead **decomposes**
+/// into two real, independently-verified dispatches:
+///
+/// 1. [`conv_forward`] (with an internally-managed workspace, since this
+///    function's signature has none of its own) computes the convolution
+///    into `output`.
+/// 2. `apply_fused_bn_activation` (crate-private, in `super::fused`)
+///    applies `output = activation(output * fused_scale[c] + fused_bias[c])`
+///    in place, in a single elementwise kernel pass.
+///
+/// This still saves one memory round-trip relative to three fully separate
+/// conv / BN / activation kernels (the BN affine and activation share one
+/// load-compute-store pass), even though it is not the zero-round-trip
+/// single-kernel fusion the name aspires to. Once `FusedConvBnAct` grows a
+/// real kernel body (verified against the same CPU oracle used for this
+/// decomposition), this function can switch back to the single-kernel path
+/// without changing its signature or behaviour.
+///
+/// # Arguments
+///
+/// * `handle` — DNN handle.
+/// * `input` — Input tensor.
+/// * `filter` — Filter weights.
+/// * `output` — Mutable output tensor.
+/// * `conv_desc` — Convolution parameters.
+/// * `bn_params` — Fused BN scale and bias (device pointers).
+/// * `activation` — Activation function to apply after BN.
+///
+/// # Errors
+///
+/// Same as [`conv_forward`]. Also returns [`DnnError::UnsupportedOperation`]
+/// for tensor layouts other than NCHW/NHWC.
+pub fn conv_bn_relu<T: GpuFloat>(
+    handle: &DnnHandle,
+    input: &TensorDesc<T>,
+    filter: &TensorDesc<T>,
+    output: &mut TensorDescMut<T>,
+    conv_desc: &ConvolutionDescriptor,
+    bn_params: &FusedBnParams,
+    activation: Activation,
+) -> DnnResult<()> {
+    let problem = ConvProblem::from_descriptors(input, filter, output, conv_desc)?;
+    problem.validate()?;
+
+    if bn_params.channels != problem.out_channels {
+        return Err(DnnError::InvalidArgument(format!(
+            "BN channels ({}) != out_channels ({})",
+            bn_params.channels, problem.out_channels
+        )));
+    }
+
+    // Step 1: the real convolution, written directly into `output`.
+    conv_forward_with_auto_workspace(handle, input, filter, output, conv_desc)?;
+
+    // Step 2: BN affine + activation epilogue, applied to `output` in place.
+    apply_fused_bn_activation(handle, output, &problem, bn_params, activation)
+}
+
+/// Runs [`conv_forward`], allocating and supplying a workspace buffer
+/// internally when the selected algorithm needs one.
+///
+/// `conv_bn_relu` has no workspace parameter of its own (it is meant to be
+/// a simple, convenience, fully-owned-buffers entry point), so it probes
+/// `conv_forward` the same way `oxicuda-dnn`'s own regression coverage does
+/// (`gpu_tests::conv_fprop::conv_forward_winograd_eligible_shape_matches_cpu_oracle`):
+/// call once with no workspace, and if the dispatcher reports how many
+/// bytes it needs via [`DnnError::WorkspaceRequired`], allocate exactly
+/// that much and retry. Algorithms that need no workspace (`Direct`,
+/// `ImplicitGemm`) succeed on the first call and never allocate anything.
+fn conv_forward_with_auto_workspace<T: GpuFloat>(
+    handle: &DnnHandle,
+    input: &TensorDesc<T>,
+    filter: &TensorDesc<T>,
+    output: &mut TensorDescMut<T>,
+    conv_desc: &ConvolutionDescriptor,
+) -> DnnResult<()> {
+    match conv_forward(handle, input, filter, output, conv_desc, None) {
+        Err(DnnError::WorkspaceRequired(bytes)) => {
+            let mut workspace = DeviceBuffer::<u8>::alloc(bytes)?;
+            conv_forward(
+                handle,
+                input,
+                filter,
+                output,
+                conv_desc,
+                Some(&mut workspace),
+            )
+        }
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build ConvProblem for dgrad
+// ---------------------------------------------------------------------------
+
+/// Constructs a [`ConvProblem`] for the backward data pass.
+///
+/// The "input" for dgrad is the forward input shape (grad_input),
+/// and the "output" is the forward output shape (grad_output).
+fn build_dgrad_problem<T: GpuFloat>(
+    filter: &TensorDesc<T>,
+    _grad_output: &TensorDesc<T>,
+    grad_input: &TensorDescMut<T>,
+    conv_desc: &ConvolutionDescriptor,
+) -> DnnResult<ConvProblem> {
+    let layout = grad_input.layout;
+    let ndim = layout.expected_ndim();
+    let spatial = layout.spatial_dims();
+
+    if grad_input.dims.len() != ndim {
+        return Err(DnnError::InvalidDimension(format!(
+            "grad_input has {} dims, expected {ndim}",
+            grad_input.dims.len()
+        )));
+    }
+
+    let batch = grad_input.dims[0];
+    let in_channels = grad_input.dims[1];
+    let in_dims = grad_input.dims[2..].to_vec();
+
+    let out_channels = filter.dims[0];
+    let filter_dims = if filter.dims.len() >= 2 + spatial {
+        filter.dims[2..2 + spatial].to_vec()
+    } else {
+        return Err(DnnError::InvalidDimension("filter dims too short".into()));
+    };
+
+    Ok(ConvProblem {
+        batch,
+        in_channels,
+        in_dims,
+        out_channels,
+        filter_dims,
+        padding: conv_desc.padding.clone(),
+        stride: conv_desc.stride.clone(),
+        dilation: conv_desc.dilation.clone(),
+        groups: conv_desc.groups,
+        input_type: T::PTX_TYPE,
+        output_type: T::PTX_TYPE,
+        layout,
+    })
+}
+
+/// Constructs a [`ConvProblem`] for the backward filter pass.
+fn build_wgrad_problem<T: GpuFloat>(
+    input: &TensorDesc<T>,
+    _grad_output: &TensorDesc<T>,
+    grad_filter: &TensorDescMut<T>,
+    conv_desc: &ConvolutionDescriptor,
+) -> DnnResult<ConvProblem> {
+    let layout = input.layout;
+    let spatial = layout.spatial_dims();
+
+    let batch = input.dims[0];
+    let in_channels = input.dims[1];
+    let in_dims = input.dims[2..].to_vec();
+
+    let out_channels = grad_filter.dims[0];
+    let filter_dims = if grad_filter.dims.len() >= 2 + spatial {
+        grad_filter.dims[2..2 + spatial].to_vec()
+    } else {
+        return Err(DnnError::InvalidDimension(
+            "grad_filter dims too short".into(),
+        ));
+    };
+
+    Ok(ConvProblem {
+        batch,
+        in_channels,
+        in_dims,
+        out_channels,
+        filter_dims,
+        padding: conv_desc.padding.clone(),
+        stride: conv_desc.stride.clone(),
+        dilation: conv_desc.dilation.clone(),
+        groups: conv_desc.groups,
+        input_type: T::PTX_TYPE,
+        output_type: T::PTX_TYPE,
+        layout,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::TensorLayout;
+
+    /// Verifies that algorithm selection works through the API path.
+    #[test]
+    fn select_algorithm_through_problem() {
+        let problem = ConvProblem {
+            batch: 1,
+            in_channels: 64,
+            in_dims: vec![32, 32],
+            out_channels: 128,
+            filter_dims: vec![1, 1],
+            padding: vec![0, 0],
+            stride: vec![1, 1],
+            dilation: vec![1, 1],
+            groups: 1,
+            input_type: oxicuda_ptx::ir::PtxType::F32,
+            output_type: oxicuda_ptx::ir::PtxType::F32,
+            layout: TensorLayout::Nchw,
+        };
+        let algo = problem.select_algorithm(oxicuda_ptx::arch::SmVersion::Sm80);
+        assert_eq!(algo, ConvAlgorithm::Direct);
+    }
+
+    #[test]
+    fn build_dgrad_problem_validates_dims() {
+        // This test verifies the helper constructs a valid problem.
+        let filter = TensorDesc::<f32>::from_raw(
+            0,
+            vec![128, 64, 3, 3],
+            vec![576, 9, 3, 1],
+            TensorLayout::Nchw,
+        );
+        let grad_out = TensorDesc::<f32>::from_raw(
+            0,
+            vec![1, 128, 32, 32],
+            vec![131072, 1024, 32, 1],
+            TensorLayout::Nchw,
+        );
+        let grad_in = TensorDescMut::<f32>::from_raw(
+            0,
+            vec![1, 64, 32, 32],
+            vec![65536, 1024, 32, 1],
+            TensorLayout::Nchw,
+        );
+        let conv_desc = ConvolutionDescriptor::conv2d(1, 1, 1, 1, 1, 1, 1);
+
+        if let (Ok(f), Ok(go), Ok(gi), Ok(cd)) = (filter, grad_out, grad_in, conv_desc) {
+            let problem = build_dgrad_problem::<f32>(&f, &go, &gi, &cd);
+            assert!(problem.is_ok());
+            if let Ok(p) = problem {
+                assert_eq!(p.batch, 1);
+                assert_eq!(p.in_channels, 64);
+                assert_eq!(p.out_channels, 128);
+            }
+        }
+    }
+}

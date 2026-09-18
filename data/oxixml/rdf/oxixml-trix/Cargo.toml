@@ -1,0 +1,40 @@
+[package]
+name = "oxixml-trix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TriX (XML-based RDF) parser and serializer."
+keywords = ["trix", "rdf", "xml", "parser", "quads"]
+categories = ["parser-implementations", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-model = { workspace = true }
+oxixml-xml = { workspace = true }
+oxixml-qname = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+
+[dev-dependencies]
+oxixml-turtle = { path = "../oxixml-turtle" }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[features]
+default = []
+
+## Enables asynchronous parsing and serialization on top of `tokio`'s
+## `AsyncRead` / `AsyncWrite`: `TriXParser::for_tokio_async_reader` and
+## `TriXSerializer::for_tokio_async_writer`. Off by default, so the crate stays
+## third-party-free in its default configuration.
+async-tokio = ["dep:tokio"]
+
+[lints]
+workspace = true

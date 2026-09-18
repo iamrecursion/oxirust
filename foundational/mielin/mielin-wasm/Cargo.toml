@@ -1,0 +1,45 @@
+[package]
+name = "mielin-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly sandboxing and execution runtime for agent cells using Wasmtime"
+keywords = ["wasm", "webassembly", "sandbox", "runtime", "wasmtime"]
+categories = ["wasm", "os", "network-programming"]
+readme = "README.md"
+documentation = "https://docs.rs/mielin-wasm"
+
+[features]
+default = []
+persistent-cache = []
+preview2 = ["dep:wasmtime-wasi"]
+# Feature-gated alternative engine stubs.
+# Wire up the corresponding crate dependencies to activate a real runtime.
+wasmer-engine = []
+wasm3-engine = []
+
+[dependencies]
+wasmtime.workspace = true
+wasmtime-wasi = { workspace = true, optional = true }
+wasmparser.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+oxiarc-lz4.workspace = true
+
+mielin-cells.workspace = true
+mielin-hal.workspace = true
+mielin-tensor.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+wat.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "wasm_benchmarks"
+harness = false

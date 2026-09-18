@@ -1,0 +1,85 @@
+[package]
+name = "oxify-connect-vision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Vision/OCR connector for OxiFY workflows"
+repository = "https://github.com/cool-japan/oxify"
+categories = ["multimedia::images", "api-bindings", "computer-vision"]
+keywords = ["vision", "ocr", "image-processing", "computer-vision"]
+
+[dependencies]
+oxify-model = { version = "0.2.0", path = "../oxify-model" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+
+# Image processing
+image = "0.25"
+imageproc = "0.27"
+ndarray = "0.17"
+
+# ONNX Runtime for Surya/PaddleOCR (Pure Rust — no C/C++ dependencies)
+oxionnx = { version = "0.1.7", features = ["ndarray"], optional = true }
+
+# Tesseract OCR (using leptess which provides Tesseract bindings)
+leptess = { version = "0.14", optional = true }
+
+# Parallel processing
+rayon = { workspace = true }
+
+# Base64 encoding for image data
+base64 = "0.22"
+
+# UUID for temp file names
+uuid = { workspace = true }
+
+# CPU detection for batch processing
+num_cpus = { workspace = true }
+
+# Model downloading
+dirs = { workspace = true }
+oxicrypto-hash = { workspace = true }
+oxicrypto-mac = { workspace = true }
+hex = { workspace = true }
+oxihttp = { workspace = true }
+
+# Configuration
+serde_yaml = "0.9"
+toml = { workspace = true }
+
+# Timestamps for benchmarking
+chrono = { workspace = true }
+
+[features]
+default = ["mock"]
+mock = []
+tesseract = ["leptess"]
+onnx = ["dep:oxionnx"]
+surya = ["onnx"]
+paddle = ["onnx"]
+google-vision = []
+azure-vision = []
+aws-textract = []
+cuda = []
+coreml = []
+redis = []
+sqlite = []
+all-providers = ["mock", "tesseract", "surya", "paddle", "google-vision", "azure-vision", "aws-textract"]
+all-features = ["all-providers", "redis", "sqlite", "cuda", "coreml"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = { workspace = true, features = ["async_tokio"] }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+
+[[bench]]
+name = "vision_bench"
+harness = false

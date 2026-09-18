@@ -1,0 +1,54 @@
+[package]
+name = "bench-regression"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Performance regression testing for OxiZ SMT solver"
+
+[[bin]]
+name = "regression"
+path = "src/main.rs"
+
+[dependencies]
+# OxiZ crates
+oxiz-core = { workspace = true, features = ["std"] }
+oxiz-sat = { workspace = true, features = ["std"] }
+# `"nlsat"` is named explicitly, not inherited. The workspace dependency table
+# sets `default-features = false`, so this line's feature list is the whole
+# feature set this crate gets; before `nlsat` was split out of `oxiz-theories`'s
+# `std`, "std" alone carried the nonlinear (QF_NRA/QF_NIA) solver in. Naming it
+# keeps this crate deciding exactly the logics it decided before.
+oxiz-solver = { workspace = true, features = ["std", "nlsat"] }
+oxiz-theories = { workspace = true, features = ["std", "nlsat"] }
+oxiz-opt.workspace = true
+oxiz-smtcomp.workspace = true
+
+# Benchmarking
+criterion.workspace = true
+
+# Utilities
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+num-bigint.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "oxiz_benchmarks"
+harness = false
+path = "benches/oxiz_benchmarks.rs"
+
+[lints.rust]
+unused_variables = "allow"
+dead_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+too_many_arguments = "allow"
+type_complexity = "allow"

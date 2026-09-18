@@ -1,0 +1,98 @@
+[package]
+name = "sklears-python"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Python bindings for sklears machine learning library using PyO3"
+keywords = ["machine-learning", "python", "pyo3", "scikit-learn", "bindings"]
+categories = ["api-bindings", "science", "mathematics"]
+
+[lib]
+name = "sklears_python"
+# "rlib" is additive alongside "cdylib": maturin/pip wheel builds only ever
+# look for the cdylib artifact (unaffected), but a cdylib-only crate-type
+# produces no linkable rlib, which means no separate crate -- including a
+# `benches/*.rs` criterion target or a `tests/*.rs` integration test -- can
+# `use sklears_python::...` at all (this is why the existing `tests/`
+# integration tests avoid importing the crate directly). Adding "rlib" is
+# the standard PyO3 pattern for making a `cdylib` extension module also
+# `cargo test`/`cargo bench`-able.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core sklears dependencies (enabled with SciRS2 compatibility)
+sklears-core = { workspace = true }
+sklears-linear = { workspace = true, features = ["bayesian", "elastic-net", "logistic-regression"] }
+sklears-metrics = { workspace = true }
+# TODO: Enable other crates as they get SciRS2 compatibility
+# sklears = { workspace = true, features = ["all-algorithms"] }
+sklears-clustering = { workspace = true }
+sklears-ensemble = { workspace = true }
+sklears-tree = { workspace = true }
+sklears-neural = { workspace = true }
+# sklears-neighbors = { workspace = true }
+sklears-naive-bayes = { workspace = true }
+# sklears-svm = { workspace = true }
+# sklears-decomposition = { workspace = true }
+sklears-datasets = { workspace = true }
+# sklears-feature-selection = { workspace = true }
+# sklears-gaussian-process = { workspace = true }
+# sklears-discriminant-analysis = { workspace = true }
+# sklears-manifold = { workspace = true }
+sklears-model-selection = { workspace = true }
+# sklears-utils = { workspace = true }
+
+# Python bindings
+pyo3 = { workspace = true }
+
+# Array and data handling
+numpy = { workspace = true }
+# SciRS2-Core integration for high-performance array operations
+scirs2-autograd = { workspace = true }  # Primary source for ndarray types
+scirs2-core = { workspace = true }  # Core SciRS2 functionality
+scirs2-linalg = { workspace = true }  # Linear algebra operations
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Serialization for model persistence
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Utility dependencies
+num_cpus = { workspace = true }
+rayon = { workspace = true }
+# Use SciRS2 random number generation instead of direct rand
+# rand = { workspace = true }  # Replaced with scirs2-core::random
+
+[features]
+default = []
+parallel = []
+# Forwards to sklears-core's oxicuda-backed GPU detection so that
+# `get_hardware_info()` can report real CUDA availability instead of a
+# hardcoded `false`. Without this feature (the default, Pure-Rust build),
+# `cuda_available` honestly stays `false`.
+gpu = ["sklears-core/gpu_support"]
+
+[dev-dependencies]
+# Testing dependencies
+proptest = { workspace = true }
+# Use SciRS2 random number generation in tests
+# rand = { workspace = true }  # Replaced with scirs2-core::random
+criterion = { workspace = true }
+
+# Python examples are not Rust examples - they should be run separately
+# [[example]]
+# name = "python_demo"
+# path = "examples/python_demo.py"
+# required-features = []
+
+[[bench]]
+name = "core_helpers_benchmarks"
+harness = false

@@ -1,0 +1,174 @@
+<!-- Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0. -->
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OxiScope — OxiMedia web demo</title>
+    <meta
+      name="description"
+      content="WebCodecs gives you the frames. OxiMedia gives you what to do with them — live scopes and colour grading in WebAssembly, nothing uploaded."
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">Oxi</span><span class="brand-rest">Scope</span>
+        <span class="brand-sub">OxiMedia · WebCodecs colour suite</span>
+      </div>
+      <div class="badges">
+        <span class="badge" title="Total transferred size of the .wasm modules actually loaded, read from the Resource Timing API.">
+          wasm: <strong id="wasm-badge">…</strong>
+        </span>
+        <span
+          class="badge badge-upload"
+          title="Bytes this page has sent to any server. Files become in-page blob: URLs; the webcam and patterns stay local. It is always zero — that is the point."
+        >
+          uploaded: <strong id="upload-badge">0 bytes</strong>
+        </span>
+      </div>
+    </header>
+
+    <main class="stage">
+      <section class="preview-pane" id="preview-pane">
+        <canvas id="preview" class="preview-canvas" width="16" height="9"></canvas>
+        <div class="dropzone" id="dropzone">
+          <div class="dropzone-inner">
+            <h1>Drop a video clip</h1>
+            <p>
+              …or start a source below. Everything runs locally in WebAssembly —
+              <strong>nothing is uploaded</strong>.
+            </p>
+            <div class="dropzone-actions">
+              <button type="button" id="drop-file" class="btn btn-primary">Choose file</button>
+              <button type="button" id="drop-webcam" class="btn">Webcam</button>
+              <button type="button" id="drop-pattern" class="btn">Test pattern</button>
+            </div>
+          </div>
+        </div>
+        <div class="fallback-note" id="fallback-note" hidden></div>
+      </section>
+
+      <section class="scopes-grid" aria-label="Video scopes">
+        <figure class="scope">
+          <canvas id="wf" width="512" height="256"></canvas>
+          <figcaption>Waveform · RGB parade · IRE</figcaption>
+        </figure>
+        <figure class="scope">
+          <canvas id="vs" width="256" height="256"></canvas>
+          <figcaption>Vectorscope · skin line · 75%</figcaption>
+        </figure>
+        <figure class="scope">
+          <canvas id="hist" width="512" height="256"></canvas>
+          <figcaption>Histogram · RGB</figcaption>
+        </figure>
+        <figure class="scope">
+          <canvas id="fc" width="480" height="270"></canvas>
+          <figcaption>False colour · ARRI</figcaption>
+        </figure>
+      </section>
+    </main>
+
+    <section class="controls">
+      <div class="control-group source-group">
+        <span class="group-label">Source</span>
+        <button type="button" id="btn-file" class="btn">File</button>
+        <button type="button" id="btn-webcam" class="btn">Webcam</button>
+        <select id="pattern-select" class="select" aria-label="Test pattern"></select>
+        <button type="button" id="btn-pattern" class="btn">Pattern</button>
+        <button type="button" id="btn-stop" class="btn btn-ghost">Stop</button>
+        <input id="file-input" type="file" accept="video/*" hidden />
+      </div>
+
+      <div class="control-group grade-group">
+        <span class="group-label">Grade</span>
+        <label class="ctl">
+          <span>Exposure</span>
+          <input id="exposure" type="range" min="-3" max="3" step="0.1" value="0" />
+          <output id="exposure-val">0.0 EV</output>
+        </label>
+        <label class="ctl">
+          <span>Contrast</span>
+          <input id="contrast" type="range" min="0.5" max="2" step="0.01" value="1" />
+          <output id="contrast-val">1.00</output>
+        </label>
+        <label class="ctl">
+          <span>Saturation</span>
+          <input id="saturation" type="range" min="0" max="2" step="0.01" value="1" />
+          <output id="saturation-val">1.00</output>
+        </label>
+      </div>
+
+      <div class="control-group tonemap-group">
+        <span class="group-label">Tone map</span>
+        <label class="ctl ctl-inline">
+          <span>Operator</span>
+          <select id="tonemap" class="select">
+            <option value="off">Off (clip)</option>
+            <option value="reinhard">Reinhard</option>
+            <option value="filmic">Filmic (Hable)</option>
+            <option value="aces">ACES (fitted)</option>
+            <option value="aces-odt">ACES ODT</option>
+          </select>
+        </label>
+        <label class="ctl">
+          <span>Peak</span>
+          <input id="peaknits" type="range" min="48" max="1000" step="1" value="100" />
+          <output id="peaknits-val">100 nits</output>
+        </label>
+        <label class="ctl ctl-inline">
+          <span>Gamut</span>
+          <select id="gamut" class="select">
+            <option value="off">Off</option>
+            <option value="bt2020>bt709">BT.2020 → 709</option>
+            <option value="display-p3>bt709">P3 → 709</option>
+          </select>
+        </label>
+        <p class="hint">
+          Enable an operator to roll the 100&nbsp;IRE white patch off the top of
+          the waveform. Raise exposure first for a stronger clip.
+        </p>
+      </div>
+
+      <div class="control-group export-group">
+        <button type="button" id="btn-export" class="btn btn-primary">Export .cube</button>
+        <button type="button" id="btn-reset" class="btn btn-ghost">Reset grade</button>
+      </div>
+    </section>
+
+    <div class="statusbar">
+      <span id="stats" class="stats">—</span>
+      <span id="status" class="status">Booting…</span>
+    </div>
+
+    <aside class="diagnostics">
+      <details open>
+        <summary>Capabilities</summary>
+        <ul id="cap-list" class="cap-list"></ul>
+      </details>
+    </aside>
+
+    <div class="error-panel" id="error-panel" hidden>
+      <h2 id="error-title">Something went wrong</h2>
+      <p id="error-detail"></p>
+    </div>
+
+    <footer class="footer">
+      <span id="footer-modules">Modules loaded: measuring…</span>
+      <span class="footer-sep">·</span>
+      <a href="../bench/" class="footer-link">benchmark harness</a>
+      <span class="footer-sep">·</span>
+      <span
+        >Pure-Rust, patent-free WebAssembly · © COOLJAPAN OU (Team Kitasan) · Apache-2.0</span
+      >
+    </footer>
+
+    <!-- Hidden working elements. -->
+    <video id="stage-video" class="offscreen" muted loop playsinline></video>
+    <canvas id="pattern-canvas" class="offscreen" width="960" height="540"></canvas>
+    <canvas id="scope-src" class="offscreen" width="640" height="360"></canvas>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

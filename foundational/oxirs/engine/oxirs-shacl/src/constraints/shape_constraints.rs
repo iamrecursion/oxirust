@@ -1,0 +1,1155 @@
+//! Shape-based constraint implementations.
+//!
+//! These constraints reference *other* shapes from inside a shape: a node shape
+//! can require its focus nodes to conform to another node shape, a property
+//! shape can require its values to conform to another shape, and a property
+//! shape can additionally bound how many of its values must conform to a
+//! "qualified" shape. The closed-shape constraint forbids any property outside
+//! a whitelisted set.
+//!
+//! | SHACL parameter            | Spec section | Struct                                       |
+//! |----------------------------|--------------|----------------------------------------------|
+//! | `sh:node`                  | §4.7.1       | [`NodeConstraint`]                           |
+//! | `sh:property`              | §4.7.2       | [`PropertyConstraint`]                       |
+//! | `sh:qualifiedValueShape`   | §4.7.3       | [`QualifiedValueShapeConstraint`]            |
+//! | `sh:closed`                | §4.8.1       | [`ClosedConstraint`]                         |
+
+use super::constraint_context::{ConstraintContext, ConstraintEvaluationResult};
+use crate::{validation::ValidationEngine, Result, ShaclError, ShapeId, ValidationConfig};
+use oxirs_core::{model::Term, Store, Subject};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+/// `sh:node` constraint (SHACL Core §4.7.1).
+///
+/// Requires every value node to conform to the referenced node shape.
+/// On a node shape, this delegates the validation of focus nodes to another shape.
+/// On a property shape, this requires every value reachable via `sh:path` to
+/// conform to the named node shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeConstraint {
+    /// Identifier of the node shape that values must conform to.
+    pub shape: ShapeId,
+}
+
+impl NodeConstraint {
+    pub fn new(shape: ShapeId) -> Self {
+        Self { shape }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        // Basic validation of the constraint structure
+        Ok(())
+    }
+
+    pub fn evaluate(
+        &self,
+        context: &ConstraintContext,
+        store: &dyn Store,
+    ) -> Result<ConstraintEvaluationResult> {
+        // Node constraint validates that each value node conforms to the specified shape
+        // This is the sh:node constraint from SHACL spec
+
+        let values = &context.values;
+
+        if values.is_empty() {
+            // No values to validate - this is satisfied
+            return Ok(ConstraintEvaluationResult::satisfied());
+        }
+
+        // Validate each value against the node shape
+        for value in values {
+            let conforms = self.value_conforms_to_shape(value, store, context)?;
+            if !conforms {
+                return Ok(ConstraintEvaluationResult::violated(
+                    Some(value.clone()),
+                    Some(format!(
+                        "Value node does not conform to shape '{}'",
+                        self.shape.as_str()
+                    )),
+                ));
+            }
+        }
+
+        Ok(ConstraintEvaluationResult::satisfied())
+    }
+
+    /// Check if a value conforms to the node shape
+    fn value_conforms_to_shape(
+        &self,
+        value: &Term,
+        store: &dyn Store,
+        context: &ConstraintContext,
+    ) -> Result<bool> {
+        // Get the shape definition from the validation context
+        if let Some(shapes_registry) = &context.shapes_registry {
+            if let Some(shape_def) = shapes_registry.get(&self.shape) {
+                // Create a temporary validation engine for this shape validation
+                let config = ValidationConfig::default();
+                let mut temp_shapes = indexmap::IndexMap::new();
+                temp_shapes.insert(self.shape.clone(), shape_def.clone());
+
+                let mut validator = ValidationEngine::new(&temp_shapes, config);
+
+                // Validate the value against the shape
+                match validator.validate_node_against_shape(store, shape_def, value, None) {
+                    Ok(report) => {
+                        // Check if validation passed (no violations)
+                        Ok(report.conforms())
+                    }
+                    Err(e) => {
+                        // If validation failed due to error, consider it non-conforming
+                        tracing::warn!("Node shape validation error: {}", e);
+                        Ok(false)
+                    }
+                }
+            } else {
+                // Shape not found - cannot validate
+                Err(ShaclError::ShapeParsing(format!(
+                    "Node shape '{}' not found in shapes collection",
+                    self.shape.as_str()
+                )))
+            }
+        } else {
+            // No shapes registry available - cannot validate
+            Err(ShaclError::ValidationEngine(
+                "Shapes registry not available in constraint context".to_string(),
+            ))
+        }
+    }
+}
+
+/// `sh:property` constraint (SHACL Core §4.7.2).
+///
+/// Wires another property shape into this shape's evaluation. Every value node
+/// is checked against the referenced property shape, with the property shape's
+/// own `sh:path` resolved relative to the current focus node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PropertyConstraint {
+    /// Identifier of the property shape to apply.
+    pub shape: ShapeId,
+}
+
+impl PropertyConstraint {
+    pub fn new(shape: ShapeId) -> Self {
+        Self { shape }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        // Basic validation of the constraint structure
+        Ok(())
+    }
+
+    pub fn evaluate(
+        &self,
+        context: &ConstraintContext,
+        store: &dyn Store,
+    ) -> Result<ConstraintEvaluationResult> {
+        // Property constraint validates property values according to a property shape
+        // This is the sh:property constraint from SHACL spec
+        //
+        // A property shape defines constraints on the values of a specific property
+        // For example, a property shape might constrain foaf:name to be a string with max length 100
+        //
+        // The property constraint evaluates the property shape against the focus node
+
+        // Get the property shape definition
+        if let Some(shapes_registry) = &context.shapes_registry {
+            if let Some(property_shape) = shapes_registry.get(&self.shape) {
+                // Create a temporary validation engine for this property shape validation
+                let config = ValidationConfig::default();
+                let mut temp_shapes = indexmap::IndexMap::new();
+                temp_shapes.insert(self.shape.clone(), property_shape.clone());
+
+                let mut validator = ValidationEngine::new(&temp_shapes, config);
+
+                // Validate the focus node against the property shape
+                // The property shape will define which property to check and what constraints to apply
+                match validator.validate_node_against_shape(
+                    store,
+                    property_shape,
+                    &context.focus_node,
+                    None,
+                ) {
+                    Ok(report) => {
+                        if !report.conforms() {
+                            // Property shape validation failed
+                            // Extract the first violation message for clarity
+                            let violation_msg = report
+                                .violations()
+                                .first()
+                                .and_then(|v| v.message().as_ref())
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "Focus node does not conform to property shape '{}'",
+                                        self.shape.as_str()
+                                    )
+                                });
+
+                            return Ok(ConstraintEvaluationResult::violated(
+                                Some(context.focus_node.clone()),
+                                Some(violation_msg),
+                            ));
+                        }
+                        Ok(ConstraintEvaluationResult::satisfied())
+                    }
+                    Err(e) => {
+                        // Validation error - treat as violation
+                        tracing::warn!("Property shape validation error: {}", e);
+                        Ok(ConstraintEvaluationResult::violated(
+                            Some(context.focus_node.clone()),
+                            Some(format!(
+                                "Error validating property shape '{}': {}",
+                                self.shape.as_str(),
+                                e
+                            )),
+                        ))
+                    }
+                }
+            } else {
+                // Property shape not found
+                Err(ShaclError::ShapeParsing(format!(
+                    "Property shape '{}' not found in shapes collection",
+                    self.shape.as_str()
+                )))
+            }
+        } else {
+            // No shapes registry available
+            Err(ShaclError::ValidationEngine(
+                "Shapes registry not available in constraint context".to_string(),
+            ))
+        }
+    }
+}
+
+/// `sh:qualifiedValueShape` constraint (SHACL Core §4.7.3).
+///
+/// Counts how many value nodes conform to a "qualified" shape and checks that
+/// the count falls within the configured range — `sh:qualifiedMinCount` and
+/// `sh:qualifiedMaxCount`. When `sh:qualifiedValueShapesDisjoint` is `true`,
+/// values that already match a sibling qualified shape are excluded from the count.
+///
+/// At least one of `qualified_min_count` or `qualified_max_count` must be set;
+/// see [`QualifiedValueShapeConstraint::validate`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualifiedValueShapeConstraint {
+    /// The qualified value shape that values are tested against.
+    pub shape: ShapeId,
+    /// Minimum number of conforming values (`sh:qualifiedMinCount`).
+    pub qualified_min_count: Option<u32>,
+    /// Maximum number of conforming values (`sh:qualifiedMaxCount`).
+    pub qualified_max_count: Option<u32>,
+    /// When `true`, conforming values overlapping with sibling qualified shapes are excluded
+    /// from the count (`sh:qualifiedValueShapesDisjoint`).
+    pub qualified_value_shapes_disjoint: bool,
+}
+
+impl QualifiedValueShapeConstraint {
+    pub fn new(shape: ShapeId) -> Self {
+        Self {
+            shape,
+            qualified_min_count: None,
+            qualified_max_count: None,
+            qualified_value_shapes_disjoint: false,
+        }
+    }
+
+    pub fn with_qualified_min_count(mut self, min_count: u32) -> Self {
+        self.qualified_min_count = Some(min_count);
+        self
+    }
+
+    pub fn with_qualified_max_count(mut self, max_count: u32) -> Self {
+        self.qualified_max_count = Some(max_count);
+        self
+    }
+
+    pub fn with_qualified_value_shapes_disjoint(mut self, disjoint: bool) -> Self {
+        self.qualified_value_shapes_disjoint = disjoint;
+        self
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        // Validate cardinality constraints
+        if let (Some(min), Some(max)) = (self.qualified_min_count, self.qualified_max_count) {
+            if min > max {
+                return Err(ShaclError::ShapeParsing(format!(
+                    "Qualified minimum count ({min}) cannot be greater than maximum count ({max})"
+                )));
+            }
+        }
+
+        // At least one of min or max count must be specified
+        if self.qualified_min_count.is_none() && self.qualified_max_count.is_none() {
+            return Err(ShaclError::ShapeParsing(
+                "Qualified value shape constraint must specify at least one of qualified min count or max count".to_string()
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn evaluate(
+        &self,
+        context: &ConstraintContext,
+        store: &dyn Store,
+    ) -> Result<ConstraintEvaluationResult> {
+        // Get values from context
+        let values = &context.values;
+
+        tracing::trace!(
+            "QualifiedValueShape: focus_node={:?}, values={:?}",
+            context.focus_node,
+            values
+        );
+        tracing::trace!(
+            "QualifiedValueShape: shape={}, min_count={:?}, max_count={:?}",
+            self.shape.as_str(),
+            self.qualified_min_count,
+            self.qualified_max_count
+        );
+
+        if values.is_empty() {
+            // No values to validate
+            tracing::trace!("QualifiedValueShape: No values to validate");
+            if let Some(min_count) = self.qualified_min_count {
+                if min_count > 0 {
+                    tracing::trace!(
+                        "QualifiedValueShape: VIOLATION - no values but min_count={min_count}"
+                    );
+                    return Ok(ConstraintEvaluationResult::violated(
+                        None,
+                        Some(format!(
+                            "Expected at least {} values conforming to shape '{}', but found 0 values",
+                            min_count, self.shape.as_str()
+                        )),
+                    ));
+                }
+            }
+            return Ok(ConstraintEvaluationResult::satisfied());
+        }
+
+        // Count how many values conform to the qualified shape
+        let conforming_count = self.count_conforming_values(values, store, context)?;
+        tracing::trace!(
+            "QualifiedValueShape: conforming_count={} out of {} values",
+            conforming_count,
+            values.len()
+        );
+
+        // Check min count constraint
+        if let Some(min_count) = self.qualified_min_count {
+            tracing::trace!(
+                "QualifiedValueShape: Checking min_count={min_count}, conforming_count={conforming_count}"
+            );
+            if conforming_count < min_count {
+                tracing::trace!("QualifiedValueShape: VIOLATION - conforming_count < min_count");
+                return Ok(ConstraintEvaluationResult::violated(
+                    None,
+                    Some(format!(
+                        "Expected at least {} values conforming to shape '{}', but found {} conforming values",
+                        min_count, self.shape.as_str(), conforming_count
+                    )),
+                ));
+            }
+        }
+
+        // Check max count constraint
+        if let Some(max_count) = self.qualified_max_count {
+            tracing::trace!(
+                "QualifiedValueShape: Checking max_count={max_count}, conforming_count={conforming_count}"
+            );
+            if conforming_count > max_count {
+                tracing::trace!("QualifiedValueShape: VIOLATION - conforming_count > max_count");
+                return Ok(ConstraintEvaluationResult::violated(
+                    None,
+                    Some(format!(
+                        "Expected at most {} values conforming to shape '{}', but found {} conforming values",
+                        max_count, self.shape.as_str(), conforming_count
+                    )),
+                ));
+            }
+        }
+
+        tracing::trace!("QualifiedValueShape: SATISFIED");
+        Ok(ConstraintEvaluationResult::satisfied())
+    }
+
+    /// Count values that conform to the qualified shape
+    fn count_conforming_values(
+        &self,
+        values: &[Term],
+        store: &dyn Store,
+        context: &ConstraintContext,
+    ) -> Result<u32> {
+        let mut conforming_count = 0;
+        tracing::trace!("count_conforming_values: checking {} values", values.len());
+
+        // For each value, check if it conforms to the qualified shape
+        for (i, value) in values.iter().enumerate() {
+            tracing::trace!("count_conforming_values: checking value[{i}] = {value:?}");
+            let conforms = self.value_conforms_to_shape(value, store, context)?;
+            tracing::trace!("count_conforming_values: value[{i}] conforms = {conforms}");
+            if conforms {
+                conforming_count += 1;
+            }
+        }
+
+        tracing::trace!("count_conforming_values: total conforming_count = {conforming_count}");
+        Ok(conforming_count)
+    }
+
+    /// Check if a value conforms to the qualified shape
+    pub fn value_conforms_to_shape(
+        &self,
+        value: &Term,
+        store: &dyn Store,
+        context: &ConstraintContext,
+    ) -> Result<bool> {
+        tracing::trace!(
+            "value_conforms_to_shape: checking value={:?} against shape={}",
+            value,
+            self.shape.as_str()
+        );
+        tracing::trace!(
+            "value_conforms_to_shape: shapes_registry available = {}",
+            context.shapes_registry.is_some()
+        );
+
+        // Get the shape definition from the validation context
+        // We need access to the full shapes collection to validate properly
+        if let Some(shapes_registry) = &context.shapes_registry {
+            tracing::trace!(
+                "value_conforms_to_shape: shapes_registry has {} shapes",
+                shapes_registry.len()
+            );
+            if let Some(shape_def) = shapes_registry.get(&self.shape) {
+                tracing::trace!(
+                    "value_conforms_to_shape: found shape definition for {}",
+                    self.shape.as_str()
+                );
+                // Create a temporary validation engine for this shape validation
+                let config = ValidationConfig::default();
+                let mut temp_shapes = indexmap::IndexMap::new();
+                temp_shapes.insert(self.shape.clone(), shape_def.clone());
+
+                let mut validator = ValidationEngine::new(&temp_shapes, config);
+
+                // Validate the value against the shape
+                match validator.validate_node_against_shape(store, shape_def, value, None) {
+                    Ok(report) => {
+                        // Check if validation passed (no violations)
+                        let conforms = report.conforms();
+                        tracing::trace!(
+                            "value_conforms_to_shape: validation report conforms={}, violations={}",
+                            conforms,
+                            report.violation_count()
+                        );
+                        Ok(conforms)
+                    }
+                    Err(e) => {
+                        // If validation failed due to error, consider it non-conforming
+                        tracing::trace!("value_conforms_to_shape: validation error: {e}");
+                        Ok(false)
+                    }
+                }
+            } else {
+                // Shape not found - cannot validate
+                tracing::trace!(
+                    "value_conforms_to_shape: shape {} not found in registry",
+                    self.shape.as_str()
+                );
+                Err(ShaclError::ShapeParsing(format!(
+                    "Qualified shape '{}' not found in shapes collection",
+                    self.shape.as_str()
+                )))
+            }
+        } else {
+            tracing::trace!(
+                "value_conforms_to_shape: no shapes_registry, failing loud (no fabricated result)"
+            );
+            // No shapes registry available: we cannot know whether `value`
+            // conforms to `self.shape`, so fail loudly rather than fabricate
+            // a pass/fail result (matches NodeConstraint/PropertyConstraint's
+            // behavior for the same situation, see above).
+            Err(ShaclError::ValidationEngine(
+                "Shapes registry not available in constraint context".to_string(),
+            ))
+        }
+    }
+
+    /// Enhanced evaluation with disjoint checking
+    pub fn evaluate_with_disjoint_check(
+        &self,
+        context: &ConstraintContext,
+        store: &dyn Store,
+        other_qualified_shapes: &[&QualifiedValueShapeConstraint],
+    ) -> Result<ConstraintEvaluationResult> {
+        if !self.qualified_value_shapes_disjoint {
+            // If disjoint is not required, use standard evaluation
+            return self.evaluate(context, store);
+        }
+
+        let values = &context.values;
+
+        if values.is_empty() {
+            if let Some(min_count) = self.qualified_min_count {
+                if min_count > 0 {
+                    return Ok(ConstraintEvaluationResult::violated(
+                        None,
+                        Some(format!(
+                            "Expected at least {} values conforming to shape '{}', but found 0 values",
+                            min_count, self.shape.as_str()
+                        )),
+                    ));
+                }
+            }
+            return Ok(ConstraintEvaluationResult::satisfied());
+        }
+
+        // For disjoint checking, we need to ensure that values conforming to this shape
+        // do not conform to any other qualified shapes
+        let mut conforming_values = HashSet::new();
+        let mut disjoint_violations = Vec::new();
+
+        for value in values {
+            if self.value_conforms_to_shape(value, store, context)? {
+                // Check if this value also conforms to any other qualified shape
+                let mut conforms_to_other = false;
+
+                for other_constraint in other_qualified_shapes {
+                    if other_constraint.shape != self.shape
+                        && other_constraint.value_conforms_to_shape(value, store, context)?
+                    {
+                        conforms_to_other = true;
+                        break;
+                    }
+                }
+
+                if conforms_to_other {
+                    disjoint_violations.push(value.clone());
+                } else {
+                    conforming_values.insert(value.clone());
+                }
+            }
+        }
+
+        // Report disjoint violations
+        if !disjoint_violations.is_empty() {
+            return Ok(ConstraintEvaluationResult::violated(
+                disjoint_violations.first().cloned(),
+                Some(format!(
+                    "Qualified value shapes disjoint constraint violated: {} values conform to multiple qualified shapes",
+                    disjoint_violations.len()
+                )),
+            ));
+        }
+
+        let conforming_count = conforming_values.len() as u32;
+
+        // Check min count constraint
+        if let Some(min_count) = self.qualified_min_count {
+            if conforming_count < min_count {
+                return Ok(ConstraintEvaluationResult::violated(
+                    None,
+                    Some(format!(
+                        "Expected at least {} values conforming to shape '{}', but found {} conforming values",
+                        min_count, self.shape.as_str(), conforming_count
+                    )),
+                ));
+            }
+        }
+
+        // Check max count constraint
+        if let Some(max_count) = self.qualified_max_count {
+            if conforming_count > max_count {
+                return Ok(ConstraintEvaluationResult::violated(
+                    None,
+                    Some(format!(
+                        "Expected at most {} values conforming to shape '{}', but found {} conforming values",
+                        max_count, self.shape.as_str(), conforming_count
+                    )),
+                ));
+            }
+        }
+
+        Ok(ConstraintEvaluationResult::satisfied())
+    }
+
+    /// Get performance metrics for this constraint evaluation
+    pub fn get_performance_metrics(&self) -> QualifiedCardinalityMetrics {
+        QualifiedCardinalityMetrics {
+            shape_id: self.shape.clone(),
+            min_count: self.qualified_min_count,
+            max_count: self.qualified_max_count,
+            disjoint_required: self.qualified_value_shapes_disjoint,
+            evaluation_complexity: self.estimate_evaluation_complexity(),
+        }
+    }
+
+    /// Estimate the computational complexity of evaluating this constraint
+    fn estimate_evaluation_complexity(&self) -> EvaluationComplexity {
+        if self.qualified_value_shapes_disjoint {
+            EvaluationComplexity::High
+        } else if self.qualified_min_count.is_some() && self.qualified_max_count.is_some() {
+            EvaluationComplexity::Medium
+        } else {
+            EvaluationComplexity::Low
+        }
+    }
+
+    /// Optimized evaluation for large datasets with early termination
+    pub fn evaluate_optimized(
+        &self,
+        context: &ConstraintContext,
+        store: &dyn Store,
+    ) -> Result<ConstraintEvaluationResult> {
+        let values = &context.values;
+
+        if values.is_empty() {
+            if let Some(min_count) = self.qualified_min_count {
+                if min_count > 0 {
+                    return Ok(ConstraintEvaluationResult::violated(
+                        None,
+                        Some(format!(
+                            "Expected at least {} values conforming to shape '{}', but found 0 values",
+                            min_count, self.shape.as_str()
+                        )),
+                    ));
+                }
+            }
+            return Ok(ConstraintEvaluationResult::satisfied());
+        }
+
+        let mut conforming_count = 0;
+        let max_possible = values.len() as u32;
+
+        // Early termination optimizations
+        for (i, value) in values.iter().enumerate() {
+            if self.value_conforms_to_shape(value, store, context)? {
+                conforming_count += 1;
+
+                // Early termination for max count violations
+                if let Some(max_count) = self.qualified_max_count {
+                    if conforming_count > max_count {
+                        return Ok(ConstraintEvaluationResult::violated(
+                            Some(value.clone()),
+                            Some(format!(
+                                "Expected at most {} values conforming to shape '{}', but found more than {} conforming values",
+                                max_count, self.shape.as_str(), max_count
+                            )),
+                        ));
+                    }
+                }
+            }
+
+            // Early termination if we can't possibly meet min count
+            if let Some(min_count) = self.qualified_min_count {
+                let remaining_values = max_possible - (i as u32 + 1);
+                if conforming_count + remaining_values < min_count {
+                    return Ok(ConstraintEvaluationResult::violated(
+                        None,
+                        Some(format!(
+                            "Cannot meet minimum count requirement: only {} values remaining, need {} more conforming values",
+                            remaining_values, min_count - conforming_count
+                        )),
+                    ));
+                }
+            }
+
+            // Early success if we meet min count and have no max constraint
+            if let Some(min_count) = self.qualified_min_count {
+                if conforming_count >= min_count && self.qualified_max_count.is_none() {
+                    return Ok(ConstraintEvaluationResult::satisfied());
+                }
+            }
+        }
+
+        // Final check
+        if let Some(min_count) = self.qualified_min_count {
+            if conforming_count < min_count {
+                return Ok(ConstraintEvaluationResult::violated(
+                    None,
+                    Some(format!(
+                        "Expected at least {} values conforming to shape '{}', but found {} conforming values",
+                        min_count, self.shape.as_str(), conforming_count
+                    )),
+                ));
+            }
+        }
+
+        Ok(ConstraintEvaluationResult::satisfied())
+    }
+
+    /// Evaluate with caching for repeated shape validations
+    pub fn evaluate_with_cache(
+        &self,
+        context: &ConstraintContext,
+        store: &dyn Store,
+        cache: &mut std::collections::HashMap<(Term, ShapeId), bool>,
+    ) -> Result<ConstraintEvaluationResult> {
+        let values = &context.values;
+
+        if values.is_empty() {
+            if let Some(min_count) = self.qualified_min_count {
+                if min_count > 0 {
+                    return Ok(ConstraintEvaluationResult::violated(
+                        None,
+                        Some(format!(
+                            "Expected at least {} values conforming to shape '{}', but found 0 values",
+                            min_count, self.shape.as_str()
+                        )),
+                    ));
+                }
+            }
+            return Ok(ConstraintEvaluationResult::satisfied());
+        }
+
+        let mut conforming_count = 0;
+
+        for value in values {
+            let cache_key = (value.clone(), self.shape.clone());
+
+            let conforms = if let Some(&cached_result) = cache.get(&cache_key) {
+                cached_result
+            } else {
+                let result = self.value_conforms_to_shape(value, store, context)?;
+                cache.insert(cache_key, result);
+                result
+            };
+
+            if conforms {
+                conforming_count += 1;
+            }
+        }
+
+        // Check constraints
+        if let Some(min_count) = self.qualified_min_count {
+            if conforming_count < min_count {
+                return Ok(ConstraintEvaluationResult::violated(
+                    None,
+                    Some(format!(
+                        "Expected at least {} values conforming to shape '{}', but found {} conforming values",
+                        min_count, self.shape.as_str(), conforming_count
+                    )),
+                ));
+            }
+        }
+
+        if let Some(max_count) = self.qualified_max_count {
+            if conforming_count > max_count {
+                return Ok(ConstraintEvaluationResult::violated(
+                    None,
+                    Some(format!(
+                        "Expected at most {} values conforming to shape '{}', but found {} conforming values",
+                        max_count, self.shape.as_str(), conforming_count
+                    )),
+                ));
+            }
+        }
+
+        Ok(ConstraintEvaluationResult::satisfied())
+    }
+
+    /// Parallel evaluation for large datasets (placeholder for future implementation)
+    pub fn evaluate_parallel(
+        &self,
+        context: &ConstraintContext,
+        store: &dyn Store,
+    ) -> Result<ConstraintEvaluationResult> {
+        // For now, fall back to regular evaluation
+        // In a full implementation, this would use rayon or similar for parallel processing
+        self.evaluate(context, store)
+    }
+
+    /// Statistical analysis of qualification patterns
+    pub fn analyze_qualification_patterns(
+        &self,
+        values: &[Term],
+        store: &dyn Store,
+        context: &ConstraintContext,
+    ) -> Result<QualificationAnalysis> {
+        let mut analysis = QualificationAnalysis {
+            total_values: values.len(),
+            conforming_values: 0,
+            non_conforming_values: 0,
+            conformance_rate: 0.0,
+            estimated_performance_impact: EvaluationComplexity::Low,
+        };
+
+        for value in values {
+            if self.value_conforms_to_shape(value, store, context)? {
+                analysis.conforming_values += 1;
+            } else {
+                analysis.non_conforming_values += 1;
+            }
+        }
+
+        analysis.conformance_rate = if analysis.total_values > 0 {
+            analysis.conforming_values as f64 / analysis.total_values as f64
+        } else {
+            0.0
+        };
+
+        // Estimate performance impact based on dataset size and conformance patterns
+        analysis.estimated_performance_impact = if analysis.total_values > 10000 {
+            EvaluationComplexity::High
+        } else if analysis.total_values > 1000 {
+            EvaluationComplexity::Medium
+        } else {
+            EvaluationComplexity::Low
+        };
+
+        Ok(analysis)
+    }
+}
+
+/// Performance metrics for qualified cardinality constraints
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualifiedCardinalityMetrics {
+    pub shape_id: ShapeId,
+    pub min_count: Option<u32>,
+    pub max_count: Option<u32>,
+    pub disjoint_required: bool,
+    pub evaluation_complexity: EvaluationComplexity,
+}
+
+/// Evaluation complexity levels
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EvaluationComplexity {
+    Low,
+    Medium,
+    High,
+}
+
+/// Analysis of qualification patterns in a dataset
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualificationAnalysis {
+    pub total_values: usize,
+    pub conforming_values: usize,
+    pub non_conforming_values: usize,
+    pub conformance_rate: f64,
+    pub estimated_performance_impact: EvaluationComplexity,
+}
+
+/// `sh:closed` constraint (SHACL Core §4.8.1).
+///
+/// Forbids the focus node from carrying any property outside the union of
+/// `allowed_properties` (the explicit whitelist, derived from `sh:property`
+/// declarations) and `ignore_properties` (declared via `sh:ignoredProperties`).
+/// Useful to model strict, schema-like resources.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosedConstraint {
+    /// Properties that are explicitly permitted on the focus node.
+    pub allowed_properties: Vec<Term>,
+    /// Properties to ignore when checking closedness (`sh:ignoredProperties`).
+    pub ignore_properties: Vec<Term>,
+}
+
+impl ClosedConstraint {
+    pub fn new(allowed_properties: Vec<Term>) -> Self {
+        Self {
+            allowed_properties,
+            ignore_properties: Vec::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        // Basic validation of the constraint structure
+        Ok(())
+    }
+
+    pub fn evaluate(
+        &self,
+        context: &ConstraintContext,
+        store: &dyn Store,
+    ) -> Result<ConstraintEvaluationResult> {
+        // For closed constraint, we need to check that the focus node
+        // only has properties that are in the allowed list (or are ignored)
+
+        // Get all properties for the focus node
+        let focus_node_as_subject = match &context.focus_node {
+            Term::NamedNode(node) => Subject::from(node.clone()),
+            Term::BlankNode(node) => Subject::from(node.clone()),
+            _ => {
+                return Ok(ConstraintEvaluationResult::violated(
+                    Some(context.focus_node.clone()),
+                    Some("Focus node is not a valid subject for closed constraint".to_string()),
+                ));
+            }
+        };
+
+        // Find all quads where the focus node is the subject
+        let quads = store.find_quads(Some(&focus_node_as_subject), None, None, None)?;
+
+        // Extract all predicates (properties) used by the focus node
+        let mut used_properties = HashSet::new();
+        for quad in quads {
+            let predicate_term: Term = quad.predicate().clone().into();
+            used_properties.insert(predicate_term);
+        }
+
+        // Check if any used property is not in the allowed list and not ignored
+        for property in &used_properties {
+            // Skip if property is in the ignore list
+            if self.ignore_properties.contains(property) {
+                continue;
+            }
+
+            // Check if property is in allowed list
+            if !self.allowed_properties.contains(property) {
+                return Ok(ConstraintEvaluationResult::violated(
+                    Some(property.clone()),
+                    Some(format!(
+                        "Property {property} is not allowed in closed shape (allowed: {:?})",
+                        self.allowed_properties
+                    )),
+                ));
+            }
+        }
+
+        Ok(ConstraintEvaluationResult::Satisfied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PropertyPath, ShapeId};
+    use oxirs_core::{
+        model::{GraphName, Literal, NamedNode, Object, Predicate, Quad, Subject, Term},
+        ConcreteStore,
+    };
+
+    fn make_iri(s: &str) -> Term {
+        Term::NamedNode(NamedNode::new(s).expect("valid IRI"))
+    }
+
+    fn plain_lit(s: &str) -> Term {
+        Term::Literal(Literal::new(s))
+    }
+
+    fn focus_node_term() -> Term {
+        make_iri("http://example.org/focusNode")
+    }
+
+    fn shape_id(s: &str) -> ShapeId {
+        ShapeId::new(s)
+    }
+
+    fn pred_path(p: &str) -> PropertyPath {
+        PropertyPath::Predicate(NamedNode::new(p).expect("valid IRI"))
+    }
+
+    fn base_ctx(values: Vec<Term>) -> ConstraintContext {
+        ConstraintContext::new(focus_node_term(), shape_id("http://example.org/shape"))
+            .with_path(pred_path("http://example.org/prop"))
+            .with_values(values)
+    }
+
+    fn insert_type_triple(store: &ConcreteStore, subject: &str, rdf_type: &str) {
+        let subj = Subject::from(NamedNode::new(subject).expect("IRI"));
+        let pred = Predicate::from(
+            NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type").expect("IRI"),
+        );
+        let obj = Object::from(NamedNode::new(rdf_type).expect("IRI"));
+        let quad = Quad::new(subj, pred, obj, GraphName::DefaultGraph);
+        store.insert_quad(quad).expect("insert");
+    }
+
+    // ---- QualifiedValueShapeConstraint: validate() ----
+
+    #[test]
+    fn test_qualified_value_shape_validate_ok_min_only() {
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_min_count(1);
+        assert!(c.validate().is_ok(), "Min count only should validate");
+    }
+
+    #[test]
+    fn test_qualified_value_shape_validate_ok_max_only() {
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_max_count(5);
+        assert!(c.validate().is_ok(), "Max count only should validate");
+    }
+
+    #[test]
+    fn test_qualified_value_shape_validate_ok_min_max() {
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_min_count(1)
+            .with_qualified_max_count(3);
+        assert!(c.validate().is_ok(), "Min and max count should validate");
+    }
+
+    #[test]
+    fn test_qualified_value_shape_validate_min_greater_than_max_error() {
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_min_count(5)
+            .with_qualified_max_count(3);
+        assert!(c.validate().is_err(), "Min > Max should fail validation");
+    }
+
+    #[test]
+    fn test_qualified_value_shape_validate_no_counts_error() {
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"));
+        assert!(
+            c.validate().is_err(),
+            "No min or max count should fail validation"
+        );
+    }
+
+    // ---- QualifiedValueShapeConstraint: evaluate() with no registry (fallback) ----
+
+    #[test]
+    fn test_qualified_min_empty_values_satisfied() {
+        // No values, min_count = 0: satisfied
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_min_count(0);
+        let store = ConcreteStore::new().expect("store");
+        let ctx = base_ctx(vec![]);
+        assert!(c.evaluate(&ctx, &store).expect("eval").is_satisfied());
+    }
+
+    #[test]
+    fn test_qualified_min_positive_empty_values_violated() {
+        // No values, min_count = 1: violated
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_min_count(1);
+        let store = ConcreteStore::new().expect("store");
+        let ctx = base_ctx(vec![]);
+        assert!(c.evaluate(&ctx, &store).expect("eval").is_violated());
+    }
+
+    #[test]
+    fn test_qualified_max_zero_empty_values_satisfied() {
+        // No values, max_count = 0: satisfied
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_max_count(0);
+        let store = ConcreteStore::new().expect("store");
+        let ctx = base_ctx(vec![]);
+        assert!(c.evaluate(&ctx, &store).expect("eval").is_satisfied());
+    }
+
+    #[test]
+    fn regression_qualified_value_shape_no_registry_fails_loud_not_friendshape_hack() {
+        // With no shapes_registry in the ConstraintContext and non-empty values,
+        // value_conforms_to_shape must fail loudly (Err) instead of fabricating
+        // a pass/fail result via a hardcoded "FriendShape" substring match.
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_min_count(1)
+            .with_qualified_max_count(2);
+        let store = ConcreteStore::new().expect("store");
+        let friend_iri = "http://example.org/bob";
+        insert_type_triple(&store, friend_iri, "http://example.org/Friend");
+
+        let ctx = base_ctx(vec![make_iri(friend_iri)]);
+        let result = c.evaluate(&ctx, &store);
+        assert!(
+            result.is_err(),
+            "evaluate() must fail loudly without a shapes registry, not fabricate a result"
+        );
+    }
+
+    #[test]
+    fn regression_qualified_min_no_registry_non_empty_values_fails_loud() {
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_min_count(1);
+        let store = ConcreteStore::new().expect("store");
+        let ctx = base_ctx(vec![make_iri("http://example.org/stranger")]);
+        let result = c.evaluate(&ctx, &store);
+        assert!(
+            result.is_err(),
+            "evaluate() must fail loudly without a shapes registry, not fabricate a result"
+        );
+    }
+
+    #[test]
+    fn regression_qualified_max_no_registry_non_empty_values_fails_loud() {
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/FriendShape"))
+            .with_qualified_max_count(2);
+        let store = ConcreteStore::new().expect("store");
+        for i in 1..=3 {
+            let friend_iri = format!("http://example.org/friend{i}");
+            insert_type_triple(&store, &friend_iri, "http://example.org/Friend");
+        }
+        let ctx = base_ctx(vec![
+            make_iri("http://example.org/friend1"),
+            make_iri("http://example.org/friend2"),
+            make_iri("http://example.org/friend3"),
+        ]);
+        let result = c.evaluate(&ctx, &store);
+        assert!(
+            result.is_err(),
+            "evaluate() must fail loudly without a shapes registry, not fabricate a result"
+        );
+    }
+
+    #[test]
+    fn test_qualified_disjoint_flag_is_stored() {
+        let c = QualifiedValueShapeConstraint::new(shape_id("http://example.org/S"))
+            .with_qualified_min_count(1)
+            .with_qualified_value_shapes_disjoint(true);
+        assert!(
+            c.qualified_value_shapes_disjoint,
+            "Disjoint flag should be true"
+        );
+    }
+
+    // ---- ClosedConstraint tests ----
+
+    #[test]
+    fn test_closed_constraint_validate_ok() {
+        let allowed = vec![make_iri("http://example.org/name")];
+        let c = ClosedConstraint::new(allowed);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn test_closed_empty_focus_node_violated() {
+        let c = ClosedConstraint::new(vec![]);
+        let store = ConcreteStore::new().expect("store");
+        // Literal as focus node is invalid subject
+        let ctx = ConstraintContext::new(plain_lit("invalid"), shape_id("http://example.org/S"))
+            .with_path(pred_path("http://example.org/prop"))
+            .with_values(vec![]);
+        let result = c.evaluate(&ctx, &store).expect("eval");
+        assert!(
+            result.is_violated(),
+            "Literal focus node should be violated"
+        );
+    }
+
+    #[test]
+    fn test_closed_no_extra_properties_satisfied() {
+        let allowed_pred = "http://example.org/name";
+        let c = ClosedConstraint::new(vec![make_iri(allowed_pred)]);
+        let store = ConcreteStore::new().expect("store");
+        // Insert a triple using the allowed property
+        let subj = Subject::from(NamedNode::new("http://example.org/focusNode").expect("IRI"));
+        let pred = Predicate::from(NamedNode::new(allowed_pred).expect("IRI"));
+        let obj = Object::from(Literal::new("Alice"));
+        store
+            .insert_quad(Quad::new(subj, pred, obj, GraphName::DefaultGraph))
+            .expect("insert");
+        let ctx = base_ctx(vec![]);
+        assert!(c.evaluate(&ctx, &store).expect("eval").is_satisfied());
+    }
+
+    #[test]
+    fn test_closed_extra_property_violated() {
+        let allowed_pred = "http://example.org/name";
+        let extra_pred = "http://example.org/unknownProp";
+        let c = ClosedConstraint::new(vec![make_iri(allowed_pred)]);
+        let store = ConcreteStore::new().expect("store");
+        // Insert a triple using an extra (not-allowed) property
+        let subj = Subject::from(NamedNode::new("http://example.org/focusNode").expect("IRI"));
+        let pred = Predicate::from(NamedNode::new(extra_pred).expect("IRI"));
+        let obj = Object::from(Literal::new("SomeValue"));
+        store
+            .insert_quad(Quad::new(subj, pred, obj, GraphName::DefaultGraph))
+            .expect("insert");
+        let ctx = base_ctx(vec![]);
+        assert!(c.evaluate(&ctx, &store).expect("eval").is_violated());
+    }
+}

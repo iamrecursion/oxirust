@@ -1,0 +1,61 @@
+[package]
+name = "scirs2-transform"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Data transformation module for SciRS2 (scirs2-transform)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["transform", "feature-engineering", "scientific", "ai", "machine-learning"]
+categories = ["science", "mathematics", "algorithms"]
+
+[[bench]]
+name = "transform_bench"
+harness = false
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["validation", "parallel", "simd", "array", "random"] }
+scirs2-linalg = { workspace = true }
+scirs2-fft = { workspace = true, features = ["oxifft"] }
+thiserror = { workspace = true }
+approx = { workspace = true }
+num_cpus = { workspace = true }
+regex = { workspace = true }
+ahash = { workspace = true }
+statrs = { workspace = true }
+rayon = { workspace = true }
+sysinfo = { workspace = true }
+
+# Optional dependencies for new features
+tokio = { workspace = true, optional = true, features = ["full"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
+oxicode = { workspace = true, optional = true }  # Binary serialization (SIMD-optimized)
+prometheus = { workspace = true, optional = true }
+
+# Future dependency for PandRS with appropriate abstractions
+# pandrs_wrapper = { path = "../wrappers/pandrs_wrapper", optional = true }
+
+[features]
+default = []
+simd = ["scirs2-core/simd"]
+gpu = ["scirs2-core/gpu"]
+distributed = ["dep:tokio", "dep:serde", "dep:oxicode"]  # SIMD-optimized serialization
+auto-feature-engineering = []
+monitoring = ["dep:prometheus"]
+# Enable external ML library wrappers
+# pandrs = ["dep:pandrs_wrapper"]
+
+[dev-dependencies]
+scirs2-datasets = { path = "../scirs2-datasets" }
+plotters = { workspace = true, default-features = false }
+criterion = { workspace = true }
+ndarray-rand = { workspace = true }

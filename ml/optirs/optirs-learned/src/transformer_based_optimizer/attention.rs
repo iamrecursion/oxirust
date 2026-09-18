@@ -1,0 +1,709 @@
+use std::fmt::Debug;
+// Multi-head attention mechanisms for transformer architecture
+
+use crate::common::cast_scalar;
+use crate::error::Result;
+use scirs2_core::ndarray::{Array2, Array3};
+use scirs2_core::numeric::Float;
+
+/// Multi-head attention mechanism
+pub struct MultiHeadAttention<
+    T: Float + Debug + scirs2_core::ndarray::ScalarOperand + Send + Sync + 'static,
+> {
+    /// Number of attention heads
+    num_heads: usize,
+
+    /// Dimension per head
+    head_dimension: usize,
+
+    /// Model dimension
+    model_dimension: usize,
+
+    /// Query projection weights
+    query_weights: Array2<T>,
+
+    /// Key projection weights
+    key_weights: Array2<T>,
+
+    /// Value projection weights
+    value_weights: Array2<T>,
+
+    /// Output projection weights
+    output_weights: Array2<T>,
+
+    /// Attention dropout rate
+    dropout_rate: f64,
+
+    /// Cached attention weights for analysis
+    attention_weights: Option<Array3<T>>,
+
+    /// Scale factor for attention scores
+    scale_factor: T,
+}
+
+impl<T: Float + Debug + scirs2_core::ndarray::ScalarOperand + 'static + Send + Sync>
+    MultiHeadAttention<T>
+{
+    /// Create new multi-head attention
+    pub fn new(num_heads: usize, model_dimension: usize, head_dimension: usize) -> Result<Self> {
+        if !model_dimension.is_multiple_of(num_heads) {
+            return Err(crate::error::OptimError::Other(
+                "Model dimension must be divisible by number of heads".to_string(),
+            ));
+        }
+
+        if head_dimension == 0 {
+            return Err(crate::error::OptimError::InvalidConfig(
+                "head_dimension must be greater than 0".to_string(),
+            ));
+        }
+        let scale_factor: T = cast_scalar(1.0 / (head_dimension as f64).sqrt())?;
+
+        // Xavier/Glorot uniform limit for the four square `model_dimension ×
+        // model_dimension` projections.
+        let xavier_limit = Self::xavier_limit(model_dimension, model_dimension);
+
+        let query_weights =
+            Self::initialize_weights(model_dimension, model_dimension, xavier_limit);
+        let key_weights = Self::initialize_weights(model_dimension, model_dimension, xavier_limit);
+        let value_weights =
+            Self::initialize_weights(model_dimension, model_dimension, xavier_limit);
+        let output_weights =
+            Self::initialize_weights(model_dimension, model_dimension, xavier_limit);
+
+        Ok(Self {
+            num_heads,
+            head_dimension,
+            model_dimension,
+            query_weights,
+            key_weights,
+            value_weights,
+            output_weights,
+            dropout_rate: 0.1,
+            attention_weights: None,
+            scale_factor,
+        })
+    }
+
+    /// Xavier/Glorot **uniform** limit: `sqrt(6 / (fan_in + fan_out))`.
+    ///
+    /// Two things were wrong here before (finding F64):
+    ///
+    /// 1. The limit was `sqrt(2 / (fan_in + fan_out))`, which is Glorot's target
+    ///    *standard deviation* for a normal draw. `Self::initialize_weights`
+    ///    samples `Uniform[-b, b]`, whose variance is `b² / 3`, so the projections
+    ///    started with exactly one third of the intended variance.
+    /// 2. The fan pair was `model_dimension + head_dimension`. All four
+    ///    projections are `model_dimension × model_dimension`, so both fans are
+    ///    `model_dimension`; with the default 8 heads the denominator was
+    ///    `model_dimension · 9/8` instead of `2 · model_dimension`, inflating the
+    ///    limit by a further ~1.33×.
+    ///
+    /// Net effect at the default 512/8 configuration: a per-weight standard
+    /// deviation of 0.0340 where Glorot asks for 0.0442.
+    pub fn xavier_limit(fan_in: usize, fan_out: usize) -> f64 {
+        (6.0 / (fan_in + fan_out).max(1) as f64).sqrt()
+    }
+
+    /// Draw a weight matrix from `Uniform[-limit, limit]`.
+    ///
+    /// `limit` is the uniform half-width, not a standard deviation — use
+    /// [`Self::xavier_limit`]. The generator handle is acquired once per matrix
+    /// rather than once per element.
+    fn initialize_weights(rows: usize, cols: usize, limit: f64) -> Array2<T> {
+        let mut weights = Array2::<T>::zeros((rows, cols));
+        let mut rng = scirs2_core::random::thread_rng();
+
+        for elem in weights.iter_mut() {
+            let random_val = rng.random::<f64>();
+            let scaled_val = (random_val - 0.5) * 2.0 * limit;
+            *elem = scirs2_core::numeric::NumCast::from(scaled_val).unwrap_or_else(|| T::zero());
+        }
+
+        weights
+    }
+
+    /// Forward pass through multi-head attention
+    pub fn forward(
+        &mut self,
+        query: &Array2<T>,
+        key: &Array2<T>,
+        value: &Array2<T>,
+    ) -> Result<Array2<T>> {
+        // Input shape is (batch_size * seq_length, model_dim)
+        let total_seq_len = query.shape()[0];
+        let model_dim = query.shape()[1];
+
+        // The four projections are `model_dimension × model_dimension`, so a
+        // caller whose feature width differs used to hit an ndarray shape panic
+        // inside `dot` rather than getting a typed error back. Q/K/V must also
+        // agree with each other, since they are reshaped with the same
+        // `seq_length`.
+        if model_dim != self.model_dimension {
+            return Err(crate::error::OptimError::InvalidConfig(format!(
+                "MultiHeadAttention was built for model dimension {} but the query \
+                 has {model_dim} features",
+                self.model_dimension
+            )));
+        }
+        if key.shape() != query.shape() || value.shape() != query.shape() {
+            return Err(crate::error::OptimError::InvalidConfig(format!(
+                "MultiHeadAttention needs query, key and value of equal shape: \
+                 query {:?}, key {:?}, value {:?}",
+                query.shape(),
+                key.shape(),
+                value.shape()
+            )));
+        }
+        if total_seq_len == 0 {
+            return Err(crate::error::OptimError::InvalidConfig(
+                "MultiHeadAttention cannot attend over an empty sequence".to_string(),
+            ));
+        }
+
+        // NOTE: For v1.0.0, batch_size=1 is intentional (single optimization task per forward pass)
+        //
+        // Optimization tasks typically process one trajectory at a time. Multi-batch support
+        // would enable parallel optimization of multiple independent tasks, which is planned
+        // for v1.1.0+ when used with distributed training features.
+        //
+        // For v1.0.0:
+        // - batch_size = 1 (single task)
+        // - seq_length = total_seq_len (full optimization history)
+        //
+        // PLANNED (v1.1.0+): Explicit batch dimension in forward() signature for parallel tasks
+        let batch_size = 1;
+        let seq_length = total_seq_len;
+
+        // Linear projections
+        let q = query.dot(&self.query_weights);
+        let k = key.dot(&self.key_weights);
+        let v = value.dot(&self.value_weights);
+
+        // Reshape for multi-head attention
+        let q_heads = self.reshape_for_heads(&q, batch_size, seq_length)?;
+        let k_heads = self.reshape_for_heads(&k, batch_size, seq_length)?;
+        let v_heads = self.reshape_for_heads(&v, batch_size, seq_length)?;
+
+        // Compute attention
+        let attention_output = self.compute_attention(&q_heads, &k_heads, &v_heads)?;
+
+        // Reshape back and apply output projection
+        let reshaped_output = self.reshape_from_heads(&attention_output, batch_size, seq_length)?;
+        let output = reshaped_output.dot(&self.output_weights);
+
+        Ok(output)
+    }
+
+    /// Reshape tensor for multi-head attention
+    fn reshape_for_heads(
+        &self,
+        tensor: &Array2<T>,
+        batch_size: usize,
+        seq_length: usize,
+    ) -> Result<Array3<T>> {
+        // Reshape from (batch_size * seq_length, model_dim) to (batch_size, seq_length, num_heads, head_dim)
+        // Then transpose to (batch_size, num_heads, seq_length, head_dim)
+
+        let mut reshaped =
+            Array3::<T>::zeros((batch_size, self.num_heads, seq_length * self.head_dimension));
+
+        for batch in 0..batch_size {
+            for head in 0..self.num_heads {
+                for seq in 0..seq_length {
+                    for dim in 0..self.head_dimension {
+                        let input_idx = batch * seq_length + seq;
+                        let input_dim = head * self.head_dimension + dim;
+                        let output_idx = seq * self.head_dimension + dim;
+
+                        if input_idx < tensor.shape()[0] && input_dim < tensor.shape()[1] {
+                            reshaped[[batch, head, output_idx]] = tensor[[input_idx, input_dim]];
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(reshaped)
+    }
+
+    /// Reshape tensor back from multi-head format
+    fn reshape_from_heads(
+        &self,
+        tensor: &Array3<T>,
+        batch_size: usize,
+        seq_length: usize,
+    ) -> Result<Array2<T>> {
+        let mut output = Array2::<T>::zeros((batch_size * seq_length, self.model_dimension));
+
+        for batch in 0..batch_size {
+            for head in 0..self.num_heads {
+                for seq in 0..seq_length {
+                    for dim in 0..self.head_dimension {
+                        let input_idx = seq * self.head_dimension + dim;
+                        let output_row = batch * seq_length + seq;
+                        let output_col = head * self.head_dimension + dim;
+
+                        if input_idx < tensor.shape()[2]
+                            && output_row < output.shape()[0]
+                            && output_col < output.shape()[1]
+                        {
+                            output[[output_row, output_col]] = tensor[[batch, head, input_idx]];
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Compute scaled dot-product attention
+    fn compute_attention(
+        &mut self,
+        query: &Array3<T>,
+        key: &Array3<T>,
+        value: &Array3<T>,
+    ) -> Result<Array3<T>> {
+        let batch_size = query.shape()[0];
+        let num_heads = query.shape()[1];
+        let seq_length = query.shape()[2] / self.head_dimension;
+
+        let mut attention_output = Array3::<T>::zeros(query.raw_dim());
+        let mut attention_weights =
+            Array3::<T>::zeros((batch_size, num_heads, seq_length * seq_length));
+
+        for batch in 0..batch_size {
+            for head in 0..num_heads {
+                // Extract Q, K, V for this batch and head
+                let q_slice = self.extract_head_slice(query, batch, head, seq_length)?;
+                let k_slice = self.extract_head_slice(key, batch, head, seq_length)?;
+                let v_slice = self.extract_head_slice(value, batch, head, seq_length)?;
+
+                // Compute attention scores: Q * K^T / sqrt(d_k)
+                let scores = self.compute_attention_scores(&q_slice, &k_slice)?;
+
+                // Apply softmax
+                let attention_probs = self.softmax(&scores)?;
+
+                // Store attention weights for analysis
+                for i in 0..seq_length {
+                    for j in 0..seq_length {
+                        if i * seq_length + j < attention_weights.shape()[2] {
+                            attention_weights[[batch, head, i * seq_length + j]] =
+                                attention_probs[[i, j]];
+                        }
+                    }
+                }
+
+                // Apply attention to values: Attention * V
+                let attended_values = attention_probs.dot(&v_slice);
+
+                // Store result
+                for i in 0..seq_length {
+                    for j in 0..self.head_dimension {
+                        let output_idx = i * self.head_dimension + j;
+                        if output_idx < attention_output.shape()[2] {
+                            attention_output[[batch, head, output_idx]] = attended_values[[i, j]];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cache attention weights
+        self.attention_weights = Some(attention_weights);
+
+        Ok(attention_output)
+    }
+
+    /// Extract slice for specific batch and head
+    fn extract_head_slice(
+        &self,
+        tensor: &Array3<T>,
+        batch: usize,
+        head: usize,
+        seq_length: usize,
+    ) -> Result<Array2<T>> {
+        let mut slice = Array2::<T>::zeros((seq_length, self.head_dimension));
+
+        for seq in 0..seq_length {
+            for dim in 0..self.head_dimension {
+                let tensor_idx = seq * self.head_dimension + dim;
+                if tensor_idx < tensor.shape()[2] {
+                    slice[[seq, dim]] = tensor[[batch, head, tensor_idx]];
+                }
+            }
+        }
+
+        Ok(slice)
+    }
+
+    /// Compute attention scores
+    fn compute_attention_scores(&self, query: &Array2<T>, key: &Array2<T>) -> Result<Array2<T>> {
+        let seq_length = query.shape()[0];
+        let mut scores = Array2::<T>::zeros((seq_length, seq_length));
+
+        for i in 0..seq_length {
+            for j in 0..seq_length {
+                let mut score = T::zero();
+                for k in 0..self.head_dimension {
+                    score = score + query[[i, k]] * key[[j, k]];
+                }
+                scores[[i, j]] = score * self.scale_factor;
+            }
+        }
+
+        Ok(scores)
+    }
+
+    /// Apply softmax to attention scores
+    fn softmax(&self, scores: &Array2<T>) -> Result<Array2<T>> {
+        let seq_length = scores.shape()[0];
+        let mut probs = Array2::<T>::zeros((seq_length, seq_length));
+
+        for i in 0..seq_length {
+            // Find max for numerical stability
+            let mut max_score = T::neg_infinity();
+            for j in 0..seq_length {
+                if scores[[i, j]] > max_score {
+                    max_score = scores[[i, j]];
+                }
+            }
+
+            // Compute exponentials and sum
+            let mut exp_sum = T::zero();
+            let mut exp_scores = vec![T::zero(); seq_length];
+
+            for j in 0..seq_length {
+                // `Float::exp` stays in `T`; the old f64 round-trip needed an
+                // `expect` that panicked for any element type without a
+                // lossless `to_f64`.
+                exp_scores[j] = (scores[[i, j]] - max_score).exp();
+                exp_sum = exp_sum + exp_scores[j];
+            }
+
+            // Normalize. `exp(0) == 1` for the max entry, so `exp_sum` is at
+            // least 1 for any finite row; a non-positive sum means the row was
+            // all -inf or NaN, which cannot be normalized.
+            if exp_sum <= T::zero() || !exp_sum.is_finite() {
+                return Err(crate::error::OptimError::ComputationError(format!(
+                    "attention row {i} has no finite scores to normalize"
+                )));
+            }
+            for j in 0..seq_length {
+                probs[[i, j]] = exp_scores[j] / exp_sum;
+            }
+        }
+
+        Ok(probs)
+    }
+
+    /// Get cached attention weights
+    pub fn get_attention_weights(&self) -> Option<Array3<T>> {
+        self.attention_weights.clone()
+    }
+
+    /// Reset parameters
+    pub fn reset(&mut self) -> Result<()> {
+        let xavier_limit = Self::xavier_limit(self.model_dimension, self.model_dimension);
+
+        self.query_weights =
+            Self::initialize_weights(self.model_dimension, self.model_dimension, xavier_limit);
+        self.key_weights =
+            Self::initialize_weights(self.model_dimension, self.model_dimension, xavier_limit);
+        self.value_weights =
+            Self::initialize_weights(self.model_dimension, self.model_dimension, xavier_limit);
+        self.output_weights =
+            Self::initialize_weights(self.model_dimension, self.model_dimension, xavier_limit);
+
+        self.attention_weights = None;
+
+        Ok(())
+    }
+
+    /// Get parameter count
+    pub fn parameter_count(&self) -> usize {
+        self.query_weights.len()
+            + self.key_weights.len()
+            + self.value_weights.len()
+            + self.output_weights.len()
+    }
+
+    /// Read-only views of the four projections, in `(query, key, value, output)`
+    /// order. Each is `model_dimension × model_dimension`.
+    ///
+    /// Immutable borrows only, so the shape invariants [`Self::forward`] relies on
+    /// stay under this type's control. Exposed so initialization statistics can be
+    /// asserted from outside the crate — see the `xavier_initialization`
+    /// integration test.
+    pub fn projection_snapshots(&self) -> (&Array2<T>, &Array2<T>, &Array2<T>, &Array2<T>) {
+        (
+            &self.query_weights,
+            &self.key_weights,
+            &self.value_weights,
+            &self.output_weights,
+        )
+    }
+
+    /// Set dropout rate
+    pub fn set_dropout_rate(&mut self, rate: f64) {
+        self.dropout_rate = rate.clamp(0.0, 1.0);
+    }
+}
+
+/// Attention mechanism trait for different attention types
+pub trait AttentionMechanism<
+    T: Float + Debug + scirs2_core::ndarray::ScalarOperand + Send + Sync + 'static,
+>
+{
+    fn compute_attention(
+        &mut self,
+        query: &Array2<T>,
+        key: &Array2<T>,
+        value: &Array2<T>,
+    ) -> Result<Array2<T>>;
+
+    fn get_attention_weights(&self) -> Option<Array3<T>>;
+    fn parameter_count(&self) -> usize;
+    fn reset(&mut self) -> Result<()>;
+}
+
+impl<T: Float + Debug + scirs2_core::ndarray::ScalarOperand + 'static + Send + Sync>
+    AttentionMechanism<T> for MultiHeadAttention<T>
+{
+    fn compute_attention(
+        &mut self,
+        query: &Array2<T>,
+        key: &Array2<T>,
+        value: &Array2<T>,
+    ) -> Result<Array2<T>> {
+        self.forward(query, key, value)
+    }
+
+    fn get_attention_weights(&self) -> Option<Array3<T>> {
+        self.attention_weights.clone()
+    }
+
+    fn parameter_count(&self) -> usize {
+        self.parameter_count()
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.reset()
+    }
+}
+
+/// Self-attention specific implementation
+pub struct SelfAttention<
+    T: Float + Debug + scirs2_core::ndarray::ScalarOperand + Send + Sync + 'static,
+> {
+    multi_head_attention: MultiHeadAttention<T>,
+}
+
+impl<T: Float + Debug + scirs2_core::ndarray::ScalarOperand + 'static + Send + Sync>
+    SelfAttention<T>
+{
+    pub fn new(num_heads: usize, model_dimension: usize, head_dimension: usize) -> Result<Self> {
+        let multi_head_attention =
+            MultiHeadAttention::new(num_heads, model_dimension, head_dimension)?;
+
+        Ok(Self {
+            multi_head_attention,
+        })
+    }
+
+    pub fn forward(&mut self, input: &Array2<T>) -> Result<Array2<T>> {
+        // Self-attention: Q = K = V = input
+        self.multi_head_attention.forward(input, input, input)
+    }
+}
+
+/// Cross-attention implementation
+pub struct CrossAttention<
+    T: Float + Debug + scirs2_core::ndarray::ScalarOperand + Send + Sync + 'static,
+> {
+    multi_head_attention: MultiHeadAttention<T>,
+}
+
+impl<T: Float + Debug + scirs2_core::ndarray::ScalarOperand + 'static + Send + Sync>
+    CrossAttention<T>
+{
+    pub fn new(num_heads: usize, model_dimension: usize, head_dimension: usize) -> Result<Self> {
+        let multi_head_attention =
+            MultiHeadAttention::new(num_heads, model_dimension, head_dimension)?;
+
+        Ok(Self {
+            multi_head_attention,
+        })
+    }
+
+    pub fn forward(&mut self, query: &Array2<T>, context: &Array2<T>) -> Result<Array2<T>> {
+        // Cross-attention: Q = query, K = V = context
+        self.multi_head_attention.forward(query, context, context)
+    }
+}
+
+/// Attention visualization utilities
+pub struct AttentionVisualizer<
+    T: Float + Debug + scirs2_core::ndarray::ScalarOperand + Send + Sync + 'static,
+> {
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: Float + Debug + scirs2_core::ndarray::ScalarOperand + 'static + Send + Sync> Default
+    for AttentionVisualizer<T>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Float + Debug + scirs2_core::ndarray::ScalarOperand + 'static + Send + Sync>
+    AttentionVisualizer<T>
+{
+    pub fn new() -> Self {
+        Self {
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Extract attention patterns for analysis.
+    ///
+    /// Per-head entropy is the mean of `-Σ p log p` over **every** batch element,
+    /// not just batch 0: reading only the first slice threw away all but one
+    /// task's attention distribution while still reporting the result as the
+    /// head's entropy.
+    pub fn extract_attention_patterns(
+        &self,
+        attention_weights: &Array3<T>,
+    ) -> AttentionPatterns<T> {
+        let batch_size = attention_weights.shape()[0];
+        let num_heads = attention_weights.shape()[1];
+        let seq_length_squared = attention_weights.shape()[2];
+        let seq_length = (seq_length_squared as f64).sqrt() as usize;
+
+        let mut head_entropies = vec![T::zero(); num_heads];
+
+        // An empty batch or head axis leaves every mean undefined; report zeros
+        // rather than dividing by zero.
+        if batch_size == 0 || num_heads == 0 {
+            return AttentionPatterns {
+                head_entropies,
+                attention_diversity: T::zero(),
+                sequence_length: seq_length,
+                num_heads,
+            };
+        }
+
+        let batch_count: T =
+            scirs2_core::numeric::NumCast::from(batch_size).unwrap_or_else(|| T::one());
+        let head_count: T =
+            scirs2_core::numeric::NumCast::from(num_heads).unwrap_or_else(|| T::one());
+        let span = (seq_length * seq_length).min(seq_length_squared);
+        let mut attention_diversity = T::zero();
+
+        for head in 0..num_heads {
+            let mut entropy = T::zero();
+            for batch in 0..batch_size {
+                for idx in 0..span {
+                    let prob = attention_weights[[batch, head, idx]];
+                    if prob > T::zero() {
+                        // `Float::ln` keeps the whole term in `T`; the previous
+                        // f64 round-trip needed an `expect` that could panic for
+                        // an element type without a lossless `to_f64`.
+                        entropy = entropy - prob * prob.ln();
+                    }
+                }
+            }
+            let mean_entropy = entropy / batch_count;
+            head_entropies[head] = mean_entropy;
+            attention_diversity = attention_diversity + mean_entropy;
+        }
+
+        AttentionPatterns {
+            head_entropies,
+            attention_diversity: attention_diversity / head_count,
+            sequence_length: seq_length,
+            num_heads,
+        }
+    }
+}
+
+/// Attention pattern analysis results
+#[derive(Debug, Clone)]
+pub struct AttentionPatterns<
+    T: Float + Debug + scirs2_core::ndarray::ScalarOperand + Send + Sync + 'static,
+> {
+    pub head_entropies: Vec<T>,
+    pub attention_diversity: T,
+    pub sequence_length: usize,
+    pub num_heads: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multi_head_attention_creation() {
+        let attention = MultiHeadAttention::<f32>::new(8, 512, 64);
+        assert!(attention.is_ok());
+
+        let mha = attention.expect("MultiHeadAttention::new should succeed");
+        assert_eq!(mha.num_heads, 8);
+        assert_eq!(mha.model_dimension, 512);
+        assert_eq!(mha.head_dimension, 64);
+    }
+
+    #[test]
+    fn test_attention_forward_pass() {
+        let mut attention = MultiHeadAttention::<f32>::new(4, 128, 32)
+            .expect("MultiHeadAttention::new should succeed");
+
+        let seq_length = 10;
+        let batch_size = 2;
+        let input = Array2::<f32>::zeros((batch_size * seq_length, 128));
+
+        let result = attention.forward(&input, &input, &input);
+        assert!(result.is_ok());
+
+        let output = result.expect("forward should succeed");
+        assert_eq!(output.shape(), &[batch_size * seq_length, 128]);
+    }
+
+    #[test]
+    fn test_self_attention() {
+        let mut self_attention =
+            SelfAttention::<f32>::new(4, 128, 32).expect("SelfAttention::new should succeed");
+
+        let input = Array2::<f32>::zeros((20, 128)); // batch_size * seq_length = 20
+        let result = self_attention.forward(&input);
+        assert!(result.is_ok());
+
+        let output = result.expect("forward should succeed");
+        assert_eq!(output.shape(), input.shape());
+    }
+
+    #[test]
+    fn test_parameter_count() {
+        let attention = MultiHeadAttention::<f32>::new(8, 512, 64)
+            .expect("MultiHeadAttention::new should succeed");
+        let param_count = attention.parameter_count();
+
+        // 4 weight matrices of size 512x512
+        let expected = 4 * 512 * 512;
+        assert_eq!(param_count, expected);
+    }
+
+    #[test]
+    fn test_attention_visualization() {
+        let visualizer = AttentionVisualizer::<f32>::new();
+        let attention_weights = Array3::<f32>::zeros((1, 4, 100)); // 1 batch, 4 heads, 10x10 sequence
+
+        let patterns = visualizer.extract_attention_patterns(&attention_weights);
+        assert_eq!(patterns.num_heads, 4);
+        assert_eq!(patterns.sequence_length, 10);
+        assert_eq!(patterns.head_entropies.len(), 4);
+    }
+}

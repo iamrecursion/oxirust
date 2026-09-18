@@ -1,0 +1,78 @@
+[package]
+name = "oxirs-shacl-ai"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "AI-powered shape induction and data repair suggestions for SHACL validation"
+keywords = ["shacl", "ai", "machine-learning", "validation", "rdf"]
+categories = ["science", "algorithms", "data-structures"]
+readme = "README.md"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+oxirs-core.workspace = true
+oxirs-shacl.workspace = true
+
+# SciRS2 dependencies for AI-powered SHACL validation
+scirs2-core = { workspace = true }
+scirs2-stats = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+# ndarray and rand now provided by scirs2-core (SciRS2 compliance)
+regex.workspace = true
+indexmap.workspace = true
+uuid.workspace = true
+threadpool = "1.8"
+async-trait.workspace = true
+reqwest = { workspace = true, optional = true }
+futures.workspace = true
+dashmap.workspace = true
+# datafusion.workspace = true  # Temporarily disabled due to version conflicts
+fastrand.workspace = true
+url = { workspace = true, features = ["serde"] }
+oxiarc-deflate = { workspace = true }
+oxiarc-zstd = { workspace = true }
+oxiarc-lz4 = { workspace = true }
+sha2.workspace = true
+hex.workspace = true
+once_cell.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tracing-subscriber.workspace = true
+
+[[example]]
+name = "advanced_scirs2_integration_demo"
+required-features = ["gpu"]
+
+[[bench]]
+name = "advanced_scirs2_benchmarks"
+harness = false
+required-features = ["gpu"]
+
+[features]
+default = []
+shape-induction = []
+data-repair = []
+# Enable network-based LLM providers (OpenAI, Anthropic).
+# Requires a valid API key at runtime; default features remain 100% offline.
+llm-network = ["dep:reqwest"]
+# GPU acceleration via scirs2-core's Pure-Rust `gpu` feature (no GPU FFI).
+# Gates `advanced_scirs2_integration.rs`, which imports `scirs2_core::gpu`.
+gpu = ["scirs2-core/gpu"]

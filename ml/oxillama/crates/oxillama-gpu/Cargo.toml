@@ -1,0 +1,36 @@
+[package]
+name = "oxillama-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Optional wgpu GPU compute backend for OxiLLaMa"
+keywords = ["llm", "gpu", "wgpu", "compute", "webgpu"]
+categories = ["science", "hardware-support"]
+readme = "README.md"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+thiserror.workspace = true
+oxillama-gguf  = { workspace = true, default-features = false }
+half.workspace = true
+wgpu     = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[dev-dependencies]
+naga = { workspace = true }
+# Used only as the upstream-pinned oracle for golden-vector / CPU-vs-GPU
+# cross-check tests (see src/kernels/golden_tests.rs and
+# tests/cpu_gpu_cross_check.rs) — never a runtime dependency of this crate.
+oxillama-quant = { path = "../oxillama-quant", default-features = false }
+
+

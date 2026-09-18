@@ -1,0 +1,34 @@
+# cargo-deny configuration for the oximedia-web nested workspace.
+# Run: cargo deny --manifest-path web/Cargo.toml check licenses
+
+[graph]
+targets = [
+    { triple = "wasm32-unknown-unknown" },
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+]
+
+[licenses]
+version = 2
+# confidence-threshold left at cargo-deny's default (0.8)
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "ISC",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"

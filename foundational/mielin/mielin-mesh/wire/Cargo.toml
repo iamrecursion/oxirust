@@ -1,0 +1,62 @@
+[package]
+name = "mielin-mesh-wire"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "QUIC-based wire protocol for agent migration and mesh communication with compression and security"
+keywords = ["quic", "protocol", "networking", "migration", "distributed"]
+categories = ["network-programming", "asynchronous", "cryptography"]
+readme = "README.md"
+documentation = "https://docs.rs/mielin-mesh-wire"
+
+[dependencies]
+tokio.workspace = true
+oxiquic-transport.workspace = true
+oxiquic-crypto.workspace = true
+serde.workspace = true
+oxicode.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+oxitls-rcgen.workspace = true
+rand.workspace = true
+oxiarc-lz4.workspace = true
+oxiarc-zstd.workspace = true
+libm.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+
+# WebSocket support
+tokio-tungstenite.workspace = true
+futures.workspace = true
+
+# ACME / Let's Encrypt integration (in-house RFC 8555 client — instant-acme removed)
+base64.workspace = true
+x509-parser.workspace = true
+oxihttp-client = { workspace = true, features = ["tls"] }
+p256.workspace = true
+oxicrypto-sig.workspace = true
+oxicrypto-hash.workspace = true
+oxicrypto-rand.workspace = true
+oxicrypto-kex.workspace = true
+oxicrypto-kdf.workspace = true
+oxicrypto-core.workspace = true
+ml-kem.workspace = true
+rustls-pemfile.workspace = true
+postcard.workspace = true
+
+mielin-mesh-core.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+
+[[bench]]
+name = "wire"
+harness = false

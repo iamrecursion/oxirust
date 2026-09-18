@@ -1,0 +1,8 @@
+# Testing dependencies for scirs2-python
+pytest>=8.0.0
+pytest-cov>=4.1.0
+numpy>=1.24.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+hypothesis>=6.92.0
+pandas>=2.0.0  # For benchmarking

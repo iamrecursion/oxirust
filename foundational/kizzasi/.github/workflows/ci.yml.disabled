@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main, '0.2.0', '0.*' ]
+  pull_request:
+    branches: [ master, main, '0.2.0' ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Features that require external C/system libraries (ROS2, FFmpeg, HDF5)
+  # are excluded from CI. Use --all-features only on crates without C deps.
+  # kizzasi-python is excluded because it requires Python dev headers.
+  CI_EXCLUDE: "--exclude kizzasi-python"
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta, nightly]
+        exclude:
+          # Reduce CI load by excluding some combinations
+          - os: macos-latest
+            rust: beta
+          - os: windows-latest
+            rust: beta
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-
+
+      - name: Check formatting
+        if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        if: matrix.rust == 'stable'
+        run: cargo clippy --all-targets --workspace $CI_EXCLUDE -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace $CI_EXCLUDE --verbose
+
+      - name: Run tests (all crates)
+        run: cargo test --workspace $CI_EXCLUDE --verbose
+
+      - name: Build documentation
+        if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
+        run: cargo doc --workspace $CI_EXCLUDE --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  minimal-versions:
+    name: Minimal Versions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-minimal-versions
+        run: cargo install cargo-minimal-versions
+
+      - name: Check with minimal versions
+        run: cargo minimal-versions check --workspace $CI_EXCLUDE
+
+  miri:
+    name: Miri (Undefined Behavior Detection)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly with miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Setup miri
+        run: cargo miri setup
+
+      - name: Run miri tests (kizzasi-tokenizer)
+        working-directory: crates/kizzasi-tokenizer
+        run: cargo miri test
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run cargo-audit
+        uses: rustsec/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  unused-deps:
+    name: Check Unused Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-udeps
+        run: cargo install cargo-udeps --locked
+
+      - name: Check for unused dependencies
+        run: cargo +nightly udeps --workspace $CI_EXCLUDE
+
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: cargo check --workspace --exclude kizzasi-python
+
+  proptest:
+    name: Property Tests
+    runs-on: ubuntu-latest
+    env:
+      PROPTEST_CASES: 256
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --exclude kizzasi-python -- proptest
+
+  cross-platform:
+    name: Cross-platform Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Run tests
+        run: cargo test --workspace --exclude kizzasi-python
+        shell: bash
+
+  perf-regression:
+    name: Performance Regression Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run performance regression tests (release)
+        run: cargo test --test perf_regression -p kizzasi-model --release -- --nocapture
+        shell: bash
+
+  wasm-check:
+    name: WASM Compilation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Check kizzasi-tokenizer for WASM (no-default-features)
+        run: cargo check --target wasm32-unknown-unknown -p kizzasi-tokenizer --no-default-features
+      - name: Check kizzasi-tokenizer for WASM (wasm feature)
+        run: cargo check --target wasm32-unknown-unknown -p kizzasi-tokenizer --no-default-features --features wasm

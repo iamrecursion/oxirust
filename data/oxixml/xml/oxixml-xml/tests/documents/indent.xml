@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<library xmlns="urn:example:library" xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <shelf id="1" />
+    <shelf id="2">
+        <!-- a comment written at depth two -->
+        <?render mode="fast"?>
+        <book isbn="978-0-00-000000-1">
+            <dc:title>First and Foremost</dc:title>
+            <dc:creator>Alice</dc:creator>
+            <tags>
+                <tag />
+                <tag>reference</tag>
+            </tags>
+        </book>
+        <book isbn="978-0-00-000000-2">
+            <dc:title>Second</dc:title>
+            <dc:creator>Bob</dc:creator>
+        </book>
+    </shelf>
+</library>

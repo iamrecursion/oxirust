@@ -1,0 +1,146 @@
+[package]
+name = "voirs-dataset"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/voirs-dataset"
+keywords = ["voirs", "dataset", "ljspeech", "jvs", "audio-data"]
+categories = ["science", "data-structures", "multimedia::audio"]
+rust-version.workspace = true
+description = "Dataset utilities for VoiRS (LJSpeech, JVS, etc.)"
+readme = "README.md"
+
+[lib]
+name = "voirs_dataset"
+crate-type = ["lib"]
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core.workspace = true
+scirs2-fft.workspace = true
+
+# FFT (for mel spectrogram computation)
+oxifft.workspace = true
+
+# HTTP and file handling
+reqwest.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+# Pure-Rust TLS provider (rustls + RustCrypto) — installed before any TLS handshake
+oxitls-adapter-rustls-rustcrypto.workspace = true
+rustls.workspace = true
+
+# Audio processing
+hound.workspace = true
+dasp.workspace = true
+claxon.workspace = true
+lewton.workspace = true
+# Optional codecs (minimp3 / LAME are C-FFI; FLAC is Pure-Rust via OxiAudio) —
+# gated behind the non-default `ffi-codecs` feature (COOLJAPAN policy).
+# Pure-Rust FLAC encoding (OxiAudio, FLAC via flacenc) — replaces C-FFI flac-bound.
+oxiaudio-core = { workspace = true, optional = true }
+oxiaudio-encode = { workspace = true, optional = true }
+minimp3 = { workspace = true, optional = true }
+mp3lame-encoder = { workspace = true, optional = true }
+
+# Compression and archives
+oxiarc-deflate.workspace = true
+oxiarc-archive.workspace = true
+oxiarc-bzip2.workspace = true
+
+# Serialization and data formats
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+toml.workspace = true
+oxicode.workspace = true
+ordered-float.workspace = true
+parquet.workspace = true
+arrow.workspace = true
+
+# Async traits
+async-trait.workspace = true
+
+# Date and time handling
+chrono.workspace = true
+
+# UUID generation
+uuid.workspace = true
+
+# Hashing and request signing (real AWS SigV4 request signing for cloud
+# storage integration; md5 is also used by versioning.rs)
+md5.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+
+# Futures and async utilities
+futures.workspace = true
+
+# File system and paths
+walkdir.workspace = true
+tempfile.workspace = true
+memmap2.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# System information
+num_cpus.workspace = true
+
+# Platform APIs
+libc.workspace = true
+
+# Simple random generation
+fastrand.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+tokio-test.workspace = true
+futures.workspace = true
+
+[[bench]]
+name = "processing"
+harness = false
+
+[[bench]]
+name = "quality"
+harness = false
+
+[[bench]]
+name = "scalability"
+harness = false
+
+[[bench]]
+name = "augmentation"
+harness = false
+
+[features]
+default = []
+# Enables optional audio codecs: Pure-Rust FLAC encode (OxiAudio, via flacenc),
+# minimp3 (C-FFI MP3 decode), and LAME (C-FFI MP3 encode). OFF by default to keep
+# the default build Pure Rust. Without this feature, MP3 decode/encode via these
+# libraries returns a clear "requires 'ffi-codecs'" error, and FLAC encode falls
+# back to WAV.
+ffi-codecs = ["dep:oxiaudio-core", "dep:oxiaudio-encode", "dep:minimp3", "dep:mp3lame-encoder"]
+# Parquet manifest codecs. Each is backed by a compression crate that COOLJAPAN
+# policy keeps out of default builds (flate2, snap, lz4_flex), so all are OFF by
+# default. Without the matching feature, writing a manifest with that codec
+# returns `DatasetError::ConfigError` naming the feature;
+# `ParquetCompression::None` is always available.
+parquet-gzip = ["parquet/flate2-zlib-rs"]
+parquet-snappy = ["parquet/snap"]
+parquet-lz4 = ["parquet/lz4"]
+[lints]
+workspace = true

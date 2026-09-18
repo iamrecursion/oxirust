@@ -1,0 +1,19 @@
+[package]
+name = "scirs2-validation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared statistical validation framework for COOLJAPAN ecosystem"
+repository.workspace = true
+keywords = ["statistics", "validation", "testing", "distributions", "scientific"]
+categories = ["science", "mathematics", "development-tools::testing"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []

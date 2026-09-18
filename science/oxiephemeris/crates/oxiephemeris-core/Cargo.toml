@@ -1,0 +1,30 @@
+[package]
+name = "oxiephemeris-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "OxiEphemeris: two-part Julian Date/calendar arithmetic, TAI/TT/TDB time scales, and leap seconds"
+keywords = ["ephemeris", "astronomy", "jpl", "astrology"]
+categories = ["science", "no-std"]
+
+[features]
+default = []
+# Enables `std`-only conveniences (e.g. `std::error::Error` for `CoreError`).
+# The crate is `#![no_std]` when this feature is disabled.
+std = []
+
+[dependencies]
+libm.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

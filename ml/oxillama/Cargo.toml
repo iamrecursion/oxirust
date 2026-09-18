@@ -1,0 +1,185 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxillama-gguf",
+    "crates/oxillama-quant",
+    "crates/oxillama-arch",
+    "crates/oxillama-runtime",
+    "crates/oxillama-server",
+    "crates/oxillama-bench",
+    "crates/oxillama-py",
+    "crates/oxillama-wasm",
+    "crates/oxillama-gpu",
+    "crates/oxillama",
+    "crates/oxillama-cli",
+]
+
+[workspace.package]
+version = "0.1.5"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxillama"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+rust-version = "1.89"
+homepage = "https://github.com/cool-japan/oxillama"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "llama", "pure-rust"]
+categories = ["science", "algorithms", "command-line-utilities"]
+
+[workspace.dependencies]
+# ── Internal crates ──
+oxillama-gguf = { path = "crates/oxillama-gguf", version = "0.1.5", default-features = false }
+oxillama-quant = { path = "crates/oxillama-quant", version = "0.1.5", default-features = false }
+oxillama-arch = { path = "crates/oxillama-arch", version = "0.1.5", default-features = false }
+oxillama-runtime = { path = "crates/oxillama-runtime", version = "0.1.5", default-features = false }
+oxillama-server = { path = "crates/oxillama-server", version = "0.1.5" }
+oxillama-bench = { path = "crates/oxillama-bench", version = "0.1.5" }
+oxillama-py = { path = "crates/oxillama-py", version = "0.1.5" }
+oxillama-wasm = { path = "crates/oxillama-wasm", version = "0.1.5" }
+oxillama-gpu = { path = "crates/oxillama-gpu", version = "0.1.5", default-features = false }
+oxillama = { path = "crates/oxillama", version = "0.1.5", default-features = false }
+oxillama-cli = { path = "crates/oxillama-cli", version = "0.1.5" }
+
+# ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
+scirs2-core = { version = "0.6.5", default-features = false }
+scirs2-linalg = { version = "0.6.5", default-features = false }
+scirs2-neural = { version = "0.6.5", default-features = false }
+oxiblas = "0.2.2"
+oxifft = "0.4.2"
+
+# ── Error handling ──
+thiserror = "2.0.20"
+anyhow = "1.0.104"
+
+# ── Observability ──
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# ── Serialization ──
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+oxicode = { version = "0.2.6", features = ["serde"] }
+uuid = { version = "1.24.1", features = ["v4", "fast-rng", "macro-diagnostics"] }
+
+# ── Async runtime ──
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+futures-util = "0.3.34"
+tokio-util = { version = "0.7.19", features = ["full"] }
+
+# ── HTTP server ──
+axum = { version = "0.8.9", features = ["ws", "multipart"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.0", features = ["cors", "limit", "trace"] }
+
+# ── CLI ──
+clap = { version = "4.6.6", features = ["derive", "env"] }
+colored = "3.1.1"
+indicatif = "0.18.6"
+rustyline = "18.0.1"
+clap_complete = "4.6.9"
+clap_mangen = "0.3.3"
+dirs = "6.0.0"
+toml = "1.1.4"
+
+# ── Binary / memory / numerics ──
+memmap2 = "0.9.11"
+half = { version = "2.7.1", features = ["serde"] }
+blake3 = "1.8.6"
+
+# ── Parallelism ──
+rayon = "1.12.0"
+
+# ── Tokenizer ──
+tokenizers = { version = "0.23.1", default-features = false }
+fancy-regex = "0.19.0"
+
+# ── HTTP client (pure-Rust body, native-tls for TLS) ──
+# default-features off: ureq's own `default = ["rustls", "gzip"]` would pull
+# in a second (unused) TLS stack plus flate2/miniz_oxide for a feature this
+# crate's Range-GET GGUF downloader never exercises. hf-hub 1.0.0 (below) no
+# longer uses ureq at all, so this is the only ureq consumer in the workspace
+# and flate2/miniz_oxide are fully absent from the graph — see deny.toml.
+ureq = { version = "3.4.0", default-features = false, features = ["native-tls"] }
+
+# ── HuggingFace Hub ──
+# Bumped to 1.0.0 in v0.1.4 (2026-08-17): a from-scratch rewrite (old `ureq`
+# feature and `api::sync::{ApiBuilder, ApiError, ApiRepo}` / top-level
+# `Cache`/`Repo`/`RepoType` types are gone). crates/oxillama-cli/src/hub.rs
+# and crates/oxillama-py/src/hub.rs are migrated to the new `HFClient` /
+# `HFClientSync` / `HFRepositorySync` / `HFError` API; `blocking` keeps both
+# call sites synchronous over the now-async reqwest/tokio core (see
+# CHANGELOG.md). `rustls-tls` is required — hf-hub has no TLS-free feature.
+# Only reachable via the opt-in `hub` feature (off by default in both
+# consuming crates) — see deny.toml for the lz4_flex/aws-lc-sys consequences
+# of this bump.
+hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# ── TUI ──
+ratatui = { version = "0.30.2", features = ["crossterm"] }
+crossterm = "0.29.0"
+
+# ── Python / WASM bindings ──
+pyo3 = { version = "0.29.2", features = ["abi3-py38"] }
+numpy = { version = "0.29.0", default-features = false }
+wasm-bindgen = "0.2.127"
+wasm-bindgen-futures = "0.4.77"
+js-sys = "0.3.104"
+console_error_panic_hook = "0.1.7"
+serde-wasm-bindgen = "0.6.5"
+wasm-streams = "0.6.0"
+
+# ── Temp files / atomic writes ──
+tempfile = "3.27.0"
+
+# ── Crypto ──
+sha2 = { version = "0.11.0", default-features = false }
+hmac = "0.13.0"
+rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", "sha2"] }
+base64 = "0.23.1"
+rand = "0.10.2"
+# Pinned to 0.6 (do NOT `cargo upgrade`): rsa 0.9 depends on rand_core 0.6 and exposes its
+# `CryptoRngCore`/`OsRng` (used by oxillama-server JWT RS256 tests). `OsRng` and the `getrandom`
+# feature were removed in rand_core 0.9+. The `=` pin makes `cargo upgrade` skip it; unpin when
+# moving to rsa 0.10.
+rand_core = { version = "=0.6", features = ["getrandom"] }
+
+# ── Platform directories ──
+directories = "6.0.0"
+
+# ── GPU / WebGPU ──
+# Bumped to 30.0.0 in v0.1.4 (2026-08-17); oxillama-gpu migrated off the
+# 29.x API in the same change (see CHANGELOG.md).
+wgpu = "30.0.0"
+pollster = "1.0.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+naga = { version = "30.0.0", features = ["wgsl-in", "msl-out", "spv-out"] }
+
+# ── Benchmarking (dev) ──
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.11.0"
+sysinfo = "0.39.6"
+tabled = "0.21.0"
+
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+# Overflow checking is scoped to the crates that do arithmetic on untrusted
+# bytes rather than applied workspace-wide: measured cost is 10-22% CPU, which
+# is not worth paying inside the quant kernels and forward passes, where the
+# operands come from already-validated tensor metadata.
+overflow-checks = false
+
+# An unchecked overflow here turned into a bounds-check bypass in release
+# builds — a 40-byte crafted file defeated `BinaryReader::check`. The
+# individual sites now use `checked_*`; this catches the next one before it
+# ships. Untrusted input, negligible share of inference time.
+[profile.release.package.oxillama-gguf]
+overflow-checks = true
+
+# Parses untrusted HTTP request bodies and path parameters.
+[profile.release.package.oxillama-server]
+overflow-checks = true

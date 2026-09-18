@@ -1,0 +1,9 @@
+{
+  "name": "filter_acompressor",
+  "args": ["-i", "in.mkv", "-af", "acompressor", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "audio_filters": 1
+  }
+}

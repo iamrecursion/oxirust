@@ -1,0 +1,63 @@
+[package]
+name = "oxiarc-lzw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["compression", "lzw", "tiff", "pure-rust", "archive"]
+categories = ["compression", "encoding"]
+description = "Pure Rust LZW compression for TIFF and GIF formats"
+readme = "README.md"
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# TIFF-LZW differential oracle tests (tests/tiff_lzw_oracle.rs) that shell out
+# to `python3` + Pillow (libtiff-backed) and, when present, libtiff's `tiffcp`.
+# They validate real-world interop in BOTH directions: Pillow-compressed
+# strips must decode byte-identically, and oxiarc-compressed TIFFs must be
+# accepted by Pillow/libtiff. Tests self-skip when the tools are absent.
+# Mirrors the `lha-oracle` feature pattern in `oxiarc-lzhuf`.
+tiff-oracle = []
+
+# GIF-LZW differential oracle tests (tests/gif_oracle.rs) that shell out to
+# `python3` + Pillow, whose GIF plugin is an independent LZW implementation.
+# Both directions: Pillow-written GIFs must decode byte-identically here, and
+# GIFs built around `gif_compress` output must read back byte-identically in
+# Pillow. Tests self-skip when the tools are absent.
+gif-oracle = []
+
+# UNIX `compress(1)` / `.Z` differential oracle tests (tests/z_oracle.rs) that
+# shell out to the system `compress`, `uncompress` and `gzip -dc`. They check
+# BOTH directions: real `compress -b N` output must decode byte-identically
+# here, and this crate's `.Z` output must be byte-identical to (and accepted
+# by) the reference tools. Tests self-skip when the tools are absent.
+z-oracle = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+weezl.workspace = true
+
+[[bench]]
+name = "lzw_bench"
+harness = false
+
+[[bench]]
+name = "lzw_into_bench"
+harness = false
+
+[[bench]]
+name = "z_bench"
+harness = false
+
+[lints]
+workspace = true

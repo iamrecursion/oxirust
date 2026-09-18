@@ -1,0 +1,74 @@
+[package]
+name = "oximedia-conform"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional media conforming system for OxiMedia - EDL/XML/AAF timeline reconstruction"
+keywords = ["edl", "editorial", "post-production", "multimedia", "video"]
+categories = ["multimedia", "parser-implementations"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-timecode = { workspace = true }
+oximedia-edl = { workspace = true }
+oximedia-aaf = { workspace = true }
+oximedia-container = { workspace = true }
+oximedia-metadata = { workspace = true }
+oximedia-transcode = { workspace = true }
+oximedia-workflow = { workspace = true }
+
+# Workspace dependencies
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rayon = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+
+# Database
+oxisql-core = { workspace = true }
+oxisql-sqlite-compat = { workspace = true }
+
+# Additional dependencies
+regex.workspace = true
+glob = "0.3"
+walkdir.workspace = true
+sha2 = { workspace = true }
+md5 = "0.8"
+hex.workspace = true
+xxhash-rust = { workspace = true }
+strsim = "0.11"
+quick-xml = { workspace = true }
+tracing = { workspace = true }
+num_cpus = { workspace = true }
+pathdiff = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion = { workspace = true }
+
+[features]
+default = []
+# Enable `SqliteConnectionBlocking`-backed catalog and session storage.
+# The oxisql-core and oxisql-sqlite-compat deps are unconditional here
+# (always compiled in); this feature flag exists so callers can opt-in
+# consistently with the rest of the OxiMedia workspace.
+sqlite = []
+
+[lib]
+name = "oximedia_conform"
+path = "src/lib.rs"

@@ -1,0 +1,842 @@
+//! Advanced optimizer trait hierarchy for TrustformeRS.
+//!
+//! This module extends the base `Optimizer` trait from `trustformers-core` with
+//! additional specialized traits for different categories of optimizers, providing
+//! better organization and extensibility.
+//!
+//! # Trait Hierarchy
+//!
+//! ```text
+//! Optimizer (from trustformers-core)
+//!     │
+//!     ├── StatefulOptimizer
+//!     │   ├── MomentumOptimizer
+//!     │   │   ├── AdaptiveMomentumOptimizer  (Adam, AdamW, etc.)
+//!     │   │   └── ClassicalMomentumOptimizer (SGD with momentum)
+//!     │   └── SecondOrderOptimizer (L-BFGS, Newton-CG, etc.)
+//!     │
+//!     ├── DistributedOptimizer
+//!     │   ├── GradientCompressionOptimizer
+//!     │   ├── FederatedOptimizer
+//!     │   └── AsyncOptimizer
+//!     │
+//!     ├── HardwareOptimizer
+//!     │   ├── SIMDOptimizer
+//!     │   ├── GPUOptimizer
+//!     │   └── EdgeOptimizer
+//!     │
+//!     └── MetaOptimizer
+//!         ├── LookaheadOptimizer
+//!         ├── ScheduledOptimizer
+//!         └── CompositeOptimizer
+//! ```
+
+use crate::common::StateMemoryStats;
+use std::collections::HashMap;
+use trustformers_core::errors::{Result, TrustformersError};
+use trustformers_core::tensor::Tensor;
+use trustformers_core::traits::Optimizer;
+
+/// Extended optimizer trait with state management capabilities.
+///
+/// This trait builds on the base `Optimizer` trait to provide standardized
+/// state management, serialization, and configuration access.
+pub trait StatefulOptimizer: Optimizer {
+    /// The configuration type for this optimizer.
+    type Config: Clone + Send + Sync;
+
+    /// The state type used by this optimizer.
+    type State: Send + Sync;
+
+    /// Gets a reference to the optimizer's configuration.
+    fn config(&self) -> &Self::Config;
+
+    /// Gets a reference to the optimizer's internal state.
+    fn state(&self) -> &Self::State;
+
+    /// Gets a mutable reference to the optimizer's internal state.
+    fn state_mut(&mut self) -> &mut Self::State;
+
+    /// Saves the optimizer state to a dictionary for checkpointing.
+    fn state_dict(&self) -> Result<HashMap<String, Tensor>>;
+
+    /// Loads optimizer state from a dictionary during checkpoint restoration.
+    fn load_state_dict(&mut self, state: HashMap<String, Tensor>) -> Result<()>;
+
+    /// Gets memory usage statistics for this optimizer.
+    fn memory_usage(&self) -> StateMemoryStats;
+
+    /// Resets the optimizer state (useful for training restarts).
+    fn reset_state(&mut self);
+
+    /// Returns the number of parameters being optimized.
+    fn num_parameters(&self) -> usize;
+
+    /// Saves the optimizer state to `path`.
+    ///
+    /// The default implementation serialises [`Self::state_dict`] with `oxicode`, so
+    /// every implementor gets checkpointing for free and all implementors share one
+    /// on-disk format. Override only to add a format of your own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state cannot be produced, encoded, or written.
+    fn save_state(&self, path: &std::path::Path) -> Result<()> {
+        let state = self.state_dict()?;
+        let encoded = encode_state_dict(&state)?;
+        std::fs::write(path, encoded).map_err(|error| {
+            TrustformersError::io_error(format!(
+                "failed to write optimizer state to {}: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Loads the optimizer state written by [`Self::save_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, is not a state dictionary this
+    /// crate wrote, or does not match this optimizer's expectations.
+    fn load_state(&mut self, path: &std::path::Path) -> Result<()> {
+        let bytes = std::fs::read(path).map_err(|error| {
+            TrustformersError::io_error(format!(
+                "failed to read optimizer state from {}: {error}",
+                path.display()
+            ))
+        })?;
+        let state = decode_state_dict(&bytes)?;
+        self.load_state_dict(state)
+    }
+}
+
+/// Wire format of a serialised optimizer state dictionary.
+///
+/// Tensors are stored as `(name, shape, f32 payload)` triples. `f32` is the only
+/// dtype optimizer state uses in this crate.
+type WireStateDict = Vec<(String, Vec<usize>, Vec<f32>)>;
+
+/// Encodes a state dictionary for [`StatefulOptimizer::save_state`].
+///
+/// # Errors
+///
+/// Returns an error when a tensor is not `f32`-readable or encoding fails.
+pub fn encode_state_dict(state: &HashMap<String, Tensor>) -> Result<Vec<u8>> {
+    let mut wire: WireStateDict = Vec::with_capacity(state.len());
+    for (name, tensor) in state {
+        wire.push((name.clone(), tensor.shape().to_vec(), tensor.data_f32()?));
+    }
+    // Deterministic order keeps checkpoints byte-reproducible.
+    wire.sort_by(|a, b| a.0.cmp(&b.0));
+
+    oxicode::serde::encode_to_vec(&wire, oxicode::config::standard()).map_err(|error| {
+        TrustformersError::invalid_state(format!("failed to encode optimizer state: {error}"))
+    })
+}
+
+/// Decodes a state dictionary written by [`encode_state_dict`].
+///
+/// # Errors
+///
+/// Returns an error when the bytes are not a state dictionary or a payload length
+/// disagrees with its shape.
+pub fn decode_state_dict(bytes: &[u8]) -> Result<HashMap<String, Tensor>> {
+    let (wire, _): (WireStateDict, usize) =
+        oxicode::serde::decode_from_slice(bytes, oxicode::config::standard()).map_err(|error| {
+            TrustformersError::invalid_state(format!("failed to decode optimizer state: {error}"))
+        })?;
+
+    let mut state = HashMap::with_capacity(wire.len());
+    for (name, shape, values) in wire {
+        let expected: usize = shape.iter().product();
+        if values.len() != expected {
+            return Err(TrustformersError::invalid_state(format!(
+                "optimizer state entry '{name}' has {} values but shape {shape:?} needs {expected}",
+                values.len()
+            )));
+        }
+        state.insert(name, Tensor::from_vec(values, &shape)?);
+    }
+    Ok(state)
+}
+
+/// Trait for optimizers that use momentum-based updates.
+///
+/// This includes both classical momentum (SGD) and adaptive momentum (Adam family).
+pub trait MomentumOptimizer: StatefulOptimizer {
+    /// Gets the momentum decay coefficient (β1 in Adam, momentum in SGD).
+    fn momentum_coeff(&self) -> f32;
+
+    /// Sets the momentum decay coefficient.
+    fn set_momentum_coeff(&mut self, coeff: f32);
+
+    /// Gets the current momentum buffers (for debugging/analysis).
+    fn momentum_buffers(&self) -> &HashMap<String, Vec<f32>>;
+
+    /// Clears all momentum buffers (useful for fine-tuning).
+    fn clear_momentum(&mut self);
+}
+
+/// Trait for adaptive momentum optimizers (Adam, AdamW, RAdam, etc.).
+///
+/// These optimizers maintain both first and second moment estimates.
+pub trait AdaptiveMomentumOptimizer: MomentumOptimizer {
+    /// Gets the second moment decay coefficient (β2 in Adam).
+    fn variance_coeff(&self) -> f32;
+
+    /// Sets the second moment decay coefficient.
+    fn set_variance_coeff(&mut self, coeff: f32);
+
+    /// Gets the epsilon value for numerical stability.
+    fn epsilon(&self) -> f32;
+
+    /// Sets the epsilon value.
+    fn set_epsilon(&mut self, eps: f32);
+
+    /// Gets the current variance buffers (for debugging/analysis).
+    fn variance_buffers(&self) -> &HashMap<String, Vec<f32>>;
+
+    /// Clears variance buffers.
+    fn clear_variance(&mut self);
+
+    /// Applies bias correction to momentum and variance estimates.
+    fn apply_bias_correction(&self, momentum: f32, variance: f32, step: usize) -> (f32, f32);
+}
+
+/// Trait for classical momentum optimizers (SGD variants).
+pub trait ClassicalMomentumOptimizer: MomentumOptimizer {
+    /// Gets the dampening factor.
+    fn dampening(&self) -> f32;
+
+    /// Sets the dampening factor.
+    fn set_dampening(&mut self, dampening: f32);
+
+    /// Whether Nesterov momentum is enabled.
+    fn nesterov(&self) -> bool;
+
+    /// Enables or disables Nesterov momentum.
+    fn set_nesterov(&mut self, nesterov: bool);
+}
+
+/// Trait for second-order optimization methods.
+///
+/// These optimizers use curvature information (Hessian approximations).
+pub trait SecondOrderOptimizer: StatefulOptimizer {
+    /// The type used to represent curvature information.
+    type CurvatureInfo;
+
+    /// Updates the curvature approximation with new gradient information.
+    fn update_curvature(&mut self, gradients: &[Tensor]) -> Result<()>;
+
+    /// Gets the current curvature approximation.
+    fn curvature_info(&self) -> &Self::CurvatureInfo;
+
+    /// Applies the inverse Hessian approximation to compute search direction.
+    fn apply_inverse_hessian(&self, gradient: &Tensor) -> Result<Tensor>;
+
+    /// Gets the maximum number of curvature pairs stored (for L-BFGS).
+    fn history_size(&self) -> usize;
+}
+
+/// Trait for distributed optimization capabilities.
+///
+/// Provides interfaces for gradient synchronization and distributed training.
+pub trait DistributedOptimizer: Optimizer {
+    /// The communicator type used for distributed operations.
+    type Communicator;
+
+    /// Performs all-reduce operation on gradients.
+    fn all_reduce_gradients(&mut self, gradients: &mut [Tensor]) -> Result<()>;
+
+    /// Broadcasts parameters from rank 0 to all other ranks.
+    fn broadcast_parameters(&mut self, parameters: &mut [Tensor]) -> Result<()>;
+
+    /// Gets the current rank in the distributed group.
+    fn rank(&self) -> usize;
+
+    /// Gets the total number of ranks in the distributed group.
+    fn world_size(&self) -> usize;
+
+    /// Synchronizes optimizer state across all ranks.
+    fn sync_state(&mut self) -> Result<()>;
+}
+
+/// Trait for optimizers with gradient compression capabilities.
+pub trait GradientCompressionOptimizer: DistributedOptimizer {
+    /// The compression method used.
+    type CompressionMethod;
+
+    /// Compresses gradients before communication.
+    fn compress_gradients(&self, gradients: &[Tensor]) -> Result<Vec<u8>>;
+
+    /// Decompresses received gradient data.
+    fn decompress_gradients(&self, data: &[u8]) -> Result<Vec<Tensor>>;
+
+    /// Gets the compression ratio achieved.
+    fn compression_ratio(&self) -> f32;
+
+    /// Sets the compression parameters.
+    fn set_compression_config(&mut self, config: Self::CompressionMethod);
+}
+
+/// Trait for federated learning optimizers.
+pub trait FederatedOptimizer: DistributedOptimizer {
+    /// Client information type.
+    type ClientInfo;
+
+    /// Aggregates model updates from multiple clients.
+    fn aggregate_updates(
+        &mut self,
+        updates: &[Tensor],
+        clients: &[Self::ClientInfo],
+    ) -> Result<Tensor>;
+
+    /// Selects clients for the next round of training.
+    fn select_clients(
+        &self,
+        available_clients: &[Self::ClientInfo],
+        num_clients: usize,
+    ) -> Vec<usize>;
+
+    /// Applies differential privacy to updates.
+    fn apply_differential_privacy(&mut self, update: &mut Tensor) -> Result<()>;
+}
+
+/// Trait for asynchronous optimization methods.
+pub trait AsyncOptimizer: DistributedOptimizer {
+    /// Applies delayed gradients with staleness compensation.
+    fn apply_delayed_gradients(&mut self, gradients: &[Tensor], staleness: usize) -> Result<()>;
+
+    /// Gets the maximum allowed staleness.
+    fn max_staleness(&self) -> usize;
+
+    /// Sets the staleness compensation method.
+    fn set_staleness_compensation(&mut self, method: StalenessCompensation);
+}
+
+/// Staleness compensation methods for asynchronous optimization.
+#[derive(Debug, Clone, Copy)]
+pub enum StalenessCompensation {
+    /// No compensation for staleness.
+    None,
+    /// Linear scaling by staleness factor.
+    Linear,
+    /// Exponential decay based on staleness.
+    Exponential,
+    /// Polynomial scaling with configurable degree.
+    Polynomial(f32),
+}
+
+/// Trait for hardware-specific optimizer optimizations.
+pub trait HardwareOptimizer: Optimizer {
+    /// The target hardware type.
+    type HardwareTarget;
+
+    /// Optimizes the optimizer for specific hardware.
+    fn optimize_for_hardware(&mut self, target: Self::HardwareTarget) -> Result<()>;
+
+    /// Gets hardware utilization statistics.
+    fn hardware_utilization(&self) -> HardwareStats;
+
+    /// Checks if the optimizer is compatible with the current hardware.
+    fn is_hardware_compatible(&self) -> bool;
+}
+
+/// Hardware utilization statistics.
+#[derive(Debug, Clone)]
+pub struct HardwareStats {
+    /// Memory bandwidth utilization (0.0 to 1.0).
+    pub memory_bandwidth_utilization: f32,
+    /// Compute utilization (0.0 to 1.0).
+    pub compute_utilization: f32,
+    /// Cache hit rate (0.0 to 1.0).
+    pub cache_hit_rate: f32,
+    /// FLOPS per second achieved.
+    pub flops_per_second: f64,
+}
+
+/// Trait for SIMD-optimized operations.
+pub trait SIMDOptimizer: HardwareOptimizer {
+    /// The SIMD instruction set being used.
+    type SIMDType;
+
+    /// Checks if SIMD operations are available.
+    fn simd_available(&self) -> bool;
+
+    /// Gets the SIMD vector width.
+    fn vector_width(&self) -> usize;
+
+    /// Applies SIMD-optimized parameter updates.
+    fn simd_update(&mut self, parameters: &mut [Tensor], gradients: &[Tensor]) -> Result<()>;
+}
+
+/// Trait for GPU-accelerated optimizers.
+pub trait GPUOptimizer: HardwareOptimizer {
+    /// The GPU compute capability.
+    type ComputeCapability;
+
+    /// Transfers optimizer state to GPU.
+    fn to_gpu(&mut self) -> Result<()>;
+
+    /// Transfers optimizer state to CPU.
+    fn to_cpu(&mut self) -> Result<()>;
+
+    /// Launches GPU kernels for parameter updates.
+    fn gpu_update(&mut self, parameters: &mut [Tensor], gradients: &[Tensor]) -> Result<()>;
+
+    /// Gets GPU memory usage.
+    fn gpu_memory_usage(&self) -> GPUMemoryStats;
+}
+
+/// GPU memory usage statistics.
+#[derive(Debug, Clone)]
+pub struct GPUMemoryStats {
+    /// Total GPU memory in bytes.
+    pub total_memory: usize,
+    /// Used GPU memory in bytes.
+    pub used_memory: usize,
+    /// Available GPU memory in bytes.
+    pub available_memory: usize,
+    /// Memory usage by optimizer state.
+    pub optimizer_memory: usize,
+}
+
+/// Trait for edge device optimized optimizers.
+pub trait EdgeOptimizer: HardwareOptimizer {
+    /// Power consumption statistics.
+    type PowerStats;
+
+    /// Optimizes for low power consumption.
+    fn optimize_for_power(&mut self) -> Result<()>;
+
+    /// Gets current power consumption statistics.
+    fn power_stats(&self) -> Self::PowerStats;
+
+    /// Reduces precision to save memory and power.
+    fn reduce_precision(&mut self, bits: u8) -> Result<()>;
+}
+
+/// Trait for meta-optimizers that wrap other optimizers.
+pub trait MetaOptimizer: Optimizer {
+    /// The base optimizer type being wrapped.
+    type BaseOptimizer: Optimizer;
+
+    /// Gets a reference to the base optimizer.
+    fn base_optimizer(&self) -> &Self::BaseOptimizer;
+
+    /// Gets a mutable reference to the base optimizer.
+    fn base_optimizer_mut(&mut self) -> &mut Self::BaseOptimizer;
+
+    /// Applies the meta-optimization strategy.
+    fn apply_meta_strategy(
+        &mut self,
+        parameters: &mut [Tensor],
+        gradients: &[Tensor],
+    ) -> Result<()>;
+}
+
+/// Trait for lookahead meta-optimizers.
+pub trait LookaheadOptimizer: MetaOptimizer {
+    /// Gets the lookahead step size (α).
+    fn lookahead_alpha(&self) -> f32;
+
+    /// Sets the lookahead step size.
+    fn set_lookahead_alpha(&mut self, alpha: f32);
+
+    /// Gets the lookahead update frequency (k).
+    fn lookahead_k(&self) -> usize;
+
+    /// Sets the lookahead update frequency.
+    fn set_lookahead_k(&mut self, k: usize);
+
+    /// Gets the slow weights (for debugging).
+    fn slow_weights(&self) -> &HashMap<String, Vec<f32>>;
+}
+
+/// Trait for scheduled optimizers with learning rate scheduling.
+pub trait ScheduledOptimizer: Optimizer {
+    /// The scheduler type.
+    type Scheduler;
+
+    /// Gets a reference to the scheduler.
+    fn scheduler(&self) -> &Self::Scheduler;
+
+    /// Gets a mutable reference to the scheduler.
+    fn scheduler_mut(&mut self) -> &mut Self::Scheduler;
+
+    /// Updates the learning rate based on the scheduler.
+    fn update_lr(&mut self) -> Result<()>;
+
+    /// Gets the current scheduled learning rate.
+    fn current_lr(&self) -> f32;
+}
+
+/// Trait for composite optimizers that combine multiple optimization strategies.
+pub trait CompositeOptimizer: Optimizer {
+    /// The component optimizer types.
+    type Components;
+
+    /// Gets references to all component optimizers.
+    fn components(&self) -> &Self::Components;
+
+    /// Gets mutable references to all component optimizers.
+    fn components_mut(&mut self) -> &mut Self::Components;
+
+    /// Applies updates from all component optimizers.
+    fn apply_composite_update(
+        &mut self,
+        parameters: &mut [Tensor],
+        gradients: &[Tensor],
+    ) -> Result<()>;
+
+    /// Gets the weight assigned to each component.
+    fn component_weights(&self) -> Vec<f32>;
+
+    /// Sets the weights for each component.
+    fn set_component_weights(&mut self, weights: Vec<f32>) -> Result<()>;
+}
+
+/// Optimizer factory trait for creating optimizers with different configurations.
+pub trait OptimizerFactory {
+    /// The optimizer type produced by this factory.
+    type Optimizer: Optimizer;
+
+    /// The configuration type for the optimizer.
+    type Config;
+
+    /// Creates a new optimizer with the given configuration.
+    fn create(&self, config: Self::Config) -> Result<Self::Optimizer>;
+
+    /// Lists all available optimizer variants.
+    fn available_variants(&self) -> Vec<&'static str>;
+
+    /// Creates an optimizer by name with default configuration.
+    fn create_by_name(&self, name: &str) -> Result<Self::Optimizer>;
+}
+
+/// Trait for optimizers that can be serialized and restored.
+pub trait SerializableOptimizer: Optimizer {
+    /// Serializes the optimizer to bytes.
+    fn serialize(&self) -> Result<Vec<u8>>;
+
+    /// Deserializes an optimizer from bytes.
+    fn deserialize(data: &[u8]) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Gets the serialization format version.
+    fn version(&self) -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_staleness_compensation() {
+        let compensation = StalenessCompensation::Linear;
+        assert!(
+            matches!(compensation, StalenessCompensation::Linear),
+            "Expected Linear staleness compensation"
+        );
+    }
+
+    #[test]
+    fn test_hardware_stats() {
+        let stats = HardwareStats {
+            memory_bandwidth_utilization: 0.8,
+            compute_utilization: 0.9,
+            cache_hit_rate: 0.95,
+            flops_per_second: 1e12,
+        };
+
+        assert_eq!(stats.memory_bandwidth_utilization, 0.8);
+        assert_eq!(stats.compute_utilization, 0.9);
+        assert_eq!(stats.cache_hit_rate, 0.95);
+        assert_eq!(stats.flops_per_second, 1e12);
+    }
+
+    #[test]
+    fn test_gpu_memory_stats() {
+        let stats = GPUMemoryStats {
+            total_memory: 16 * 1024 * 1024 * 1024,    // 16 GB
+            used_memory: 8 * 1024 * 1024 * 1024,      // 8 GB
+            available_memory: 8 * 1024 * 1024 * 1024, // 8 GB
+            optimizer_memory: 1024 * 1024 * 1024,     // 1 GB
+        };
+
+        assert_eq!(stats.total_memory, 16 * 1024 * 1024 * 1024);
+        assert_eq!(
+            stats.used_memory + stats.available_memory,
+            stats.total_memory
+        );
+        assert!(stats.optimizer_memory <= stats.used_memory);
+    }
+
+    #[test]
+    fn test_staleness_compensation_none() {
+        let comp = StalenessCompensation::None;
+        assert!(matches!(comp, StalenessCompensation::None));
+    }
+
+    #[test]
+    fn test_staleness_compensation_exponential() {
+        let comp = StalenessCompensation::Exponential;
+        assert!(matches!(comp, StalenessCompensation::Exponential));
+    }
+
+    #[test]
+    fn test_staleness_compensation_polynomial() {
+        let comp = StalenessCompensation::Polynomial(2.0);
+        if let StalenessCompensation::Polynomial(degree) = comp {
+            assert_eq!(degree, 2.0);
+        } else {
+            panic!("Expected Polynomial variant");
+        }
+    }
+
+    #[test]
+    fn test_hardware_stats_all_zero() {
+        let stats = HardwareStats {
+            memory_bandwidth_utilization: 0.0,
+            compute_utilization: 0.0,
+            cache_hit_rate: 0.0,
+            flops_per_second: 0.0,
+        };
+        assert_eq!(stats.memory_bandwidth_utilization, 0.0);
+        assert_eq!(stats.flops_per_second, 0.0);
+    }
+
+    #[test]
+    fn test_hardware_stats_max_utilization() {
+        let stats = HardwareStats {
+            memory_bandwidth_utilization: 1.0,
+            compute_utilization: 1.0,
+            cache_hit_rate: 1.0,
+            flops_per_second: 1e15,
+        };
+        assert!(stats.memory_bandwidth_utilization <= 1.0);
+        assert!(stats.compute_utilization <= 1.0);
+        assert!(stats.cache_hit_rate <= 1.0);
+    }
+
+    #[test]
+    fn test_gpu_memory_stats_zero_usage() {
+        let stats = GPUMemoryStats {
+            total_memory: 16 * 1024 * 1024 * 1024,
+            used_memory: 0,
+            available_memory: 16 * 1024 * 1024 * 1024,
+            optimizer_memory: 0,
+        };
+        assert_eq!(stats.used_memory, 0);
+        assert_eq!(stats.total_memory, stats.available_memory);
+    }
+
+    #[test]
+    fn test_gpu_memory_stats_full_usage() {
+        let total = 8 * 1024 * 1024 * 1024_usize;
+        let stats = GPUMemoryStats {
+            total_memory: total,
+            used_memory: total,
+            available_memory: 0,
+            optimizer_memory: total / 4,
+        };
+        assert_eq!(stats.available_memory, 0);
+        assert!(stats.optimizer_memory <= stats.used_memory);
+    }
+
+    #[test]
+    fn test_gpu_memory_stats_optimizer_fraction() {
+        let total = 16 * 1024 * 1024 * 1024_usize;
+        let used = 12 * 1024 * 1024 * 1024_usize;
+        let optimizer = 3 * 1024 * 1024 * 1024_usize;
+        let stats = GPUMemoryStats {
+            total_memory: total,
+            used_memory: used,
+            available_memory: total - used,
+            optimizer_memory: optimizer,
+        };
+        assert_eq!(stats.available_memory, 4 * 1024 * 1024 * 1024);
+        assert!(stats.optimizer_memory < stats.used_memory);
+    }
+
+    #[test]
+    fn test_hardware_stats_clone() {
+        let stats = HardwareStats {
+            memory_bandwidth_utilization: 0.5,
+            compute_utilization: 0.7,
+            cache_hit_rate: 0.9,
+            flops_per_second: 5e11,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.memory_bandwidth_utilization, 0.5);
+        assert_eq!(cloned.compute_utilization, 0.7);
+    }
+
+    #[test]
+    fn test_gpu_memory_stats_clone() {
+        let stats = GPUMemoryStats {
+            total_memory: 1000,
+            used_memory: 500,
+            available_memory: 500,
+            optimizer_memory: 100,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.total_memory, 1000);
+    }
+
+    #[test]
+    fn test_staleness_compensation_copy() {
+        let comp = StalenessCompensation::Linear;
+        let copied = comp;
+        assert!(matches!(copied, StalenessCompensation::Linear));
+    }
+
+    #[test]
+    fn test_hardware_stats_realistic_gpu() {
+        let stats = HardwareStats {
+            memory_bandwidth_utilization: 0.75,
+            compute_utilization: 0.85,
+            cache_hit_rate: 0.92,
+            flops_per_second: 1.2e13,
+        };
+        assert!(
+            stats.memory_bandwidth_utilization > 0.0 && stats.memory_bandwidth_utilization <= 1.0
+        );
+        assert!(stats.compute_utilization > 0.0 && stats.compute_utilization <= 1.0);
+        assert!(stats.flops_per_second > 1e12);
+    }
+
+    #[test]
+    fn test_hardware_stats_edge_device() {
+        let stats = HardwareStats {
+            memory_bandwidth_utilization: 0.3,
+            compute_utilization: 0.4,
+            cache_hit_rate: 0.6,
+            flops_per_second: 1e9,
+        };
+        assert!(stats.flops_per_second < 1e10);
+        assert!(stats.compute_utilization < 0.5);
+    }
+
+    #[test]
+    fn test_gpu_memory_stats_consistency() {
+        let stats = GPUMemoryStats {
+            total_memory: 8 * 1024 * 1024 * 1024,
+            used_memory: 6 * 1024 * 1024 * 1024,
+            available_memory: 2 * 1024 * 1024 * 1024,
+            optimizer_memory: 2 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(
+            stats.used_memory + stats.available_memory,
+            stats.total_memory
+        );
+    }
+
+    #[test]
+    fn test_staleness_polynomial_fractional() {
+        let comp = StalenessCompensation::Polynomial(0.5);
+        if let StalenessCompensation::Polynomial(degree) = comp {
+            assert!(degree > 0.0 && degree < 1.0);
+        }
+    }
+
+    #[test]
+    fn test_staleness_polynomial_high_degree() {
+        let comp = StalenessCompensation::Polynomial(10.0);
+        if let StalenessCompensation::Polynomial(degree) = comp {
+            assert!(degree > 5.0);
+        }
+    }
+
+    #[test]
+    fn test_hardware_stats_debug_format() {
+        let stats = HardwareStats {
+            memory_bandwidth_utilization: 0.5,
+            compute_utilization: 0.5,
+            cache_hit_rate: 0.5,
+            flops_per_second: 1.0,
+        };
+        let debug_str = format!("{:?}", stats);
+        assert!(debug_str.contains("HardwareStats"));
+    }
+
+    #[test]
+    fn test_gpu_memory_stats_debug_format() {
+        let stats = GPUMemoryStats {
+            total_memory: 100,
+            used_memory: 50,
+            available_memory: 50,
+            optimizer_memory: 10,
+        };
+        let debug_str = format!("{:?}", stats);
+        assert!(debug_str.contains("GPUMemoryStats"));
+    }
+}
+
+#[cfg(test)]
+mod state_persistence_tests {
+    use super::*;
+    use crate::adam::Adam;
+
+    /// Regression: `StatefulOptimizer` declared `state_dict`/`load_state_dict` as
+    /// required methods with no file-level counterpart, so every implementor had to
+    /// hand-roll checkpointing. The trait now ships a default round trip.
+    #[test]
+    fn save_state_and_load_state_round_trip() {
+        let mut optimizer = Adam::new(0.01, (0.9, 0.999), 1e-8, 0.0);
+        let mut param = Tensor::from_vec(vec![1.0_f32, 2.0], &[2]).expect("tensor");
+        let grad = Tensor::from_vec(vec![0.5_f32, -0.5], &[2]).expect("grad");
+        optimizer.update_named("w", &mut param, &grad).expect("step 1");
+        Optimizer::step(&mut optimizer);
+        optimizer.update_named("w", &mut param, &grad).expect("step 2");
+
+        let path = std::env::temp_dir().join(format!(
+            "trustformers-optim-state-{}.bin",
+            std::process::id()
+        ));
+        optimizer.save_state(&path).expect("save_state");
+
+        let mut restored = Adam::new(0.5, (0.1, 0.1), 1e-2, 0.9);
+        restored.load_state(&path).expect("load_state");
+        let _ = std::fs::remove_file(&path);
+
+        let original = optimizer.state_dict().expect("state_dict");
+        let round_trip = restored.state_dict().expect("state_dict");
+        assert_eq!(original.len(), round_trip.len(), "every entry must survive");
+        for (key, tensor) in &original {
+            let other = round_trip.get(key).unwrap_or_else(|| panic!("missing '{key}'"));
+            assert_eq!(other.shape(), tensor.shape(), "shape of '{key}'");
+            assert_eq!(
+                other.data_f32().expect("data"),
+                tensor.data_f32().expect("data"),
+                "payload of '{key}'"
+            );
+        }
+    }
+
+    /// Corrupt bytes must be reported, not silently ignored.
+    #[test]
+    fn decoding_rejects_corrupt_state() {
+        assert!(decode_state_dict(&[0xff, 0x00, 0x13, 0x37]).is_err());
+    }
+
+    /// A payload whose length disagrees with its shape must be rejected.
+    #[test]
+    fn decoding_rejects_a_shape_payload_mismatch() {
+        let wire: Vec<(String, Vec<usize>, Vec<f32>)> =
+            vec![("w".to_string(), vec![4], vec![1.0, 2.0])];
+        let bytes =
+            oxicode::serde::encode_to_vec(&wire, oxicode::config::standard()).expect("encode");
+        assert!(decode_state_dict(&bytes).is_err());
+    }
+
+    /// Loading must fail loudly when the file does not exist.
+    #[test]
+    fn load_state_reports_a_missing_file() {
+        let mut optimizer = Adam::new(0.01, (0.9, 0.999), 1e-8, 0.0);
+        let path = std::env::temp_dir().join("trustformers-optim-definitely-absent.bin");
+        let _ = std::fs::remove_file(&path);
+        assert!(optimizer.load_state(&path).is_err());
+    }
+}

@@ -1,0 +1,4 @@
+[tasks.test]
+command = "cargo"
+args = ["test", "--lib"]
+description = "Run only the library tests to avoid timeouts in example and benchmark tests"

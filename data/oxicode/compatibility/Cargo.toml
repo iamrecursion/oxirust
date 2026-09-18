@@ -1,0 +1,24 @@
+[package]
+name = "oxicode_compatibility"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+description = "Compatibility tests for oxicode"
+keywords = ["binary", "compatibility", "testing"]
+categories = ["encoding", "development-tools::testing"]
+
+publish = false
+
+[dependencies]
+oxicode = { path = "..", version = "0.2.7", features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+
+
+[dev-dependencies]
+# Compatibility oracle: never upgrade to 3.0 (3.x has an incompatible API).
+# Pinned in [workspace.dependencies] at the repo root; inherited here per workspace policy.
+bincode = { workspace = true }

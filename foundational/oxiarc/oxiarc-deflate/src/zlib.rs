@@ -1,0 +1,1203 @@
+//! Zlib format wrapper for DEFLATE compression.
+//!
+//! The zlib format (RFC 1950) wraps raw DEFLATE data with a header and
+//! an Adler-32 checksum. It is widely used in PNG, HTTP compression, and
+//! many other applications.
+//!
+//! # Format
+//!
+//! ```text
+//! +---+---+============+---+---+---+---+
+//! |CMF|FLG| compressed |    ADLER32    |
+//! +---+---+============+---+---+---+---+
+//! ```
+//!
+//! - CMF: Compression Method and Flags
+//!   - Bits 0-3: CM (Compression Method) - must be 8 for DEFLATE
+//!   - Bits 4-7: CINFO (Compression Info) - log2(window size) - 8
+//! - FLG: Flags
+//!   - Bits 0-4: FCHECK - check bits so (CMF*256 + FLG) mod 31 == 0
+//!   - Bit 5: FDICT - preset dictionary present
+//!   - Bits 6-7: FLEVEL - compression level (0-3)
+//! - Compressed data (DEFLATE format)
+//! - ADLER32: Adler-32 checksum of uncompressed data (big-endian)
+
+use crate::deflate::{Deflater, deflate};
+use crate::inflate::{Inflater, inflate};
+use oxiarc_core::error::{OxiArcError, Result};
+
+/// Maximum dictionary size for zlib (32KB).
+pub const MAX_DICTIONARY_SIZE: usize = 32768;
+
+/// Zlib compression level indicator in header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ZlibLevel {
+    /// Fastest compression.
+    Fastest = 0,
+    /// Fast compression.
+    Fast = 1,
+    /// Default compression.
+    Default = 2,
+    /// Maximum compression.
+    Maximum = 3,
+}
+
+impl ZlibLevel {
+    /// Convert from compression level (0-9) to the zlib header's `FLEVEL`
+    /// hint, using zlib's own `deflateInit2` mapping (levels 0-1 → 0, 2-5 → 1,
+    /// 6 → 2, 7-9 → 3).
+    ///
+    /// The field is advisory — no decoder acts on it — but matching zlib means
+    /// `zlib_compress(data, level)` is byte-identical to
+    /// `zlib.compress(data, level)` at levels 1..=9, which is what the encoder
+    /// oracle asserts. (Level 0 is excluded on purpose: zlib sizes each stored
+    /// block to the room left in its output buffer, so its level-0 bytes depend
+    /// on the caller. This encoder writes into an unbounded sink and emits the
+    /// format maximum, which is never larger — see
+    /// `tests/zlib_encoder_oracle.rs`.)
+    fn from_level(level: u8) -> Self {
+        match level {
+            0..=1 => Self::Fastest,
+            2..=5 => Self::Fast,
+            6 => Self::Default,
+            _ => Self::Maximum,
+        }
+    }
+}
+
+/// Adler-32 checksum calculator.
+///
+/// Adler-32 is a checksum algorithm designed by Mark Adler.
+/// It is faster than CRC-32 but provides less protection against random errors.
+#[derive(Clone, Debug)]
+pub struct Adler32 {
+    a: u32,
+    b: u32,
+}
+
+/// Largest prime smaller than 65536.
+const ADLER_MOD: u32 = 65521;
+
+/// Number of bytes to process before reducing.
+const NMAX: usize = 5552;
+
+impl Adler32 {
+    /// Create a new Adler-32 calculator.
+    pub fn new() -> Self {
+        Self { a: 1, b: 0 }
+    }
+
+    /// Update the checksum with more data.
+    ///
+    /// The naive form (`a += x; b += a;`) is a serial dependency chain of
+    /// two adds per byte and cannot be vectorised. Instead the bytes of a
+    /// block are folded into two fixed-width lane accumulators, both updated
+    /// with pure vertical adds that a compiler turns into SIMD:
+    ///
+    /// ```text
+    /// per 32-byte group g:  run[j]      += x[g][j]        // running lane sums
+    ///                       weighted[j] += run[j]         // == sum_g (K-g) x[g][j]
+    /// ```
+    ///
+    /// With `K` groups of `L = 32` bytes the block's contribution follows in
+    /// closed form from one horizontal reduction per block rather than per
+    /// group:
+    ///
+    /// ```text
+    /// a' = a + sum_j run[j]
+    /// b' = b + K*L*a + L * sum_j weighted[j] - sum_j j * run[j]
+    /// ```
+    ///
+    /// (the last term corrects for the within-group position, since
+    /// `weighted` weights a whole group uniformly). The result is
+    /// bit-identical to the byte-at-a-time version — the identity is exact,
+    /// not an approximation — and `Adler32::update` is therefore
+    /// split-invariant: any chunking of the same data yields the same
+    /// checksum.
+    ///
+    /// Blocks stay at or below `NMAX` bytes and the block-level combination
+    /// is done in `u64`, so no intermediate can overflow (`run[j]` peaks at
+    /// `255 * NMAX/L`, `weighted[j]` at `255 * K(K+1)/2`).
+    pub fn update(&mut self, data: &[u8]) {
+        /// Bytes per vector step, and the number of lane accumulators.
+        const LANES: usize = 32;
+        /// Largest multiple of `LANES` that is still within `NMAX`.
+        const BLOCK: usize = NMAX - (NMAX % LANES);
+
+        let modulus = u64::from(ADLER_MOD);
+        let mut a = u64::from(self.a);
+        let mut b = u64::from(self.b);
+
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let take = remaining.len().min(BLOCK);
+            let (block, rest) = remaining.split_at(take);
+            remaining = rest;
+
+            let mut groups = block.chunks_exact(LANES);
+            let mut run = [0u32; LANES];
+            let mut weighted = [0u32; LANES];
+            let mut vector_bytes = 0u64;
+            for group in &mut groups {
+                // A fixed-size reference, so the two loops below compile to
+                // straight-line vector adds with no length check.
+                if let Ok(group) = <&[u8; LANES]>::try_from(group) {
+                    for (lane, &byte) in run.iter_mut().zip(group.iter()) {
+                        *lane += u32::from(byte);
+                    }
+                    for (acc, &lane) in weighted.iter_mut().zip(run.iter()) {
+                        *acc += lane;
+                    }
+                    vector_bytes += LANES as u64;
+                }
+            }
+
+            if vector_bytes > 0 {
+                let mut sum = 0u64;
+                let mut prefix = 0u64;
+                let mut offset = 0u64;
+                for (index, (&lane, &acc)) in run.iter().zip(weighted.iter()).enumerate() {
+                    sum += u64::from(lane);
+                    prefix += u64::from(acc);
+                    offset += index as u64 * u64::from(lane);
+                }
+                b += vector_bytes * a + LANES as u64 * prefix - offset;
+                a += sum;
+                a %= modulus;
+                b %= modulus;
+            }
+
+            for &byte in groups.remainder() {
+                a += u64::from(byte);
+                b += a;
+            }
+            a %= modulus;
+            b %= modulus;
+        }
+
+        self.a = a as u32;
+        self.b = b as u32;
+    }
+
+    /// Finalize and return the checksum.
+    pub fn finish(&self) -> u32 {
+        (self.b << 16) | self.a
+    }
+
+    /// Compute Adler-32 checksum of data in one shot.
+    pub fn checksum(data: &[u8]) -> u32 {
+        let mut adler = Self::new();
+        adler.update(data);
+        adler.finish()
+    }
+}
+
+impl Default for Adler32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compress data using zlib format.
+///
+/// # Arguments
+///
+/// * `input` - Data to compress
+/// * `level` - Compression level (0-9)
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::zlib::{zlib_compress, zlib_decompress};
+///
+/// let data = b"Hello, World! Hello, World!";
+/// let compressed = zlib_compress(data, 6).expect("zlib_compress");
+/// let decompressed = zlib_decompress(&compressed).expect("zlib_decompress");
+/// assert_eq!(decompressed, data);
+/// ```
+pub fn zlib_compress(input: &[u8], level: u8) -> Result<Vec<u8>> {
+    let level = level.min(9);
+
+    // Compress with DEFLATE
+    let compressed = deflate(input, level)?;
+
+    // Build output with header and checksum
+    let mut output = Vec::with_capacity(6 + compressed.len());
+
+    // CMF byte: CM=8 (DEFLATE), CINFO=7 (32KB window)
+    let cmf: u8 = 0x78; // 0111_1000 = CINFO=7, CM=8
+
+    // FLG byte: FCHECK calculated so (CMF*256 + FLG) % 31 == 0
+    let flevel = ZlibLevel::from_level(level) as u8;
+    let fdict = 0u8; // No preset dictionary
+    let fcheck = {
+        let base = (cmf as u16) * 256 + ((flevel << 6) | (fdict << 5)) as u16;
+        let remainder = base % 31;
+        if remainder == 0 {
+            0
+        } else {
+            (31 - remainder) as u8
+        }
+    };
+    let flg = (flevel << 6) | (fdict << 5) | fcheck;
+
+    output.push(cmf);
+    output.push(flg);
+
+    // Compressed data
+    output.extend_from_slice(&compressed);
+
+    // Adler-32 checksum (big-endian)
+    let checksum = Adler32::checksum(input);
+    output.push((checksum >> 24) as u8);
+    output.push((checksum >> 16) as u8);
+    output.push((checksum >> 8) as u8);
+    output.push(checksum as u8);
+
+    Ok(output)
+}
+
+/// Compress data using zlib format with a preset dictionary.
+///
+/// The dictionary is used to improve compression for data that shares
+/// patterns with the dictionary. The dictionary checksum is stored in
+/// the zlib header (FDICT=1) so the decompressor knows which dictionary
+/// to use.
+///
+/// # Arguments
+///
+/// * `input` - Data to compress
+/// * `level` - Compression level (0-9)
+/// * `dictionary` - Dictionary data (up to 32KB)
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::zlib::{zlib_compress_with_dict, zlib_decompress_with_dict};
+///
+/// let dict = b"common patterns and shared content";
+/// let data = b"This text has common patterns that match the dictionary";
+/// let compressed = zlib_compress_with_dict(data, 6, dict).expect("zlib_compress_with_dict");
+/// let decompressed = zlib_decompress_with_dict(&compressed, dict).expect("zlib_decompress_with_dict");
+/// assert_eq!(decompressed, data);
+/// ```
+pub fn zlib_compress_with_dict(input: &[u8], level: u8, dictionary: &[u8]) -> Result<Vec<u8>> {
+    let level = level.min(9);
+
+    // Create deflater with dictionary
+    let mut deflater = Deflater::with_dictionary(level, dictionary);
+    let compressed = deflater.compress_to_vec(input)?;
+
+    // Get dictionary checksum
+    let dict_checksum = deflater
+        .dictionary_checksum()
+        .unwrap_or_else(|| Adler32::checksum(dictionary));
+
+    // Build output with header, dictionary checksum, and data
+    let mut output = Vec::with_capacity(10 + compressed.len());
+
+    // CMF byte: CM=8 (DEFLATE), CINFO=7 (32KB window)
+    let cmf: u8 = 0x78; // 0111_1000 = CINFO=7, CM=8
+
+    // FLG byte with FDICT=1
+    let flevel = ZlibLevel::from_level(level) as u8;
+    let fdict = 1u8; // Preset dictionary present
+    let fcheck = {
+        let base = (cmf as u16) * 256 + ((flevel << 6) | (fdict << 5)) as u16;
+        let remainder = base % 31;
+        if remainder == 0 {
+            0
+        } else {
+            (31 - remainder) as u8
+        }
+    };
+    let flg = (flevel << 6) | (fdict << 5) | fcheck;
+
+    output.push(cmf);
+    output.push(flg);
+
+    // Dictionary checksum (big-endian)
+    output.push((dict_checksum >> 24) as u8);
+    output.push((dict_checksum >> 16) as u8);
+    output.push((dict_checksum >> 8) as u8);
+    output.push(dict_checksum as u8);
+
+    // Compressed data
+    output.extend_from_slice(&compressed);
+
+    // Adler-32 checksum of uncompressed data (big-endian)
+    let checksum = Adler32::checksum(input);
+    output.push((checksum >> 24) as u8);
+    output.push((checksum >> 16) as u8);
+    output.push((checksum >> 8) as u8);
+    output.push(checksum as u8);
+
+    Ok(output)
+}
+
+/// Decompress zlib format data.
+///
+/// # Arguments
+///
+/// * `input` - Zlib compressed data
+///
+/// # `input` must be exactly one member
+///
+/// The Adler-32 trailer is read from the **last four bytes of `input`**,
+/// not from the position immediately after the DEFLATE stream, so `input`
+/// must end exactly where the member ends. A slice carrying trailing bytes
+/// (padding, a second concatenated member, a container's next field) fails
+/// with [`OxiArcError::CrcMismatch`] — the generic checksum-mismatch error,
+/// raised here for an **Adler-32** — rather than ignoring them. Callers
+/// that hold a buffer with an unknown tail — a PNG `IDAT` chain, a TIFF
+/// strip — should drive
+/// [`WrappedInflate`](crate::WrappedInflate)`::new(`[`InflateWrapper::Zlib`](crate::InflateWrapper)`)`
+/// instead, which locates the trailer itself and applies an explicit
+/// [`TrailingPolicy`](crate::TrailingPolicy).
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::zlib::{zlib_compress, zlib_decompress};
+///
+/// let data = b"Hello, World! Hello, World!";
+/// let compressed = zlib_compress(data, 6).expect("zlib_compress");
+/// let decompressed = zlib_decompress(&compressed).expect("zlib_decompress");
+/// assert_eq!(decompressed, data);
+/// ```
+pub fn zlib_decompress(input: &[u8]) -> Result<Vec<u8>> {
+    let deflate_data = zlib_payload(input)?;
+    let decompressed = inflate(deflate_data)?;
+    verify_zlib_trailer(input, &decompressed)?;
+    Ok(decompressed)
+}
+
+/// Validate a zlib header and return the raw DEFLATE payload it wraps.
+fn zlib_payload(input: &[u8]) -> Result<&[u8]> {
+    if input.len() < 6 {
+        return Err(OxiArcError::invalid_header("zlib data too short"));
+    }
+
+    let cmf = input[0];
+    let flg = input[1];
+
+    // Validate CMF
+    let cm = cmf & 0x0F;
+    if cm != 8 {
+        return Err(OxiArcError::invalid_header(
+            "unsupported compression method",
+        ));
+    }
+
+    let cinfo = cmf >> 4;
+    if cinfo > 7 {
+        return Err(OxiArcError::invalid_header("invalid window size"));
+    }
+
+    // Validate check bits
+    let check = (cmf as u16) * 256 + (flg as u16);
+    if check % 31 != 0 {
+        return Err(OxiArcError::invalid_header("zlib header check failed"));
+    }
+
+    // Check for preset dictionary
+    let fdict = (flg >> 5) & 1;
+    if fdict != 0 {
+        // Dictionary is required but not provided
+        // The caller should use zlib_decompress_with_dict instead
+        return Err(OxiArcError::unsupported_method(
+            "preset dictionary required - use zlib_decompress_with_dict",
+        ));
+    }
+
+    Ok(&input[2..input.len() - 4])
+}
+
+/// Verify the trailing big-endian Adler-32 of a zlib stream against the
+/// bytes that were decoded from it.
+fn verify_zlib_trailer(input: &[u8], decompressed: &[u8]) -> Result<()> {
+    let Some(trailer) = input.get(input.len() - 4..) else {
+        return Err(OxiArcError::invalid_header("zlib data too short"));
+    };
+    let stored_checksum = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let computed_checksum = Adler32::checksum(decompressed);
+
+    // `CrcMismatch` is the workspace's generic checksum-mismatch error; the
+    // checksum being compared here is RFC 1950 §8.2's Adler-32, not a CRC.
+    if stored_checksum != computed_checksum {
+        return Err(OxiArcError::crc_mismatch(
+            computed_checksum,
+            stored_checksum,
+        ));
+    }
+    Ok(())
+}
+
+/// Decompress zlib format data straight into a caller-supplied buffer.
+///
+/// The zlib wrapper of [`inflate_into`](crate::inflate_into): the header is
+/// validated, the DEFLATE payload is decoded directly into `output` with no
+/// intermediate `Vec`, and the trailing Adler-32 is verified against the
+/// bytes written.
+///
+/// # `input` must be exactly one member
+///
+/// As with [`zlib_decompress`], the Adler-32 is read from the **last four
+/// bytes of `input`**: this function requires a slice that ends exactly
+/// where the zlib member ends, and rejects one with trailing bytes.
+/// Image codecs holding a buffer with an unknown tail should use
+/// [`WrappedInflate`](crate::WrappedInflate) with an explicit
+/// [`TrailingPolicy`](crate::TrailingPolicy) instead.
+///
+/// # Returns
+///
+/// The number of bytes written to `output`.
+///
+/// # Errors
+///
+/// [`OxiArcError::BufferTooSmall`] when the stream decodes to more than
+/// `output.len()` bytes, [`OxiArcError::CrcMismatch`] (the generic
+/// checksum-mismatch error) when the **Adler-32** trailer does not match,
+/// plus the usual header/EOF/Huffman errors. Preset
+/// dictionaries are not supported on this path (no history precedes
+/// `output`); use [`zlib_decompress_with_dict`] for those.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::zlib::{zlib_compress, zlib_decompress_into};
+///
+/// let data = b"Hello, World! Hello, World!";
+/// let compressed = zlib_compress(data, 6).expect("zlib_compress");
+/// let mut out = vec![0u8; data.len()];
+/// let n = zlib_decompress_into(&compressed, &mut out).expect("zlib_decompress_into");
+/// assert_eq!(&out[..n], data);
+/// ```
+pub fn zlib_decompress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let deflate_data = zlib_payload(input)?;
+    let written = crate::inflate_into(deflate_data, output)?;
+    let decoded = output.get(..written).unwrap_or_default();
+    verify_zlib_trailer(input, decoded)?;
+    Ok(written)
+}
+
+/// Decompress zlib format data with a preset dictionary.
+///
+/// The dictionary must match the one used during compression.
+/// The function verifies that the dictionary checksum matches the
+/// one stored in the zlib header.
+///
+/// # Arguments
+///
+/// * `input` - Zlib compressed data
+/// * `dictionary` - Dictionary data (must match the compression dictionary)
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::zlib::{zlib_compress_with_dict, zlib_decompress_with_dict};
+///
+/// let dict = b"common patterns and shared content";
+/// let data = b"This text has common patterns that match the dictionary";
+/// let compressed = zlib_compress_with_dict(data, 6, dict).expect("zlib_compress_with_dict");
+/// let decompressed = zlib_decompress_with_dict(&compressed, dict).expect("zlib_decompress_with_dict");
+/// assert_eq!(decompressed, data);
+/// ```
+pub fn zlib_decompress_with_dict(input: &[u8], dictionary: &[u8]) -> Result<Vec<u8>> {
+    if input.len() < 10 {
+        return Err(OxiArcError::invalid_header(
+            "zlib data with dictionary too short",
+        ));
+    }
+
+    let cmf = input[0];
+    let flg = input[1];
+
+    // Validate CMF
+    let cm = cmf & 0x0F;
+    if cm != 8 {
+        return Err(OxiArcError::invalid_header(
+            "unsupported compression method",
+        ));
+    }
+
+    let cinfo = cmf >> 4;
+    if cinfo > 7 {
+        return Err(OxiArcError::invalid_header("invalid window size"));
+    }
+
+    // Validate check bits
+    let check = (cmf as u16) * 256 + (flg as u16);
+    if check % 31 != 0 {
+        return Err(OxiArcError::invalid_header("zlib header check failed"));
+    }
+
+    // Check for preset dictionary
+    let fdict = (flg >> 5) & 1;
+    let deflate_start = if fdict != 0 {
+        // Read dictionary checksum
+        let stored_dict_checksum = u32::from_be_bytes([input[2], input[3], input[4], input[5]]);
+        let computed_dict_checksum = Adler32::checksum(dictionary);
+
+        if stored_dict_checksum != computed_dict_checksum {
+            return Err(OxiArcError::crc_mismatch(
+                computed_dict_checksum,
+                stored_dict_checksum,
+            ));
+        }
+
+        6 // DEFLATE data starts after 2-byte header + 4-byte dict checksum
+    } else {
+        2 // No dictionary in header, but we still use the provided one
+    };
+
+    // Decompress DEFLATE data with dictionary
+    let deflate_data = &input[deflate_start..input.len() - 4];
+
+    let mut inflater = Inflater::with_dictionary(dictionary);
+    let mut cursor = std::io::Cursor::new(deflate_data);
+    let decompressed = inflater.inflate_reader(&mut cursor)?;
+
+    // Verify Adler-32 checksum
+    let stored_checksum = u32::from_be_bytes([
+        input[input.len() - 4],
+        input[input.len() - 3],
+        input[input.len() - 2],
+        input[input.len() - 1],
+    ]);
+    let computed_checksum = Adler32::checksum(&decompressed);
+
+    if stored_checksum != computed_checksum {
+        return Err(OxiArcError::crc_mismatch(
+            computed_checksum,
+            stored_checksum,
+        ));
+    }
+
+    Ok(decompressed)
+}
+
+/// Check if zlib data requires a preset dictionary.
+///
+/// Returns `Some(checksum)` if a dictionary is required, where `checksum`
+/// is the Adler-32 checksum of the expected dictionary.
+/// Returns `None` if no dictionary is required.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::zlib::{zlib_compress_with_dict, zlib_requires_dictionary};
+///
+/// let dict = b"test dictionary";
+/// let compressed = zlib_compress_with_dict(b"test data", 6, dict).expect("zlib_compress_with_dict");
+/// let required_checksum = zlib_requires_dictionary(&compressed);
+/// assert!(required_checksum.is_some());
+/// ```
+pub fn zlib_requires_dictionary(input: &[u8]) -> Option<u32> {
+    if input.len() < 6 {
+        return None;
+    }
+
+    let flg = input[1];
+    let fdict = (flg >> 5) & 1;
+
+    if fdict != 0 && input.len() >= 6 {
+        Some(u32::from_be_bytes([input[2], input[3], input[4], input[5]]))
+    } else {
+        None
+    }
+}
+
+/// Zlib compressor implementing streaming interface.
+#[derive(Debug)]
+pub struct ZlibCompressor {
+    level: u8,
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+impl ZlibCompressor {
+    /// Create a new zlib compressor.
+    pub fn new(level: u8) -> Self {
+        Self {
+            level: level.min(9),
+            buffer: Vec::new(),
+            finished: false,
+        }
+    }
+
+    /// Feed data to the compressor.
+    pub fn write(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+    }
+
+    /// Finish compression and return compressed data.
+    pub fn finish(&mut self) -> Result<Vec<u8>> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.finished = true;
+        zlib_compress(&self.buffer, self.level)
+    }
+
+    /// Reset the compressor.
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.finished = false;
+    }
+}
+
+/// Zlib decompressor implementing streaming interface.
+#[derive(Debug)]
+pub struct ZlibDecompressor {
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+impl ZlibDecompressor {
+    /// Create a new zlib decompressor.
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            finished: false,
+        }
+    }
+
+    /// Feed data to the decompressor.
+    pub fn write(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+    }
+
+    /// Finish decompression and return decompressed data.
+    pub fn finish(&mut self) -> Result<Vec<u8>> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.finished = true;
+        zlib_decompress(&self.buffer)
+    }
+
+    /// Reset the decompressor.
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.finished = false;
+    }
+}
+
+impl Default for ZlibDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_adler32_empty() {
+        let checksum = Adler32::checksum(&[]);
+        assert_eq!(checksum, 1);
+    }
+
+    #[test]
+    fn test_adler32_hello() {
+        // Known value for "Hello"
+        let checksum = Adler32::checksum(b"Hello");
+        assert_eq!(checksum, 0x058C01F5);
+    }
+
+    #[test]
+    fn test_adler32_incremental() {
+        let data = b"Hello, World!";
+
+        let one_shot = Adler32::checksum(data);
+
+        let mut adler = Adler32::new();
+        adler.update(&data[..6]);
+        adler.update(&data[6..]);
+        let incremental = adler.finish();
+
+        assert_eq!(one_shot, incremental);
+    }
+
+    #[test]
+    fn test_adler32_large() {
+        // Test with data larger than NMAX
+        let data = vec![0x42u8; 10000];
+        let mut adler = Adler32::new();
+        adler.update(&data);
+        let checksum = adler.finish();
+        assert_ne!(checksum, 0);
+    }
+
+    #[test]
+    fn test_zlib_header() {
+        let compressed = zlib_compress(b"test", 6).expect("compress failed");
+
+        // Check CMF byte
+        assert_eq!(compressed[0], 0x78);
+
+        // Check FLG header validation
+        let cmf = compressed[0] as u16;
+        let flg = compressed[1] as u16;
+        assert_eq!((cmf * 256 + flg) % 31, 0);
+    }
+
+    #[test]
+    fn test_zlib_roundtrip_simple() {
+        let data = b"Hello, World!";
+        let compressed = zlib_compress(data, 6).expect("compress failed");
+        let decompressed = zlib_decompress(&compressed).expect("decompress failed");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zlib_roundtrip_repeated() {
+        let data = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let compressed = zlib_compress(data, 6).expect("compress failed");
+        // Should compress well
+        assert!(compressed.len() < data.len());
+        let decompressed = zlib_decompress(&compressed).expect("decompress failed");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zlib_roundtrip_empty() {
+        let data: &[u8] = b"";
+        let compressed = zlib_compress(data, 6).expect("compress failed");
+        let decompressed = zlib_decompress(&compressed).expect("decompress failed");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zlib_roundtrip_large() {
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+        let compressed = zlib_compress(&data, 6).expect("compress failed");
+        let decompressed = zlib_decompress(&compressed).expect("decompress failed");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zlib_levels() {
+        // Test with data that compresses well with fixed Huffman (levels 1-4)
+        let data = b"Hello, World! Hello, World! Hello, World!";
+
+        for level in 1..=9 {
+            let compressed = zlib_compress(data, level)
+                .unwrap_or_else(|_| panic!("level {} compress failed", level));
+            let decompressed = zlib_decompress(&compressed)
+                .unwrap_or_else(|_| panic!("level {} decompress failed", level));
+            assert_eq!(&decompressed[..], &data[..]);
+        }
+    }
+
+    #[test]
+    fn test_zlib_level_0() {
+        // Level 0 (stored blocks) with smaller data
+        let data = b"Hello, World!";
+        let compressed = zlib_compress(data, 0).expect("level 0 compress failed");
+        let decompressed = zlib_decompress(&compressed).expect("level 0 decompress failed");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zlib_checksum_verification() {
+        let data = b"Test data for checksum";
+        let mut compressed = zlib_compress(data, 6).expect("compress failed");
+
+        // Corrupt the checksum (last 4 bytes)
+        let len = compressed.len();
+        compressed[len - 1] ^= 0xFF;
+
+        let result = zlib_decompress(&compressed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zlib_invalid_header() {
+        // Invalid compression method
+        let bad_data = [0x08, 0x1D, 0x00, 0x00, 0x00, 0x01]; // CM != 8
+        let result = zlib_decompress(&bad_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zlib_too_short() {
+        let short_data = [0x78, 0x9C];
+        let result = zlib_decompress(&short_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compressor_streaming() {
+        let mut compressor = ZlibCompressor::new(6);
+        compressor.write(b"Hello, ");
+        compressor.write(b"World!");
+        let compressed = compressor.finish().expect("compress failed");
+
+        let decompressed = zlib_decompress(&compressed).expect("decompress failed");
+        assert_eq!(decompressed, b"Hello, World!");
+    }
+
+    #[test]
+    fn test_decompressor_streaming() {
+        let compressed = zlib_compress(b"Hello, World!", 6).expect("compress failed");
+
+        let mut decompressor = ZlibDecompressor::new();
+        decompressor.write(&compressed[..5]);
+        decompressor.write(&compressed[5..]);
+        let decompressed = decompressor.finish().expect("decompress failed");
+        assert_eq!(decompressed, b"Hello, World!");
+    }
+
+    // Dictionary compression tests
+
+    #[test]
+    fn test_zlib_dictionary_roundtrip() {
+        // Use a dictionary that contains patterns similar to the data
+        let dictionary = b"Hello World common patterns repeating text";
+        let data = b"Hello World Hello World repeating text patterns";
+
+        let compressed =
+            zlib_compress_with_dict(data, 6, dictionary).expect("dictionary compress failed");
+        let decompressed = zlib_decompress_with_dict(&compressed, dictionary)
+            .expect("dictionary decompress failed");
+
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zlib_dictionary_header() {
+        let dictionary = b"test dictionary";
+        let data = b"test data";
+
+        let compressed =
+            zlib_compress_with_dict(data, 6, dictionary).expect("dictionary compress failed");
+
+        // Check CMF byte
+        assert_eq!(compressed[0], 0x78);
+
+        // Check FDICT flag is set
+        let flg = compressed[1];
+        let fdict = (flg >> 5) & 1;
+        assert_eq!(fdict, 1, "FDICT flag should be set");
+
+        // Check header validation
+        let cmf = compressed[0] as u16;
+        let flg = compressed[1] as u16;
+        assert_eq!((cmf * 256 + flg) % 31, 0, "Header check should pass");
+
+        // Dictionary checksum should be present
+        let dict_checksum =
+            u32::from_be_bytes([compressed[2], compressed[3], compressed[4], compressed[5]]);
+        let expected_checksum = Adler32::checksum(dictionary);
+        assert_eq!(
+            dict_checksum, expected_checksum,
+            "Dictionary checksum mismatch"
+        );
+    }
+
+    #[test]
+    fn test_zlib_requires_dictionary() {
+        let dictionary = b"test dictionary";
+        let data = b"test data";
+
+        // Without dictionary
+        let compressed_no_dict = zlib_compress(data, 6).expect("compress failed");
+        assert!(
+            zlib_requires_dictionary(&compressed_no_dict).is_none(),
+            "Should not require dictionary"
+        );
+
+        // With dictionary
+        let compressed_with_dict =
+            zlib_compress_with_dict(data, 6, dictionary).expect("dictionary compress failed");
+        let required_checksum = zlib_requires_dictionary(&compressed_with_dict);
+        assert!(required_checksum.is_some(), "Should require dictionary");
+        assert_eq!(
+            required_checksum.unwrap_or(0),
+            Adler32::checksum(dictionary),
+            "Dictionary checksum mismatch"
+        );
+    }
+
+    #[test]
+    fn test_zlib_dictionary_wrong_dict_error() {
+        let dictionary = b"correct dictionary";
+        let wrong_dictionary = b"wrong dictionary data";
+        let data = b"test data for compression";
+
+        let compressed =
+            zlib_compress_with_dict(data, 6, dictionary).expect("dictionary compress failed");
+
+        // Trying to decompress with wrong dictionary should fail
+        let result = zlib_decompress_with_dict(&compressed, wrong_dictionary);
+        assert!(result.is_err(), "Should fail with wrong dictionary");
+    }
+
+    #[test]
+    fn test_zlib_dictionary_no_dict_error() {
+        let dictionary = b"test dictionary";
+        let data = b"test data";
+
+        let compressed =
+            zlib_compress_with_dict(data, 6, dictionary).expect("dictionary compress failed");
+
+        // Trying to decompress without dictionary should fail
+        let result = zlib_decompress(&compressed);
+        assert!(result.is_err(), "Should fail without dictionary");
+    }
+
+    #[test]
+    fn test_zlib_dictionary_better_compression() {
+        // Use repeating pattern data with dictionary
+        let dictionary = b"AAABBBCCCDDDEEE";
+        let data = b"AAABBBCCCDDDEEEAAABBBCCCDDDEEEAAABBBCCCDDDEEE";
+
+        let compressed_no_dict = zlib_compress(data, 6).expect("compress failed");
+        let compressed_with_dict =
+            zlib_compress_with_dict(data, 6, dictionary).expect("dictionary compress failed");
+
+        // Dictionary compression should work correctly
+        let decompressed = zlib_decompress_with_dict(&compressed_with_dict, dictionary)
+            .expect("decompress failed");
+        assert_eq!(decompressed, data);
+
+        // Verify both decompress correctly
+        let decompressed_no_dict = zlib_decompress(&compressed_no_dict).expect("decompress failed");
+        assert_eq!(decompressed_no_dict, data);
+    }
+
+    #[test]
+    fn test_zlib_dictionary_empty_data() {
+        let dictionary = b"test dictionary";
+        let data: &[u8] = b"";
+
+        let compressed =
+            zlib_compress_with_dict(data, 6, dictionary).expect("dictionary compress failed");
+        let decompressed = zlib_decompress_with_dict(&compressed, dictionary)
+            .expect("dictionary decompress failed");
+
+        assert!(decompressed.is_empty());
+    }
+
+    #[test]
+    fn test_zlib_dictionary_large_dict() {
+        // Create a large dictionary (near 32KB)
+        let dictionary: Vec<u8> = (0..30000).map(|i| (i % 256) as u8).collect();
+        let data = b"Some test data that may use parts of the large dictionary";
+
+        let compressed =
+            zlib_compress_with_dict(data, 6, &dictionary).expect("dictionary compress failed");
+        let decompressed = zlib_decompress_with_dict(&compressed, &dictionary)
+            .expect("dictionary decompress failed");
+
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zlib_dictionary_levels() {
+        // Use the same data as the passing roundtrip test
+        let dictionary = b"Hello World common patterns repeating text";
+        let data = b"Hello World Hello World repeating text patterns";
+
+        for level in 0..=9 {
+            let compressed = zlib_compress_with_dict(data, level, dictionary)
+                .unwrap_or_else(|_| panic!("level {} dictionary compress failed", level));
+            let decompressed = zlib_decompress_with_dict(&compressed, dictionary)
+                .unwrap_or_else(|_| panic!("level {} dictionary decompress failed", level));
+            assert_eq!(
+                &decompressed[..],
+                &data[..],
+                "Level {} roundtrip failed",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_raw_deflate_with_dictionary() {
+        use crate::deflate::Deflater;
+        use crate::inflate::Inflater;
+
+        // Use data that clearly has dictionary matches
+        let dictionary = b"AAABBBCCCDDDEEE";
+        let data = b"AAABBBCCCDDDEEEAAABBBCCC";
+
+        for level in [0u8, 1, 6] {
+            // Compress with dictionary
+            let mut deflater = Deflater::with_dictionary(level, dictionary);
+            let compressed = deflater
+                .compress_to_vec(data)
+                .unwrap_or_else(|_| panic!("level {} deflate failed", level));
+
+            // Decompress with dictionary
+            let mut inflater = Inflater::with_dictionary(dictionary);
+            let mut cursor = std::io::Cursor::new(&compressed);
+            let decompressed = inflater
+                .inflate_reader(&mut cursor)
+                .unwrap_or_else(|e| panic!("level {} inflate failed: {:?}", level, e));
+
+            assert_eq!(
+                &decompressed[..],
+                &data[..],
+                "Level {} raw deflate roundtrip failed",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_deflate_dict_simple() {
+        use crate::deflate::Deflater;
+        use crate::inflate::Inflater;
+
+        // Very simple case: data same as dictionary
+        let dictionary = b"Hello World";
+        let data = b"Hello World";
+
+        let mut deflater = Deflater::with_dictionary(6, dictionary);
+        let compressed = deflater.compress_to_vec(data).expect("deflate failed");
+
+        let mut inflater = Inflater::with_dictionary(dictionary);
+        let mut cursor = std::io::Cursor::new(&compressed);
+        let decompressed = inflater
+            .inflate_reader(&mut cursor)
+            .expect("inflate failed");
+
+        assert_eq!(&decompressed[..], &data[..]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod adler_reference_tests {
+    use super::{ADLER_MOD, Adler32};
+
+    /// Byte-at-a-time reference implementation (RFC 1950 §9).
+    fn adler32_reference(data: &[u8]) -> u32 {
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+        for &byte in data {
+            a = (a + byte as u32) % ADLER_MOD;
+            b = (b + a) % ADLER_MOD;
+        }
+        (b << 16) | a
+    }
+
+    #[test]
+    fn matches_reference_over_many_shapes() {
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        // Every length across the group / block boundaries, plus long runs.
+        let mut lengths: Vec<usize> = (0..200).collect();
+        lengths.extend([
+            5519, 5520, 5521, 5535, 5536, 5537, 5551, 5552, 5553, 11071, 11072, 11073, 70000,
+        ]);
+
+        for len in lengths {
+            for pattern in 0..3 {
+                let data: Vec<u8> = (0..len)
+                    .map(|i| match pattern {
+                        0 => 0xFF,
+                        1 => (i % 251) as u8,
+                        _ => next() as u8,
+                    })
+                    .collect();
+                assert_eq!(
+                    Adler32::checksum(&data),
+                    adler32_reference(&data),
+                    "len={len} pattern={pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_updates_match_single_shot() {
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(31)) as u8).collect();
+        for split in [0usize, 1, 7, 31, 32, 33, 5535, 5536, 12345, 39_999, 40_000] {
+            let mut incremental = Adler32::new();
+            incremental.update(&data[..split]);
+            incremental.update(&data[split..]);
+            assert_eq!(
+                incremental.finish(),
+                Adler32::checksum(&data),
+                "split={split}"
+            );
+        }
+    }
+
+    /// The lane-accumulator form must stay bit-identical to the
+    /// byte-at-a-time definition **from an arbitrary running state**, not
+    /// just from `(a, b) = (1, 0)`. That is the case the block-level
+    /// closed form has to get right: `b` is seeded with `n * a` and the
+    /// intermediate `L * sum(weighted)` is the largest number the routine
+    /// ever forms.
+    #[test]
+    fn matches_reference_from_a_saturated_running_state() {
+        // Drive `a` up towards BASE-1 before the block under test.
+        let warmup = vec![0xFFu8; 1000];
+        let mut reference_a: u32 = 1;
+        let mut reference_b: u32 = 0;
+        let step = |data: &[u8], a: &mut u32, b: &mut u32| {
+            for &byte in data {
+                *a = (*a + byte as u32) % ADLER_MOD;
+                *b = (*b + *a) % ADLER_MOD;
+            }
+        };
+
+        let mut subject = Adler32::new();
+        subject.update(&warmup);
+        step(&warmup, &mut reference_a, &mut reference_b);
+
+        // Worst case for the accumulators: full NMAX-sized blocks of 0xFF.
+        for len in [5536usize, 5552, 5553, 11_104, 17_000] {
+            let block = vec![0xFFu8; len];
+            let mut probe = subject.clone();
+            probe.update(&block);
+            let (mut a, mut b) = (reference_a, reference_b);
+            step(&block, &mut a, &mut b);
+            assert_eq!(probe.finish(), (b << 16) | a, "len={len}");
+        }
+    }
+
+    /// Split-invariance across many random cut points, not just one.
+    #[test]
+    fn many_way_splits_match_a_single_update() {
+        let data: Vec<u8> = (0..60_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let expected = Adler32::checksum(&data);
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..25 {
+            let mut checksum = Adler32::new();
+            let mut pos = 0usize;
+            while pos < data.len() {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let take = ((rng % 9_000) as usize + 1).min(data.len() - pos);
+                checksum.update(data.get(pos..pos + take).unwrap_or_default());
+                pos += take;
+            }
+            assert_eq!(checksum.finish(), expected);
+        }
+    }
+
+    #[test]
+    fn known_vectors() {
+        assert_eq!(Adler32::checksum(b""), 1);
+        assert_eq!(Adler32::checksum(b"a"), 0x0062_0062);
+        assert_eq!(Adler32::checksum(b"abc"), 0x024d_0127);
+        assert_eq!(Adler32::checksum(b"Wikipedia"), 0x11E6_0398);
+    }
+}

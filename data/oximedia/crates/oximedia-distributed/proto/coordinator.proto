@@ -1,0 +1,282 @@
+syntax = "proto3";
+
+package oximedia.distributed;
+
+// Central coordinator service
+service CoordinatorService {
+  // Worker registration and management
+  rpc RegisterWorker(WorkerRegistration) returns (WorkerRegistrationResponse);
+  rpc Heartbeat(WorkerHeartbeat) returns (HeartbeatResponse);
+  rpc UnregisterWorker(WorkerUnregistration) returns (UnregistrationResponse);
+
+  // Job management
+  rpc RequestJob(JobRequest) returns (JobAssignment);
+  rpc ReportProgress(ProgressReport) returns (ProgressAcknowledgment);
+  rpc SubmitResult(JobResult) returns (ResultAcknowledgment);
+  rpc ReportFailure(JobFailure) returns (FailureAcknowledgment);
+
+  // Coordinator queries
+  rpc GetWorkerStatus(WorkerStatusRequest) returns (WorkerStatusResponse);
+  rpc GetJobStatus(JobStatusRequest) returns (JobStatusResponse);
+  rpc CancelJob(JobCancellation) returns (CancellationResponse);
+}
+
+// Worker capabilities and information
+message WorkerCapabilities {
+  // Hardware capabilities
+  uint32 cpu_cores = 1;
+  uint64 memory_bytes = 2;
+  repeated string gpu_devices = 3;
+
+  // Codec support
+  repeated string supported_codecs = 4;
+  repeated string supported_hwaccels = 5;
+
+  // Performance metrics
+  float relative_speed = 6;  // Encoding speed relative to baseline
+  uint32 max_concurrent_jobs = 7;
+}
+
+// Worker registration
+message WorkerRegistration {
+  string worker_id = 1;
+  string hostname = 2;
+  string ip_address = 3;
+  uint32 port = 4;
+  WorkerCapabilities capabilities = 5;
+  map<string, string> metadata = 6;
+}
+
+message WorkerRegistrationResponse {
+  bool success = 1;
+  string message = 2;
+  string assigned_worker_id = 3;
+}
+
+// Heartbeat mechanism
+message WorkerHeartbeat {
+  string worker_id = 1;
+  WorkerStatus status = 2;
+  repeated string active_job_ids = 3;
+  WorkerMetrics metrics = 4;
+}
+
+message WorkerStatus {
+  enum State {
+    IDLE = 0;
+    BUSY = 1;
+    FULL = 2;
+    DRAINING = 3;
+    ERROR = 4;
+  }
+  State state = 1;
+  uint32 active_jobs = 2;
+  uint32 queued_jobs = 3;
+}
+
+message WorkerMetrics {
+  float cpu_usage = 1;
+  float memory_usage = 2;
+  float gpu_usage = 3;
+  uint64 bytes_processed = 4;
+  uint32 frames_encoded = 5;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  repeated string jobs_to_cancel = 2;
+  bool should_drain = 3;
+}
+
+// Worker unregistration
+message WorkerUnregistration {
+  string worker_id = 1;
+  string reason = 2;
+}
+
+message UnregistrationResponse {
+  bool success = 1;
+}
+
+// Job request and assignment
+message JobRequest {
+  string worker_id = 1;
+  uint32 max_jobs = 2;
+  repeated string preferred_codecs = 3;
+}
+
+message JobAssignment {
+  message Job {
+    string job_id = 1;
+    EncodingTask task = 2;
+    uint32 priority = 3;
+    int64 deadline_timestamp = 4;
+  }
+
+  repeated Job jobs = 1;
+  bool has_more = 2;
+}
+
+// Encoding task definition
+message EncodingTask {
+  enum SplitStrategy {
+    SEGMENT_BASED = 0;
+    TILE_BASED = 1;
+    GOP_BASED = 2;
+  }
+
+  string task_id = 1;
+  string source_url = 2;
+  string codec = 3;
+  SplitStrategy strategy = 4;
+
+  // Task segment
+  oneof segment {
+    TimeSegment time_segment = 5;
+    TileSegment tile_segment = 6;
+    GopSegment gop_segment = 7;
+  }
+
+  // Encoding parameters
+  EncodingParams params = 8;
+  string output_url = 9;
+}
+
+message TimeSegment {
+  double start_time = 1;
+  double end_time = 2;
+  double overlap = 3;
+}
+
+message TileSegment {
+  uint32 tile_x = 1;
+  uint32 tile_y = 2;
+  uint32 tile_width = 3;
+  uint32 tile_height = 4;
+}
+
+message GopSegment {
+  uint64 start_frame = 1;
+  uint64 end_frame = 2;
+  repeated uint64 keyframe_indices = 3;
+}
+
+message EncodingParams {
+  uint32 bitrate = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  string preset = 4;
+  string profile = 5;
+  uint32 crf = 6;
+  map<string, string> extra_params = 7;
+}
+
+// Progress reporting
+message ProgressReport {
+  string job_id = 1;
+  string worker_id = 2;
+  float progress = 3;  // 0.0 to 1.0
+  uint64 frames_encoded = 4;
+  uint64 bytes_written = 5;
+  float encoding_speed = 6;  // frames per second
+  int64 estimated_completion_timestamp = 7;
+}
+
+message ProgressAcknowledgment {
+  bool acknowledged = 1;
+}
+
+// Result submission
+message JobResult {
+  string job_id = 1;
+  string worker_id = 2;
+  string output_url = 3;
+  uint64 output_size = 4;
+  double encoding_time = 5;
+  ResultMetadata metadata = 6;
+}
+
+message ResultMetadata {
+  uint64 frames_encoded = 1;
+  double average_bitrate = 2;
+  string checksum = 3;
+  map<string, string> extra_metadata = 4;
+}
+
+message ResultAcknowledgment {
+  bool acknowledged = 1;
+  string next_job_id = 2;
+}
+
+// Failure reporting
+message JobFailure {
+  string job_id = 1;
+  string worker_id = 2;
+  string error_message = 3;
+  string error_code = 4;
+  bool is_transient = 5;
+}
+
+message FailureAcknowledgment {
+  bool should_retry = 1;
+  string reassigned_job_id = 2;
+}
+
+// Status queries
+message WorkerStatusRequest {
+  oneof query {
+    string worker_id = 1;
+    bool all_workers = 2;
+  }
+}
+
+message WorkerStatusResponse {
+  repeated WorkerInfo workers = 1;
+}
+
+message WorkerInfo {
+  string worker_id = 1;
+  string hostname = 2;
+  WorkerStatus status = 3;
+  WorkerMetrics metrics = 4;
+  int64 last_heartbeat_timestamp = 5;
+}
+
+message JobStatusRequest {
+  oneof query {
+    string job_id = 1;
+    string task_id = 2;
+  }
+}
+
+message JobStatusResponse {
+  enum JobState {
+    PENDING = 0;
+    ASSIGNED = 1;
+    IN_PROGRESS = 2;
+    COMPLETED = 3;
+    FAILED = 4;
+    CANCELLED = 5;
+  }
+
+  string job_id = 1;
+  JobState state = 2;
+  string assigned_worker_id = 3;
+  float progress = 4;
+  int64 started_timestamp = 5;
+  int64 completed_timestamp = 6;
+}
+
+// Job cancellation
+message JobCancellation {
+  oneof target {
+    string job_id = 1;
+    string task_id = 2;
+  }
+  string reason = 3;
+}
+
+message CancellationResponse {
+  bool success = 1;
+  repeated string cancelled_job_ids = 2;
+}

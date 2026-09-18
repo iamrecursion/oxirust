@@ -1,0 +1,64 @@
+# cargo-deny configuration for SciRS2
+# This file defines policies for dependencies, licenses, and security
+
+[advisories]
+version = 2
+ignore = [
+    "RUSTSEC-2024-0436", # paste - unmaintained but widely used, no replacement yet
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml DoS via wayland-scanner's build-time Wayland protocol XML codegen (not runtime/attacker-controlled input) <- smithay-client-toolkit <- winit <- egui/eframe (optional GUI feature). egui/eframe 0.35.0 is latest; no newer release bumps this yet." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic runtime, same wayland-scanner build-time-only codegen path as RUSTSEC-2026-0195; not reachable with attacker-controlled XML." },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained (not an active vuln) via ab_glyph <- sctk-adwaita <- winit (GUI) and ab_glyph <- plotters <- criterion (dev-only benches); blocked on upstream migrating to skrifa or bumping past it." },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack (PKCS#1v1.5 decryption timing side-channel) via oxitls-rustcrypto-provider. Verified (docs.rs) the provider only implements TLS_ECDHE_* cipher suites; RSA is used solely for certificate signature verify/sign, never the static-RSA decryption path Marvin targets. No fixed rsa release exists upstream." },
+]
+
+[licenses]
+version = 2
+# Licensing policy for COOLJAPAN Pure Rust ecosystem
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "NCSA",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Multiple versions of the same crate
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+# Deny specific crates per COOLJAPAN Pure Rust Policy
+deny = [
+    # OpenBLAS/BLAS dependencies (use OxiBLAS instead)
+    { name = "openblas-src" },
+    { name = "blas-src" },
+    { name = "cblas-sys" },
+    { name = "lapack-src" },
+    { name = "lapacke-sys" },
+
+    # bincode (use oxicode instead)
+    { name = "bincode" },
+]
+
+# Skip version checking for certain crates
+skip = []
+skip-tree = []
+
+[sources]
+# Only allow crates from official registries and COOLJAPAN org
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = ["cool-japan", "rust-lang"]

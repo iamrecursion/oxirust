@@ -1,0 +1,89 @@
+# oxiphysics-geometry
+
+**[Stable]** Geometric shapes, mesh processing, and spatial algorithms for the OxiPhysics engine.
+
+[![Tests](https://img.shields.io/badge/tests-3120-brightgreen)](https://github.com/cool-japan/oxiphysics)
+[![docs.rs](https://img.shields.io/docsrs/oxiphysics-geometry)](https://docs.rs/oxiphysics_geometry)
+[![version](https://img.shields.io/badge/version-0.1.3-blue)](https://crates.io/crates/oxiphysics-geometry)
+
+Part of the [OxiPhysics](https://github.com/cool-japan/oxiphysics) project.
+
+## Overview
+
+`oxiphysics-geometry` delivers a comprehensive geometry library covering primitive shapes,
+advanced mesh processing, parametric curves and surfaces, computational geometry, and
+procedural generation. 57+ modules, 3,245 public items, 3,120 passing tests, 0 stubs.
+
+## Features
+
+- **Primitive shapes** — `Sphere`, `BoxShape`, `Capsule`, `Cylinder`, `Cone`, `Torus`, `Compound`
+- **Meshes** — `TriangleMesh`, `ConvexHull`, `HeightField`; mesh ops, boolean ops, repair, quality metrics
+- **Parametric & implicit** — NURBS, B-splines, implicit surfaces, level sets, signed distance fields
+- **Computational geometry** — Voronoi diagrams, Quickhull, convex hull, medial axis
+- **Subdivision & remeshing** — Loop/Catmull-Clark subdivision, decimation, remeshing, simplification
+- **Point clouds** — point cloud processing, spatial hashing
+- **Procedural** — fractal geometry, terrain processing, origami, geodesic domes
+- **Topology** — topology analysis, swept volumes, offset surfaces
+- **Robot geometry** — kinematic chain geometry primitives
+- **CSG** — constructive solid geometry (union, intersection, difference)
+
+## Modules (57+)
+
+`bspline` · `capsule` · `convex_hull` · `csg` · `cylinder` · `decimation` ·
+`fractal_geometry` · `geodesic` · `heightfield` · `implicit_surfaces` · `level_set` ·
+`medial_axis` · `mesh_boolean` · `mesh_ops` · `mesh_processing` · `mesh_quality` ·
+`mesh_repair` · `mesh_simplification` · `nurbs_geometry` · `offset_surface` · `origami` ·
+`parametric` · `point_cloud` · `procedural_geometry` · `quickhull` · `remesh` ·
+`robot_geometry` · `shape` · `signed_distance_field` · `spatial_hash` · `sphere` ·
+`subdivision` · `swept` · `terrain_processing` · `topology` · `topology_geometry` ·
+`torus` · `triangle_mesh` · `voronoi` · …
+
+## Quick Example
+
+The Rust block below is compiled and run by `cargo test --doc`, so it cannot
+drift away from the real API.
+
+```rust
+use oxiphysics_core::math::Vec3;
+use oxiphysics_geometry::{ConvexHull3DVec, Sdf, SdfSphere, Shape, Sphere, TriangleMesh};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Primitive shapes implement the `Shape` trait (volume, inertia, support, ray casts).
+    let sphere = Sphere::new(1.0);
+    println!("sphere volume: {:.4}", sphere.volume());
+
+    // Build a watertight tetrahedron mesh in memory ...
+    let mesh = TriangleMesh::new(
+        vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ],
+        vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+    );
+    assert!(mesh.is_watertight());
+    println!("mesh surface area: {:.4}", mesh.surface_area());
+
+    // ... and compute its convex hull with QuickHull (`None` for degenerate input).
+    let hull = ConvexHull3DVec::build(&mesh.vertices).ok_or("degenerate point set")?;
+    assert!((hull.volume() - 1.0 / 6.0).abs() < 1e-12);
+    println!(
+        "hull: {} vertices, {} faces, volume {:.4}",
+        hull.n_vertices(),
+        hull.n_faces(),
+        hull.volume()
+    );
+
+    // Signed distance to an analytic sphere SDF: negative inside, positive outside.
+    let sdf = SdfSphere::new([0.0, 0.0, 0.0], 1.0);
+    let inside = sdf.distance([0.5, 0.0, 0.0]);
+    assert!((inside + 0.5).abs() < 1e-12);
+    println!("signed distance at (0.5, 0, 0): {inside:.4}");
+    Ok(())
+}
+```
+
+## License
+
+Apache-2.0 — Copyright 2026 COOLJAPAN OU (Team KitaSan)

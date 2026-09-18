@@ -1,0 +1,26 @@
+[package]
+name = "oximedia-edl"
+description = "Edit Decision List (EDL) parser and generator for media workflows"
+keywords = ["edl", "editorial", "post-production", "multimedia", "video"]
+categories = ["multimedia", "parser-implementations"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-timecode = { workspace = true }
+thiserror = { workspace = true }
+nom = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+bitflags = { workspace = true }
+rayon = { workspace = true }
+smallvec = { workspace = true }
+
+[lints]
+workspace = true

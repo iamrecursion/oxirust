@@ -1,0 +1,389 @@
+# oxillama-py — TODO
+
+## 1. Overview
+
+`oxillama-py` provides PyO3-based Python bindings for the OxiLLaMa Pure
+Rust LLM inference engine. It exposes the core Rust types — `Engine`,
+`SpeculativeEngine`, and `LoadedLora` — to Python code via a `cdylib`
+extension module that is compiled and packaged as a `maturin`-built
+wheel. Long-running Rust calls (load, generate, embed) release the GIL
+via `py.detach(...)` so Python threads keep running during inference,
+and streaming is supported by re-acquiring the GIL per token when
+calling a user-supplied Python callable.
+
+The binding layer itself remains 100% Pure Rust — PyO3 is a pure Rust
+FFI shim to CPython, so the COOLJAPAN Pure Rust Policy is honoured on
+both sides of the interpreter boundary.
+
+## 2. Status Snapshot
+
+| Key                 | Value                                                    |
+|---------------------|----------------------------------------------------------|
+| Version             | 0.1.5 (workspace-pinned)                                 |
+| Overall completion  | ~80% (all v1.1 items shipped; hub-download progress bar regression from the hf-hub 1.0 migration fixed 2026-08-17 — see Known Gaps) |
+| Rust source files   | 16 (`lib.rs`, `engine.rs`, `speculative.rs`, `lora.rs`, `sampler.rs`, `error.rs`, `callback.rs`, `async_support.rs`, `hub.rs`, `cancel.rs`, `chat_template.rs`, `dlpack.rs`, `generation.rs`, `snapshot.rs`, `tokenizer.rs`, `torch_interop.rs`) |
+| Rust unit tests     | 131 across all modules (verified 2026-08-17)             |
+| Python tests        | 226 across pytest suites (config, sampler, streaming, exceptions, cancellation token incl. live-engine early-exit; model-backed tests gated on `OXILLAMA_TEST_MODEL` — 184 pass / 42 skip without a model) |
+| Public API items    | 16 (`EngineConfig`, `Engine`, `AsyncEngine`, `SamplerConfig`, `SpeculativeConfig`, `SpeculativeEngine`, `Lora`, `Tokenizer`, `CancellationToken`, + exception hierarchy — the latter gained `GpuUnavailableError` in v0.1.4) |
+| PyO3                | 0.29.2 (0.22 → 0.24 → 0.28 → 0.29.2; resolves RUSTSEC-2025-0020, RUSTSEC-2026-0176, RUSTSEC-2026-0177) |
+| Wheel build         | via `maturin` (`pyproject.toml` + abi3-py38)            |
+| Target Python       | 3.8+ (stable ABI wheel)                                  |
+| Crate type          | `cdylib` + `rlib` (rlib for in-workspace `cargo test`)  |
+
+## 3. Module Map
+
+| File                    | Role                                              |
+|-------------------------|---------------------------------------------------|
+| `src/lib.rs`            | `#[pymodule]` registration for all public classes |
+| `src/engine.rs`         | `Engine` + `EngineConfig` class bindings          |
+| `src/speculative.rs`    | `SpeculativeEngine` + `SpeculativeConfig`         |
+| `src/lora.rs`           | `Lora` (wraps `LoadedLora`) class                 |
+| `src/sampler.rs`        | `SamplerConfig` class (constructor + helpers)     |
+| `src/error.rs`          | `RuntimeError` / `ArchError` → Python exceptions  |
+| `src/callback.rs`       | Streaming callback bridge + progress-bar `Throttler`/`ProgressBridge` |
+| `src/async_support.rs`  | `AsyncEngine` (`PyAsyncEngine`) async/await bindings |
+| `src/cancel.rs`         | `CancellationToken` cooperative-cancellation handle |
+| `src/chat_template.rs`  | Chat-template renderer (`chatml`/`llama3`/`alpaca`), invoked by `PyTokenizer::apply_chat_template` |
+| `src/dlpack.rs`         | DLPack v0.8 tensor export (`logits_dlpack`, `embeddings_dlpack`) |
+| `src/generation.rs`     | `FinishReason` / `GenerationConfig` / `GenerationOutcome` behind `generate_detailed` |
+| `src/hub.rs`            | HuggingFace Hub loader (`Engine.from_hub`, `hub.load_from_hub`); optional `hub` feature |
+| `src/snapshot.rs`       | `Engine.snapshot`/`restore` Pure-Rust persistence |
+| `src/tokenizer.rs`      | `Tokenizer` (`PyTokenizer`) class bindings        |
+| `src/torch_interop.rs`  | placeholder for future Rust-side `torch.Tensor` helpers |
+| `pyproject.toml`        | maturin build config (`features = ["pyo3/extension-module"]`) |
+| `python/tests/`         | pytest suite (imports the built extension)        |
+
+## 4. Shipped in v0.1.0
+
+- `Engine` class: GGUF model load, `tokenize`, `decode_token`, `embed`,
+  `generate`, `generate_streaming`, `apply_lora`, `reset`,
+  `hidden_size`, `is_eos`, `is_loaded`.
+- `EngineConfig` class: keyword-only constructor with sensible defaults
+  (`num_threads=4`, optional `context_size`, optional `tokenizer_path`,
+  optional `sampler`).
+- `SpeculativeEngine` + `SpeculativeConfig`: draft + target pair,
+  accept/reject run in Rust; Python blocks on `generate` and receives a
+  string once the loop terminates.
+- `Lora` class: `Lora.load(path)` returns a loaded adapter with
+  `rank`, `alpha`, `num_adapters()` accessors.
+- `SamplerConfig` class: all ten sampler knobs (temperature, top-k,
+  top-p, min-p, repetition penalty + window, seed, Mirostat v2 triple)
+  plus `greedy()` and `mirostat_v2(tau, eta)` static constructors.
+- GIL-release policy: all heavy Rust calls wrap in `py.detach(...)` so
+  they don't block other Python threads. Streaming callbacks re-enter
+  the GIL via `Python::attach(...)` on every token.
+- Streaming callback API: `engine.generate_streaming(prompt,
+  max_tokens=..., callback=fn)` invokes a user-supplied Python callable
+  with each decoded token string.
+- Error mapping: `RuntimeError` / `ArchError` variants mapped to Python
+  built-ins (`PyIOError`, `PyValueError`, `PyRuntimeError`) with
+  informative payload strings.
+- PyO3 0.28 migration (0.22 → 0.24 → 0.28): resolves RUSTSEC-2025-0020
+  (cycle-collection soundness) shipped in 0.22.
+- maturin-driven wheel build (ABI3 / stable ABI) — a single wheel works
+  across Python 3.8 through current.
+- 62 Rust-side unit tests across the 6 modules + 26 pytest cases
+  (config/no-model layer ungated; model-backed tests gated on
+  `OXILLAMA_TEST_MODEL`).
+- `EngineConfig`, `SamplerConfig`, `SpeculativeConfig`, `Lora` all
+  implement `__repr__` for interactive debugging.
+
+## 5. Known Gaps / Incomplete
+
+This is the 75% gap — the polish work the 25% number represents.
+
+- ~~**No `.pyi` type stubs.**~~ ✅ `.pyi` type stubs generated
+  (`__init__.pyi`); IDEs now infer types and `mypy`/`pyright` can validate.
+- **No async support.** ~~`engine.generate(...)` blocks the calling
+  thread; there is no `async def` / `await` path via `pyo3-asyncio`.~~
+  ✅ `PyAsyncEngine` shipped (`async_support.rs`).
+- ~~**No numpy interop.** `embed()` and (future) logits return Python
+  `List[float]`, not `ndarray[float32]` — slow for large tensors.~~ ✅
+  Shipped: `embed_numpy() → PyArray1`, `embed_batch_numpy() → PyArray2`,
+  gated on `numpy` feature.
+- ~~**Tokenizer not exposed as a Python object.**~~ ✅ `PyTokenizer`
+  class shipped (`from_file`, `from_json`, `encode`, `decode`,
+  `vocab_size`, `id_to_token`).
+- ~~**No ergonomic `Sampler` builder beyond the dataclass-ish
+  `SamplerConfig`.**~~ ✅ Per-call sampler overrides landed
+  (`temperature`, `top_p`, `top_k`, `seed` kwargs on `generate`/`generate_streaming`).
+- ~~**Error variants are flat-mapped**~~ ✅ Custom exception hierarchy
+  shipped: `OxiLlamaError` → `LoadError`, `GenerateError`,
+  `TokenizerError`, `GrammarError`, `QuantError` via `register_exceptions()`.
+- **Pytest suite breadth.** See the Status Snapshot table above for the
+  current pytest count; full-coverage property tests and fixture-driven
+  minimal-GGUF round-trips are still outstanding.
+- ~~**No sphinx autodoc / readthedocs.io site.** Users rely on
+  docstrings visible only via `help()` in a REPL.~~ ✅ `docs/` skeleton
+  shipped with `conf.py`, `index.rst`, `quickstart.rst`, `api.rst`;
+  uses `furo` theme with `sphinx.ext.autodoc` + `napoleon` + `intersphinx`.
+- ~~**No PyPI publish workflow / CI gate.** Wheels are built locally via
+  `maturin build`; there is no GitHub Action matrix for Linux /
+  macOS / Windows × Python 3.8–3.13.~~ ✅ `.github/workflows/publish_py.yml`
+  shipped; builds manylinux2014 x86_64/aarch64 (via zig), macOS universal2,
+  and Windows x86_64; publishes on `py-v*` tag push.
+- ~~**No HuggingFace Hub integration.** Users must download GGUF files
+  manually; no `Engine.from_hub("meta-llama/...")` convenience.~~ ✅
+  `Engine.from_hub()` shipped (`hub.rs`); `oxillama_py.hub.load_from_hub()`
+  convenience function added; GIL released during download.
+  **Regression found 2026-08-17 (v0.1.4), fixed same day:** the `hf-hub`
+  0.5 → 1.0 migration (`hub.rs`, gated behind the optional `hub` feature —
+  `default = []` in `Cargo.toml`) replaced `ApiBuilder::new()` (which
+  defaulted `progress = true`) with the 1.0 `HFClient::builder()` /
+  `split_id()` + `client.model()` API. hf-hub 1.0 has no built-in progress
+  renderer, only a `ProgressHandler` callback, and `oxillama-py` did not
+  depend on `indicatif` (unlike `oxillama-cli`, which does and implements
+  its own bar) — so `Engine.from_hub(...)` / `oxillama_py.hub.load_from_hub()`
+  downloads stopped showing a progress bar, a real user-visible regression
+  from v0.1.3. Fixed by adding `indicatif = { workspace = true, optional =
+  true }` to `crates/oxillama-py/Cargo.toml` (gated on `hub`, alongside
+  `hf-hub`) and a `PullProgress` struct in `hub.rs` implementing
+  `hf_hub::progress::ProgressHandler`, wired via `.progress(PullProgress::
+  new())` on the `download_file()` builder — a near-verbatim duplicate of
+  `oxillama-cli`'s `PullProgress` (see that struct's doc comment for why it
+  isn't shared instead).
+- [x] **`Engine.snapshot(path)` / `Engine.restore(path)` Pure-Rust persistence** (planned 2026-05-03, supersedes "No pickle / checkpoint support" gap)
+  - **Goal:** First-class persistence on `Engine` (and `AsyncEngine`) without exposing pickle. Three methods on `PyEngine`:
+    1. `engine.snapshot(path)` — atomic write of the live engine state (model fingerprint, KV cache, sampler config, grammar source, tokenizer path, context size, num_threads) to a Pure-Rust `OXISNAP1` file via the existing `InferenceEngine::snapshot()` API.
+    2. `engine.snapshot_bytes() -> bytes` — same payload returned in-memory for callers that want to manage I/O themselves (multiprocessing, network transport, etc.).
+    3. `Engine.restore(snapshot_path, *, model_path=None)` — classmethod that reads the file, peeks the embedded `model_path` (when no override is given), and reconstructs a fully loaded engine via `InferenceEngine::resume()`.
+    Plus `Engine.snapshot_info(path) -> SnapshotInfo` metadata peek, `__reduce__`/`__reduce_ex__` pickle-refusal hooks on all three engine types.
+  - **Files:** `src/snapshot.rs` (NEW), `src/engine.rs`, `src/async_support.rs`, `src/speculative.rs`, `src/lib.rs`, `Cargo.toml`, `python/oxillama_py/snapshot.py` (NEW), `python/oxillama_py/__init__.py`, `python/oxillama_py/__init__.pyi`, `python/tests/test_engine_snapshot.py` (NEW), `python/tests/test_imports.py`, `docs/snapshot.rst` (NEW), `docs/index.rst`.
+  - **Prerequisites:** None. Runtime `InferenceEngine::snapshot()` / `::resume()` already exist at `oxillama_runtime/src/snapshot.rs`. `tempfile` already a workspace dep.
+  - **Tests:** 6 Rust unit tests + 6 pure-Python + 8 model-gated (`OXILLAMA_TEST_MODEL`).
+  - done 2026-05-03 — `PySnapshotInfo`, `write_snapshot_atomic`, `read_and_peek_snapshot` shipped in `snapshot.rs`; `snapshot`, `snapshot_bytes`, `snapshot_info`, `restore`, `__reduce__`, `__reduce_ex__` landed on `PyEngine`; async wrappers (`snapshot`, `snapshot_bytes`) on `PyAsyncEngine`; pickle-refusal hooks on `PySpeculativeEngine`; `oxillama_py.snapshot` Python module (`SnapshotError`, `dump`, `dumps`, `load`, `loads`, `snapshot_info`) shipped; `__init__.py` + `.pyi` updated; tests added; docs/snapshot.rst shipped; clippy clean; Rust unit tests pass (4/4); Python tests pass (8/8 non-gated); workspace tests 2031/2031 pass.
+- [x] **Polymorphic progress-bar hook with rich `ProgressEvent` contract** (planned 2026-05-03)
+  - **Goal:** First-class `progress=` kwarg on `Engine.generate{,_streaming}`, `SpeculativeEngine.generate{,_streaming}`, and `AsyncEngine.generate{,_stream}` that accepts (a) any `tqdm`/`tqdm.notebook.tqdm`, (b) any `ipywidgets.IntProgress`, (c) any `Callable[[ProgressEvent], None]`, or (d) `None`. Rust-side throttling caps callback invocations at ~50 ms or 4 tokens (whichever first), always firing on the first and final token. RAII finaliser ensures the widget is closed / set to 100 % even on Python exception, cancellation, or EOS. Existing `callback=` kwarg is left untouched (additive, fully backwards-compatible). The v0.1.1 `TqdmProgress` shim is kept as a compat alias but documented as deprecated.
+  - **Design:**
+    - **Rust API shape (`engine.rs`):** add `progress: Option<Py<PyAny>>` and `progress_throttle_ms: Option<u64>` and `progress_throttle_tokens: Option<usize>` keyword-only kwargs to `PyEngine::generate` and `PyEngine::generate_streaming`. Mirror in `PySpeculativeEngine::generate{,_streaming}` (`speculative.rs`). For `PyAsyncEngine::generate{,_stream}` (`async_support.rs`), forward the kwargs to the underlying sync call inside the `asyncio.to_thread` closure.
+    - **Python-side adapter (`python/oxillama_py/progress.py`, NEW, ~220 lines):** module-level `make_progress_adapter(obj, max_tokens) -> Callable[[ProgressEvent], None] | None` that does duck-typed dispatch:
+      1. `obj is None` → `None` (no-op).
+      2. `hasattr(obj, "update") and hasattr(obj, "set_postfix_str") and hasattr(obj, "close")` → tqdm path (`_TqdmAdapter`): call `pbar.update(1)`, `pbar.set_postfix_str(f"{tok_per_sec:.1f} tok/s", refresh=False)`, set `pbar.total = max_tokens` once on first event, call `pbar.close()` in finaliser.
+      3. `hasattr(obj, "value") and hasattr(obj, "max")` and class name contains `"Progress"` (covers `IntProgress`, `FloatProgress`) → ipywidgets path (`_IPyWidgetAdapter`): set `obj.max = max_tokens` once, set `obj.value = event.tokens_generated`, optionally `obj.description = f"{tok_per_sec:.1f} tok/s"`; on finalise set `obj.bar_style = "success"` (or `"danger"` on error) and `obj.value = obj.max`.
+      4. `callable(obj)` → wrap directly: `obj(event)`.
+      5. Else → `TypeError("progress must be a tqdm pbar, ipywidgets.IntProgress, callable, or None")`.
+      All adapters expose a `__call__(event)` and a `finalise(error: Exception | None)` method; `make_progress_adapter` returns the bare `__call__` plus a separate `finaliser` callable so the Rust side can drive both.
+    - **Polymorphic dispatch on the Rust side:** Rust does *not* introspect the Python object. Instead, on the very first call the Rust binding invokes a single Python helper `oxillama_py.progress._build_bridge(progress, max_tokens) -> (callback, finaliser)`. The result is two `Py<PyAny>` callables stored in a small struct `ProgressBridge { callback: Py<PyAny>, finaliser: Py<PyAny>, throttle: Throttler, start: Instant, tokens: usize }`. This keeps all duck typing in Python where it belongs.
+    - **Throttling implementation (`callback.rs`):** new `Throttler { last_fire: Instant, tokens_since_fire: usize, min_interval: Duration, min_tokens: usize }` with method `should_fire(&mut self, force: bool) -> bool`. Returns `true` iff `force || self.last_fire.elapsed() >= self.min_interval || self.tokens_since_fire >= self.min_tokens`. Defaults: 50 ms, 4 tokens. Always force-fire on first token (`tokens_total == 1`) and on final token (callback driven from the cleanup epilogue, see below). Throttler lives entirely in the Rust closure that wraps the user callback — Python is never touched on a throttled tick, only `tokens_total` and `tokens_since_fire` are incremented.
+    - **`ProgressEvent` (Python `@dataclass(frozen=True, slots=True)` in `progress.py`):** fields `tokens_generated: int`, `tokens_total: int | None` (= max_tokens), `elapsed_secs: float`, `tokens_per_sec: float`, `eta_secs: float | None` (None until ≥2 tokens), `is_final: bool`, `text_so_far: str` (always `""` unless `progress_capture_text=True` kwarg is set; gated to avoid O(n²) string growth in the hot loop). Constructed Python-side from a `(tokens_generated, elapsed_ns, is_final, text_so_far)` 4-tuple passed by Rust — cheaper than a `#[pyclass]` per token. Re-exported as `oxillama_py.ProgressEvent`.
+    - **Exception safety / cleanup (RAII):** Rust uses a `ProgressGuard` struct holding the `finaliser: Py<PyAny>` and a `result: Cell<Option<Result<(), PyErr>>>`. The guard's `Drop` impl calls `Python::attach(|py| finaliser.call1(py, (error_repr,)))` so the bar is closed even on panic, early return, EOS, cancellation, or Python exception inside the callback. Inside the per-token closure, `cb.call1(...)` errors are caught and stashed (like the existing `strict_callback` pattern) — generation never aborts because the bar threw. A new kwarg `strict_progress: bool = False` mirrors `strict_callback`: when true, the first stashed error is re-raised after generation completes.
+    - **Async path (`async_support.rs`):** `generate_stream` already runs generation in a `thread::spawn` and feeds tokens through a `queue.Queue`. Add a parallel `progress_queue` so the background thread drives the progress callback on the asyncio side via `loop.call_soon_threadsafe`. Avoids the Rust-side `Python::attach` from the spawned thread fighting with the asyncio loop.
+    - **Cancellation interaction:** `progress=` integrates with the existing `cancel_token=` kwarg by force-firing the finaliser with `error=CancelledError("generation cancelled")` so widgets render the cancellation visibly (`bar_style="warning"` on ipywidgets, `set_postfix_str("cancelled")` on tqdm).
+  - **Files:**
+    - `crates/oxillama-py/src/callback.rs` (modified, +~140 lines): add `Throttler` struct, `ProgressBridge` struct with `Drop` impl (= RAII guard), helper `make_progress_callback(progress: Option<Py<PyAny>>, max_tokens: usize, throttle_ms: u64, throttle_tokens: usize, capture_text: bool) -> ProgressBridge` that imports `oxillama_py.progress._build_bridge`. Six new Rust unit tests (Python interpreter required for the bridge build, no-op tests for the throttler).
+    - `crates/oxillama-py/src/engine.rs` (modified, +~80 lines): wire `progress=`, `progress_throttle_ms=`, `progress_throttle_tokens=`, `progress_capture_text=`, `strict_progress=` kwargs into `generate` and `generate_streaming`. Compose the user `callback` (1-arg token) and the progress bridge into a single `FnMut(&str)` closure. Update docstrings with a Jupyter example.
+    - `crates/oxillama-py/src/speculative.rs` (modified, +~40 lines): add the same kwargs to `PySpeculativeEngine::generate` and `generate_streaming`.
+    - `crates/oxillama-py/src/async_support.rs` (modified, +~50 lines): add `progress=` kwarg to `generate` and `generate_stream`; for `generate_stream`, drive the progress callback via `loop.call_soon_threadsafe` to avoid GIL contention from the spawned worker.
+    - `crates/oxillama-py/python/oxillama_py/progress.py` (NEW, ~220 lines): `ProgressEvent` frozen dataclass, `_TqdmAdapter`, `_IPyWidgetAdapter`, `_CallableAdapter`, `make_progress_adapter(obj, max_tokens) -> (callback, finaliser)`, `_build_bridge(...)` (the Rust→Python entry point).
+    - `crates/oxillama-py/python/oxillama_py/__init__.py` (modified, +~6 lines): re-export `ProgressEvent`, `make_progress_adapter`. Mark `TqdmProgress` as deprecated alias (DeprecationWarning on import).
+    - `crates/oxillama-py/python/oxillama_py/__init__.pyi` (modified, +~50 lines): add `ProgressEvent` dataclass stub, extend all four `generate*` signatures with the new kwargs, document `progress` parameter type as `Union[Any, Callable[[ProgressEvent], None], None]`.
+    - `crates/oxillama-py/python/tests/test_progress.py` (NEW, ~280 lines): see Tests below — pure-Python tests with `FakeTqdm` and `FakeIntProgress` doubles; native-extension tests gated on `OXILLAMA_TEST_MODEL`.
+    - `crates/oxillama-py/docs/progress.rst` (NEW, ~120 lines): user-facing doc with three Jupyter notebook snippets (tqdm.auto, ipywidgets, custom callable). Wire into `crates/oxillama-py/docs/index.rst` toctree.
+    - `crates/oxillama-py/Cargo.toml` (no changes — no new Rust deps; `Instant`/`Duration` are in `std`).
+    - `crates/oxillama-py/TODO.md` (modified): tick this item off when done; add to "Shipped in v0.1.2" section once landed.
+  - **Prerequisites:** None. The existing `callback.rs` `StreamingCallbackBridge` and `cancel.rs` patterns are the reference templates.
+  - **Tests:**
+    1. `test_progress_event_dataclass_fields` — construct `ProgressEvent(5, 100, 0.5, 10.0, 9.5, False, "")` and assert all fields readable, frozen (raises on assignment).
+    2. `test_make_progress_adapter_none_returns_none` — `make_progress_adapter(None, 100)` returns `(None, None)`.
+    3. `test_make_progress_adapter_dispatches_tqdm` — pass `FakeTqdm()`, assert returned callback updates `count`, finaliser sets `closed=True`.
+    4. `test_make_progress_adapter_dispatches_ipywidgets` — pass `FakeIntProgress()`, assert callback sets `value`, finaliser sets `bar_style="success"`.
+    5. `test_make_progress_adapter_dispatches_callable` — pass `lambda evt: collected.append(evt)`, assert events flow through.
+    6. `test_make_progress_adapter_rejects_invalid` — pass `42`, assert `TypeError` raised with helpful message.
+    7. `test_throttler_fires_on_first_token` — Rust unit test: new `Throttler` with `min_interval=1s, min_tokens=999`; call `should_fire(force=true)` once, returns `true`.
+    8. `test_throttler_throttles_subsequent_calls` — Rust unit test: after first fire, `should_fire(force=false)` returns `false` until interval elapses or token count crosses threshold.
+    9. `test_throttler_fires_on_token_threshold` — Rust unit test: with `min_tokens=4`, after 4 calls `should_fire` returns `true`.
+    10. `test_progress_callback_finalised_on_completion` — gated on `OXILLAMA_TEST_MODEL`: run `generate("hi", max_tokens=8, progress=fake_pbar)`, assert `fake_pbar.closed` is `True`.
+    11. `test_progress_callback_finalised_on_exception` — gated test: pass a callable that raises after 2 tokens, assert finaliser still ran (RAII guard).
+    12. `test_progress_callback_finalised_on_cancellation` — gated test: pass `cancel_token` and trigger from another thread, assert tqdm `set_postfix_str("cancelled")` was called.
+    13. `test_strict_progress_propagates_callback_error` — gated test: callable raises `ValueError`, `strict_progress=True` re-raises after generation completes.
+    14. `test_progress_capture_text_off_by_default` — gated test: assert `event.text_so_far == ""` when `progress_capture_text=False` (default).
+    15. `test_progress_capture_text_on_accumulates` — gated test: assert `event.text_so_far` grows monotonically when `progress_capture_text=True`.
+    16. `test_progress_event_eta_none_until_two_tokens` — gated test: capture events; assert `events[0].eta_secs is None`, `events[2].eta_secs > 0`.
+    17. `test_progress_throttling_reduces_callback_count` — gated test: generate 200 tokens with default throttling, assert callback fired ≤ ~10× (confirms throttle works) and that first/final tokens always fired.
+    18. `test_async_engine_progress_kwarg` — gated async test: `await engine.generate("hi", progress=fake)` triggers the bar from inside the asyncio thread without deadlock.
+    19. `test_speculative_engine_progress_kwarg` — gated test on speculative path: same RAII semantics hold.
+    20. `test_legacy_callback_kwarg_still_works` — backwards-compat: `generate_streaming(callback=lambda tok: None)` (1-arg) still works without `progress=`.
+    21. `test_callback_and_progress_compose` — gated test: passing both `callback=` and `progress=` fires both per-token (callback every token, progress throttled).
+    22. `test_tqdm_progress_deprecated_warning` — pure-Python: `from oxillama_py import TqdmProgress` emits `DeprecationWarning` mentioning `progress=` migration.
+  - **Risk:**
+    - *Risk 1*: Calling Python `_build_bridge` once per generation pulls one extra import — mitigated by caching the helper module reference in `lib.rs` (same pattern as `_oxillama_async_helper`).
+    - *Risk 2*: `loop.call_soon_threadsafe` in the async path requires the loop reference at spawn time — captured into the worker via the same kwargs/locals mechanism that the existing `_TokenStream` uses; pattern already proven.
+    - *Risk 3*: `ipywidgets.IntProgress` duck-typing collision with future widgets that have `value`/`max` but aren't progress bars — mitigated by also requiring class-name substring `"Progress"` and by allowing the user to pass a `_CallableAdapter`-wrapped explicit callable as escape hatch.
+    - *Risk 4*: RAII `Drop` running during a panic might re-enter Python while the GIL is poisoned — mitigated by `std::panic::catch_unwind` around the per-token closure (the runtime already catches panics at the engine boundary; we just need to ensure the finaliser is called outside the unwind path via the explicit `result.set(...)` check rather than relying on `Drop`-during-unwind).
+    - *Risk 5*: The existing `TqdmProgress` shim is widely advertised in v0.1.1 docs. Mitigation: keep it as a DeprecationWarning-emitting alias that internally constructs `progress=` with the new bridge, so existing code continues to render — the warning just nudges migration.
+  - ✅ done 2026-05-03 — `Throttler`, `ProgressBridge`, `make_progress_bridge` shipped in `callback.rs` (5 new Rust unit tests); `progress=`/`progress_throttle_ms`/`progress_throttle_tokens`/`progress_capture_text`/`strict_progress` kwargs landed on `Engine.generate{,_streaming}`, `SpeculativeEngine.generate{,_streaming}`, and `AsyncEngine.generate{,_stream}`; pure-Python `oxillama_py.progress` (`ProgressEvent`, `_TqdmAdapter`, `_IPyWidgetAdapter`, `_CallableAdapter`, `make_progress_adapter`, `_build_bridge`) shipped; `__init__.py` lazy `__getattr__` keeps `TqdmProgress`/`CollectTokens` working under `DeprecationWarning`; 11 new pure-Python tests in `test_progress.py` plus 12 model-gated tests; `docs/progress.rst` shipped and wired via `index.rst`. `clippy -p oxillama-py --all-features --all-targets -- -D warnings` clean; 86/86 Rust unit tests pass; pure-Python progress suite 11/11.
+- ~~**File naming drift.** Streaming helper lives at `src/streaming.rs`
+  rather than the documented `src/callback.rs`.~~ ✅ Renamed to
+  `src/callback.rs`; `lib.rs` updated accordingly.
+- ~~**No logits / probability exposure.** Users who want to read the
+  raw logits for a prompt (e.g. for classification, scoring, or
+  custom sampling) have no entry point — only the sampled tokens
+  surface.~~ ✅ `Engine.forward_logits(text) -> List[float]` shipped;
+  `forward_logits_numpy()` also available (numpy feature).
+- ~~**No cancellation token.** A long-running `generate(...)` cannot be
+  interrupted from Python short of `Ctrl-C` at the shell — no
+  `engine.cancel()` or cooperative cancellation handle is exposed.~~
+  ✅ `CancellationToken` class shipped (`cancel.rs`); accepted as
+  `cancel_token=` kwarg by `generate()` and `generate_streaming()`.
+  **Caveat found 2026-08-05 — ✅ fixed the same day:** cancellation used not to
+  shorten wall-clock generation time at all. `oxillama_runtime`'s decode loop
+  (`run_decode_loop` in `crates/oxillama-runtime/src/engine/generation.rs`) had
+  no cancellation check, and its per-token callback is infallible
+  (`impl FnMut(&str)`, no way to signal "stop"), so `inner.generate(...)` always
+  ran to natural completion (EOS or `max_tokens`) regardless of
+  `token.cancel()`. `Engine.generate()`'s callback even read the flag and threw
+  the result away (`flag.load(Ordering::Relaxed);` with no `if`) — a dead read
+  that looked like a check. Both methods only consulted `cancelled.load()`
+  *after* the blocking call returned, so `generate(..., max_tokens=2048,
+  cancel_token=t)` cancelled at token 1 still burned all 2048 forward passes
+  before raising.
+  **The fix:** `GenerationConfig` gained
+  `cancel_flag: Option<Arc<AtomicBool>>` (default `None`, zero-cost when
+  unused), checked once per decode iteration ahead of the `max_tokens` and
+  context-length checks, breaking with the new `FinishReason::Cancelled` and
+  returning everything produced so far. `Engine.generate()`,
+  `generate_streaming()`, and `generate_detailed()` now build that config
+  (via `build_generation_config` in `src/engine.rs`) and bind the token's flag
+  to it; the dead `flag.load()` read is gone. The post-hoc
+  `PyRuntimeError("generation cancelled")` is unchanged, so the Python-visible
+  contract is identical — only much faster.
+  **Coverage:** `crates/oxillama-runtime/tests/cancellation.rs` (synthetic
+  model: cancel after N tokens stops at N, pre-cancelled emits nothing, an
+  unraised flag changes nothing, plus the pre-tokenized entry point) and
+  `python/tests/test_cancellation_token.py`'s three `OXILLAMA_TEST_MODEL`-gated
+  tests, which compare against a *measured* uncancelled baseline rather than a
+  fixed wall-clock budget.
+  **Measured:** `test_progress.py::test_progress_callback_finalised_on_cancellation`
+  — documented above as taking "tens of minutes under load" for exactly this
+  reason — now completes in **2.35 s** on Qwen3-4B-Instruct.
+- ~~**Callback exceptions swallowed.**~~ ✅ Fixed: `strict_callback=True` kwarg on
+  `generate_streaming()` propagates Python exceptions raised inside the callback
+  instead of silencing them.  Default (`strict_callback=False`) preserves the
+  original silent behaviour.
+- ~~**No input validation at the pyo3 boundary — `EngineConfig(context_size=0)`
+  and `SamplerConfig(temperature=-0.1)` constructed successfully instead of
+  raising.**~~ ✅ Fixed: the `#[new]` constructors (`EngineConfig.__new__` /
+  `SamplerConfig.__new__`, `engine.rs` / `sampler.rs`) now validate before
+  constructing and raise `ValueError` with a specific message on failure —
+  `model_path` (empty or whitespace-only), `context_size` (`0`; `None` still
+  means "use the model's default"), `temperature` (negative or `NaN`),
+  `top_p`/`min_p` (outside the closed interval `[0.0, 1.0]`),
+  `repetition_penalty` (non-positive or `NaN`), and `mirostat` (outside
+  `{0, 1, 2}`). Deliberately left unvalidated: `top_k`/`num_threads`/
+  `repetition_penalty_window` (unsigned at the FFI boundary — a negative
+  Python `int` is already rejected by pyo3's own argument conversion before
+  any of this crate's code runs, and `0` is a legitimate "auto"/"disabled"
+  value for each), and `frequency_penalty`/`presence_penalty` (negative is
+  valid OpenAI-style semantics, not a misbehaving input). The previously
+  unvalidated constructors are kept internally (`EngineConfig::new` /
+  `SamplerConfig::new`, not exposed to Python) for this module's own
+  already-known-valid Rust-side test fixtures. 11 new Rust unit tests
+  (`py_new` validation, `engine.rs`/`sampler.rs`) + 21 new pytest cases
+  (`test_engine_config.py`, `test_sampler_config.py`), including boundary
+  values (`0.0`/`1.0` for `top_p`/`min_p`, `repetition_penalty=1.0`, every
+  `mirostat` mode) proven still accepted.
+
+## 6. v1.1 Roadmap
+
+- ~~Generate `.pyi` type stubs~~ ✅ Shipped (`__init__.pyi`).
+- ~~Upgrade `SamplerConfig` to a fully-kwarg-friendly Python class and
+  accept per-call sampler overrides~~ ✅ Shipped.
+- ~~Expose `Tokenizer` as a first-class Python class~~ ✅ `PyTokenizer`
+  shipped with `encode`, `decode`, `vocab_size`, `id_to_token`.
+  ~~Remaining: `encode_batch`, chat-template apply.~~ ✅ Both shipped: `encode_batch()` and `apply_chat_template()` (chatml/llama3/alpaca).
+- ~~Return `numpy.ndarray[float32]` from `embed()`; accept `ndarray`
+  logits input on the decode path.~~ ✅ Shipped: `embed_numpy()` and
+  `embed_batch_numpy()` return `numpy.ndarray[float32]`, gated on `numpy`
+  feature. ~~Remaining: accept `ndarray` logits input on the decode path.~~ ✅ `decode_from_logits(logits, temperature, top_k, top_p)` in `oxillama_py.utils`.
+- ~~Structured Python exception hierarchy mirroring the Rust
+  `RuntimeError` tree~~ ✅ Shipped: `OxiLlamaError` → `LoadError`,
+  `GenerateError`, `GrammarError`, `TokenizerError`, `QuantError`.
+  ~~Remaining: `KvCacheFullError`.~~ ✅ Shipped: `KvCacheFullError` is now a distinct subclass of `OxiLlamaError`.
+- ~~Full pytest suite (>80% coverage) with a fixtures directory holding
+  a tiny synthetic GGUF built via the `oxillama-gguf` `test_utils`
+  helpers so tests run without a network download.~~ ✅ Shipped: comprehensive
+  pytest suite with `test_imports.py`, `test_engine_config.py`,
+  `test_sampler_config.py`, `test_cancellation_token.py`,
+  `test_streaming_callback.py`, `test_exceptions.py`; pure-Python tests
+  run without native extension; native tests skip gracefully.
+- ~~Sphinx autodoc + readthedocs.io (`oxillama-py.readthedocs.io`) with
+  rendered examples and an API reference.~~ ✅ `docs/` skeleton shipped.
+- ~~PyPI publish workflow: GitHub Actions matrix building wheels for
+  manylinux2014 x86_64 / aarch64, macOS universal2, and Windows x86_64
+  across CPython 3.8–3.13 + PyPy 3.10.~~ ✅ `.github/workflows/publish_py.yml` shipped.
+- ~~Jupyter / tqdm-friendly streaming callback protocol — a `TqdmProgress` helper wrapping the token callback.~~ ✅ Shipped: `python/oxillama_py/tqdm_helper.py` with `TqdmProgress` (wraps any tqdm pbar) and `CollectTokens`; re-exported from package top-level. Also shipped: `decode_from_logits()` in `utils.py` for pure-Python sampling from logits ndarrays.
+- ~~Rename `src/streaming.rs` → `src/callback.rs` and update docs.~~ ✅ Done.
+- ~~Typed `Protocol` class for streaming callbacks~~ ✅ Shipped:
+  `StreamingCallback` runtime-checkable Protocol in `python/oxillama_py/callback.py`;
+  re-exported from package top-level; `.pyi` stub updated;
+  `TokenCallback` type alias added.
+
+## 7. v2.0+ Vision
+
+- Native async engine: `await engine.generate(prompt)` via
+  `pyo3-asyncio`, with cancellation propagated to the Rust side.
+- Streaming async iterators: `async for tok in engine.stream(prompt)`.
+- `torch.Tensor` interop: accept and return `torch.Tensor` for logits,
+  embeddings, and KV cache state — zero-copy via DLPack where possible.
+- `pydantic` config: `EngineConfig(BaseModel)` with validated
+  construction, JSON schema export, and config-file loading.
+- ~~HuggingFace Hub loader:
+  `Engine.from_hub("meta-llama/Meta-Llama-3-8B-Instruct-GGUF")` with
+  automatic download + on-disk cache + revision pinning.~~ ✅ Shipped:
+  `Engine.from_hub()` classmethod + `oxillama_py.hub.load_from_hub()`.
+- Drop-in tokenizer compat with `transformers.AutoTokenizer` surface
+  (`encode`, `decode`, `apply_chat_template`, `pad_token_id`, ...).
+- Typer-based CLI: `python -m oxillama chat --model ...` mirroring
+  the Rust `oxillama` binary, reusing the same config schema.
+- Jupyter magic: `%%oxillama prompt` cell magic for quick prompting
+  from notebook cells.
+- Multi-engine orchestration primitives: a Python-level pool /
+  scheduler that load-balances across several loaded `Engine`s.
+- Observability hooks: `on_token`, `on_accept`, `on_reject`, and
+  `on_cache_evict` callback protocols for telemetry tooling.
+- Optional `ray` / `dask` integration for sharded inference.
+
+- ~~**`torch.Tensor` interop.**~~ ✅ Shipped (v0.1.3 Track F): `torch_helper.py` adds `Engine.logits_torch(text)` and `Engine.embeddings_torch(text)` via DLPack zero-copy; monkey-patched onto `Engine` at import time by `__init__.py`; lazy `torch` import so absence of PyTorch never prevents package import; `logits_torch` / `embeddings_torch` stubs added to `__init__.pyi`; `src/torch_interop.rs` placeholder for future Rust-side helpers; Python test suite in `tests/test_torch_interop.py` (17 tests).
+
+*Last updated: 2026-08-17 (v0.1.4 — hf-hub 1.0 migration; hub-download
+progress bar regression fixed same day via `indicatif` + `PullProgress`;
+PyO3 0.29.2)*
+
+## Proposed follow-ups
+
+- **R1 — `pickle_checkpoint_support` scope clarification (proposed 2026-05-03)** ✅ Resolved: user chose "Snapshot/restore API (no pickle)" direction; implemented as plan block above (planned 2026-05-03).
+
+- ✅ **R2 — `SpeculativeEngine.snapshot/restore` (done 2026-05-05)**
+
+  Implemented Track E of OxiLLaMa v0.1.3. Shipped:
+
+  1. `SpeculativeEngineSnapshot` in `oxillama-runtime/src/snapshot.rs` with `encode()`/`decode()`/`fingerprint()`, magic header `b"OXISPEC1"`, LE wire format (no oxicode for the outer envelope so magic can be checked before allocation).
+  2. `RuntimeError::SpecSnapshotIncompatible(String)` added to `error.rs`.
+  3. `SpeculativeEngine::snapshot()`, `snapshot_to_file()`, `resume()`, `resume_from_file()` in `speculative.rs`; `Xorshift64::raw_state()` / `from_raw_state()` accessors added.
+  4. Python `PySpeculativeEngine`: `snapshot(path)`, `snapshot_bytes() -> bytes`, `restore(cls, path, target_model, draft_model)`, `__reduce__` / `__reduce_ex__` (now real pickle support).
+  5. `.pyi` stubs updated for `SpeculativeEngine`.
+  6. 6 Rust unit tests in `snapshot.rs` + Python test file `test_speculative_snapshot.py` (13 pure-Python method-existence tests + 3 model-gated integration tests).
+  7. `oxillama-runtime::RuntimeError::SpecSnapshotIncompatible` wired into `error.rs` in `oxillama-py`.
+
+- ✅ **R3 — Hub-aware snapshots (done 2026-05-05)**
+
+  Shipped as Track F of OxiLLaMa v0.1.3.
+
+  1. Added `HubOrigin { repo_id, filename, sha256 }` serde struct to `snapshot.rs`.
+  2. Added `EngineSnapshotMeta { model_path, hub_origin: Option<HubOrigin> }` envelope with JSON sidecar (`path + ".meta.json"`).
+  3. Extended `Engine.snapshot(path, *, hub_origin=None)` — when `hub_origin` is provided, serialises the origin metadata to the sidecar file.
+  4. Updated `Engine.restore()` to read the sidecar on restore: if `hub_origin` is set and the local model path is missing, it re-downloads via `hub::download_model_from_hub` and verifies SHA-256.
+  5. Added `Engine.from_snapshot_with_hub(snapshot_path)` classmethod (convenience alias for `restore()` with hub-aware logic).
+  6. Added `HubOrigin` TypedDict to `__init__.pyi`; updated `Engine.snapshot`, `.restore`, `from_snapshot_with_hub` stubs.
+  7. Rust unit tests: `hub_origin_serde_roundtrip`, `snapshot_meta_with_hub_origin_roundtrip`, `snapshot_meta_without_hub_origin_roundtrip`, `sha256_hex_length_and_format`, `meta_path_for_appends_suffix`.
+  8. Python tests: `test_hub_snapshot.py` (12 tests) + `test_dlpack.py` (13 tests).
+
+- ✅ **DLPack tensor interop (done 2026-05-05)**
+
+  Shipped as Track F of OxiLLaMa v0.1.3.
+
+  1. New `src/dlpack.rs` with DLPack v0.8 C structs (`DLDevice`, `DLDataType`, `DLTensor`, `DLManagedTensor`) and `vec_to_dlpack` / `dlpack_to_vec` public functions.
+  2. `Engine.logits_dlpack(text)` — runs `forward_logits(text)` and returns the vocab-length f32 vector as a `"dltensor"` PyCapsule with shape `[vocab_size]`.
+  3. `Engine.embeddings_dlpack(text)` — runs `embed(text)` and returns the hidden-state vector as a `"dltensor"` PyCapsule with shape `[1, hidden_size]`.
+  4. Capsule memory is owned by the `DLManagedTensor`; freed by CPython GC via `capsule_destructor` → `managed_tensor_deleter`.
+  5. Rust unit tests: `dlpack_shape_matches_input`, `dlpack_dtype_is_f32`, `dlpack_device_is_cpu`, `dlpack_capsule_name_is_dltensor`, `dlpack_deleter_null_is_safe`.

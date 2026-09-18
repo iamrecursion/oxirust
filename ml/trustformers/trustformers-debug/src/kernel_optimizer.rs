@@ -1,0 +1,1702 @@
+//! Kernel optimization analyzer and recommendation engine
+//!
+//! This module provides comprehensive analysis of GPU kernel performance,
+//! identifies optimization opportunities, and suggests specific improvements.
+// reason: debug/profiling scaffolding — structs are constructed and their fields/methods
+// are retained for the data model, serialization completeness, and future consumers that
+// do not yet read every member. Consolidated from many item-level #[allow(dead_code)].
+#![allow(dead_code)]
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::Duration;
+use uuid::Uuid;
+
+use crate::advanced_gpu_profiler::{
+    AccessLocalityMetrics, CachePerformanceAnalysis, CoalescingAnalysis, ComputeBottleneckAnalysis,
+    ComputeBottleneckType, ComputeUtilizationProfile, ConfigPerformanceMeasurement,
+    ImplementationDifficulty, InstructionMixAnalysis, KernelExecutionProfile, KernelOptimization,
+    MemoryAccessAnalysis, OptimalLaunchConfig, ResourceUtilizationMetrics,
+};
+
+/// CPU-side analytical computations backing the analyzers in this module
+/// (occupancy estimation, roofline classification, fusion detection).
+mod analysis;
+
+/// Performance-regression detection (baseline establishment + Welch's
+/// t-test comparison) backing [`PerformanceRegressionDetector`]. Types are
+/// re-exported here so existing `crate::kernel_optimizer::{Foo, ...}`
+/// paths keep working after the split.
+mod regression;
+pub use regression::*;
+
+/// Comprehensive kernel optimization analyzer
+#[derive(Debug)]
+pub struct KernelOptimizationAnalyzer {
+    kernel_profiles: HashMap<String, KernelExecutionProfile>,
+    optimization_suggestions: HashMap<String, Vec<KernelOptimization>>,
+    launch_config_analyzer: LaunchConfigAnalyzer,
+    memory_access_analyzer: MemoryAccessAnalyzer,
+    compute_utilization_analyzer: ComputeUtilizationAnalyzer,
+    fusion_analyzer: KernelFusionAnalyzer,
+    performance_regression_detector: PerformanceRegressionDetector,
+}
+
+/// Launch configuration optimization engine
+#[derive(Debug)]
+pub struct LaunchConfigAnalyzer {
+    optimal_configs: HashMap<String, OptimalLaunchConfig>,
+    config_performance_history: HashMap<String, Vec<ConfigPerformanceMeasurement>>,
+    autotuning_enabled: bool,
+    search_space_cache: HashMap<String, LaunchConfigSearchSpace>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchConfigSearchSpace {
+    pub kernel_name: String,
+    pub min_block_size: (u32, u32, u32),
+    pub max_block_size: (u32, u32, u32),
+    pub block_size_constraints: Vec<BlockSizeConstraint>,
+    pub shared_memory_constraints: MemoryConstraints,
+    pub register_constraints: RegisterConstraints,
+    pub occupancy_targets: OccupancyTargets,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BlockSizeConstraint {
+    MultipleOf(u32),
+    PowerOfTwo,
+    MaxThreadsPerBlock(u32),
+    SharedMemoryLimit(usize),
+    RegisterLimit(u32),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConstraints {
+    pub max_shared_memory_per_block: usize,
+    pub bank_conflict_aware: bool,
+    pub coalescing_optimization: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterConstraints {
+    pub max_registers_per_thread: u32,
+    pub spill_threshold: u32,
+    pub occupancy_impact_threshold: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OccupancyTargets {
+    pub minimum_occupancy: f64,
+    pub target_occupancy: f64,
+    pub theoretical_occupancy: f64,
+}
+
+/// Memory access pattern analysis engine
+#[derive(Debug)]
+pub struct MemoryAccessAnalyzer {
+    access_patterns: HashMap<String, MemoryAccessAnalysis>,
+    coalescing_analysis: HashMap<String, CoalescingAnalysis>,
+    cache_performance: HashMap<String, CachePerformanceAnalysis>,
+    stride_analysis: HashMap<String, StrideAnalysisResult>,
+    bank_conflict_analyzer: BankConflictAnalyzer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrideAnalysisResult {
+    pub kernel_name: String,
+    pub detected_strides: Vec<DetectedStride>,
+    pub access_pattern_classification: AccessPatternType,
+    pub optimization_potential: f64,
+    pub recommended_optimizations: Vec<StrideOptimization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedStride {
+    pub stride_bytes: usize,
+    pub frequency: u64,
+    pub memory_region: String,
+    pub performance_impact: StrideImpact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StrideImpact {
+    Optimal,  // Stride = 1 element
+    Good,     // Small stride, good cache utilization
+    Moderate, // Medium stride, some cache misses
+    Poor,     // Large stride, many cache misses
+    Critical, // Very large stride, severe performance impact
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AccessPatternType {
+    Sequential,
+    Strided,
+    Random,
+    Blocked,
+    Sparse,
+    Irregular,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrideOptimization {
+    pub optimization_type: StrideOptimizationType,
+    pub description: String,
+    pub expected_improvement: f64,
+    pub implementation_complexity: ImplementationDifficulty,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StrideOptimizationType {
+    DataLayoutReorganization,
+    AccessReordering,
+    TilingStrategy,
+    PrefetchingStrategy,
+    VectorizedAccess,
+}
+
+/// Bank conflict analysis for shared memory
+#[derive(Debug)]
+pub struct BankConflictAnalyzer {
+    conflict_patterns: HashMap<String, BankConflictPattern>,
+    resolution_strategies: HashMap<String, Vec<ConflictResolutionStrategy>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BankConflictPattern {
+    pub kernel_name: String,
+    pub conflict_count: u64,
+    pub conflict_severity: ConflictSeverity,
+    pub conflicting_addresses: Vec<ConflictingAccess>,
+    pub bank_utilization: Vec<f64>, // Utilization per bank
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConflictSeverity {
+    None,
+    Low,    // 2-way conflicts
+    Medium, // 4-way conflicts
+    High,   // 8-way conflicts
+    Severe, // 16+ way conflicts
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictingAccess {
+    pub address_pattern: String,
+    pub conflict_degree: u32,
+    pub access_frequency: u64,
+    pub performance_penalty: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictResolutionStrategy {
+    pub strategy_type: ConflictResolutionType,
+    pub description: String,
+    pub expected_speedup: f64,
+    pub implementation_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConflictResolutionType {
+    ArrayPadding,
+    AccessReordering,
+    DataStructureReorganization,
+    BroadcastOptimization,
+    MemoryLayoutChange,
+}
+
+/// Compute utilization analysis engine
+#[derive(Debug)]
+pub struct ComputeUtilizationAnalyzer {
+    utilization_profiles: HashMap<String, ComputeUtilizationProfile>,
+    bottleneck_analysis: HashMap<String, ComputeBottleneckAnalysis>,
+    arithmetic_intensity_analyzer: ArithmeticIntensityAnalyzer,
+    resource_balancer: ResourceBalancer,
+}
+
+#[derive(Debug)]
+pub struct ArithmeticIntensityAnalyzer {
+    intensity_profiles: HashMap<String, ArithmeticIntensityProfile>,
+    roofline_models: HashMap<i32, RooflineModel>, // Per device
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArithmeticIntensityProfile {
+    pub kernel_name: String,
+    pub operations_per_byte: f64,
+    pub compute_intensity: ComputeIntensityCategory,
+    pub memory_bound_ratio: f64,
+    pub compute_bound_ratio: f64,
+    pub roofline_position: RooflinePosition,
+    pub optimization_direction: OptimizationDirection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ComputeIntensityCategory {
+    MemoryBound,  // < 1 op/byte
+    Balanced,     // 1-10 ops/byte
+    ComputeBound, // > 10 ops/byte
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RooflinePosition {
+    pub current_performance: f64,    // GFLOPS
+    pub theoretical_peak: f64,       // GFLOPS
+    pub memory_bandwidth_limit: f64, // GB/s
+    pub efficiency_percentage: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OptimizationDirection {
+    IncreaseComputeIntensity,
+    ImproveMemoryEfficiency,
+    BalanceComputeMemory,
+    OptimizeForLatency,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RooflineModel {
+    pub device_id: i32,
+    pub peak_compute_performance: f64, // GFLOPS
+    pub peak_memory_bandwidth: f64,    // GB/s
+    pub cache_hierarchy: CacheHierarchy,
+    pub compute_capabilities: ComputeCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheHierarchy {
+    pub l1_cache_bandwidth: f64,
+    pub l2_cache_bandwidth: f64,
+    pub shared_memory_bandwidth: f64,
+    pub texture_cache_bandwidth: f64,
+    pub constant_cache_bandwidth: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeCapabilities {
+    pub fp32_performance: f64,
+    pub fp16_performance: f64,
+    pub int32_performance: f64,
+    pub tensor_performance: f64,
+    pub special_function_performance: f64,
+}
+
+/// Resource balancing engine
+#[derive(Debug)]
+pub struct ResourceBalancer {
+    resource_profiles: HashMap<String, ResourceProfile>,
+    balancing_strategies: HashMap<String, Vec<BalancingStrategy>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceProfile {
+    pub kernel_name: String,
+    pub register_pressure: ResourcePressure,
+    pub shared_memory_pressure: ResourcePressure,
+    pub occupancy_limiting_factor: OccupancyLimitingFactor,
+    pub resource_utilization_efficiency: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResourcePressure {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OccupancyLimitingFactor {
+    RegisterCount,
+    SharedMemoryUsage,
+    BlockSize,
+    WarpCount,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalancingStrategy {
+    pub strategy_type: BalancingStrategyType,
+    pub description: String,
+    pub expected_occupancy_improvement: f64,
+    pub performance_impact: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BalancingStrategyType {
+    RegisterOptimization,
+    SharedMemoryOptimization,
+    BlockSizeAdjustment,
+    WorkDistributionOptimization,
+    ResourcePartitioning,
+}
+
+/// Kernel fusion analysis engine
+#[derive(Debug)]
+pub struct KernelFusionAnalyzer {
+    fusion_opportunities: HashMap<String, Vec<FusionOpportunity>>,
+    dependency_graph: KernelDependencyGraph,
+    fusion_templates: Vec<FusionTemplate>,
+    cost_benefit_analyzer: FusionCostBenefitAnalyzer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionOpportunity {
+    pub opportunity_id: Uuid,
+    pub kernel_group: Vec<String>,
+    pub fusion_type: FusionType,
+    pub data_dependencies: Vec<DataDependency>,
+    pub expected_speedup: f64,
+    pub memory_savings: usize,
+    pub implementation_complexity: ImplementationDifficulty,
+    pub fusion_feasibility: FusionFeasibility,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FusionType {
+    ElementwiseFusion,      // Simple element-wise operations
+    ProducerConsumerFusion, // Producer directly feeds consumer
+    LoopFusion,             // Fuse similar loop structures
+    ReductionFusion,        // Combine multiple reductions
+    ConvolutionFusion,      // Fuse convolution with activation/bias
+    AttentionFusion,        // Fuse attention mechanism components
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataDependency {
+    pub source_kernel: String,
+    pub target_kernel: String,
+    pub dependency_type: DependencyType,
+    pub data_size: usize,
+    pub access_pattern: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DependencyType {
+    ReadAfterWrite,
+    WriteAfterRead,
+    WriteAfterWrite,
+    Reduction,
+    Broadcast,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionFeasibility {
+    pub resource_constraints_satisfied: bool,
+    pub register_usage_feasible: bool,
+    pub shared_memory_feasible: bool,
+    pub synchronization_complexity: SynchronizationComplexity,
+    pub fusion_confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SynchronizationComplexity {
+    None,
+    Minimal,
+    Moderate,
+    Complex,
+    Prohibitive,
+}
+
+#[derive(Debug)]
+pub struct KernelDependencyGraph {
+    nodes: HashMap<String, KernelNode>,
+    edges: Vec<DependencyEdge>,
+    fusion_clusters: Vec<FusionCluster>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelNode {
+    pub kernel_name: String,
+    pub execution_time: Duration,
+    pub memory_footprint: usize,
+    pub resource_requirements: ResourceRequirements,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceRequirements {
+    pub registers_per_thread: u32,
+    pub shared_memory_per_block: usize,
+    pub max_threads_per_block: u32,
+    pub memory_bandwidth_required: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyEdge {
+    pub source: String,
+    pub target: String,
+    pub dependency: DataDependency,
+    pub weight: f64, // Strength of dependency
+}
+
+#[derive(Debug, Clone)]
+pub struct FusionCluster {
+    pub cluster_id: Uuid,
+    pub kernels: Vec<String>,
+    pub fusion_potential: f64,
+    pub estimated_speedup: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionTemplate {
+    pub template_name: String,
+    pub pattern_signature: String,
+    pub applicable_kernels: Vec<String>,
+    pub fusion_strategy: FusionStrategy,
+    pub expected_benefits: FusionBenefits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionStrategy {
+    pub strategy_name: String,
+    pub implementation_approach: String,
+    pub resource_management: String,
+    pub synchronization_strategy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionBenefits {
+    pub memory_bandwidth_reduction: f64,
+    pub kernel_launch_overhead_reduction: f64,
+    pub cache_locality_improvement: f64,
+    pub register_pressure_impact: f64,
+}
+
+/// Fusion cost-benefit analyzer
+#[derive(Debug)]
+pub struct FusionCostBenefitAnalyzer {
+    cost_models: HashMap<FusionType, CostModel>,
+    benefit_predictors: HashMap<FusionType, BenefitPredictor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostModel {
+    pub fusion_type: FusionType,
+    pub development_cost: f64,
+    pub validation_cost: f64,
+    pub maintenance_cost: f64,
+    pub risk_factor: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenefitPredictor {
+    pub fusion_type: FusionType,
+    pub performance_model: PerformanceModel,
+    pub memory_model: MemoryModel,
+    pub energy_model: EnergyModel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceModel {
+    pub base_speedup_factor: f64,
+    pub scaling_factors: HashMap<String, f64>,
+    pub confidence_interval: (f64, f64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryModel {
+    pub memory_reduction_factor: f64,
+    pub bandwidth_savings: f64,
+    pub cache_improvement: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnergyModel {
+    pub energy_reduction_factor: f64,
+    pub power_efficiency_improvement: f64,
+}
+
+// Implementation of the main analyzer
+
+impl KernelOptimizationAnalyzer {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            kernel_profiles: HashMap::new(),
+            optimization_suggestions: HashMap::new(),
+            launch_config_analyzer: LaunchConfigAnalyzer::new()?,
+            memory_access_analyzer: MemoryAccessAnalyzer::new()?,
+            compute_utilization_analyzer: ComputeUtilizationAnalyzer::new()?,
+            fusion_analyzer: KernelFusionAnalyzer::new()?,
+            performance_regression_detector: PerformanceRegressionDetector::new()?,
+        })
+    }
+
+    /// Create an analyzer with empty state, for the fallback path when
+    /// [`Self::new`] fails.
+    ///
+    /// Every sub-analyzer starts from the same empty maps [`Self::new`] builds;
+    /// the only difference is that this constructor cannot fail. It is named
+    /// `new_empty` rather than the previous `new_stub` because nothing here is
+    /// stubbed out: analysis on this instance is fully functional, it simply
+    /// starts with no recorded history.
+    pub fn new_empty() -> Self {
+        Self {
+            kernel_profiles: HashMap::new(),
+            optimization_suggestions: HashMap::new(),
+            launch_config_analyzer: LaunchConfigAnalyzer::new_empty(),
+            memory_access_analyzer: MemoryAccessAnalyzer::new_empty(),
+            compute_utilization_analyzer: ComputeUtilizationAnalyzer::new_empty(),
+            fusion_analyzer: KernelFusionAnalyzer::new_empty(),
+            performance_regression_detector: PerformanceRegressionDetector::new_empty(),
+        }
+    }
+
+    /// Names of every kernel this analyzer holds a real execution profile for.
+    pub fn analyzed_kernel_names(&self) -> Vec<&str> {
+        self.kernel_profiles.keys().map(String::as_str).collect()
+    }
+
+    /// Optimization suggestions recorded so far, keyed by kernel name.
+    pub fn optimization_suggestions(&self) -> &HashMap<String, Vec<KernelOptimization>> {
+        &self.optimization_suggestions
+    }
+
+    /// Analyze a kernel execution and generate optimization suggestions
+    pub fn analyze_kernel(
+        &mut self,
+        kernel_name: &str,
+        profile_data: KernelProfileData,
+    ) -> Result<Vec<KernelOptimization>> {
+        // Update kernel profile
+        self.update_kernel_profile(kernel_name, profile_data.clone())?;
+
+        // Analyze different aspects
+        let launch_config_optimizations =
+            self.launch_config_analyzer.analyze(kernel_name, &profile_data)?;
+        let memory_optimizations =
+            self.memory_access_analyzer.analyze(kernel_name, &profile_data)?;
+        let compute_optimizations =
+            self.compute_utilization_analyzer.analyze(kernel_name, &profile_data)?;
+
+        // Combine all optimizations
+        let mut all_optimizations = Vec::new();
+        all_optimizations.extend(launch_config_optimizations);
+        all_optimizations.extend(memory_optimizations);
+        all_optimizations.extend(compute_optimizations);
+
+        // Rank optimizations by expected impact
+        all_optimizations.sort_by(|a, b| {
+            b.expected_improvement
+                .performance_gain_percentage
+                .partial_cmp(&a.expected_improvement.performance_gain_percentage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Store suggestions
+        self.optimization_suggestions
+            .insert(kernel_name.to_string(), all_optimizations.clone());
+
+        // Check for performance regressions
+        self.performance_regression_detector
+            .check_regression(kernel_name, &profile_data)?;
+
+        Ok(all_optimizations)
+    }
+
+    /// Analyze kernel fusion opportunities
+    pub fn analyze_fusion_opportunities(
+        &mut self,
+        kernel_sequence: &[String],
+    ) -> Result<Vec<FusionOpportunity>> {
+        self.fusion_analyzer.find_fusion_opportunities(kernel_sequence)
+    }
+
+    /// Get comprehensive optimization report for a kernel
+    pub fn get_optimization_report(&self, kernel_name: &str) -> Result<KernelOptimizationReport> {
+        let profile = self
+            .kernel_profiles
+            .get(kernel_name)
+            .ok_or_else(|| anyhow::anyhow!("Kernel profile not found: {}", kernel_name))?;
+
+        let optimizations =
+            self.optimization_suggestions.get(kernel_name).cloned().unwrap_or_default();
+
+        let launch_config_analysis = self.launch_config_analyzer.get_analysis(kernel_name)?;
+        let memory_analysis = self.memory_access_analyzer.get_analysis(kernel_name)?;
+        let compute_analysis = self.compute_utilization_analyzer.get_analysis(kernel_name)?;
+
+        let fusion_opportunities =
+            self.fusion_analyzer.get_opportunities_for_kernel(kernel_name)?;
+        let regression_status = self.performance_regression_detector.get_status(kernel_name)?;
+
+        Ok(KernelOptimizationReport {
+            kernel_name: kernel_name.to_string(),
+            current_performance: profile.clone(),
+            optimization_suggestions: optimizations,
+            launch_config_analysis,
+            memory_analysis,
+            compute_analysis,
+            fusion_opportunities,
+            regression_status,
+            overall_optimization_potential: self.calculate_optimization_potential(kernel_name)?,
+        })
+    }
+
+    fn update_kernel_profile(
+        &mut self,
+        kernel_name: &str,
+        profile_data: KernelProfileData,
+    ) -> Result<()> {
+        let profile = self.kernel_profiles.entry(kernel_name.to_string()).or_insert_with(|| {
+            KernelExecutionProfile {
+                kernel_name: kernel_name.to_string(),
+                execution_count: 0,
+                total_execution_time: Duration::ZERO,
+                avg_execution_time: Duration::ZERO,
+                min_execution_time: Duration::MAX,
+                max_execution_time: Duration::ZERO,
+                grid_sizes: Vec::new(),
+                block_sizes: Vec::new(),
+                shared_memory_usage: Vec::new(),
+                register_usage: Vec::new(),
+                occupancy_measurements: Vec::new(),
+                compute_utilization: Vec::new(),
+                memory_bandwidth_utilization: Vec::new(),
+                warp_efficiency: Vec::new(),
+                memory_efficiency: Vec::new(),
+            }
+        });
+
+        // Update profile with new data
+        profile.execution_count += 1;
+        profile.total_execution_time += profile_data.execution_time;
+        profile.avg_execution_time = profile.total_execution_time / profile.execution_count as u32;
+
+        if profile_data.execution_time < profile.min_execution_time {
+            profile.min_execution_time = profile_data.execution_time;
+        }
+        if profile_data.execution_time > profile.max_execution_time {
+            profile.max_execution_time = profile_data.execution_time;
+        }
+
+        profile.grid_sizes.push(profile_data.grid_size);
+        profile.block_sizes.push(profile_data.block_size);
+        profile.shared_memory_usage.push(profile_data.shared_memory_bytes);
+        profile.register_usage.push(profile_data.registers_per_thread);
+        profile.occupancy_measurements.push(profile_data.occupancy);
+        profile.compute_utilization.push(profile_data.compute_utilization);
+        profile
+            .memory_bandwidth_utilization
+            .push(profile_data.memory_bandwidth_utilization);
+        profile.warp_efficiency.push(profile_data.warp_efficiency);
+        profile.memory_efficiency.push(profile_data.memory_efficiency);
+
+        Ok(())
+    }
+
+    fn calculate_optimization_potential(&self, kernel_name: &str) -> Result<OptimizationPotential> {
+        let optimizations = self
+            .optimization_suggestions
+            .get(kernel_name)
+            .ok_or_else(|| anyhow::anyhow!("No optimizations found for kernel: {}", kernel_name))?;
+
+        let max_performance_gain = optimizations
+            .iter()
+            .map(|opt| opt.expected_improvement.performance_gain_percentage)
+            .fold(0.0, f64::max);
+
+        let total_memory_savings = optimizations
+            .iter()
+            .map(|opt| opt.expected_improvement.memory_usage_reduction_percentage)
+            .sum::<f64>();
+
+        let avg_implementation_difficulty = optimizations
+            .iter()
+            .map(|opt| match opt.implementation_difficulty {
+                ImplementationDifficulty::Trivial => 1.0,
+                ImplementationDifficulty::Easy => 2.0,
+                ImplementationDifficulty::Moderate => 3.0,
+                ImplementationDifficulty::Difficult => 4.0,
+                ImplementationDifficulty::Expert => 5.0,
+            })
+            .sum::<f64>()
+            / optimizations.len() as f64;
+
+        Ok(OptimizationPotential {
+            max_performance_gain,
+            total_memory_savings,
+            avg_implementation_difficulty,
+            optimization_count: optimizations.len(),
+            priority_score: self
+                .calculate_priority_score(max_performance_gain, avg_implementation_difficulty),
+        })
+    }
+
+    fn calculate_priority_score(&self, performance_gain: f64, difficulty: f64) -> f64 {
+        // Higher score = higher priority
+        // Balance performance gain against implementation difficulty
+        performance_gain / (difficulty * difficulty)
+    }
+}
+
+// Helper structures and implementations
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelProfileData {
+    pub execution_time: Duration,
+    pub grid_size: (u32, u32, u32),
+    pub block_size: (u32, u32, u32),
+    pub shared_memory_bytes: usize,
+    pub registers_per_thread: u32,
+    pub occupancy: f64,
+    pub compute_utilization: f64,
+    pub memory_bandwidth_utilization: f64,
+    pub warp_efficiency: f64,
+    pub memory_efficiency: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelOptimizationReport {
+    pub kernel_name: String,
+    pub current_performance: KernelExecutionProfile,
+    pub optimization_suggestions: Vec<KernelOptimization>,
+    pub launch_config_analysis: LaunchConfigAnalysisResult,
+    pub memory_analysis: MemoryAnalysisResult,
+    pub compute_analysis: ComputeAnalysisResult,
+    pub fusion_opportunities: Vec<FusionOpportunity>,
+    /// Real regression status computed from this kernel's execution-time
+    /// history, or `None` when there is not yet enough real data to
+    /// establish and compare against a baseline -- see
+    /// [`PerformanceRegressionDetector::get_status`]. Never a fabricated
+    /// "stable" placeholder.
+    pub regression_status: Option<RegressionStatus>,
+    pub overall_optimization_potential: OptimizationPotential,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationPotential {
+    pub max_performance_gain: f64,
+    pub total_memory_savings: f64,
+    pub avg_implementation_difficulty: f64,
+    pub optimization_count: usize,
+    pub priority_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchConfigAnalysisResult {
+    pub current_config: (u32, u32, u32, u32, u32, u32), // grid + block
+    pub optimal_config: OptimalLaunchConfig,
+    pub configuration_recommendations: Vec<ConfigurationRecommendation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigurationRecommendation {
+    pub recommendation_type: ConfigurationRecommendationType,
+    pub current_value: String,
+    pub recommended_value: String,
+    pub expected_improvement: f64,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConfigurationRecommendationType {
+    BlockSizeOptimization,
+    GridSizeOptimization,
+    SharedMemoryOptimization,
+    OccupancyImprovement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryAnalysisResult {
+    pub access_pattern_analysis: MemoryAccessAnalysis,
+    pub coalescing_analysis: CoalescingAnalysis,
+    pub cache_performance: CachePerformanceAnalysis,
+    pub memory_optimization_recommendations: Vec<MemoryOptimizationRecommendation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryOptimizationRecommendation {
+    pub recommendation_type: MemoryOptimizationRecommendationType,
+    pub description: String,
+    pub expected_improvement: f64,
+    pub implementation_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MemoryOptimizationRecommendationType {
+    CoalescingImprovement,
+    CacheOptimization,
+    StrideOptimization,
+    BankConflictResolution,
+    PrefetchingStrategy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeAnalysisResult {
+    pub utilization_profile: ComputeUtilizationProfile,
+    pub bottleneck_analysis: ComputeBottleneckAnalysis,
+    pub arithmetic_intensity_analysis: ArithmeticIntensityProfile,
+    pub resource_utilization_recommendations: Vec<ResourceOptimizationRecommendation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceOptimizationRecommendation {
+    pub recommendation_type: ResourceOptimizationRecommendationType,
+    pub description: String,
+    pub expected_benefit: f64,
+    pub resource_impact: ResourceImpact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResourceOptimizationRecommendationType {
+    RegisterOptimization,
+    SharedMemoryOptimization,
+    OccupancyImprovement,
+    ComputeIntensityBalance,
+    ResourceLoadBalancing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceImpact {
+    pub register_usage_change: i32,
+    pub shared_memory_change: i32,
+    pub occupancy_change: f64,
+    pub performance_change: f64,
+}
+
+// Sub-analyzer constructors. `new()` is the fallible form used on the normal
+// path; `new_empty()` is the infallible form used by
+// `KernelOptimizationAnalyzer::new_empty`. Both start from empty state.
+
+impl LaunchConfigAnalyzer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            optimal_configs: HashMap::new(),
+            config_performance_history: HashMap::new(),
+            autotuning_enabled: true,
+            search_space_cache: HashMap::new(),
+        })
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            optimal_configs: HashMap::new(),
+            config_performance_history: HashMap::new(),
+            autotuning_enabled: false,
+            search_space_cache: HashMap::new(),
+        }
+    }
+
+    fn analyze(
+        &mut self,
+        _kernel_name: &str,
+        profile_data: &KernelProfileData,
+    ) -> Result<Vec<KernelOptimization>> {
+        // Real CPU-side launch-configuration analysis: estimate occupancy from
+        // the launch descriptor + documented sm_86 device limits and emit
+        // block-size / register / shared-memory recommendations.
+        Ok(analysis::analyze_launch_config(profile_data))
+    }
+
+    fn get_analysis(&self, kernel_name: &str) -> Result<LaunchConfigAnalysisResult> {
+        // Simplified implementation
+        Ok(LaunchConfigAnalysisResult {
+            current_config: (1, 1, 1, 256, 1, 1),
+            optimal_config: OptimalLaunchConfig {
+                kernel_name: kernel_name.to_string(),
+                optimal_block_size: (256, 1, 1),
+                optimal_grid_size: (1024, 1, 1),
+                optimal_shared_memory: 0,
+                expected_occupancy: 1.0,
+                expected_performance: 1.0,
+                constraints: vec![],
+            },
+            configuration_recommendations: vec![],
+        })
+    }
+}
+
+impl MemoryAccessAnalyzer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            access_patterns: HashMap::new(),
+            coalescing_analysis: HashMap::new(),
+            cache_performance: HashMap::new(),
+            stride_analysis: HashMap::new(),
+            bank_conflict_analyzer: BankConflictAnalyzer::new()?,
+        })
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            access_patterns: HashMap::new(),
+            coalescing_analysis: HashMap::new(),
+            cache_performance: HashMap::new(),
+            stride_analysis: HashMap::new(),
+            bank_conflict_analyzer: BankConflictAnalyzer::new_empty(),
+        }
+    }
+
+    fn analyze(
+        &mut self,
+        _kernel_name: &str,
+        profile_data: &KernelProfileData,
+    ) -> Result<Vec<KernelOptimization>> {
+        // Real CPU-side memory-access analysis: classify coalescing / warp
+        // divergence from the measured efficiency metrics and emit fixes.
+        Ok(analysis::analyze_memory_access(profile_data))
+    }
+
+    fn get_analysis(&self, kernel_name: &str) -> Result<MemoryAnalysisResult> {
+        // Simplified implementation
+        Ok(MemoryAnalysisResult {
+            access_pattern_analysis: MemoryAccessAnalysis {
+                kernel_name: kernel_name.to_string(),
+                total_memory_transactions: 0,
+                coalesced_transactions: 0,
+                uncoalesced_transactions: 0,
+                stride_patterns: vec![],
+                access_locality: AccessLocalityMetrics {
+                    temporal_locality_score: 0.8,
+                    spatial_locality_score: 0.9,
+                    working_set_size: 1024,
+                    reuse_distance_avg: 10.0,
+                },
+                bank_conflicts: 0,
+                cache_line_utilization: 0.85,
+            },
+            coalescing_analysis: CoalescingAnalysis {
+                kernel_name: kernel_name.to_string(),
+                coalescing_efficiency: 0.9,
+                uncoalesced_regions: vec![],
+                suggested_improvements: vec![],
+            },
+            cache_performance: CachePerformanceAnalysis {
+                kernel_name: kernel_name.to_string(),
+                l1_cache_hit_rate: 0.85,
+                l2_cache_hit_rate: 0.70,
+                texture_cache_hit_rate: 0.95,
+                shared_memory_bank_conflicts: 0,
+                cache_thrashing_detected: false,
+                recommended_cache_optimizations: vec![],
+            },
+            memory_optimization_recommendations: vec![],
+        })
+    }
+}
+
+impl ComputeUtilizationAnalyzer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            utilization_profiles: HashMap::new(),
+            bottleneck_analysis: HashMap::new(),
+            arithmetic_intensity_analyzer: ArithmeticIntensityAnalyzer::new()?,
+            resource_balancer: ResourceBalancer::new()?,
+        })
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            utilization_profiles: HashMap::new(),
+            bottleneck_analysis: HashMap::new(),
+            arithmetic_intensity_analyzer: ArithmeticIntensityAnalyzer::new_empty(),
+            resource_balancer: ResourceBalancer::new_empty(),
+        }
+    }
+
+    fn analyze(
+        &mut self,
+        _kernel_name: &str,
+        profile_data: &KernelProfileData,
+    ) -> Result<Vec<KernelOptimization>> {
+        // Real CPU-side compute-utilization analysis: place the kernel on the
+        // roofline (arithmetic intensity vs ridge point) and classify the
+        // bottleneck (memory-bound / compute-bound / latency-bound).
+        Ok(analysis::analyze_compute_utilization(profile_data))
+    }
+
+    fn get_analysis(&self, kernel_name: &str) -> Result<ComputeAnalysisResult> {
+        // Simplified implementation
+        Ok(ComputeAnalysisResult {
+            utilization_profile: ComputeUtilizationProfile {
+                kernel_name: kernel_name.to_string(),
+                arithmetic_intensity: 2.5,
+                compute_throughput: 1000.0,
+                memory_throughput: 800.0,
+                compute_to_memory_ratio: 1.25,
+                warp_execution_efficiency: 0.95,
+                instruction_mix: InstructionMixAnalysis {
+                    integer_ops_percentage: 20.0,
+                    float_ops_percentage: 70.0,
+                    double_ops_percentage: 5.0,
+                    special_function_ops_percentage: 2.0,
+                    memory_ops_percentage: 25.0,
+                    control_flow_ops_percentage: 3.0,
+                },
+                resource_utilization: ResourceUtilizationMetrics {
+                    register_utilization: 0.75,
+                    shared_memory_utilization: 0.60,
+                    constant_memory_utilization: 0.30,
+                    texture_cache_utilization: 0.80,
+                    compute_unit_utilization: 0.85,
+                },
+            },
+            bottleneck_analysis: ComputeBottleneckAnalysis {
+                kernel_name: kernel_name.to_string(),
+                primary_bottleneck: ComputeBottleneckType::MemoryBandwidth,
+                bottleneck_severity: 0.6,
+                contributing_factors: vec![],
+                optimization_opportunities: vec![],
+            },
+            arithmetic_intensity_analysis: ArithmeticIntensityProfile {
+                kernel_name: kernel_name.to_string(),
+                operations_per_byte: 2.5,
+                compute_intensity: ComputeIntensityCategory::Balanced,
+                memory_bound_ratio: 0.6,
+                compute_bound_ratio: 0.4,
+                roofline_position: RooflinePosition {
+                    current_performance: 800.0,
+                    theoretical_peak: 1000.0,
+                    memory_bandwidth_limit: 900.0,
+                    efficiency_percentage: 80.0,
+                },
+                optimization_direction: OptimizationDirection::IncreaseComputeIntensity,
+            },
+            resource_utilization_recommendations: vec![],
+        })
+    }
+}
+
+impl KernelFusionAnalyzer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            fusion_opportunities: HashMap::new(),
+            dependency_graph: KernelDependencyGraph::new(),
+            fusion_templates: vec![],
+            cost_benefit_analyzer: FusionCostBenefitAnalyzer::new()?,
+        })
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            fusion_opportunities: HashMap::new(),
+            dependency_graph: KernelDependencyGraph::new(),
+            fusion_templates: vec![],
+            cost_benefit_analyzer: FusionCostBenefitAnalyzer::new_empty(),
+        }
+    }
+
+    fn find_fusion_opportunities(
+        &mut self,
+        kernel_sequence: &[String],
+    ) -> Result<Vec<FusionOpportunity>> {
+        // Real CPU-side fusion detection: examine each adjacent producer→consumer
+        // pair, classify the kernels, and model the memory-traffic speedup.
+        let opportunities = analysis::find_fusion_opportunities(kernel_sequence);
+
+        // Index opportunities by participating kernel so per-kernel reports can
+        // surface them later.
+        for opportunity in &opportunities {
+            for kernel in &opportunity.kernel_group {
+                self.fusion_opportunities
+                    .entry(kernel.clone())
+                    .or_default()
+                    .push(opportunity.clone());
+            }
+        }
+
+        Ok(opportunities)
+    }
+
+    fn get_opportunities_for_kernel(&self, kernel_name: &str) -> Result<Vec<FusionOpportunity>> {
+        Ok(self.fusion_opportunities.get(kernel_name).cloned().unwrap_or_default())
+    }
+}
+
+// Constructors for the remaining sub-analyzers; same `new`/`new_empty` pairing
+// as above.
+
+impl BankConflictAnalyzer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            conflict_patterns: HashMap::new(),
+            resolution_strategies: HashMap::new(),
+        })
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            conflict_patterns: HashMap::new(),
+            resolution_strategies: HashMap::new(),
+        }
+    }
+}
+
+impl ArithmeticIntensityAnalyzer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            intensity_profiles: HashMap::new(),
+            roofline_models: HashMap::new(),
+        })
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            intensity_profiles: HashMap::new(),
+            roofline_models: HashMap::new(),
+        }
+    }
+}
+
+impl ResourceBalancer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            resource_profiles: HashMap::new(),
+            balancing_strategies: HashMap::new(),
+        })
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            resource_profiles: HashMap::new(),
+            balancing_strategies: HashMap::new(),
+        }
+    }
+}
+
+impl KernelDependencyGraph {
+    fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+            edges: vec![],
+            fusion_clusters: vec![],
+        }
+    }
+}
+
+impl FusionCostBenefitAnalyzer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cost_models: HashMap::new(),
+            benefit_predictors: HashMap::new(),
+        })
+    }
+
+    fn new_empty() -> Self {
+        Self {
+            cost_models: HashMap::new(),
+            benefit_predictors: HashMap::new(),
+        }
+    }
+}
+
+/// Configuration for kernel optimization analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelOptimizationConfig {
+    /// Enable launch configuration optimization
+    pub enable_launch_config_optimization: bool,
+    /// Enable memory access optimization
+    pub enable_memory_access_optimization: bool,
+    /// Enable kernel fusion analysis
+    pub enable_kernel_fusion: bool,
+    /// Enable performance regression detection
+    pub enable_regression_detection: bool,
+    /// Maximum number of optimization suggestions per kernel
+    pub max_optimization_suggestions: usize,
+    /// Minimum performance improvement threshold (percentage)
+    pub min_improvement_threshold: f64,
+}
+
+impl Default for KernelOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            enable_launch_config_optimization: true,
+            enable_memory_access_optimization: true,
+            enable_kernel_fusion: true,
+            enable_regression_detection: true,
+            max_optimization_suggestions: 10,
+            min_improvement_threshold: 5.0,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "kernel_optimizer_tests.rs"]
+mod kernel_optimizer_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kernel_optimization_config_default() {
+        let config = KernelOptimizationConfig::default();
+        assert!(config.enable_launch_config_optimization);
+        assert!(config.enable_memory_access_optimization);
+        assert!(config.enable_kernel_fusion);
+        assert!(config.enable_regression_detection);
+        assert_eq!(config.max_optimization_suggestions, 10);
+        assert!((config.min_improvement_threshold - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_launch_config_search_space_creation() {
+        let space = LaunchConfigSearchSpace {
+            kernel_name: "matmul_kernel".to_string(),
+            min_block_size: (1, 1, 1),
+            max_block_size: (1024, 1024, 64),
+            block_size_constraints: vec![
+                BlockSizeConstraint::MultipleOf(32),
+                BlockSizeConstraint::PowerOfTwo,
+            ],
+            shared_memory_constraints: MemoryConstraints {
+                max_shared_memory_per_block: 49152,
+                bank_conflict_aware: true,
+                coalescing_optimization: true,
+            },
+            register_constraints: RegisterConstraints {
+                max_registers_per_thread: 255,
+                spill_threshold: 64,
+                occupancy_impact_threshold: 0.5,
+            },
+            occupancy_targets: OccupancyTargets {
+                minimum_occupancy: 0.25,
+                target_occupancy: 0.75,
+                theoretical_occupancy: 1.0,
+            },
+        };
+        assert_eq!(space.kernel_name, "matmul_kernel");
+        assert_eq!(space.block_size_constraints.len(), 2);
+    }
+
+    #[test]
+    fn test_stride_analysis_result_creation() {
+        let result = StrideAnalysisResult {
+            kernel_name: "conv_kernel".to_string(),
+            detected_strides: vec![DetectedStride {
+                stride_bytes: 4,
+                frequency: 1000,
+                memory_region: "global".to_string(),
+                performance_impact: StrideImpact::Optimal,
+            }],
+            access_pattern_classification: AccessPatternType::Sequential,
+            optimization_potential: 0.3,
+            recommended_optimizations: vec![],
+        };
+        assert_eq!(result.detected_strides.len(), 1);
+        assert!(matches!(
+            result.access_pattern_classification,
+            AccessPatternType::Sequential
+        ));
+    }
+
+    #[test]
+    fn test_bank_conflict_pattern_creation() {
+        let pattern = BankConflictPattern {
+            kernel_name: "shared_mem_kernel".to_string(),
+            conflict_count: 50,
+            conflict_severity: ConflictSeverity::Medium,
+            conflicting_addresses: vec![ConflictingAccess {
+                address_pattern: "stride_4".to_string(),
+                conflict_degree: 4,
+                access_frequency: 100,
+                performance_penalty: 0.15,
+            }],
+            bank_utilization: vec![0.8, 0.7, 0.9, 0.6],
+        };
+        assert_eq!(pattern.conflict_count, 50);
+        assert!(matches!(
+            pattern.conflict_severity,
+            ConflictSeverity::Medium
+        ));
+    }
+
+    #[test]
+    fn test_conflict_resolution_strategy_creation() {
+        let strategy = ConflictResolutionStrategy {
+            strategy_type: ConflictResolutionType::ArrayPadding,
+            description: "Add padding to shared memory arrays".to_string(),
+            expected_speedup: 1.3,
+            implementation_steps: vec![
+                "Identify conflicting arrays".to_string(),
+                "Add padding to array declarations".to_string(),
+            ],
+        };
+        assert!(matches!(
+            strategy.strategy_type,
+            ConflictResolutionType::ArrayPadding
+        ));
+        assert!(strategy.expected_speedup > 1.0);
+    }
+
+    #[test]
+    fn test_arithmetic_intensity_profile() {
+        let profile = ArithmeticIntensityProfile {
+            kernel_name: "gemm".to_string(),
+            operations_per_byte: 50.0,
+            compute_intensity: ComputeIntensityCategory::ComputeBound,
+            memory_bound_ratio: 0.2,
+            compute_bound_ratio: 0.8,
+            roofline_position: RooflinePosition {
+                current_performance: 500.0,
+                theoretical_peak: 1000.0,
+                memory_bandwidth_limit: 900.0,
+                efficiency_percentage: 50.0,
+            },
+            optimization_direction: OptimizationDirection::IncreaseComputeIntensity,
+        };
+        assert!(matches!(
+            profile.compute_intensity,
+            ComputeIntensityCategory::ComputeBound
+        ));
+        assert!((profile.roofline_position.efficiency_percentage - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_roofline_model() {
+        let model = RooflineModel {
+            device_id: 0,
+            peak_compute_performance: 10000.0,
+            peak_memory_bandwidth: 900.0,
+            cache_hierarchy: CacheHierarchy {
+                l1_cache_bandwidth: 12000.0,
+                l2_cache_bandwidth: 3000.0,
+                shared_memory_bandwidth: 6000.0,
+                texture_cache_bandwidth: 2000.0,
+                constant_cache_bandwidth: 8000.0,
+            },
+            compute_capabilities: ComputeCapabilities {
+                fp32_performance: 10000.0,
+                fp16_performance: 20000.0,
+                int32_performance: 5000.0,
+                tensor_performance: 100000.0,
+                special_function_performance: 2500.0,
+            },
+        };
+        assert!(model.peak_compute_performance > 0.0);
+        assert!(
+            model.cache_hierarchy.l1_cache_bandwidth > model.cache_hierarchy.l2_cache_bandwidth
+        );
+    }
+
+    #[test]
+    fn test_resource_profile() {
+        let profile = ResourceProfile {
+            kernel_name: "attention_kernel".to_string(),
+            register_pressure: ResourcePressure::High,
+            shared_memory_pressure: ResourcePressure::Medium,
+            occupancy_limiting_factor: OccupancyLimitingFactor::RegisterCount,
+            resource_utilization_efficiency: 0.65,
+        };
+        assert!(matches!(profile.register_pressure, ResourcePressure::High));
+        assert!(matches!(
+            profile.occupancy_limiting_factor,
+            OccupancyLimitingFactor::RegisterCount
+        ));
+    }
+
+    #[test]
+    fn test_balancing_strategy() {
+        let strategy = BalancingStrategy {
+            strategy_type: BalancingStrategyType::RegisterOptimization,
+            description: "Reduce register usage per thread".to_string(),
+            expected_occupancy_improvement: 0.15,
+            performance_impact: 0.10,
+        };
+        assert!(strategy.expected_occupancy_improvement > 0.0);
+    }
+
+    #[test]
+    fn test_fusion_opportunity() {
+        let opportunity = FusionOpportunity {
+            opportunity_id: Uuid::new_v4(),
+            kernel_group: vec!["bias_add".to_string(), "relu".to_string()],
+            fusion_type: FusionType::ElementwiseFusion,
+            data_dependencies: vec![DataDependency {
+                source_kernel: "bias_add".to_string(),
+                target_kernel: "relu".to_string(),
+                dependency_type: DependencyType::ReadAfterWrite,
+                data_size: 4096,
+                access_pattern: "sequential".to_string(),
+            }],
+            expected_speedup: 1.5,
+            memory_savings: 4096,
+            implementation_complexity: ImplementationDifficulty::Easy,
+            fusion_feasibility: FusionFeasibility {
+                resource_constraints_satisfied: true,
+                register_usage_feasible: true,
+                shared_memory_feasible: true,
+                synchronization_complexity: SynchronizationComplexity::None,
+                fusion_confidence: 0.95,
+            },
+        };
+        assert_eq!(opportunity.kernel_group.len(), 2);
+        assert!(matches!(
+            opportunity.fusion_type,
+            FusionType::ElementwiseFusion
+        ));
+        assert!(opportunity.fusion_feasibility.resource_constraints_satisfied);
+    }
+
+    #[test]
+    fn test_fusion_cost_benefit_analyzer_new_empty() {
+        let analyzer = FusionCostBenefitAnalyzer::new_empty();
+        assert!(analyzer.cost_models.is_empty());
+    }
+
+    // StatisticalAnalyzer now lives in (and is private to) the `regression`
+    // submodule -- see kernel_optimizer/regression.rs's own test module for
+    // its `new`/`new_empty` coverage.
+
+    #[test]
+    fn test_stride_impact_variants() {
+        let impacts = [
+            StrideImpact::Optimal,
+            StrideImpact::Good,
+            StrideImpact::Moderate,
+            StrideImpact::Poor,
+            StrideImpact::Critical,
+        ];
+        assert_eq!(impacts.len(), 5);
+    }
+
+    #[test]
+    fn test_access_pattern_type_variants() {
+        let patterns = [
+            AccessPatternType::Sequential,
+            AccessPatternType::Strided,
+            AccessPatternType::Random,
+            AccessPatternType::Blocked,
+            AccessPatternType::Sparse,
+            AccessPatternType::Irregular,
+        ];
+        assert_eq!(patterns.len(), 6);
+    }
+
+    #[test]
+    fn test_stride_optimization() {
+        let opt = StrideOptimization {
+            optimization_type: StrideOptimizationType::TilingStrategy,
+            description: "Apply loop tiling for better cache utilization".to_string(),
+            expected_improvement: 0.25,
+            implementation_complexity: ImplementationDifficulty::Moderate,
+        };
+        assert!(matches!(
+            opt.optimization_type,
+            StrideOptimizationType::TilingStrategy
+        ));
+    }
+
+    #[test]
+    fn test_occupancy_targets() {
+        let targets = OccupancyTargets {
+            minimum_occupancy: 0.25,
+            target_occupancy: 0.75,
+            theoretical_occupancy: 1.0,
+        };
+        assert!(targets.minimum_occupancy < targets.target_occupancy);
+        assert!(targets.target_occupancy <= targets.theoretical_occupancy);
+    }
+
+    #[test]
+    fn test_memory_constraints() {
+        let constraints = MemoryConstraints {
+            max_shared_memory_per_block: 49152,
+            bank_conflict_aware: true,
+            coalescing_optimization: true,
+        };
+        assert!(constraints.bank_conflict_aware);
+        assert_eq!(constraints.max_shared_memory_per_block, 49152);
+    }
+
+    #[test]
+    fn test_compute_capabilities() {
+        let caps = ComputeCapabilities {
+            fp32_performance: 10000.0,
+            fp16_performance: 20000.0,
+            int32_performance: 5000.0,
+            tensor_performance: 100000.0,
+            special_function_performance: 2500.0,
+        };
+        assert!(caps.fp16_performance > caps.fp32_performance);
+        assert!(caps.tensor_performance > caps.fp16_performance);
+    }
+
+    #[test]
+    fn test_fusion_cost_benefit_analyzer_new() {
+        let result = FusionCostBenefitAnalyzer::new();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_fusion_type_variants() {
+        let types = [
+            FusionType::ElementwiseFusion,
+            FusionType::ProducerConsumerFusion,
+            FusionType::LoopFusion,
+            FusionType::ReductionFusion,
+            FusionType::ConvolutionFusion,
+            FusionType::AttentionFusion,
+        ];
+        assert_eq!(types.len(), 6);
+    }
+
+    #[test]
+    fn test_dependency_type_variants() {
+        let types = [
+            DependencyType::ReadAfterWrite,
+            DependencyType::WriteAfterRead,
+            DependencyType::WriteAfterWrite,
+            DependencyType::Reduction,
+            DependencyType::Broadcast,
+        ];
+        assert_eq!(types.len(), 5);
+    }
+
+    #[test]
+    fn test_data_dependency_creation() {
+        let dep = DataDependency {
+            source_kernel: "conv1".to_string(),
+            target_kernel: "relu1".to_string(),
+            dependency_type: DependencyType::ReadAfterWrite,
+            data_size: 8192,
+            access_pattern: "contiguous".to_string(),
+        };
+        assert_eq!(dep.source_kernel, "conv1");
+        assert_eq!(dep.data_size, 8192);
+    }
+
+    #[test]
+    fn test_fusion_feasibility_creation() {
+        let feasibility = FusionFeasibility {
+            resource_constraints_satisfied: true,
+            register_usage_feasible: true,
+            shared_memory_feasible: false,
+            synchronization_complexity: SynchronizationComplexity::None,
+            fusion_confidence: 0.7,
+        };
+        assert!(feasibility.resource_constraints_satisfied);
+        assert!(!feasibility.shared_memory_feasible);
+    }
+
+    #[test]
+    fn test_optimization_direction_variants() {
+        let dirs = [
+            OptimizationDirection::IncreaseComputeIntensity,
+            OptimizationDirection::ImproveMemoryEfficiency,
+            OptimizationDirection::BalanceComputeMemory,
+            OptimizationDirection::OptimizeForLatency,
+        ];
+        assert_eq!(dirs.len(), 4);
+    }
+
+    #[test]
+    fn test_block_size_constraint_variants() {
+        let constraints = [
+            BlockSizeConstraint::MultipleOf(32),
+            BlockSizeConstraint::PowerOfTwo,
+            BlockSizeConstraint::MaxThreadsPerBlock(1024),
+            BlockSizeConstraint::SharedMemoryLimit(49152),
+            BlockSizeConstraint::RegisterLimit(255),
+        ];
+        assert_eq!(constraints.len(), 5);
+    }
+
+    #[test]
+    fn test_register_constraints_creation() {
+        let constraints = RegisterConstraints {
+            max_registers_per_thread: 255,
+            spill_threshold: 64,
+            occupancy_impact_threshold: 0.5,
+        };
+        assert_eq!(constraints.max_registers_per_thread, 255);
+        assert!((constraints.occupancy_impact_threshold - 0.5).abs() < f64::EPSILON);
+    }
+
+    fn low_occupancy_matmul_profile() -> KernelProfileData {
+        KernelProfileData {
+            execution_time: Duration::from_micros(250),
+            grid_size: (4096, 1, 1),
+            block_size: (256, 1, 1),
+            shared_memory_bytes: 0,
+            registers_per_thread: 128, // register-limited → low occupancy
+            occupancy: 0.33,
+            compute_utilization: 0.65,
+            memory_bandwidth_utilization: 0.45,
+            warp_efficiency: 0.92,
+            memory_efficiency: 0.88,
+        }
+    }
+
+    #[test]
+    fn test_analyze_kernel_returns_real_optimizations() {
+        let mut analyzer =
+            KernelOptimizationAnalyzer::new().expect("analyzer construction should succeed");
+        let opts = analyzer
+            .analyze_kernel("matmul_tile", low_occupancy_matmul_profile())
+            .expect("analysis should succeed");
+        assert!(
+            !opts.is_empty(),
+            "low-occupancy register-limited kernel must yield optimizations"
+        );
+        // Results are ranked by performance gain (descending) and within range.
+        for window in opts.windows(2) {
+            assert!(
+                window[0].expected_improvement.performance_gain_percentage
+                    >= window[1].expected_improvement.performance_gain_percentage
+            );
+        }
+        for opt in &opts {
+            assert!((0.0..=1.0).contains(&opt.confidence));
+            assert!((0.0..=95.0).contains(&opt.expected_improvement.performance_gain_percentage));
+        }
+    }
+
+    #[test]
+    fn test_analyze_memory_bound_kernel() {
+        let mut analyzer =
+            KernelOptimizationAnalyzer::new().expect("analyzer construction should succeed");
+        let profile = KernelProfileData {
+            execution_time: Duration::from_micros(80),
+            grid_size: (8192, 1, 1),
+            block_size: (256, 1, 1),
+            shared_memory_bytes: 0,
+            registers_per_thread: 32,
+            occupancy: 0.55,
+            compute_utilization: 0.15,
+            memory_bandwidth_utilization: 0.9,
+            warp_efficiency: 0.6,
+            memory_efficiency: 0.4,
+        };
+        let opts = analyzer.analyze_kernel("gemv", profile).expect("analysis should succeed");
+        assert!(
+            !opts.is_empty(),
+            "memory-bound kernel must yield optimizations"
+        );
+        assert!(opts.iter().any(|o| matches!(
+            o.optimization_type,
+            crate::advanced_gpu_profiler::OptimizationType::MemoryCoalescing
+                | crate::advanced_gpu_profiler::OptimizationType::ComputeIntensityBalance
+        )));
+    }
+
+    #[test]
+    fn test_analyze_fusion_opportunities_public_api() {
+        let mut analyzer =
+            KernelOptimizationAnalyzer::new().expect("analyzer construction should succeed");
+        let sequence = vec![
+            "matmul_qk".to_string(),
+            "softmax".to_string(),
+            "matmul_v".to_string(),
+            "bias_add".to_string(),
+            "gelu".to_string(),
+        ];
+        let opportunities = analyzer
+            .analyze_fusion_opportunities(&sequence)
+            .expect("fusion analysis should succeed");
+        assert!(
+            !opportunities.is_empty(),
+            "an attention-style kernel chain must expose fusion opportunities"
+        );
+        for opp in &opportunities {
+            assert!(opp.expected_speedup > 1.0);
+            assert_eq!(opp.kernel_group.len(), 2);
+            assert!(opp.memory_savings > 0);
+            assert!((0.0..=1.0).contains(&opp.fusion_feasibility.fusion_confidence));
+        }
+        // Opportunities are indexed per participating kernel.
+        let report = analyzer.fusion_analyzer.get_opportunities_for_kernel("softmax");
+        assert!(report.is_ok());
+        assert!(!report.expect("indexed opportunities").is_empty());
+    }
+}

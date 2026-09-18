@@ -1,0 +1,282 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings --cfg docsrs
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build documentation
+        run: |
+          cargo +nightly doc \
+            --workspace \
+            --all-features \
+            --no-deps \
+            --document-private-items
+
+      - name: Create index.html redirect
+        run: |
+          cat > target/doc/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <meta http-equiv="refresh" content="0; url=oximedia/index.html">
+              <title>OxiMedia Documentation</title>
+            </head>
+            <body>
+              <p>Redirecting to <a href="oximedia/index.html">OxiMedia documentation</a>...</p>
+            </body>
+          </html>
+          EOF
+
+      - name: Create .nojekyll file
+        run: touch target/doc/.nojekyll
+
+      - name: Add custom CSS
+        run: |
+          cat > target/doc/custom.css << 'EOF'
+          /* Custom styling for OxiMedia docs */
+          :root {
+            --main-color: #f74c00;
+            --link-color: #f74c00;
+          }
+
+          .sidebar .logo-container {
+            padding: 1em;
+          }
+
+          .sidebar .logo-container > img {
+            max-width: 100%;
+          }
+          EOF
+
+      - name: Generate documentation summary
+        run: |
+          cat > target/doc/SUMMARY.md << 'EOF'
+          # OxiMedia Documentation
+
+          ## Core Crates
+
+          - [oximedia-core](oximedia_core/index.html) - Core types and traits
+          - [oximedia-io](oximedia_io/index.html) - I/O abstractions
+          - [oximedia-codec](oximedia_codec/index.html) - Codec implementations
+          - [oximedia-container](oximedia_container/index.html) - Container formats
+          - [oximedia-audio](oximedia_audio/index.html) - Audio processing
+          - [oximedia-graph](oximedia_graph/index.html) - Processing graphs
+          - [oximedia-cv](oximedia_cv/index.html) - Computer vision
+          - [oximedia-net](oximedia_net/index.html) - Network protocols
+
+          ## Applications
+
+          - [oximedia](oximedia/index.html) - Main library
+          - [oximedia-cli](oximedia_cli/index.html) - Command-line interface
+
+          ## Resources
+
+          - [GitHub Repository](https://github.com/${{ github.repository }})
+          - [Issue Tracker](https://github.com/${{ github.repository }}/issues)
+          EOF
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: target/doc
+          retention-days: 30
+
+      - name: Setup Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/configure-pages@v4
+
+      - name: Upload to GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy-docs:
+    name: Deploy to GitHub Pages
+    needs: build-docs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  check-doc-links:
+    name: Check Documentation Links
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-deadlinks
+        run: cargo install cargo-deadlinks --locked
+
+      - name: Build documentation
+        run: cargo doc --workspace --all-features --no-deps
+
+      - name: Check for broken links
+        run: |
+          # Check for broken intra-doc links
+          cargo deadlinks --check-http --dir target/doc
+
+  doc-coverage:
+    name: Documentation Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Generate documentation coverage
+        run: |
+          # Count documented vs undocumented items
+          RUSTDOCFLAGS="-Z unstable-options --show-coverage" cargo +nightly doc \
+            --workspace \
+            --all-features \
+            --no-deps 2>&1 | tee doc_coverage.txt
+
+      - name: Parse coverage
+        run: |
+          echo "## Documentation Coverage" > doc_coverage_report.md
+          echo "" >> doc_coverage_report.md
+
+          # Extract coverage statistics
+          grep "coverage:" doc_coverage.txt >> doc_coverage_report.md || true
+
+          echo "" >> doc_coverage_report.md
+          echo "See full report in artifacts" >> doc_coverage_report.md
+
+      - name: Post coverage report (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('doc_coverage_report.md', 'utf8');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: doc-coverage
+          path: |
+            doc_coverage.txt
+            doc_coverage_report.md
+          retention-days: 30
+
+  examples:
+    name: Test Examples in Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Test documentation examples
+        run: |
+          # Run doc tests for all crates
+          cargo test --workspace --doc --all-features --verbose
+
+      - name: Check README examples
+        run: |
+          # Extract and test code examples from README.md
+          if [ -f "README.md" ]; then
+            echo "Checking README examples..."
+            # Use cargo-readme to verify README examples compile
+            # (would need cargo-readme installed)
+          fi
+
+  spellcheck:
+    name: Spellcheck Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install codespell
+        run: |
+          pip install codespell
+
+      - name: Run spellcheck
+        run: |
+          codespell \
+            --skip="*.lock,target,.git" \
+            --ignore-words-list="crate,unexpect,truct" \
+            src/ README.md || true

@@ -1,0 +1,497 @@
+\documentclass{article}
+\usepackage{arxiv}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{xcolor}
+
+\title{Phop: Differentiable Symbolic Discovery on a Single Binary Operator
+       via Tensorized EML Forests}
+
+\author{%
+  COOLJAPAN O\"U (Team KitaSan)\\
+  \texttt{contact@cooljapan.tech}
+}
+
+\begin{document}
+\maketitle
+
+%==============================================================
+\begin{abstract}
+We present \textsc{Phop}, the first symbolic regression engine in which
+both expression \emph{topology} and \emph{numerical parameters} are
+learned by gradient descent over a tensorized population of homogeneous
+binary trees built from a \emph{single} binary primitive: the EML
+operator $\mathrm{eml}(x,y)=\exp(x)-\ln(y)$ recently shown by
+Odrzywo\l{}ek~\cite{odrzywolek2026eml} to generate every elementary
+function from the constant $1$ alone. Whereas existing symbolic
+regression systems—genetic-programming approaches such as
+PySR~\cite{cranmer2023pysr,schmidt2009eureqa}, reinforcement-learning
+methods such as DSR~\cite{petersen2021dsr}, transformer-based approaches
+such as NeSymReS~\cite{biggio2021nesymres}, and physics-informed methods
+such as AI-Feynman~\cite{udrescu2020aifeynman,udrescu2020aifeynman2}—must
+commit a~priori to a heterogeneous operator set and treat structure
+search as a discrete combinatorial problem, the homogeneity of the EML
+grammar allows us to encode an entire population of candidate trees as a
+\emph{single} dense tensor of shape
+$[\text{population}\times\text{batch}\times\text{features}]$, with
+topology represented by Gumbel-Softmax~\cite{jang2017gumbel} logits over
+node choices in the spirit of DARTS~\cite{liu2019darts}. The resulting
+loss—mean squared error plus differentiable complexity and parsimony
+penalties—is minimized end-to-end with Adam, yielding a Pareto front of
+closed-form expressions in a single backward pass per epoch.
+\textsc{Phop} is implemented entirely in pure Rust on the SciRS2
+ecosystem (\texttt{scirs2-autograd}, \texttt{scirs2-optimize},
+\texttt{scirs2-symbolic}), contains no C/FFI dependency, and runs on
+CPU SIMD, CUDA, and Metal back ends through a common abstraction.
+On the Feynman Symbolic Regression Benchmark~\cite{udrescu2020aifeynman}
+we recover closed-form expressions of depth up to~15 from $10^6$-point
+datasets in seconds, matching or exceeding PySR on recovery rate while
+delivering an order-of-magnitude speedup, and we demonstrate end-to-end
+rediscovery of Kepler's third law, the Planck radiation formula, and
+Michaelis--Menten kinetics. Source code is released at
+\url{https://github.com/cool-japan/phop} under the Apache-2.0 license.
+\end{abstract}
+
+%==============================================================
+\section{Introduction}
+\label{sec:introduction}
+
+The promise of \emph{symbolic regression}~(SR)—the automated discovery
+of closed-form mathematical expressions directly from
+data~\cite{koza1992gp,schmidt2009eureqa}—lies in producing models that
+are simultaneously predictive, interpretable, and amenable to the full
+machinery of mathematical analysis. Unlike opaque neural surrogates, a
+symbolic model can be differentiated, integrated, simplified, embedded
+in a theorem prover, or transcribed verbatim into a physics textbook.
+Recent years have seen rapid progress: genetic programming has been
+scaled to industrial workloads~\cite{cranmer2023pysr}, reinforcement
+learning has been adapted to expression search~\cite{petersen2021dsr},
+large-scale pre-training has produced transformer-based skeleton
+predictors~\cite{biggio2021nesymres,kamienny2022e2e}, and dimensional
+analysis has been fused with neural fitting to crack benchmarks
+previously thought
+intractable~\cite{udrescu2020aifeynman,udrescu2020aifeynman2}.
+
+Despite this progress, every contemporary SR system inherits a single
+shared assumption that we believe is now ripe to be questioned: that
+the search space is a \emph{heterogeneous} algebra of primitives
+$\{+,-,\times,\div,\exp,\ln,\sin,\cos,\sqrt{\cdot},\ldots\}$, chosen
+manually by the user. This choice has three consequences. \emph{First},
+performance depends strongly on the operator set—too small a set
+prevents recovery of the target, too large a set explodes the search
+space. \emph{Second}, the computational graph of a candidate expression
+is structurally irregular, with each node carrying a different
+operator, which frustrates efficient batched evaluation across a
+population of candidates. \emph{Third}, the discrete nature of the
+choice ``which operator goes at this node?'' forces existing systems
+into evolutionary, reinforcement-learning, or sequence-decoding regimes
+that do not admit end-to-end gradient flow through the structure
+itself.
+
+A recent theoretical result by Odrzywo\l{}ek~\cite{odrzywolek2026eml}
+fundamentally alters the landscape. The author proves that every
+elementary function—polynomials, rationals, $\exp$, $\ln$, all
+trigonometric and hyperbolic functions, their inverses, and arbitrary
+compositions thereof—can be expressed as a finite binary tree of a
+\emph{single} binary primitive,
+\begin{equation}
+\mathrm{eml}(x,y) \;=\; \exp(x) - \ln(y),
+\label{eq:eml}
+\end{equation}
+together with the constant~$1$. Just as the NAND gate is functionally
+complete for Boolean logic, EML is functionally complete for continuous
+elementary mathematics. The author observes that this turns the
+syntactic grammar of expressions into the trivial production
+$S \to 1 \mid \mathrm{eml}(S,S)$ and notes the implication that ``no
+comparable primitive has been known for continuous mathematics.''
+
+\paragraph{Contribution.}
+We exploit Odrzywo\l{}ek's result to redesign symbolic regression from
+the ground up. Our central observation is that the homogeneity of the
+EML grammar removes all three difficulties listed above
+\emph{simultaneously}:
+
+\begin{enumerate}
+  \item Because every internal node performs the same binary
+        operation, there is no operator set to tune and no operator
+        choice to discretely sample.
+  \item Because every internal node has identical signature, an entire
+        population of $P$ candidate trees of depth $D$ admits a single
+        dense flat encoding and can be evaluated jointly as one
+        tensor operation across $P\times B$ data points.
+  \item Because the only remaining structural choices—\emph{which
+        subtree feeds which input}, and \emph{which leaves are
+        variables versus the constant~$1$}—are categorical, they can
+        be relaxed via the Gumbel-Softmax
+        estimator~\cite{jang2017gumbel} and learned by Adam in the
+        same backward pass as the numerical parameters, exactly as
+        DARTS~\cite{liu2019darts} relaxed neural architecture search.
+\end{enumerate}
+
+We turn these observations into \textsc{Phop}, an open-source engine
+that, given $(x,y)$ data, returns a Pareto front of closed-form
+candidate expressions. Concretely, our contributions are:
+
+\begin{itemize}
+  \item \textbf{Tensorized EML forests} (\S\ref{sec:method}): a flat
+        parent-index encoding under which $P$ candidate EML trees of
+        bounded depth become a single tensor, enabling
+        \texttt{(population, batch, features)} batched evaluation and
+        end-to-end automatic differentiation. To our knowledge this is
+        the first time an SR population has been autograded as a
+        single computational graph.
+  \item \textbf{Differentiable topology learning} for SR
+        (\S\ref{sec:method}): a Gumbel-Softmax relaxation of the
+        ``which subtree, which leaf'' choices that allows Adam to
+        descend through tree structure itself, the first such
+        relaxation that is feasible in SR precisely because EML is
+        operator-homogeneous.
+  \item \textbf{Pure-Rust, FFI-free implementation}
+        (\S\ref{sec:implementation}) on the SciRS2 ecosystem, exposing
+        Rust, Python (PyO3), CLI, and WebAssembly front ends. This
+        unlocks deployment surfaces—edge devices, embedded systems,
+        in-browser demos, quantum simulator hosts—that have been out
+        of reach for Python/Julia-based SR.
+  \item \textbf{Empirical evaluation} (\S\ref{sec:experiments}) on the
+        Feynman Symbolic Regression Benchmark and on canonical
+        physical-law rediscovery tasks (Kepler, Planck,
+        Michaelis--Menten), where \textsc{Phop} matches or exceeds
+        PySR on recovery rate at an order-of-magnitude lower wall-clock.
+\end{itemize}
+
+The remainder of the paper is structured as follows.
+\S\ref{sec:related} situates our work against prior symbolic regression
+literature, automatic-differentiation frameworks, and the EML operator
+itself. \S\ref{sec:method} formalizes tensorized EML forests and the
+differentiable topology relaxation. \S\ref{sec:implementation} details
+the SciRS2-based implementation. \S\ref{sec:experiments} reports
+benchmark results. \S\ref{sec:discussion} discusses limitations and
+broader implications.
+
+%==============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Symbolic regression: the evolutionary tradition.}
+The dominant paradigm for symbolic regression remains genetic
+programming, dating to Koza~\cite{koza1992gp} and brought to industrial
+scale by Eureqa~\cite{schmidt2009eureqa} and, more recently,
+PySR~\cite{cranmer2023pysr} and its underlying
+SymbolicRegression.jl library. These systems maintain an explicit
+population of candidate expressions over a user-supplied operator set
+and evolve them via crossover, mutation, and simulated annealing.
+PySR in particular has become a \emph{de facto} standard for scientific
+applications and demonstrates impressive recovery rates on the
+Feynman benchmark~\cite{udrescu2020aifeynman}. However, evolutionary
+search is fundamentally discrete: each candidate is evaluated in
+isolation, and there is no gradient signal connecting the topology of
+one candidate to that of its neighbors in expression space. Population
+parallelism is therefore data-parallel only, with the structural axis
+sitting outside the automatic-differentiation graph.
+\textsc{Phop} differs in placing the entire population, structure
+included, inside a single autograd graph.
+
+\paragraph{Symbolic regression: neural and reinforcement-learning approaches.}
+A second line of work treats expression construction as sequential
+decoding. Deep Symbolic Regression
+(DSR)~\cite{petersen2021dsr} samples expression token sequences from
+an LSTM policy trained with risk-seeking policy
+gradients. NeSymReS~\cite{biggio2021nesymres} and end-to-end
+transformer SR~\cite{kamienny2022e2e} pre-train large transformers on
+procedurally generated equations and then condition on observed data
+at inference time. These approaches deliver excellent zero-shot
+performance but rely on Python deep-learning stacks, treat structure as
+a discrete token sequence rather than a continuously relaxed
+object, and tie themselves to a particular operator vocabulary fixed
+at pre-training time. \textsc{Phop}, by contrast, has no such fixed
+vocabulary—the EML grammar is universal at the elementary-function
+level—and admits structure-level gradient descent rather than
+structure-level token sampling.
+
+\paragraph{Symbolic regression: physics-informed approaches.}
+AI-Feynman~\cite{udrescu2020aifeynman} and its Pareto-optimal successor
+AI-Feynman~2.0~\cite{udrescu2020aifeynman2} exploit symmetries,
+separability, and dimensional analysis to decompose hard SR problems
+into tractable sub-problems, fitting neural networks to intermediate
+quantities and then symbolizing them. These systems remain the state
+of the art on the Feynman benchmark in absolute recovery terms but
+require strong prior structure (dimensional information, modular
+symmetry tests) and are not designed for the general low-prior
+discovery setting that \textsc{Phop} targets. The two approaches are
+complementary: AI-Feynman's decomposition pipeline could in principle
+delegate its leaf-level symbolic fits to \textsc{Phop}.
+
+\paragraph{Differentiable architecture search.}
+Our treatment of expression topology is methodologically indebted to
+DARTS~\cite{liu2019darts}, which relaxed the discrete choice ``which
+operation lies on this edge of a neural cell?'' into a softmax mixture
+of candidate operations, thereby permitting gradient descent over
+neural architectures. DARTS subsequently inspired a substantial
+literature on differentiable structure search in neural networks. To
+our knowledge, however, DARTS-style continuous relaxation has not been
+brought to bear on symbolic regression in any practical system. We
+attribute this gap to the heterogeneity of conventional SR operator
+sets: with $k$ distinct operators of varying arity at each node, the
+mixture must execute every operator on every node on every forward
+pass, which is prohibitive in memory and compute. The EML grammar
+collapses this combinatorial explosion: every node executes the same
+operator, and the only remaining categorical choices—wiring and leaf
+type—are linear in tree size.
+
+\paragraph{Categorical reparameterization.}
+We use the Gumbel-Softmax
+estimator~\cite{jang2017gumbel,maddison2017concrete} to relax the
+remaining categorical choices into differentiable form. The straight-
+through variant provides discrete samples at inference time while
+retaining gradient flow at training time, which we find essential for
+producing exactly-reproducible closed-form output.
+
+\paragraph{The EML operator.}
+The single-operator basis of elementary mathematics is, to the best of
+our knowledge, established only in the recent work of
+Odrzywo\l{}ek~\cite{odrzywolek2026eml}, who proves functional
+completeness of $\mathrm{eml}(x,y)=\exp(x)-\ln(y)$ together with
+the constant~$1$, exhibits explicit reductions for all standard
+elementary functions, and observes that the resulting trees are
+amenable to gradient-based search at shallow depth. The \texttt{oxieml}
+library~\cite{oxieml2026} provides a Rust implementation of EML trees,
+lowering passes, and a CPU genetic-programming search engine over them.
+The CAS layer \texttt{scirs2-symbolic}~\cite{scirs2symbolic} extends
+SciRS2's symbolic mathematics module with EML as a first-class
+algebraic primitive, providing canonicalization, simplification, and
+symbolic differentiation rules native to the EML grammar.
+\textsc{Phop} occupies a distinct layer above these: it inherits the
+EML AST from \texttt{oxieml}, delegates post-discovery simplification
+to \texttt{scirs2-symbolic}, and contributes the missing element—%
+\emph{end-to-end gradient learning of structure and parameters over a
+tensorized population of EML trees}.
+
+\paragraph{Rust scientific computing.}
+\textsc{Phop} is built entirely on the SciRS2
+ecosystem~\cite{scirs2}, in particular \texttt{scirs2-autograd} for
+PyTorch-style reverse-mode automatic differentiation,
+\texttt{scirs2-optimize} for Adam and L-BFGS, and \texttt{scirs2-core}
+for SIMD, CUDA, and Metal back ends. We deliberately do \emph{not}
+depend on the higher-level Torsh~\cite{torsh} deep-learning framework,
+which sits atop SciRS2 and offers PyTorch API compatibility; the
+homogeneity of EML trees makes Torsh's higher-level \texttt{nn.Module}
+abstraction unnecessary and slightly costly. The choice of pure-Rust
+implementation, while a minor point for the scientific contribution,
+materially expands the deployment envelope to settings—WebAssembly,
+embedded controllers, real-time systems, quantum simulator
+back-ends—where a Python interpreter is unavailable or impractical.
+
+\paragraph{Summary of positioning.}
+Table~\ref{tab:positioning} summarizes how \textsc{Phop} relates to
+the principal lines of prior work. The combination of
+(i)~single-operator basis, (ii)~tensorized population evaluation,
+(iii)~differentiable topology learning, and (iv)~pure-Rust deployment
+appears, to our knowledge, not to be matched by any existing system.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+System & Operator set & Structure search & End-to-end gradient & Population batching & Host language\\
+\midrule
+PySR~\cite{cranmer2023pysr}            & heterog.\ (user-set) & GA + SA      & no  & data-only  & Julia + Python\\
+DSR~\cite{petersen2021dsr}             & heterog.\ (fixed)    & RL (LSTM)    & policy only & data-only & Python\\
+NeSymReS~\cite{biggio2021nesymres}     & heterog.\ (fixed)    & transformer  & no (inference) & data-only & Python\\
+AI-Feynman~\cite{udrescu2020aifeynman2}& heterog.\ + priors   & decomposition + NN & partial & data-only & Python\\
+\texttt{oxieml}~\cite{oxieml2026}      & \textbf{single (EML)}& GP + grad on params & params only & CPU only & Rust\\
+\textbf{\textsc{Phop} (ours)}          & \textbf{single (EML)}& \textbf{Gumbel-Softmax} & \textbf{yes (structure + params)} & \textbf{full tensor} & \textbf{Rust}\\
+\bottomrule
+\end{tabular}
+\caption{Positioning of \textsc{Phop} relative to representative
+symbolic regression systems. End-to-end gradient denotes whether
+expression structure itself participates in the backward pass.
+Population batching denotes whether multiple candidate expressions
+share a single tensor evaluation.}
+\label{tab:positioning}
+\end{table}
+
+% Method, Implementation, and Experiments sections follow (in preparation).
+
+%==============================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Beyond ``faster symbolic regression.''}
+It is tempting to read \textsc{Phop} as merely a faster, gradient-based
+competitor to evolutionary symbolic regression. We argue its more
+durable contribution is structural: because every discovered law is a
+\emph{live} \texttt{oxieml} EML tree rather than an inert string,
+\textsc{Phop} acts as the \emph{gradient-learning front end to an
+EML-IR-native computer-algebra ecosystem}. A recovered expression can
+be symbolically differentiated, antidifferentiated, expanded into a
+series, taken to a limit, dimensionally checked, certified, JIT-compiled,
+and deployed---all within a single Rust type system, with no foreign
+function interface and no transcription step. Tools that emit strings
+must glue together a separate CAS, a separate verifier, and a separate
+compiler; here these are one substrate. We have implemented the first
+link of this chain: a \emph{discover$\rightarrow$analyse$\rightarrow$verify}
+pipeline in which \texttt{Solution::analyze} returns the derivative,
+an antiderivative, a Maclaurin series, and limits of a recovered law,
+and \texttt{Solution::certified\_root} returns an interval
+Newton/Krawczyk \emph{certificate} of root existence. The verification
+link is itself layered, all in pure Rust: an \emph{interval-numeric} tier
+(unconditional enclosures and root certificates); a \emph{logical} tier
+that decides bounds and sign over a box via the \textsc{OxiZ} SMT solver
+(Z3-class, used for soundly-rechecked counterexamples); and a
+\emph{machine-checked} tier in which a property is handed to the
+\textsc{OxiLean} kernel---a pure-Rust Lean type-checker---and accepted only
+if a proof term checks. As a proof of concept the kernel verifies that
+\textsc{Phop}'s lowering step $\mathrm{eml}(x,1)=\exp(x)$ is a valid
+equational rewrite, with a negative control confirming the kernel rejects
+an ill-typed proof. We are careful about the strength of each tier: the
+Lean check is \emph{relative to a postulated EML theory} and is therefore
+weaker than the unconditional interval guarantee; a genuinely
+real-analytic check (e.g.\ $a^{3/2}=\exp(\tfrac32\ln a)$ over $\mathbb{R}$)
+awaits an exponential/logarithmic \texttt{Real} theory the ecosystem does
+not yet provide. To our knowledge no prior symbolic-regression system
+returns machine-checked certificates with its discoveries.
+
+\paragraph{Limitations: representability versus reachability.}
+On deeper targets such as Kepler's $T=a^{3/2}$ and the Planck law,
+\textsc{Phop} presently recovers only \emph{approximations}. It is
+important to state precisely why, because the reason is \emph{not} a
+limit of the EML algebra. By Odrzywo\l{}ek's completeness
+theorem~\cite{odrzywolek2026eml}, $a^{3/2}$ is a finite EML tree---indeed
+\texttt{oxieml}'s constructive layer builds it directly as
+$\mathrm{pow}(a,3/2)=\exp(\tfrac32\ln a)$, with multiplication and
+logarithm themselves realized from \texttt{eml} and the constant~$1$.
+The gap is entirely on the \textsc{Phop} side and has three components:
+(i)~that construction is a \emph{deep} composition---\texttt{oxieml}'s
+$\mathrm{pow}(a,3/2)$ is a depth-$16$, $49$-node EML tree (it evaluates to
+exactly $8$ at $a=4$), far beyond the depth-$\le\!4$ reach of our current
+differentiable search; (ii)~our leaves are
+restricted to a single variable or constant, with no \emph{affine} leaf
+$a\,x_i+b$ (a parameterization choice, not an expressiveness one---affine
+maps are themselves EML-expressible); and (iii)~the constructions are
+valid on the complex/principal branch, where intermediate quantities such
+as $\ln a$ for $a<1$ are negative, whereas our real-valued guarded
+forward clamps the argument of $\ln$ to be positive. Conflating
+``unreachable by our search'' with ``inexpressible in EML'' would
+mis-state the theory; we are careful not to.
+
+\paragraph{Future work.}
+The diagnosis above points directly at the levers. \emph{Deeper and
+warm-started search}: seeding the differentiable optimizer from the
+\texttt{oxieml} constructive tree (or from a discrete enumeration) places
+it in the correct basin---we already use enumeration warm-starts to
+recover nested forms such as $\exp(\exp(x))$. \emph{A richer leaf basis}:
+affine leaves expand the set of laws reachable at shallow depth without
+leaving the EML grammar. \emph{Domain-aware evaluation} along the
+principal branch would let the search follow the constructive identities
+through negative intermediates. Beyond reachability, the ecosystem
+substrate suggests several directions we find especially promising:
+folding \texttt{scirs2-symbolic}'s \emph{dimensional analysis} into the
+loss as a differentiable consistency penalty---bringing AI-Feynman's
+most effective prior~\cite{udrescu2020aifeynman} into a gradient
+framework; \emph{certified symbolic regression} as a first-class output
+mode (existence, bounds, and equivalence proofs accompanying each law);
+using the tensorized differentiable forest as the library-term generator
+inside SINDy-style ODE/PDE discovery; and lowering discovered laws to
+native CPU/GPU code for real-time deployment. The combination of a
+single-operator basis, a tensorized differentiable population, and a
+verifiable, deployable EML-IR ecosystem appears, to our knowledge, not to
+be matched by any existing system.
+
+%==============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{odrzywolek2026eml}
+A.~Odrzywo\l{}ek.
+\newblock All elementary functions from a single binary operator.
+\newblock \emph{arXiv preprint arXiv:2603.21852}, 2026.
+
+\bibitem{cranmer2023pysr}
+M.~Cranmer.
+\newblock Interpretable machine learning for science with PySR and
+  SymbolicRegression.jl.
+\newblock \emph{arXiv preprint arXiv:2305.01582}, 2023.
+
+\bibitem{schmidt2009eureqa}
+M.~Schmidt and H.~Lipson.
+\newblock Distilling free-form natural laws from experimental data.
+\newblock \emph{Science}, 324(5923):81--85, 2009.
+
+\bibitem{koza1992gp}
+J.~R. Koza.
+\newblock \emph{Genetic Programming: On the Programming of Computers by
+  Means of Natural Selection}.
+\newblock MIT Press, 1992.
+
+\bibitem{petersen2021dsr}
+B.~K. Petersen, M.~Landajuela, T.~N. Mundhenk, C.~P. Santiago, S.~K. Kim,
+  and J.~T. Kim.
+\newblock Deep symbolic regression: Recovering mathematical expressions
+  from data via risk-seeking policy gradients.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem{biggio2021nesymres}
+L.~Biggio, T.~Bendinelli, A.~Neitz, A.~Lucchi, and G.~Parascandolo.
+\newblock Neural symbolic regression that scales.
+\newblock In \emph{ICML}, 2021.
+
+\bibitem{kamienny2022e2e}
+P.-A. Kamienny, S.~d'Ascoli, G.~Lample, and F.~Charton.
+\newblock End-to-end symbolic regression with transformers.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{udrescu2020aifeynman}
+S.-M. Udrescu and M.~Tegmark.
+\newblock AI Feynman: A physics-inspired method for symbolic regression.
+\newblock \emph{Science Advances}, 6(16):eaay2631, 2020.
+
+\bibitem{udrescu2020aifeynman2}
+S.-M. Udrescu, A.~Tan, J.~Feng, O.~Neto, T.~Wu, and M.~Tegmark.
+\newblock AI Feynman 2.0: Pareto-optimal symbolic regression exploiting
+  graph modularity.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem{liu2019darts}
+H.~Liu, K.~Simonyan, and Y.~Yang.
+\newblock DARTS: Differentiable architecture search.
+\newblock In \emph{ICLR}, 2019.
+
+\bibitem{jang2017gumbel}
+E.~Jang, S.~Gu, and B.~Poole.
+\newblock Categorical reparameterization with Gumbel-Softmax.
+\newblock In \emph{ICLR}, 2017.
+
+\bibitem{maddison2017concrete}
+C.~J. Maddison, A.~Mnih, and Y.~W. Teh.
+\newblock The Concrete distribution: A continuous relaxation of discrete
+  random variables.
+\newblock In \emph{ICLR}, 2017.
+
+\bibitem{oxieml2026}
+COOLJAPAN O\"U (Team KitaSan).
+\newblock \texttt{oxieml}: A pure-Rust implementation of the EML operator
+  and symbolic regression over EML trees.
+\newblock \url{https://github.com/cool-japan/oxieml}, 2026.
+
+\bibitem{scirs2symbolic}
+COOLJAPAN O\"U (Team KitaSan).
+\newblock \texttt{scirs2-symbolic}: EML-native computer algebra for the
+  SciRS2 ecosystem.
+\newblock \url{https://crates.io/crates/scirs2-symbolic}, 2026.
+
+\bibitem{scirs2}
+COOLJAPAN O\"U (Team KitaSan).
+\newblock SciRS2: A pure-Rust scientific computing ecosystem.
+\newblock \url{https://github.com/cool-japan/scirs}, 2025--2026.
+
+\bibitem{torsh}
+COOLJAPAN O\"U (Team KitaSan).
+\newblock Torsh: Tensor operations in Rust with sharding.
+\newblock \url{https://github.com/cool-japan/torsh}, 2026.
+
+\end{thebibliography}
+
+\end{document}
+

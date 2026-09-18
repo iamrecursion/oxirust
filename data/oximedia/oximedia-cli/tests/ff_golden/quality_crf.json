@@ -1,0 +1,10 @@
+{
+  "name": "quality_crf",
+  "args": ["-i", "in.mkv", "-c:v", "libaom-av1", "-crf", "28", "out.webm"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_codec": "av1",
+    "crf": 28.0
+  }
+}

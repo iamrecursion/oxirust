@@ -1,0 +1,27 @@
+[package]
+name = "oxixml-xinclude"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XInclude 1.0 (Second Edition) processing over oxixml-dom."
+keywords = ["xml", "xinclude", "dom", "infoset", "xpointer"]
+categories = ["parsing", "parser-implementations", "data-structures"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-xml = { workspace = true, features = ["encoding"] }
+oxixml-dom = { workspace = true }
+oxixml-iri = { workspace = true }
+oxixml-qname = { workspace = true }
+oxixml-encoding = { workspace = true }
+
+[lints]
+workspace = true

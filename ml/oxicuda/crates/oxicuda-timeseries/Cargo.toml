@@ -1,0 +1,37 @@
+[package]
+name         = "oxicuda-timeseries"
+description  = "Time-series forecasting & classification for OxiCUDA: TCN, NHiTS, PatchTST, TimesNet, iTransformer, RevIN, series decomposition — pure Rust, zero CUDA SDK dependency."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme                 = "README.md"
+keywords = ["gpu", "time-series", "forecasting", "transformer", "tcn"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[features]
+# On-device GPU validation of the hand-written PTX kernels (RTX A4000 / sm_86).
+gpu-tests = []
+
+[dependencies]
+oxicuda-fft = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name    = "ts_ops"
+harness = false

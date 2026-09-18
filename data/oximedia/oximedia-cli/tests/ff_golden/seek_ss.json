@@ -1,0 +1,9 @@
+{
+  "name": "seek_ss",
+  "args": ["-i", "in.mkv", "-ss", "00:00:10", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "seek": "00:00:10"
+  }
+}

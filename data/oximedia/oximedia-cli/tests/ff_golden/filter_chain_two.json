@@ -1,0 +1,9 @@
+{
+  "name": "filter_chain_two",
+  "args": ["-i", "in.mkv", "-vf", "scale=1280:720,fps=30", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_filters": 2
+  }
+}

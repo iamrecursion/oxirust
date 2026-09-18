@@ -1,0 +1,23 @@
+[package]
+name = "tensorlogic-oxicuda-rng"
+version.workspace = true
+description = "OxiCUDA RNG wrapper for TensorLogic (GPU + CPU fallback)"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["rng", "random", "gpu", "cuda", "statistics"]
+categories = ["science", "algorithms", "mathematics"]
+
+[features]
+default = ["cpu"]
+cpu = ["dep:scirs2-core"]
+gpu = ["dep:oxicuda-rand", "dep:oxicuda-driver", "dep:oxicuda-memory"]
+
+[dependencies]
+thiserror.workspace = true
+scirs2-core = { workspace = true, optional = true }
+oxicuda-rand   = { workspace = true, optional = true }
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }

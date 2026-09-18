@@ -1,0 +1,41 @@
+[package]
+name         = "oxicuda-infer"
+description  = "High-performance GPU inference engine for OxiCUDA: PagedAttention KV cache, continuous batching, speculative decoding, structured sampling, and quantized inference."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme                 = "README.md"
+keywords = ["gpu", "inference", "neural-network", "cuda", "deep-learning"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[features]
+# Enables on-device GPU tests that JIT-compile the hand-written PTX kernels,
+# launch them on a real CUDA device, and assert numerical equivalence to the
+# crate's CPU references (`paged_attention_cpu`, `sampling::softmax`, …). The
+# tests skip gracefully when no GPU is present, so the feature is safe to enable
+# on CPU-only machines.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name = "infer_engine"
+harness = false

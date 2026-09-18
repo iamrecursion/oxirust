@@ -1,0 +1,3 @@
+# Extend the default `clippy::doc_markdown` word list (".." keeps defaults):
+# proper names cited in doc comments that look like mixed-case identifiers.
+doc-valid-idents = ["McCarthy", "OxiEphemeris", ".."]

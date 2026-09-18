@@ -1,0 +1,24 @@
+//! Auto-generated module structure
+
+pub mod advanced_indexing;
+pub(crate) mod blocked_reductions;
+pub mod cpuexecutor_traits;
+pub mod custom_ops;
+pub mod elementwise_ops;
+pub mod functions;
+#[cfg(test)]
+mod functions_tests;
+pub mod parallel;
+pub mod pool_heuristics;
+pub mod pooled_ops;
+pub(crate) mod simd_ops;
+pub mod thread_local_pool;
+pub mod types;
+
+// Re-export all types
+pub use custom_ops::{apply_custom_unary, custom_binary_op, custom_reduce, custom_unary_op};
+pub use elementwise_ops::ScalarOp;
+pub use functions::*;
+pub use pool_heuristics::{AccessPatternTracker, PoolingPolicy, PoolingRecommender, PoolingReport};
+pub use thread_local_pool::{AggregatedPoolStats, ThreadLocalPoolManager, ThreadLocalPoolStats};
+pub use types::*;

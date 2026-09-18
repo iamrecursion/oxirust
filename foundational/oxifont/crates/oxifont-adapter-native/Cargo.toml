@@ -1,0 +1,40 @@
+[package]
+name = "oxifont-adapter-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OxiFont native OS font adapter (CoreText / DirectWrite)"
+keywords = ["font", "coretext", "directwrite", "native"]
+categories = ["text-processing", "os"]
+
+[features]
+default = []
+db = ["dep:oxifont-db"]
+
+[dependencies]
+oxifont-core   = { workspace = true }
+oxifont-parser = { workspace = true }
+oxifont-db     = { workspace = true, optional = true }
+
+[target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
+oxifont-adapter-pure = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { workspace = true }
+core-text       = { workspace = true }
+core-graphics   = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
+[dev-dependencies]
+criterion            = { workspace = true }
+oxifont-adapter-pure = { path = "../oxifont-adapter-pure" }
+oxifont-db           = { path = "../oxifont-db" }
+
+[[bench]]
+name    = "native_bench"
+harness = false

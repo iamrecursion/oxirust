@@ -1,0 +1,38 @@
+[package]
+name = "oximedia-optimize"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Codec optimization and tuning suite for OxiMedia"
+keywords = ["optimization", "codec", "encoding", "video", "multimedia"]
+categories = ["multimedia::encoding"]
+readme = "README.md"
+
+[features]
+ml-decision = ["oximedia-neural"]
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-codec = { workspace = true, default-features = true }
+thiserror.workspace = true
+rayon.workspace = true
+scirs2-core.workspace = true
+oximedia-neural = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "cache_prefetch"
+harness = false
+
+[[bench]]
+name = "presets"
+harness = false

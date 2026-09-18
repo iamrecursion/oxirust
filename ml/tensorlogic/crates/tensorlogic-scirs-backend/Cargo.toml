@@ -1,0 +1,78 @@
+[package]
+name = "tensorlogic-scirs-backend"
+version.workspace = true
+description = "SciRS2-powered tensor execution backend for TensorLogic"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tensorlogic-scirs-backend"
+readme = "README.md"
+keywords = ["tensor", "logic", "scientific-computing", "numerical", "backend"]
+categories = ["science", "algorithms", "mathematics"]
+
+[features]
+default = ["cpu"]
+cpu = []
+simd = ["cpu", "scirs2-core/simd", "scirs2-linalg/simd"]
+gpu = []
+parallel = ["scirs2-core/parallel"]
+# ToRSh tensor interoperability (pure Rust PyTorch alternative)
+torsh = ["dep:torsh-core", "dep:torsh-tensor"]
+# Enable integration tests that require tensorlogic-compiler
+integration-tests = []
+
+[dependencies]
+tensorlogic-infer.workspace = true
+tensorlogic-ir.workspace = true
+scirs2-core.workspace = true
+scirs2-linalg = { workspace = true, features = ["tensor_contraction"] }
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+parking_lot = { workspace = true }
+# ToRSh interoperability (pure Rust PyTorch alternative)
+torsh-core = { workspace = true, optional = true }
+torsh-tensor = { workspace = true, optional = true }
+
+[dev-dependencies]
+tensorlogic-compiler.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "forward_pass"
+harness = false
+
+[[bench]]
+name = "simd_comparison"
+harness = false
+
+[[bench]]
+name = "memory_footprint"
+harness = false
+
+[[bench]]
+name = "gradient_stability"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "parallel_performance"
+harness = false
+
+[[bench]]
+name = "operation_benchmarks"
+harness = false
+
+[[bench]]
+name = "simd_specific"
+harness = false
+
+[[bench]]
+name = "end_to_end"
+harness = false

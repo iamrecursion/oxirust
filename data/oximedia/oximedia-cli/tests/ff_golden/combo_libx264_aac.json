@@ -1,0 +1,16 @@
+{
+  "name": "combo_libx264_aac",
+  "args": ["-y", "-i", "in.mp4", "-c:v", "libx264", "-c:a", "aac", "-crf", "23", "-preset", "fast", "-b:v", "4M", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 2,
+    "contains_diagnostic_kinds": ["PatentCodecSubstituted"],
+    "contains_diagnostic_messages": ["libx264", "aac"],
+    "jobs": 1,
+    "video_codec": "av1",
+    "audio_codec": "opus",
+    "preset": "fast",
+    "crf": 23.0,
+    "video_bitrate": "4M",
+    "overwrite": true
+  }
+}

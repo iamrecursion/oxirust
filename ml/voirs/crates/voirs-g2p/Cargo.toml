@@ -1,0 +1,113 @@
+[package]
+name = "voirs-g2p"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/voirs-g2p"
+keywords = ["voirs", "g2p", "phoneme", "text-processing", "tts"]
+categories = ["text-processing", "algorithms", "science"]
+rust-version.workspace = true
+description = "Grapheme-to-Phoneme conversion for VoiRS speech synthesis"
+readme = "README.md"
+
+[lib]
+name = "voirs_g2p"
+crate-type = ["lib"]
+
+
+[dependencies]
+# SciRS2 - Scientific computing abstractions
+scirs2-core.workspace = true
+
+# Text processing
+unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+regex.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Async support
+async-trait.workspace = true
+tokio.workspace = true
+
+# Date/time for metadata
+chrono.workspace = true
+
+# FST support for Phonetisaurus
+fst.workspace = true
+memmap2.workspace = true
+tempfile.workspace = true
+
+# HTTP client for model downloading
+reqwest.workspace = true
+
+# Compression support
+oxiarc-deflate.workspace = true
+
+# FFI for OpenJTalk
+libc.workspace = true
+
+# Neural network support
+candle-core.workspace = true
+candle-nn.workspace = true
+
+# ONNX inference backend
+oxionnx = { workspace = true, optional = true }
+
+# Model serialization
+oxicode.workspace = true
+safetensors.workspace = true
+md5.workspace = true
+
+# CLI dependencies
+clap.workspace = true
+tracing-subscriber.workspace = true
+
+# Utilities
+once_cell.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+proptest.workspace = true
+chrono.workspace = true
+scirs2-core = { workspace = true, features = ["random"] }
+
+[features]
+default = []
+onnx = ["dep:oxionnx"]
+gpu = ["oxionnx?/gpu"]
+
+[[bench]]
+name = "g2p_benchmarks"
+harness = false
+
+[[bench]]
+name = "memory_profiling"
+harness = false
+
+[[bench]]
+name = "transformer_benchmarks"
+harness = false
+
+[[bench]]
+name = "phonology_benchmarks"
+harness = false
+
+[[bench]]
+name = "parallel_processing_benchmarks"
+harness = false
+
+[lints]
+workspace = true

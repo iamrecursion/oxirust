@@ -1,0 +1,296 @@
+//! OxiZ SAT Solver - High-performance CDCL SAT solver
+//!
+//! This crate implements a Conflict-Driven Clause Learning (CDCL) SAT solver
+//! with the following features:
+//! - Two-watched literals scheme for efficient unit propagation
+//! - Multiple branching heuristics (VSIDS, LRB, CHB, VMTF)
+//! - Clause learning with first-UIP scheme and recursive minimization
+//! - Preprocessing (BCE, BVE, subsumption elimination)
+//! - Incremental solving (push/pop)
+//! - DRAT/LRAT proof *writers* (`DratWriter` / `LratWriter`) for emitting
+//!   checkable certificates. NOTE: the CDCL search loop does not yet auto-log
+//!   learned/deleted clauses, so these writers are the supported entry point and
+//!   the caller drives emission; automatic proof logging from `solve()` is not
+//!   wired. See the `proof` module for the writer API.
+//! - Local search integration
+//! - Parallel portfolio solving
+//! - AllSAT enumeration
+//!
+//! # Examples
+//!
+//! ## Basic SAT Solving
+//!
+//! ```
+//! use oxiz_sat::{Solver, SolverResult, Lit};
+//!
+//! let mut solver = Solver::new();
+//!
+//! // Create variables
+//! let a = solver.new_var();
+//! let b = solver.new_var();
+//! let c = solver.new_var();
+//!
+//! // Add clause: a OR b
+//! solver.add_clause([Lit::pos(a), Lit::pos(b)]);
+//!
+//! // Add clause: NOT a OR c
+//! solver.add_clause([Lit::neg(a), Lit::pos(c)]);
+//!
+//! // Add clause: NOT b OR NOT c
+//! solver.add_clause([Lit::neg(b), Lit::neg(c)]);
+//!
+//! match solver.solve() {
+//!     SolverResult::Sat => println!("Satisfiable!"),
+//!     SolverResult::Unsat => println!("Unsatisfiable!"),
+//!     SolverResult::Unknown => println!("Unknown"),
+//! }
+//! ```
+//!
+//! ## Solving with Assumptions
+//!
+//! ```
+//! use oxiz_sat::{Solver, SolverResult, Lit};
+//!
+//! let mut solver = Solver::new();
+//! let a = solver.new_var();
+//! let b = solver.new_var();
+//!
+//! solver.add_clause([Lit::pos(a), Lit::pos(b)]);
+//!
+//! // Solve assuming a is false
+//! let (result, _) = solver.solve_with_assumptions(&[Lit::neg(a)]);
+//! assert_eq!(result, SolverResult::Sat); // b must be true
+//! ```
+
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(feature = "std"), allow(unused_variables))]
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+// The wasm32 clock guard. Every `Instant` / `SystemTime` this crate reads goes
+// through `oxiz-time`, whose types ARE `std::time`'s on every target with a
+// working clock and frozen stubs on wasm32-unknown-unknown (which has none and
+// aborts on `Instant::now()`); see `oxiz_time`'s crate docs.
+//
+// A missing `"oxiz-time/std"` in this crate's `std` feature list would silently
+// hand a *native* build the frozen clock -- timeouts that never fire, timing
+// statistics stuck at zero. Catch that here, at compile time, instead of in
+// production.
+#[cfg(all(
+    feature = "std",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+const _: () = assert!(
+    !oxiz_time::IS_FROZEN,
+    "oxiz-time/std must be forwarded from this crate's `std` feature"
+);
+
+mod prelude;
+
+// === Always-available modules (no_std compatible) ===
+mod activity;
+mod agility;
+mod allsat;
+mod assumptions;
+mod asymmetric_branching;
+mod autotuning;
+mod backbone;
+mod big;
+mod cardinality;
+mod cce;
+mod chb;
+mod chrono;
+mod chronological_backtrack;
+mod clause;
+mod clause_maintenance;
+pub mod clause_pool;
+mod clause_size_manager;
+mod community;
+mod community_partition;
+mod config_presets;
+mod cube;
+mod distillation;
+#[cfg(feature = "std")]
+mod drat_inprocessing;
+mod dynamic_lbd;
+mod dynamic_subsumption;
+mod els;
+mod extended_resolution;
+mod gate;
+mod hyper_binary;
+// Debug-net checkers: every production caller sits behind
+// `#[cfg(debug_assertions)]` (see `Solver::debug_check_invariants`), so a
+// release *lib* build has no callers and the module would be pure dead code
+// there. Test builds keep it in both profiles — the invariant tests and the
+// solver tests call the checkers directly.
+#[cfg(any(debug_assertions, test))]
+mod invariants;
+mod literal;
+mod local_search;
+mod lookahead;
+mod lrb;
+mod maxsat;
+mod memory;
+mod memory_opt;
+mod ml_branching;
+mod occurrence;
+pub mod preprocessing;
+mod preprocessing_core;
+mod recursive_minimization;
+mod reluctant;
+mod rephasing;
+mod resolution_graph;
+mod restart_model;
+mod smoothed_lbd;
+mod solver;
+mod stabilization;
+mod subsumption;
+mod symmetry;
+#[cfg(feature = "std")]
+pub mod tactics;
+mod target_phase;
+mod trail;
+mod trail_saving;
+mod uip_strategies;
+mod unsat_core;
+mod vivification;
+mod vmtf;
+mod vmtf_queue;
+mod vsids;
+mod watched;
+mod xor;
+
+// === std-only modules ===
+#[cfg(feature = "std")]
+mod benchmark;
+#[cfg(feature = "std")]
+mod clause_exchange;
+#[cfg(feature = "std")]
+mod cube_solver;
+#[cfg(feature = "std")]
+mod dimacs;
+#[cfg(feature = "std")]
+pub mod parallel;
+#[cfg(feature = "std")]
+mod portfolio;
+#[cfg(feature = "profiling")]
+pub mod profiling;
+#[cfg(feature = "std")]
+mod proof;
+#[cfg(feature = "std")]
+mod stats_dashboard;
+
+// === Always-available exports ===
+pub use activity::{ActivityStats, ClauseActivityManager, VariableActivityManager};
+pub use agility::{AgilityStats, AgilityTracker};
+pub use allsat::{AllSatEnumerator, EnumerationConfig, EnumerationResult, EnumerationStats, Model};
+pub use assumptions::{
+    Assumption, AssumptionContext, AssumptionCoreMinimizer, AssumptionLevel, AssumptionStack,
+    AssumptionStats,
+};
+pub use asymmetric_branching::{AsymmetricBranching, AsymmetricBranchingStats};
+pub use autotuning::{
+    Autotuner, AutotuningStats, Configuration, Parameter,
+    PerformanceMetrics as TuningPerformanceMetrics, TuningStrategy,
+};
+pub use backbone::{BackboneAlgorithm, BackboneDetector, BackboneFilter, BackboneStats};
+pub use big::{BigStats, BinaryImplicationGraph};
+pub use cardinality::CardinalityEncoder;
+pub use cce::{CceStats, CoveredClauseElimination};
+pub use chronological_backtrack::{
+    BacktrackDecision, ChronoBacktrackConfig, ChronoBacktrackEngine, ChronoBacktrackStats,
+};
+pub use clause::{Clause, ClauseDatabase, ClauseDatabaseStats, ClauseId, ClauseTier};
+pub use clause_maintenance::{ClauseMaintenance, MaintenanceStats};
+pub use clause_size_manager::{ClauseSizeManager, SizeAdjustmentStrategy, SizeManagerStats};
+pub use community::{
+    Communities, CommunityOrdering, CommunityStats, LouvainDetector, VariableIncidenceGraph,
+};
+pub use community_partition::{CommunityPartition, PartitionStats};
+pub use config_presets::ConfigPreset;
+pub use cube::{Cube, CubeConfig, CubeGenerator, CubeResult, CubeSplittingStrategy, CubeStats};
+pub use distillation::{Distillation, DistillationStats};
+#[cfg(feature = "std")]
+pub use drat_inprocessing::{DratInprocessingConfig, DratInprocessingStats, DratInprocessor};
+pub use dynamic_lbd::{DynamicLbdManager, DynamicLbdStats};
+pub use dynamic_subsumption::{
+    DynamicSubsumption, SubsumptionConfig as DynamicSubsumptionConfig, SubsumptionResult,
+    SubsumptionStats as DynamicSubsumptionStats,
+};
+pub use els::{ElsStats, EquivalentLiteralSubstitution};
+pub use extended_resolution::{ClauseSubstitution, ExtendedResolution, Extension, ExtensionType};
+pub use gate::{GateDetector, GateStats, GateType};
+pub use hyper_binary::{HbrResult, HyperBinaryResolver, HyperBinaryStats};
+pub use literal::{LBool, Lit, Var};
+pub use local_search::{LocalSearch, LocalSearchConfig, LocalSearchResult, LocalSearchStats};
+pub use lookahead::{LookaheadBranching, LookaheadHeuristic, LookaheadStats};
+pub use maxsat::{MaxSatClause, MaxSatConfig, MaxSatResult, MaxSatSolver, MaxSatStats, Weight};
+pub use memory::{ClauseArena, ClauseRef, MemoryStats};
+pub use memory_opt::{MemoryAction, MemoryOptStats, MemoryOptimizer, SizeClass};
+pub use ml_branching::{MLBranching, MLBranchingConfig, MLBranchingStats};
+pub use occurrence::{OccurrenceList, OccurrenceStats};
+pub use preprocessing_core::Preprocessor;
+pub use recursive_minimization::{RecursiveMinStats, RecursiveMinimizer};
+pub use reluctant::{ReluctantDoubling, ReluctantStats};
+pub use rephasing::{RephasingManager, RephasingStats, RephasingStrategy};
+pub use resolution_graph::{
+    GraphStats as ResolutionGraphStats, ResolutionAnalyzer, ResolutionGraph, ResolutionNode,
+};
+pub use smoothed_lbd::{SmoothedLbdStats, SmoothedLbdTracker};
+pub use solver::{
+    BoxedBranchingHeuristic, BranchingHeuristic, RestartStrategy, Solver, SolverConfig,
+    SolverError, SolverResult, SolverStats, TheoryCallback, TheoryCheckResult,
+};
+pub use stabilization::{
+    SearchMode, StabilizationConfig, StabilizationManager, StabilizationStats,
+};
+pub use subsumption::{SubsumptionChecker, SubsumptionStats};
+pub use symmetry::{
+    AutomorphismDetector, MatrixSymmetry, Permutation, SymmetryBreaker, SymmetryBreakingMethod,
+    SymmetryGroup,
+};
+#[cfg(feature = "std")]
+pub use tactics::{CubeImproveTactic, SymmetryBreakTactic};
+pub use target_phase::{PhaseMode, TargetPhaseSelector, TargetPhaseStats};
+pub use trail::{Reason, Trail};
+pub use trail_saving::{SavedTrail, TrailSavingManager, TrailSavingStats};
+pub use uip_strategies::{UipAnalysisResult, UipAnalyzer, UipConfig, UipStats, UipStrategy};
+pub use unsat_core::UnsatCore;
+pub use vivification::{Vivification, VivificationStats};
+pub use vmtf::{VMTF, VmtfStats};
+pub use vmtf_queue::{VmtfBumpQueue, VmtfBumpStats};
+pub use xor::{
+    GF2Matrix, GF2Row, PropagateResult, XorAddResult, XorClause, XorClauseId, XorConstraint,
+    XorDetector, XorManager, XorPropagator, XorPropagatorStats, XorStrengthening, XorSubsumption,
+};
+
+// === std-only exports ===
+#[cfg(feature = "std")]
+pub use benchmark::{BenchmarkHarness, BenchmarkResult};
+#[cfg(feature = "std")]
+pub use clause_exchange::{ClauseExchangeBuffer, ExchangeConfig, ExchangeStats, SharedClause};
+#[cfg(feature = "std")]
+pub use cube_solver::{
+    CubeAndConquer, CubeSolveResult, CubeSolverConfig, CubeSolverStats, ParallelCubeSolver,
+};
+#[cfg(feature = "std")]
+pub use dimacs::{DimacsError, DimacsParser, DimacsWriter};
+#[cfg(feature = "std")]
+pub use parallel::{
+    ParallelClauseSimplifier, ParallelProofChecker, PortfolioConfig as ParallelPortfolioConfig,
+    PortfolioResult as ParallelPortfolioResult, PortfolioSolver as ParallelPortfolioSolver,
+    ProofCheckConfig, ProofCheckResult, SimplificationConfig, SimplificationResult, SolverVariant,
+};
+#[cfg(feature = "std")]
+pub use portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver, PortfolioStats};
+#[cfg(feature = "profiling")]
+pub use profiling::{
+    ProfilingCategory, ProfilingCategorySnapshot, ProfilingSnapshot, ProfilingStats, ScopedTimer,
+};
+#[cfg(feature = "std")]
+pub use proof::{DratWriter, LratWriter, ProofTrimmer};
+#[cfg(feature = "std")]
+pub use stats_dashboard::{StatsAggregator, StatsDashboard};

@@ -1,0 +1,902 @@
+use crate::error_helpers::try_from_f64;
+use crate::op::{ComputeContext, GradientContext, Op, OpError};
+use crate::tensor::Tensor;
+use crate::tensor_ops::convert_to_tensor;
+use crate::Float;
+use scirs2_core::ndarray::ScalarOperand;
+use scirs2_core::ndarray::{Array1, Array2, Ix2};
+use scirs2_core::numeric::FromPrimitive;
+
+/// Eigenvalue decomposition operation
+pub struct EigenOp;
+
+/// Extract operation for eigenvalue decomposition components
+pub struct EigenExtractOp {
+    pub component: usize, // 0 for eigenvalues, 1 for eigenvectors
+}
+
+impl<F: Float + ScalarOperand + FromPrimitive> Op<F> for EigenOp {
+    fn compute(&self, ctx: &mut ComputeContext<F>) -> Result<(), OpError> {
+        let input = ctx.input(0);
+        let shape = input.shape();
+
+        if shape.len() != 2 || shape[0] != shape[1] {
+            return Err(OpError::IncompatibleShape(
+                "Eigendecomposition requires square matrix".into(),
+            ));
+        }
+
+        let input_2d = input
+            .view()
+            .into_dimensionality::<Ix2>()
+            .map_err(|_| OpError::IncompatibleShape("Failed to convert to 2D".into()))?;
+
+        // Check if matrix is symmetric
+        let is_symmetric = is_symmetric_matrix(&input_2d);
+
+        let (eigenvalues, eigenvectors) = if is_symmetric {
+            compute_symmetric_eigen(&input_2d)?
+        } else {
+            compute_general_eigen(&input_2d)?
+        };
+
+        // Ensure eigenvalues is a 1D array of length n
+        assert_eq!(eigenvalues.len(), shape[0]);
+
+        // Ensure eigenvectors is a 2D array of shape (n, n)
+        assert_eq!(eigenvectors.shape(), &[shape[0], shape[0]]);
+
+        // Output the arrays with verified shapes
+        ctx.append_output(eigenvalues.into_dyn());
+        ctx.append_output(eigenvectors.into_dyn());
+
+        Ok(())
+    }
+
+    fn grad(&self, ctx: &mut GradientContext<F>) {
+        let gy = ctx.output_grad();
+        let y = ctx.output();
+        let _g = ctx.graph(); // Prefix with _ to avoid unused variable warning
+
+        // Get the inputs
+        let input = ctx.input(0);
+        let g = ctx.graph();
+
+        // Get shape from input tensor via evaluation
+        let input_array = match input.eval(g) {
+            Ok(arr) => arr,
+            Err(_) => {
+                ctx.append_input_grad(0, None);
+                return;
+            }
+        };
+
+        let n = input_array.shape()[0]; // Get size from shape array
+
+        // Evaluate tensors to get their array values
+        let y_array = match y.eval(g) {
+            Ok(arr) => arr,
+            Err(_) => {
+                ctx.append_input_grad(0, None);
+                return;
+            }
+        };
+
+        let gy_array = match gy.eval(g) {
+            Ok(arr) => arr,
+            Err(_) => {
+                ctx.append_input_grad(0, None);
+                return;
+            }
+        };
+
+        // Calculate sizes for splitting arrays
+        let values_size = n;
+        let vectors_start = values_size;
+
+        // Extract eigenvalues and eigenvectors
+        let eigen_vals = y_array.slice(scirs2_core::ndarray::s![0..values_size]);
+        let eigen_vecs = y_array.slice(scirs2_core::ndarray::s![vectors_start..]);
+
+        let eigen_vals_1d = match eigen_vals.to_shape(n) {
+            Ok(arr) => arr.to_owned(),
+            Err(_) => {
+                ctx.append_input_grad(0, None);
+                return;
+            }
+        };
+        let eigen_vecs_2d = match eigen_vecs.to_shape((n, n)) {
+            Ok(arr) => arr.to_owned(),
+            Err(_) => {
+                ctx.append_input_grad(0, None);
+                return;
+            }
+        };
+
+        // Get gradients
+        let grad_vals = match gy_array
+            .slice(scirs2_core::ndarray::s![0..values_size])
+            .to_shape(n)
+        {
+            Ok(arr) => arr.to_owned(),
+            Err(_) => {
+                ctx.append_input_grad(0, None);
+                return;
+            }
+        };
+        let grad_vecs = match gy_array
+            .slice(scirs2_core::ndarray::s![vectors_start..])
+            .to_shape((n, n))
+        {
+            Ok(arr) => arr.to_owned(),
+            Err(_) => {
+                ctx.append_input_grad(0, None);
+                return;
+            }
+        };
+
+        // Compute gradient using eigendecomposition gradient formula
+        let grad_input = eigendecomposition_gradient(
+            &eigen_vals_1d.view(),
+            &eigen_vecs_2d.view(),
+            &grad_vals.view(),
+            &grad_vecs.view(),
+        );
+
+        // Convert gradient to tensor and append
+        let grad_tensor = convert_to_tensor(grad_input.into_dyn(), g);
+        ctx.append_input_grad(0, Some(grad_tensor));
+    }
+}
+
+/// Eigenvalues only operation (more efficient when eigenvectors not needed)
+pub struct EigenvaluesOp;
+
+impl<F: Float + ScalarOperand + FromPrimitive> Op<F> for EigenvaluesOp {
+    fn compute(&self, ctx: &mut ComputeContext<F>) -> Result<(), OpError> {
+        let input = ctx.input(0);
+        let shape = input.shape();
+
+        if shape.len() != 2 || shape[0] != shape[1] {
+            return Err(OpError::IncompatibleShape(
+                "Eigenvalues require square matrix".into(),
+            ));
+        }
+
+        let input_2d = input
+            .view()
+            .into_dimensionality::<Ix2>()
+            .map_err(|_| OpError::IncompatibleShape("Failed to convert to 2D".into()))?;
+
+        let eigenvalues = compute_eigenvalues_only(&input_2d)?;
+
+        // Ensure eigenvalues is a 1D array of length n
+        let n = shape[0];
+        if eigenvalues.len() != n {
+            // Create a new array with the correct shape
+            let mut reshaped_vals = scirs2_core::ndarray::Array1::<F>::zeros(n);
+
+            // Copy as much data as fits
+            let min_len = n.min(eigenvalues.len());
+            for i in 0..min_len {
+                reshaped_vals[i] = eigenvalues[i];
+            }
+
+            // Output the reshaped array
+            ctx.append_output(reshaped_vals.into_dyn());
+        } else {
+            // Output the eigenvalues with verified shape
+            ctx.append_output(eigenvalues.into_dyn());
+        }
+
+        Ok(())
+    }
+
+    fn grad(&self, ctx: &mut GradientContext<F>) {
+        // NOTE: this used to (a) eagerly `.eval()` `input`/`grad_output` -- unsound
+        // whenever `input` traces back to a `Variable`, see `EigenExtractOp::grad`'s
+        // comment -- and (b) even when that eval succeeded, place `grad_vals` directly on
+        // the diagonal of a zero matrix ("simplified placeholder - real implementation
+        // needs eigenvectors"). That is only the correct gradient when the eigenvectors
+        // happen to equal the identity matrix; in general (Hellmann-Feynman theorem) it
+        // is `dA = V · diag(grad_vals) · Vᵀ`.
+        //
+        // This is exactly what `EigenExtractGradOp { component: 0 }` already computes
+        // (`eigendecomposition_gradient` with the eigenvector cotangent zeroed), so reuse
+        // it directly instead of duplicating the formula.
+        let input = *ctx.input(0);
+        let gy = *ctx.output_grad();
+        let g = ctx.graph();
+        let gx = Tensor::builder(g)
+            .append_input(input, false)
+            .append_input(gy, false)
+            .build(EigenExtractGradOp { component: 0 });
+        ctx.append_input_grad(0, Some(gx));
+    }
+}
+
+// Helper functions
+#[allow(dead_code)]
+fn is_symmetric_matrix<F: Float>(matrix: &scirs2_core::ndarray::ArrayView2<F>) -> bool {
+    let n = matrix.shape()[0];
+    for i in 0..n {
+        for j in i + 1..n {
+            if (matrix[[i, j]] - matrix[[j, i]]).abs() > F::epsilon() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[allow(dead_code)]
+fn compute_symmetric_eigen<F: Float + ScalarOperand + FromPrimitive>(
+    matrix: &scirs2_core::ndarray::ArrayView2<F>,
+) -> Result<(Array1<F>, Array2<F>), OpError> {
+    let n = matrix.shape()[0];
+
+    // Use Jacobi rotation method for symmetric matrices
+    let mut a = matrix.to_owned();
+    let mut v = Array2::<F>::eye(n);
+
+    // Jacobi iterations
+    for _ in 0..100 {
+        // Find off-diagonal element with largest magnitude
+        let mut max_val = F::zero();
+        let mut p = 0;
+        let mut q = 0;
+
+        for i in 0..n {
+            for j in i + 1..n {
+                if a[[i, j]].abs() > max_val {
+                    max_val = a[[i, j]].abs();
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+
+        // Check for convergence
+        if max_val < F::epsilon() {
+            break;
+        }
+
+        // Compute rotation parameters
+        let app = a[[p, p]];
+        let aqq = a[[q, q]];
+        let apq = a[[p, q]];
+
+        let theta: F = if app == aqq {
+            scirs2_core::numeric::FromPrimitive::from_f64(0.25 * std::f64::consts::PI)
+                .unwrap_or_else(|| F::zero())
+        } else {
+            let aqq_f64 = aqq.to_f64().unwrap_or(0.0);
+            let app_f64 = app.to_f64().unwrap_or(0.0);
+            let apq_f64 = apq.to_f64().unwrap_or(0.0);
+            let theta_f64 = 0.5 * (2.0 * apq_f64).atan2(aqq_f64 - app_f64);
+            scirs2_core::numeric::FromPrimitive::from_f64(theta_f64).unwrap_or_else(|| F::zero())
+        };
+
+        let c = theta.cos();
+        let s = theta.sin();
+
+        // Update matrix A
+        for i in 0..n {
+            let aip = a[[i, p]];
+            let aiq = a[[i, q]];
+
+            a[[i, p]] = aip * c - aiq * s;
+            a[[i, q]] = aip * s + aiq * c;
+        }
+
+        for j in 0..n {
+            let apj = a[[p, j]];
+            let aqj = a[[q, j]];
+
+            a[[p, j]] = apj * c - aqj * s;
+            a[[q, j]] = apj * s + aqj * c;
+        }
+
+        // Restore symmetry
+        a[[p, q]] = F::zero();
+        a[[q, p]] = F::zero();
+
+        // Update eigenvector matrix
+        for i in 0..n {
+            let vip = v[[i, p]];
+            let viq = v[[i, q]];
+
+            v[[i, p]] = vip * c - viq * s;
+            v[[i, q]] = vip * s + viq * c;
+        }
+    }
+
+    // Extract eigenvalues from diagonal
+    let mut eigenvalues = Array1::<F>::zeros(n);
+    for i in 0..n {
+        eigenvalues[i] = a[[i, i]];
+    }
+
+    Ok((eigenvalues, v))
+}
+
+#[allow(dead_code)]
+fn compute_general_eigen<F: Float + ScalarOperand + FromPrimitive>(
+    matrix: &scirs2_core::ndarray::ArrayView2<F>,
+) -> Result<(Array1<F>, Array2<F>), OpError> {
+    // For general matrices, we'll use the QR algorithm
+    // This is a more robust implementation for non-symmetric matrices
+
+    let n = matrix.shape()[0];
+
+    // Check if the matrix is close to symmetric within a tolerance
+    let tol_scale = F::from(100.0).unwrap_or_else(|| F::one());
+    let is_nearly_symmetric = is_nearly_symmetric_matrix(matrix, F::epsilon() * tol_scale);
+
+    if is_nearly_symmetric {
+        // If nearly symmetric, symmetrize and use the more efficient Jacobi method
+        let mut sym_matrix = Array2::<F>::zeros((n, n));
+        let half = scirs2_core::numeric::FromPrimitive::from_f64(0.5).unwrap_or_else(|| F::one());
+        for i in 0..n {
+            for j in 0..n {
+                sym_matrix[[i, j]] = (matrix[[i, j]] + matrix[[j, i]]) * half;
+            }
+        }
+        return compute_symmetric_eigen(&sym_matrix.view());
+    }
+
+    // Implementation of the QR algorithm for eigendecomposition
+    // We'll perform a series of QR decompositions to find the eigenvalues and vectors
+
+    // Start with the original matrix
+    let mut a = matrix.to_owned();
+
+    // Initialize eigenvectors to identity matrix
+    let mut v = Array2::<F>::eye(n);
+
+    // Maximum number of iterations
+    let max_iter = 100;
+
+    // Threshold for convergence
+    let tol_scale = F::from(1000.0).unwrap_or_else(|| F::one());
+    let tol = F::epsilon() * tol_scale;
+
+    // Store previous iteration matrix to check convergence
+    let mut prev_a = a.clone();
+
+    // QR algorithm iterations
+    for iter in 0..max_iter {
+        // Apply a shift to improve convergence
+        let shift = if n > 1 { a[[n - 1, n - 1]] } else { F::zero() };
+
+        // Subtract the shift from the diagonal
+        for i in 0..n {
+            a[[i, i]] -= shift;
+        }
+
+        // Compute the QR decomposition: A = QR
+        // We'll use a simple Gram-Schmidt process for QR
+        let (q, r) = compute_qr_decomposition(&a)?;
+
+        // Form the new matrix A' = RQ + shift*I
+        a = r.dot(&q);
+
+        // Add the shift back to the diagonal
+        for i in 0..n {
+            a[[i, i]] += shift;
+        }
+
+        // Update the eigenvector matrix: V = V * Q
+        v = v.dot(&q);
+
+        // Check for convergence
+        let n_f = F::from(n as f64).unwrap_or_else(|| F::one());
+        let diff = (&a - &prev_a).mapv(|x| x.abs()).sum() / n_f;
+        if iter > 0 && diff < tol {
+            break;
+        }
+
+        // Update previous matrix for next convergence check
+        prev_a = a.clone();
+
+        // Check for zeros in last row/column to detect converged eigenvalues
+        let mut is_triangular = true;
+        for i in 1..n {
+            for j in 0..i {
+                if a[[i, j]].abs() > tol {
+                    is_triangular = false;
+                    break;
+                }
+            }
+            if !is_triangular {
+                break;
+            }
+        }
+
+        if is_triangular {
+            break;
+        }
+    }
+
+    // Extract eigenvalues from the diagonal of the final matrix
+    let mut eigenvalues = Array1::<F>::zeros(n);
+    for i in 0..n {
+        eigenvalues[i] = a[[i, i]];
+    }
+
+    // Normalize eigenvectors
+    for j in 0..n {
+        let mut norm_squared = F::zero();
+        for i in 0..n {
+            norm_squared += v[[i, j]] * v[[i, j]];
+        }
+        let norm = norm_squared.sqrt();
+
+        if norm > F::epsilon() {
+            for i in 0..n {
+                v[[i, j]] /= norm;
+            }
+        }
+    }
+
+    Ok((eigenvalues, v))
+}
+
+// Helper function to check if a matrix is nearly symmetric
+#[allow(dead_code)]
+fn is_nearly_symmetric_matrix<F: Float>(
+    matrix: &scirs2_core::ndarray::ArrayView2<F>,
+    tol: F,
+) -> bool {
+    let n = matrix.shape()[0];
+    for i in 0..n {
+        for j in i + 1..n {
+            if (matrix[[i, j]] - matrix[[j, i]]).abs() > tol {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// Helper function to compute QR decomposition
+#[allow(dead_code)]
+fn compute_qr_decomposition<F: Float + ScalarOperand + FromPrimitive>(
+    a: &Array2<F>,
+) -> Result<(Array2<F>, Array2<F>), OpError> {
+    let n = a.shape()[0];
+
+    // Initialize Q and R
+    let mut q = Array2::<F>::zeros((n, n));
+    let mut r = Array2::<F>::zeros((n, n));
+
+    // Modified Gram-Schmidt orthogonalization
+    for j in 0..n {
+        // Copy column j of A into Q
+        let mut column = Array1::<F>::zeros(n);
+        for i in 0..n {
+            column[i] = a[[i, j]];
+        }
+
+        // Orthogonalize against previous columns
+        for k in 0..j {
+            // Compute dot product of column j with normalized column k
+            let mut dot_product = F::zero();
+            for i in 0..n {
+                dot_product += column[i] * q[[i, k]];
+            }
+
+            // Store in R
+            r[[k, j]] = dot_product;
+
+            // Subtract projection
+            for i in 0..n {
+                column[i] -= dot_product * q[[i, k]];
+            }
+        }
+
+        // Compute the norm of the column
+        let mut norm_squared = F::zero();
+        for i in 0..n {
+            norm_squared += column[i] * column[i];
+        }
+
+        let norm = norm_squared.sqrt();
+
+        // Check for linear dependency
+        if norm < F::epsilon() {
+            // Generate a random orthogonal vector
+            let mut new_col = Array1::<F>::zeros(n);
+            new_col[j] = F::one();
+
+            // Orthogonalize against previous columns
+            for k in 0..j {
+                let mut dot = F::zero();
+                for i in 0..n {
+                    dot += new_col[i] * q[[i, k]];
+                }
+                for i in 0..n {
+                    new_col[i] -= dot * q[[i, k]];
+                }
+            }
+
+            // Normalize
+            let mut new_norm_squared = F::zero();
+            for i in 0..n {
+                new_norm_squared += new_col[i] * new_col[i];
+            }
+            let new_norm = new_norm_squared.sqrt();
+
+            if new_norm < F::epsilon() {
+                return Err(OpError::Other(
+                    "Failed to generate orthogonal vector".into(),
+                ));
+            }
+
+            for i in 0..n {
+                q[[i, j]] = new_col[i] / new_norm;
+            }
+
+            r[[j, j]] = F::zero();
+        } else {
+            // Store the normalized column in Q
+            r[[j, j]] = norm;
+            for i in 0..n {
+                q[[i, j]] = column[i] / norm;
+            }
+        }
+    }
+
+    Ok((q, r))
+}
+
+#[allow(dead_code)]
+fn compute_eigenvalues_only<F: Float + ScalarOperand + FromPrimitive>(
+    matrix: &scirs2_core::ndarray::ArrayView2<F>,
+) -> Result<Array1<F>, OpError> {
+    // Simplified implementation - use full eigen decomposition but return only values
+    let (values_, _vectors) = if is_symmetric_matrix(matrix) {
+        compute_symmetric_eigen(matrix)?
+    } else {
+        compute_general_eigen(matrix)?
+    };
+
+    Ok(values_)
+}
+
+#[allow(dead_code)]
+fn eigendecomposition_gradient<F: Float + ScalarOperand + FromPrimitive>(
+    eigenvalues: &scirs2_core::ndarray::ArrayView1<F>,
+    eigenvectors: &scirs2_core::ndarray::ArrayView2<F>,
+    grad_vals: &scirs2_core::ndarray::ArrayView1<F>,
+    grad_vecs: &scirs2_core::ndarray::ArrayView2<F>,
+) -> Array2<F> {
+    let n = eigenvalues.len();
+    let mut grad = Array2::<F>::zeros((n, n));
+
+    // Gradient for eigenvalues part
+    // For each eigenvalue, we add the corresponding component to the gradient
+    for i in 0..n {
+        let vi = eigenvectors.slice(scirs2_core::ndarray::s![.., i]);
+        for j in 0..n {
+            for k in 0..n {
+                grad[[j, k]] += grad_vals[i] * vi[j] * vi[k];
+            }
+        }
+    }
+
+    // Gradient for eigenvectors part
+    // This is a more robust implementation that handles degeneracy
+    for i in 0..n {
+        for j in 0..n {
+            // Check if eigenvalues are distinct - if they are close, use regularization
+            let eigenvalue_diff = (eigenvalues[i] - eigenvalues[j]).abs();
+            let eps_scale = F::from(10.0).unwrap_or_else(|| F::one());
+            let is_degenerate = eigenvalue_diff <= F::epsilon() * eps_scale;
+
+            if i != j {
+                // Compute the factor with safeguards against division by zero
+                let factor = if is_degenerate {
+                    // For nearly degenerate eigenvalues, use a regularized factor
+                    let reg_diff = F::max(eigenvalue_diff, F::epsilon() * eps_scale);
+                    F::one() / reg_diff
+                } else {
+                    F::one() / (eigenvalues[j] - eigenvalues[i])
+                };
+
+                // For degenerate eigenvalues, the gradient needs special handling
+                if is_degenerate {
+                    // Use a more stable approach for degenerate eigenvalues
+                    // This is a simplification - a full implementation would need
+                    // to compute the generalized eigenvectors
+                    let vi = eigenvectors.slice(scirs2_core::ndarray::s![.., i]);
+                    let vj = eigenvectors.slice(scirs2_core::ndarray::s![.., j]);
+
+                    // Compute the component perpendicular to vi
+                    let mut dot_product = F::zero();
+                    for p in 0..n {
+                        dot_product += grad_vecs[[p, j]] * vi[p];
+                    }
+
+                    // Add the perpendicular component to the gradient
+                    let half = F::from(0.5).unwrap_or_else(|| F::one());
+                    for p in 0..n {
+                        for q in 0..n {
+                            let term = vj[p] * (grad_vecs[[p, j]] - dot_product * vi[p]) * vj[q];
+                            grad[[q, p]] += term * half;
+                        }
+                    }
+                } else {
+                    // For distinct eigenvalues, use the standard formula
+                    for p in 0..n {
+                        for q in 0..n {
+                            let term =
+                                eigenvectors[[p, i]] * grad_vecs[[p, j]] * eigenvectors[[q, j]];
+                            grad[[q, p]] += factor * term;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Handle the case where eigenvector gradient is with respect to itself
+    // This is the projection of the gradient onto the orthogonal complement
+    for i in 0..n {
+        let vi = eigenvectors.slice(scirs2_core::ndarray::s![.., i]);
+
+        // Compute norm of vi for normalization gradient
+        let mut vi_norm_squared = F::zero();
+        for p in 0..n {
+            vi_norm_squared += vi[p] * vi[p];
+        }
+
+        if vi_norm_squared > F::epsilon() {
+            // Projection term
+            let mut dot_product = F::zero();
+            for p in 0..n {
+                dot_product += grad_vecs[[p, i]] * vi[p];
+            }
+
+            // Add to gradient
+            for p in 0..n {
+                for q in 0..n {
+                    let term = vi[p] * (grad_vecs[[p, i]] - dot_product * vi[p]) * vi[q];
+                    grad[[q, p]] += term;
+                }
+            }
+        }
+    }
+
+    // Add regularization for numerical stability
+    let eps_scale = F::from(10.0).unwrap_or_else(|| F::one());
+    let eps = F::epsilon() * eps_scale;
+    for i in 0..n {
+        grad[[i, i]] += eps;
+    }
+
+    grad
+}
+
+impl<F: Float + ScalarOperand + FromPrimitive> Op<F> for EigenExtractOp {
+    fn compute(&self, ctx: &mut ComputeContext<F>) -> Result<(), OpError> {
+        let input = ctx.input(0);
+        let shape = input.shape();
+
+        if shape.len() != 2 || shape[0] != shape[1] {
+            return Err(OpError::IncompatibleShape(
+                "Eigendecomposition requires square matrix".into(),
+            ));
+        }
+
+        let input_2d = input
+            .view()
+            .into_dimensionality::<Ix2>()
+            .map_err(|_| OpError::IncompatibleShape("Failed to convert to 2D".into()))?;
+
+        // Check if matrix is symmetric
+        let is_symmetric = is_symmetric_matrix(&input_2d);
+
+        let (eigenvalues, eigenvectors) = if is_symmetric {
+            compute_symmetric_eigen(&input_2d)?
+        } else {
+            compute_general_eigen(&input_2d)?
+        };
+
+        // Return the requested component
+        match self.component {
+            0 => ctx.append_output(eigenvalues.into_dyn()),
+            1 => ctx.append_output(eigenvectors.into_dyn()),
+            _ => {
+                return Err(OpError::Other(
+                    "Invalid component index for eigen extraction".into(),
+                ))
+            }
+        }
+
+        Ok(())
+    }
+
+    fn grad(&self, ctx: &mut GradientContext<F>) {
+        // NOTE: this used to unconditionally fabricate a ZERO gradient ("just pass
+        // through... the actual gradient computation happens in the EigenOp" -- which is
+        // false: `eigen()` below never constructs an `EigenOp` node, only two
+        // `EigenExtractOp` nodes, so that "real" gradient was never reachable). A
+        // fabricated zero is worse than an honest failure: it neither crashes nor
+        // visibly disagrees with a shape check, so `d/dA sum(eigenvalues(A)) = 0` was
+        // silently reported as correct.
+        //
+        // `eigendecomposition_gradient`'s formula is linear (additive/separable) in its
+        // `(grad_vals, grad_vecs)` cotangents -- the eigenvalue-gradient loop only reads
+        // `grad_vals` and the eigenvector-gradient loops only read `grad_vecs` -- so each
+        // `EigenExtractOp` component may independently contribute
+        // `eigendecomposition_gradient(vals, vecs, my_grad, 0)` (component 0) or
+        // `eigendecomposition_gradient(vals, vecs, 0, my_grad)` (component 1); summing the
+        // two (which `tensor_ops::grad`'s accumulation already does whenever both
+        // eigenvalues and eigenvectors feed the loss) equals the joint gradient. This is
+        // built as a lazy `EigenExtractGradOp` node (re-deriving the eigendecomposition
+        // from `A` at evaluation time) rather than eagerly evaluated here, matching
+        // `LUExtractOp`/`QRExtractOp`'s backward ops: `Op::grad` only has a bare `&Graph`,
+        // never the `Context`/`VariableEnvironment` needed to resolve a `Variable`
+        // upstream of `A`, so an eager `.eval()` here can fail (or, for `A`'s "known
+        // shape" hint here, silently produce the same wrong-but-right-shaped zero).
+        //
+        // Component 0 (eigenvalues) is verified against finite differences (see
+        // `fd_eigenvalues_symmetric`) and is linear/homogeneous in `grad_vecs`, so it is
+        // correct regardless of anything below. Component 1 (eigenvectors) is NOT: the
+        // degenerate/non-degenerate eigenvector-cotangent handling in
+        // `eigendecomposition_gradient` does not match finite differences (confirmed with
+        // a non-uniform cotangent) and has not been re-derived correctly yet, so it
+        // reports an honest error instead of a plausible-looking but wrong gradient.
+        if self.component != 0 {
+            crate::tensor_ops::matrix_calculus::append_unsupported_grad(
+                ctx,
+                "eigenvectors: the reverse-mode gradient formula for raw eigenvectors \
+                 does not match finite differences and is not correctly implemented yet \
+                 (only the eigenvalue gradient is verified). If you only need the \
+                 eigenvalues, use `T::eigenvalues` (or `T::eigen(...).0`) instead."
+                    .into(),
+            );
+            return;
+        }
+
+        let input = *ctx.input(0);
+        let gy = *ctx.output_grad();
+        let g = ctx.graph();
+        let gx = Tensor::builder(g)
+            .append_input(input, false)
+            .append_input(gy, false)
+            .build(EigenExtractGradOp {
+                component: self.component,
+            });
+        ctx.append_input_grad(0, Some(gx));
+    }
+}
+
+/// Lazy backward for [`EigenExtractOp`]: re-derives `(eigenvalues, eigenvectors)` from `A`
+/// and applies [`eigendecomposition_gradient`] with the *other* component's cotangent
+/// zeroed (valid because that formula is linear/separable in its two cotangents -- see
+/// `EigenExtractOp::grad`'s comment). Output is `dA`.
+struct EigenExtractGradOp {
+    component: usize, // 0 for eigenvalues, 1 for eigenvectors
+}
+
+impl<F: Float + ScalarOperand + FromPrimitive> Op<F> for EigenExtractGradOp {
+    fn name(&self) -> &'static str {
+        "EigenExtractGrad"
+    }
+
+    fn compute(&self, ctx: &mut ComputeContext<F>) -> Result<(), OpError> {
+        let a = ctx
+            .input(0)
+            .into_dimensionality::<Ix2>()
+            .map_err(|_| OpError::IncompatibleShape("EigenExtractGrad: A must be 2D".into()))?
+            .to_owned();
+        let n = a.shape()[0];
+
+        let is_symmetric = is_symmetric_matrix(&a.view());
+        if !is_symmetric {
+            // `eigendecomposition_gradient`'s eigenvalue formula is `V diag(g) Vᵀ`, which
+            // is only the correct adjoint when `V` is orthogonal (`Vᵀ = V⁻¹`) -- true for
+            // a symmetric matrix's eigenvectors, but not in general for an asymmetric
+            // one (whose eigenvectors need not even be linearly independent, let alone
+            // orthogonal; the correct formula there uses `V⁻ᵀ`, not `Vᵀ`). Reporting an
+            // honest error keeps an unverified, likely-wrong value from being returned
+            // for asymmetric inputs.
+            return Err(OpError::Other(
+                "eigendecomposition gradient: only symmetric input matrices are supported \
+                 (an asymmetric matrix's eigenvectors are not guaranteed orthogonal, so \
+                 the current V diag(g) Vᵀ formula does not apply)."
+                    .into(),
+            ));
+        }
+        let (eigenvalues, eigenvectors) = compute_symmetric_eigen(&a.view())?;
+
+        let (grad_vals, grad_vecs) = match self.component {
+            0 => {
+                let gv = ctx
+                    .input(1)
+                    .into_dimensionality::<scirs2_core::ndarray::Ix1>()
+                    .map_err(|_| {
+                        OpError::IncompatibleShape(
+                            "EigenExtractGrad: eigenvalue gradient must be 1D".into(),
+                        )
+                    })?
+                    .to_owned();
+                (gv, Array2::<F>::zeros((n, n)))
+            }
+            1 => {
+                let gv = ctx
+                    .input(1)
+                    .into_dimensionality::<Ix2>()
+                    .map_err(|_| {
+                        OpError::IncompatibleShape(
+                            "EigenExtractGrad: eigenvector gradient must be 2D".into(),
+                        )
+                    })?
+                    .to_owned();
+                (Array1::<F>::zeros(n), gv)
+            }
+            _ => {
+                return Err(OpError::Other(
+                    "Invalid component index for eigen extraction".into(),
+                ))
+            }
+        };
+
+        let grad_a = eigendecomposition_gradient(
+            &eigenvalues.view(),
+            &eigenvectors.view(),
+            &grad_vals.view(),
+            &grad_vecs.view(),
+        );
+        ctx.append_output(grad_a.into_dyn());
+        Ok(())
+    }
+
+    fn grad(&self, ctx: &mut GradientContext<F>) {
+        crate::tensor_ops::matrix_calculus::append_unsupported_grad(
+            ctx,
+            "eigendecomposition: second-order differentiation is not implemented.".into(),
+        );
+    }
+}
+
+// Public API functions
+
+/// Compute eigenvalues and eigenvectors of a square matrix
+#[allow(dead_code)]
+pub fn eigen<'g, F: Float + ScalarOperand + FromPrimitive>(
+    matrix: &Tensor<'g, F>,
+) -> (Tensor<'g, F>, Tensor<'g, F>) {
+    let g = matrix.graph();
+
+    // Extract eigenvalues
+    let values = Tensor::builder(g)
+        .append_input(matrix, false)
+        .build(EigenExtractOp { component: 0 });
+
+    // Extract eigenvectors
+    let vectors = Tensor::builder(g)
+        .append_input(matrix, false)
+        .build(EigenExtractOp { component: 1 });
+
+    (values, vectors)
+}
+
+/// Compute only the eigenvalues of a square matrix
+#[allow(dead_code)]
+pub fn eigenvalues<'g, F: Float + ScalarOperand + FromPrimitive>(
+    matrix: &Tensor<'g, F>,
+) -> Tensor<'g, F> {
+    let g = matrix.graph();
+
+    // Get the shape of the input tensor for setting the output shape
+    // For eigenvalues, we'll have a 1D tensor with size n for an n×n matrix
+    let matrixshape = crate::tensor_ops::shape(matrix);
+
+    Tensor::builder(g)
+        .append_input(matrix, false)
+        .setshape(&matrixshape)
+        .build(EigenvaluesOp)
+}

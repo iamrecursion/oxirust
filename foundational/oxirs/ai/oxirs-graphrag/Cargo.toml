@@ -1,0 +1,74 @@
+[package]
+name = "oxirs-graphrag"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "GraphRAG: Hybrid Vector + Graph Retrieval-Augmented Generation for OxiRS"
+keywords = ["graphrag", "rag", "knowledge-graph", "vector-search", "llm"]
+categories = ["database", "science", "text-processing"]
+readme = "README.md"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal OxiRS crates
+oxirs-rule.workspace = true
+
+# SciRS2 for graph algorithms and scientific computing
+scirs2-core.workspace = true
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+chrono.workspace = true
+lru.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+
+# Graph algorithms
+petgraph.workspace = true
+
+# Hashing (for FeedbackSession TripleId)
+seahash.workspace = true
+
+# Parallel computation
+rayon.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+criterion.workspace = true
+# Real SPARQL parser used by regression tests to round-trip generated query
+# text (rather than only trusting a mock `SparqlEngineTrait`).
+oxirs-arq.workspace = true
+
+[features]
+default = ["community-detection", "hierarchical-summarization"]
+community-detection = []
+hierarchical-summarization = []
+sparql-extensions = []
+gguf-loader = []
+
+[[bench]]
+name = "langchain_kgqa"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

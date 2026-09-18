@@ -1,0 +1,1308 @@
+//! Computational graph for automatic differentiation.
+//!
+//! This module provides the computational graph infrastructure for tracking
+//! operations and computing gradients through reverse-mode automatic differentiation.
+
+#![allow(unused_variables)] // Autodiff graph
+
+use crate::errors::{Result, TrustformersError};
+use crate::tensor::Tensor;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Unique identifier for nodes in the computation graph
+pub type NodeId = usize;
+
+/// Computational graph for tracking operations and gradients
+#[derive(Debug)]
+pub struct ComputationGraph {
+    /// Nodes in the computation graph
+    nodes: HashMap<NodeId, GraphNode>,
+    /// Next available node ID
+    next_id: NodeId,
+    /// Topological ordering of nodes
+    topological_order: Vec<NodeId>,
+    /// Whether the graph is dirty and needs recomputation
+    dirty: bool,
+    /// Root nodes (variables with no parents)
+    root_nodes: Vec<NodeId>,
+    /// Leaf nodes (outputs that gradients flow back from)
+    leaf_nodes: Vec<NodeId>,
+}
+
+/// Node in the computation graph
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    /// Unique identifier for this node
+    pub id: NodeId,
+    /// The tensor value at this node
+    pub value: Tensor,
+    /// Gradient accumulated at this node
+    pub gradient: Option<Tensor>,
+    /// Operation that produced this node
+    pub operation: Option<OperationType>,
+    /// Parent nodes (inputs to the operation)
+    pub parents: Vec<NodeId>,
+    /// Child nodes (nodes that use this as input)
+    pub children: Vec<NodeId>,
+    /// Whether this node requires gradients
+    pub requires_grad: bool,
+    /// Whether this node is a leaf (variable)
+    pub is_leaf: bool,
+    /// Name for debugging
+    pub name: Option<String>,
+    /// Shape information for optimization
+    pub shape: Vec<usize>,
+}
+
+/// Types of operations in the computation graph
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum OperationType {
+    /// Binary operations
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    MatrixMultiply,
+
+    /// Unary operations
+    Negate,
+    Reciprocal,
+    Square,
+    Sqrt,
+    Log,
+    Exp,
+
+    /// Activation functions
+    Sigmoid,
+    Tanh,
+    ReLU,
+    LeakyReLU(f32),
+    Softmax,
+    LogSoftmax,
+
+    /// Tensor operations
+    Reshape(Vec<usize>),
+    Transpose(Vec<usize>),
+    Slice(Vec<std::ops::Range<usize>>),
+    Concat(usize),     // axis
+    Split(Vec<usize>), // split sizes
+
+    /// Reduction operations
+    Sum(Option<Vec<usize>>), // axes
+    Mean(Option<Vec<usize>>), // axes
+    Max(Option<Vec<usize>>),  // axes
+    Min(Option<Vec<usize>>),  // axes
+
+    /// Specialized operations
+    LayerNorm(f32), // epsilon
+    Dropout(f32),   // probability
+    BatchNorm(f32), // epsilon
+
+    /// Rounding with a straight-through gradient estimator.
+    ///
+    /// Forward: `round(x)`. Backward: identity. This is what makes learned
+    /// (trainable) quantization work -- the rounding itself has zero derivative
+    /// almost everywhere, so the STE substitutes the identity so that gradients
+    /// reach the quantization parameters.
+    RoundStraightThrough,
+
+    /// Clamping with a clipped straight-through gradient estimator.
+    ///
+    /// Forward: `clamp(x, min, max)`. Backward: identity inside `[min, max]`,
+    /// zero outside (the value was saturated, so it cannot influence the loss).
+    ClampStraightThrough(f32, f32),
+
+    /// Custom operation
+    Custom(String),
+}
+
+/// Gradient function trait for operations
+pub trait GradientFunction: Send + Sync {
+    /// Compute gradients for the inputs given the gradient of the output
+    fn backward(&self, grad_output: &Tensor, inputs: &[&Tensor]) -> Result<Vec<Tensor>>;
+
+    /// Get the operation type
+    fn operation_type(&self) -> OperationType;
+}
+
+impl ComputationGraph {
+    /// Create a new empty computation graph
+    pub fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+            next_id: 0,
+            topological_order: Vec::new(),
+            dirty: false,
+            root_nodes: Vec::new(),
+            leaf_nodes: Vec::new(),
+        }
+    }
+
+    /// Add a new node to the graph
+    pub fn add_node(&mut self, value: Tensor, requires_grad: bool, name: Option<String>) -> NodeId {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let shape = value.shape();
+        let node = GraphNode {
+            id,
+            value,
+            gradient: None,
+            operation: None,
+            parents: Vec::new(),
+            children: Vec::new(),
+            requires_grad,
+            is_leaf: true,
+            name,
+            shape,
+        };
+
+        self.nodes.insert(id, node);
+        if requires_grad {
+            self.root_nodes.push(id);
+        }
+        self.dirty = true;
+
+        id
+    }
+
+    /// Add an operation node to the graph
+    pub fn add_operation_node(
+        &mut self,
+        value: Tensor,
+        operation: OperationType,
+        parents: Vec<NodeId>,
+        requires_grad: bool,
+        name: Option<String>,
+    ) -> Result<NodeId> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        // Update parent nodes to include this as a child
+        for parent_id in &parents {
+            if let Some(parent) = self.nodes.get_mut(parent_id) {
+                parent.children.push(id);
+            } else {
+                return Err(TrustformersError::tensor_op_error(
+                    &format!("Parent node {} not found", parent_id),
+                    "ComputationGraph::add_operation_node",
+                ));
+            }
+        }
+
+        let shape = value.shape();
+        let node = GraphNode {
+            id,
+            value,
+            gradient: None,
+            operation: Some(operation),
+            parents,
+            children: Vec::new(),
+            requires_grad,
+            is_leaf: false,
+            name,
+            shape,
+        };
+
+        self.nodes.insert(id, node);
+        self.dirty = true;
+
+        Ok(id)
+    }
+
+    /// Get a node by ID
+    pub fn get_node(&self, id: NodeId) -> Option<&GraphNode> {
+        self.nodes.get(&id)
+    }
+
+    /// Get a mutable reference to a node by ID
+    pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut GraphNode> {
+        self.nodes.get_mut(&id)
+    }
+
+    /// Compute topological ordering of nodes
+    pub fn compute_topological_order(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+
+        let mut in_degree = HashMap::new();
+        let mut queue = VecDeque::new();
+        let mut result = Vec::new();
+
+        // Initialize in-degree counts
+        for (id, node) in &self.nodes {
+            in_degree.insert(*id, node.parents.len());
+            if node.parents.is_empty() {
+                queue.push_back(*id);
+            }
+        }
+
+        // Process nodes in topological order
+        while let Some(node_id) = queue.pop_front() {
+            result.push(node_id);
+
+            let Some(node) = self.nodes.get(&node_id) else {
+                continue;
+            };
+
+            for child_id in &node.children {
+                let Some(degree) = in_degree.get_mut(child_id) else {
+                    continue;
+                };
+
+                *degree -= 1;
+                if *degree == 0 {
+                    queue.push_back(*child_id);
+                }
+            }
+        }
+
+        if result.len() != self.nodes.len() {
+            return Err(TrustformersError::tensor_op_error(
+                "Cycle detected in computation graph",
+                "ComputationGraph::compute_topological_order",
+            ));
+        }
+
+        self.topological_order = result;
+        self.dirty = false;
+
+        Ok(())
+    }
+
+    /// Perform backward pass to compute gradients
+    pub fn backward(&mut self, output_id: NodeId, grad_output: Option<Tensor>) -> Result<()> {
+        // Ensure topological order is computed
+        self.compute_topological_order()?;
+
+        // Initialize gradient for output node
+        if let Some(output_node) = self.nodes.get_mut(&output_id) {
+            let grad = match grad_output {
+                Some(g) => g,
+                None => Tensor::ones(&output_node.shape)?,
+            };
+            output_node.gradient = Some(grad);
+        } else {
+            return Err(TrustformersError::tensor_op_error(
+                &format!("Output node {} not found", output_id),
+                "ComputationGraph::backward",
+            ));
+        }
+
+        // Process nodes in reverse topological order
+        for &node_id in self.topological_order.iter().rev() {
+            let Some(node) = self.nodes.get(&node_id).cloned() else {
+                continue;
+            };
+
+            let Some(ref grad) = node.gradient else {
+                continue;
+            };
+
+            let Some(ref operation) = node.operation else {
+                continue;
+            };
+
+            // Compute gradients for parent nodes
+            let parent_gradients =
+                self.compute_operation_gradients(operation, grad, &node.parents)?;
+
+            // Accumulate gradients in parent nodes
+            for (parent_id, parent_grad) in node.parents.iter().zip(parent_gradients.iter()) {
+                let Some(parent_node) = self.nodes.get_mut(parent_id) else {
+                    continue;
+                };
+
+                if !parent_node.requires_grad {
+                    continue;
+                }
+
+                if let Some(ref mut existing_grad) = parent_node.gradient {
+                    *existing_grad = existing_grad.add(parent_grad)?;
+                } else {
+                    parent_node.gradient = Some(parent_grad.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compute gradients for an operation
+    fn compute_operation_gradients(
+        &self,
+        operation: &OperationType,
+        grad_output: &Tensor,
+        parent_ids: &[NodeId],
+    ) -> Result<Vec<Tensor>> {
+        let parent_values: Vec<&Tensor> =
+            parent_ids.iter().map(|id| &self.nodes[id].value).collect();
+
+        match operation {
+            OperationType::Add => {
+                // Gradient of addition is just the incoming gradient for both inputs
+                Ok(vec![grad_output.clone(), grad_output.clone()])
+            },
+            OperationType::Subtract => {
+                // Gradient of subtraction: da = dout, db = -dout
+                Ok(vec![grad_output.clone(), grad_output.neg()?])
+            },
+            OperationType::Multiply => {
+                // Gradient of multiplication: da = dout * b, db = dout * a
+                if parent_values.len() != 2 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "Multiply operation requires exactly 2 inputs",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                Ok(vec![
+                    grad_output.mul(parent_values[1])?,
+                    grad_output.mul(parent_values[0])?,
+                ])
+            },
+            OperationType::Divide => {
+                // Gradient of division: da = dout / b, db = -dout * a / (b * b)
+                if parent_values.len() != 2 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "Divide operation requires exactly 2 inputs",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let a = parent_values[0];
+                let b = parent_values[1];
+                Ok(vec![
+                    grad_output.div(b)?,
+                    grad_output.mul(a)?.neg()?.div(&b.mul(b)?)?,
+                ])
+            },
+            OperationType::MatrixMultiply => {
+                // Gradient of matrix multiplication: da = dout @ b^T, db = a^T @ dout
+                if parent_values.len() != 2 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "MatrixMultiply operation requires exactly 2 inputs",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let a = parent_values[0];
+                let b = parent_values[1];
+
+                // Compute gradients
+                let a_shape = a.shape();
+                let b_shape = b.shape();
+
+                let grad_a = if a_shape.len() == 2 && b_shape.len() == 2 {
+                    // Simple 2D matrix multiplication
+                    grad_output.matmul(&b.transpose(1, 0)?)?
+                } else {
+                    // Handle batch matrix multiplication
+                    let b_transposed = b.transpose(2, 1)?;
+                    grad_output.matmul(&b_transposed)?
+                };
+
+                let grad_b = if a_shape.len() == 2 && b_shape.len() == 2 {
+                    // Simple 2D matrix multiplication
+                    a.transpose(1, 0)?.matmul(grad_output)?
+                } else {
+                    // Handle batch matrix multiplication
+                    let a_transposed = a.permute(&[0, 2, 1])?;
+                    a_transposed.matmul(grad_output)?
+                };
+
+                Ok(vec![grad_a, grad_b])
+            },
+            OperationType::Sigmoid => {
+                // Gradient of sigmoid: dout * sigmoid(x) * (1 - sigmoid(x))
+                if parent_values.len() != 1 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "Sigmoid operation requires exactly 1 input",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let sigmoid_out = parent_values[0].sigmoid()?;
+                let one = Tensor::ones(&sigmoid_out.shape())?;
+                let grad_input = grad_output.mul(&sigmoid_out)?.mul(&one.sub(&sigmoid_out)?)?;
+                Ok(vec![grad_input])
+            },
+            OperationType::Tanh => {
+                // Gradient of tanh: dout * (1 - tanh(x)^2)
+                if parent_values.len() != 1 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "Tanh operation requires exactly 1 input",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let tanh_out = parent_values[0].tanh()?;
+                let one = Tensor::ones(&tanh_out.shape())?;
+                let grad_input = grad_output.mul(&one.sub(&tanh_out.mul(&tanh_out)?)?)?;
+                Ok(vec![grad_input])
+            },
+            OperationType::ReLU => {
+                // Gradient of ReLU: dout * (x > 0)
+                if parent_values.len() != 1 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "ReLU operation requires exactly 1 input",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let input = parent_values[0];
+                let zero = Tensor::zeros(&input.shape())?;
+                let mask = input.greater(&zero)?;
+                let grad_input = grad_output.mul(&mask)?;
+                Ok(vec![grad_input])
+            },
+            OperationType::LeakyReLU(alpha) => {
+                // Gradient of LeakyReLU: dout * (x > 0 ? 1 : alpha)
+                if parent_values.len() != 1 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "LeakyReLU operation requires exactly 1 input",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let input = parent_values[0];
+                let zero = Tensor::zeros(&input.shape())?;
+                let alpha_tensor = Tensor::scalar(*alpha)?;
+                let one = Tensor::ones(&input.shape())?;
+
+                let positive_mask = input.greater(&zero)?;
+                let negative_mask = one.sub(&positive_mask)?;
+
+                let grad_input =
+                    grad_output.mul(&positive_mask.add(&negative_mask.mul(&alpha_tensor)?)?)?;
+                Ok(vec![grad_input])
+            },
+            OperationType::Sum(axes) => {
+                // Gradient of sum: broadcast the gradient back to original shape
+                if parent_values.len() != 1 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "Sum operation requires exactly 1 input",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let input_shape = parent_values[0].shape();
+                let grad_input =
+                    self.broadcast_gradient(grad_output, &input_shape, axes.as_ref())?;
+                Ok(vec![grad_input])
+            },
+            OperationType::Mean(axes) => {
+                // Gradient of mean: broadcast the gradient back and divide by the number of elements
+                if parent_values.len() != 1 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "Mean operation requires exactly 1 input",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let input_shape = parent_values[0].shape();
+                let grad_broadcasted =
+                    self.broadcast_gradient(grad_output, &input_shape, axes.as_ref())?;
+
+                // Compute the number of elements that were averaged
+                let num_elements = if let Some(axes) = axes {
+                    axes.iter().map(|&axis| input_shape[axis]).product::<usize>()
+                } else {
+                    input_shape.iter().product::<usize>()
+                };
+
+                let grad_input = grad_broadcasted.scalar_div(num_elements as f32)?;
+                Ok(vec![grad_input])
+            },
+            OperationType::Reshape(target_shape) => {
+                // Gradient of reshape: reshape gradient back to original shape
+                if parent_values.len() != 1 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "Reshape operation requires exactly 1 input",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let original_shape = parent_values[0].shape();
+                let grad_input = grad_output.reshape(&original_shape)?;
+                Ok(vec![grad_input])
+            },
+            OperationType::Transpose(permutation) => {
+                // Gradient of transpose: apply inverse permutation
+                if parent_values.len() != 1 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "Transpose operation requires exactly 1 input",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                let inverse_permutation = self.compute_inverse_permutation(permutation)?;
+                let grad_input = grad_output.permute(&inverse_permutation)?;
+                Ok(vec![grad_input])
+            },
+            OperationType::Negate => {
+                Self::expect_unary(&parent_values, "Negate")?;
+                Ok(vec![grad_output.neg()?])
+            },
+            OperationType::Reciprocal => {
+                // d/dx (1/x) = -1 / x^2
+                let input = Self::expect_unary(&parent_values, "Reciprocal")?;
+                let squared = input.mul(input)?;
+                Ok(vec![grad_output.div(&squared)?.neg()?])
+            },
+            OperationType::Square => {
+                // d/dx x^2 = 2x
+                let input = Self::expect_unary(&parent_values, "Square")?;
+                Ok(vec![grad_output.mul(input)?.scalar_mul(2.0)?])
+            },
+            OperationType::Sqrt => {
+                // d/dx sqrt(x) = 1 / (2 sqrt(x))
+                let input = Self::expect_unary(&parent_values, "Sqrt")?;
+                let root = input.sqrt()?;
+                Ok(vec![grad_output.div(&root)?.scalar_mul(0.5)?])
+            },
+            OperationType::Log => {
+                // d/dx log(x) = 1/x
+                let input = Self::expect_unary(&parent_values, "Log")?;
+                Ok(vec![grad_output.div(input)?])
+            },
+            OperationType::Exp => {
+                // d/dx exp(x) = exp(x)
+                let input = Self::expect_unary(&parent_values, "Exp")?;
+                Ok(vec![grad_output.mul(&input.exp()?)?])
+            },
+            OperationType::Softmax => {
+                // dx = s * (g - sum(g * s)) over the softmax axis (the last one)
+                let input = Self::expect_unary(&parent_values, "Softmax")?;
+                let softmax_out = input.softmax(-1)?;
+                let weighted = grad_output.mul(&softmax_out)?;
+                let summed = Self::sum_last_axis_keepdim(&weighted)?;
+                Ok(vec![softmax_out.mul(&grad_output.sub(&summed)?)?])
+            },
+            OperationType::LogSoftmax => {
+                // dx = g - softmax(x) * sum(g) over the last axis
+                let input = Self::expect_unary(&parent_values, "LogSoftmax")?;
+                let softmax_out = input.softmax(-1)?;
+                let summed = Self::sum_last_axis_keepdim(grad_output)?;
+                Ok(vec![grad_output.sub(&softmax_out.mul(&summed)?)?])
+            },
+            OperationType::RoundStraightThrough => {
+                // Straight-through: the rounding is transparent to gradients.
+                Self::expect_unary(&parent_values, "RoundStraightThrough")?;
+                Ok(vec![grad_output.clone()])
+            },
+            OperationType::ClampStraightThrough(min_value, max_value) => {
+                // Clipped straight-through: saturated entries receive no gradient.
+                let input = Self::expect_unary(&parent_values, "ClampStraightThrough")?;
+                let values = input.to_vec_f32()?;
+                let mask_values: Vec<f32> = values
+                    .iter()
+                    .map(
+                        |&value| {
+                            if value >= *min_value && value <= *max_value {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        },
+                    )
+                    .collect();
+                let mask = Tensor::from_vec(mask_values, &input.shape())?;
+                Ok(vec![grad_output.mul(&mask)?])
+            },
+            OperationType::LayerNorm(epsilon) => {
+                // LayerNorm is registered with (input, weight, bias) parents.
+                if parent_values.len() != 3 {
+                    return Err(TrustformersError::tensor_op_error(
+                        "LayerNorm operation requires exactly 3 inputs (input, weight, bias)",
+                        "ComputationGraph::compute_operation_gradients",
+                    ));
+                }
+                crate::autodiff::operations::grad_fn::layer_norm_backward(
+                    grad_output,
+                    parent_values[0],
+                    parent_values[1],
+                    parent_values[2],
+                    *epsilon,
+                )
+            },
+            unsupported => {
+                // Never fabricate zeros here: a zero gradient is indistinguishable
+                // from "this parameter does not affect the loss", which silently
+                // freezes whatever sits upstream of the operation.
+                Err(TrustformersError::not_implemented(format!(
+                    "Backward pass for autodiff operation {:?} is not implemented; \
+                     the gradient would have to be invented",
+                    unsupported
+                )))
+            },
+        }
+    }
+
+    /// Check that an operation has exactly one parent and return it.
+    fn expect_unary<'a>(parent_values: &[&'a Tensor], operation: &str) -> Result<&'a Tensor> {
+        match parent_values {
+            [single] => Ok(single),
+            other => Err(TrustformersError::tensor_op_error(
+                &format!(
+                    "{} operation requires exactly 1 input, got {}",
+                    operation,
+                    other.len()
+                ),
+                "ComputationGraph::compute_operation_gradients",
+            )),
+        }
+    }
+
+    /// Sum a tensor over its last axis, keeping the rank (so the result
+    /// broadcasts back over the original tensor).
+    fn sum_last_axis_keepdim(tensor: &Tensor) -> Result<Tensor> {
+        let shape = tensor.shape();
+        if shape.is_empty() {
+            return Ok(tensor.clone());
+        }
+        let last_axis = shape.len() - 1;
+        let reduced = tensor.sum_axes(&[last_axis])?;
+        let mut keepdim_shape = shape.clone();
+        keepdim_shape[last_axis] = 1;
+        reduced.reshape(&keepdim_shape)?.broadcast_to(&shape)
+    }
+
+    /// Broadcast gradient back to original shape
+    fn broadcast_gradient(
+        &self,
+        grad_output: &Tensor,
+        original_shape: &[usize],
+        axes: Option<&Vec<usize>>,
+    ) -> Result<Tensor> {
+        if let Some(axes) = axes {
+            // Sum was performed along specific axes
+            let mut result = grad_output.clone();
+            for &axis in axes {
+                result = result.unsqueeze(axis)?;
+            }
+            result.broadcast_to(original_shape)
+        } else {
+            // Sum was performed along all axes
+            let grad_scalar = grad_output.clone();
+            grad_scalar.broadcast_to(original_shape)
+        }
+    }
+
+    /// Compute inverse permutation for transpose
+    fn compute_inverse_permutation(&self, permutation: &[usize]) -> Result<Vec<usize>> {
+        let mut inverse = vec![0; permutation.len()];
+        for (i, &p) in permutation.iter().enumerate() {
+            if p >= permutation.len() {
+                return Err(TrustformersError::tensor_op_error(
+                    &format!("Invalid permutation index: {}", p),
+                    "ComputationGraph::compute_inverse_permutation",
+                ));
+            }
+            inverse[p] = i;
+        }
+        Ok(inverse)
+    }
+
+    /// Clear all gradients in the graph
+    /// Remove nodes that cannot influence any output of the graph.
+    ///
+    /// A node is *live* when it is an output (registered via
+    /// [`ComputationGraph::set_leaf_node`], or -- when no output has been
+    /// registered -- any node with no children) or an ancestor of one. Everything
+    /// else is dead: it was computed, never consumed, and cannot receive or
+    /// contribute a gradient.
+    ///
+    /// Returns the number of nodes removed. Parent/child links, the root list and
+    /// the topological order are all repaired, so the graph stays consistent for a
+    /// subsequent backward pass.
+    pub fn eliminate_dead_nodes(&mut self) -> usize {
+        if self.nodes.is_empty() {
+            return 0;
+        }
+
+        // Outputs: explicitly registered leaves, or every childless node.
+        let outputs: Vec<NodeId> = if self.leaf_nodes.is_empty() {
+            self.nodes
+                .iter()
+                .filter(|(_, node)| node.children.is_empty())
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            self.leaf_nodes.clone()
+        };
+
+        // Walk backwards from the outputs through the parent edges.
+        let mut live: HashSet<NodeId> = HashSet::new();
+        let mut stack: Vec<NodeId> = outputs;
+        while let Some(id) = stack.pop() {
+            if !live.insert(id) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(&id) {
+                for &parent in &node.parents {
+                    if !live.contains(&parent) {
+                        stack.push(parent);
+                    }
+                }
+            }
+        }
+
+        let dead: Vec<NodeId> =
+            self.nodes.keys().copied().filter(|id| !live.contains(id)).collect();
+        if dead.is_empty() {
+            return 0;
+        }
+
+        for id in &dead {
+            // Detach the dead node from any surviving parent's child list.
+            let parents = self.nodes.get(id).map(|node| node.parents.clone()).unwrap_or_default();
+            for parent in parents {
+                if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                    parent_node.children.retain(|child| child != id);
+                }
+            }
+            self.nodes.remove(id);
+        }
+
+        self.root_nodes.retain(|id| live.contains(id));
+        self.leaf_nodes.retain(|id| live.contains(id));
+        self.topological_order.retain(|id| live.contains(id));
+        self.dirty = true;
+
+        dead.len()
+    }
+
+    pub fn zero_grad(&mut self) {
+        for node in self.nodes.values_mut() {
+            node.gradient = None;
+        }
+    }
+
+    /// Get gradient for a specific node
+    pub fn get_gradient(&self, node_id: NodeId) -> Option<&Tensor> {
+        self.nodes.get(&node_id)?.gradient.as_ref()
+    }
+
+    /// Get value for a specific node
+    pub fn get_value(&self, node_id: NodeId) -> Option<&Tensor> {
+        self.nodes.get(&node_id).map(|node| &node.value)
+    }
+
+    /// Update the value of a node
+    pub fn update_value(&mut self, node_id: NodeId, value: Tensor) -> Result<()> {
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.value = value;
+            node.shape = node.value.shape();
+            Ok(())
+        } else {
+            Err(TrustformersError::tensor_op_error(
+                &format!("Node {} not found", node_id),
+                "ComputationGraph::update_value",
+            ))
+        }
+    }
+
+    /// Get all root nodes (variables)
+    pub fn get_root_nodes(&self) -> &[NodeId] {
+        &self.root_nodes
+    }
+
+    /// Get all leaf nodes
+    pub fn get_leaf_nodes(&self) -> &[NodeId] {
+        &self.leaf_nodes
+    }
+
+    /// Set a node as a leaf node
+    pub fn set_leaf_node(&mut self, node_id: NodeId) {
+        if !self.leaf_nodes.contains(&node_id) {
+            self.leaf_nodes.push(node_id);
+        }
+    }
+
+    /// Get the number of nodes in the graph
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Get the topological order of nodes
+    pub fn get_topological_order(&self) -> &[NodeId] {
+        &self.topological_order
+    }
+
+    /// Zero all gradients in the graph
+    pub fn zero_gradients(&mut self) {
+        for node in self.nodes.values_mut() {
+            node.gradient = None;
+        }
+    }
+
+    /// Export the graph structure for visualization
+    pub fn export_graph(&self) -> GraphExport {
+        let nodes: Vec<_> = self.nodes.values().cloned().collect();
+        GraphExport {
+            nodes,
+            topological_order: self.topological_order.clone(),
+        }
+    }
+}
+
+/// Exported graph structure for visualization
+#[derive(Debug, Clone)]
+pub struct GraphExport {
+    pub nodes: Vec<GraphNode>,
+    pub topological_order: Vec<NodeId>,
+}
+
+impl Default for ComputationGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::Tensor;
+
+    #[test]
+    fn test_graph_creation() {
+        let mut graph = ComputationGraph::new();
+        assert_eq!(graph.num_nodes(), 0);
+
+        let tensor = Tensor::ones(&[2, 3]).expect("Failed to create ones tensor");
+        let node_id = graph.add_node(tensor, true, Some("test".to_string()));
+        assert_eq!(graph.num_nodes(), 1);
+        assert_eq!(node_id, 0);
+    }
+
+    #[test]
+    fn test_topological_order() {
+        let mut graph = ComputationGraph::new();
+
+        // Create a simple computation: c = a + b
+        let a = Tensor::ones(&[2, 2]).expect("Failed to create ones tensor");
+        let b = Tensor::ones(&[2, 2]).expect("Failed to create ones tensor");
+        let c = a.add(&b).expect("Addition failed");
+
+        let node_a = graph.add_node(a, true, Some("a".to_string()));
+        let node_b = graph.add_node(b, true, Some("b".to_string()));
+        let node_c = graph
+            .add_operation_node(
+                c,
+                OperationType::Add,
+                vec![node_a, node_b],
+                true,
+                Some("c".to_string()),
+            )
+            .expect("operation failed in test");
+
+        graph.compute_topological_order().expect("operation failed in test");
+        let order = graph.get_topological_order();
+        assert_eq!(order.len(), 3);
+
+        // Verify that parents come before children
+        let a_pos = order.iter().position(|&id| id == node_a).expect("operation failed in test");
+        let b_pos = order.iter().position(|&id| id == node_b).expect("operation failed in test");
+        let c_pos = order.iter().position(|&id| id == node_c).expect("operation failed in test");
+
+        assert!(a_pos < c_pos);
+        assert!(b_pos < c_pos);
+    }
+
+    #[test]
+    fn test_backward_pass() {
+        let mut graph = ComputationGraph::new();
+
+        // Create computation: c = a * b
+        let a = Tensor::scalar(2.0).expect("tensor operation failed");
+        let b = Tensor::scalar(3.0).expect("tensor operation failed");
+        let c = a.mul(&b).expect("Multiplication failed");
+
+        let node_a = graph.add_node(a.clone(), true, Some("a".to_string()));
+        let node_b = graph.add_node(b.clone(), true, Some("b".to_string()));
+        let node_c = graph
+            .add_operation_node(
+                c,
+                OperationType::Multiply,
+                vec![node_a, node_b],
+                true,
+                Some("c".to_string()),
+            )
+            .expect("operation failed in test");
+
+        // Backward pass
+        graph.backward(node_c, None).expect("operation failed in test");
+
+        // Check gradients
+        let grad_a = graph.get_gradient(node_a).expect("operation failed in test");
+        let grad_b = graph.get_gradient(node_b).expect("operation failed in test");
+
+        // Gradient of a should be b (3.0)
+        // Gradient of b should be a (2.0)
+        assert_eq!(
+            grad_a.to_vec_f32().expect("operation failed in test")[0],
+            3.0
+        );
+        assert_eq!(
+            grad_b.to_vec_f32().expect("operation failed in test")[0],
+            2.0
+        );
+    }
+
+    #[test]
+    fn test_gradient_accumulation() {
+        let mut graph = ComputationGraph::new();
+
+        let a = Tensor::scalar(2.0).expect("tensor operation failed");
+        let d = a.add(&a).expect("Addition failed");
+
+        let node_a = graph.add_node(a.clone(), true, Some("a".to_string()));
+        let node_d = graph
+            .add_operation_node(
+                d,
+                OperationType::Add,
+                vec![node_a, node_a],
+                true,
+                Some("d".to_string()),
+            )
+            .expect("operation failed in test");
+
+        graph.backward(node_d, None).expect("operation failed in test");
+
+        let grad_a = graph.get_gradient(node_a).expect("operation failed in test");
+
+        assert_eq!(
+            grad_a.to_vec_f32().expect("operation failed in test")[0],
+            2.0
+        );
+    }
+
+    // ── ComputationGraph basic tests ──
+
+    #[test]
+    fn test_new_graph_is_empty() {
+        let graph = ComputationGraph::new();
+        assert_eq!(graph.num_nodes(), 0);
+    }
+
+    #[test]
+    fn test_add_single_node() {
+        let mut graph = ComputationGraph::new();
+        let tensor = Tensor::scalar(1.0).expect("tensor operation failed");
+        let id = graph.add_node(tensor, true, Some("x".to_string()));
+        assert_eq!(id, 0);
+        assert_eq!(graph.num_nodes(), 1);
+    }
+
+    #[test]
+    fn test_add_multiple_nodes() {
+        let mut graph = ComputationGraph::new();
+        for i in 0..5 {
+            let tensor = Tensor::scalar(i as f32).expect("tensor operation failed");
+            let id = graph.add_node(tensor, true, None);
+            assert_eq!(id, i);
+        }
+        assert_eq!(graph.num_nodes(), 5);
+    }
+
+    #[test]
+    fn test_get_node() {
+        let mut graph = ComputationGraph::new();
+        let tensor = Tensor::scalar(42.0).expect("tensor operation failed");
+        let id = graph.add_node(tensor, true, Some("test".to_string()));
+
+        let node = graph.get_node(id).expect("node should exist");
+        assert_eq!(node.id, id);
+        assert_eq!(node.name, Some("test".to_string()));
+        assert!(node.requires_grad);
+        assert!(node.is_leaf);
+    }
+
+    #[test]
+    fn test_get_node_nonexistent() {
+        let graph = ComputationGraph::new();
+        assert!(graph.get_node(999).is_none());
+    }
+
+    #[test]
+    fn test_get_node_mut() {
+        let mut graph = ComputationGraph::new();
+        let tensor = Tensor::scalar(1.0).expect("tensor operation failed");
+        let id = graph.add_node(tensor, true, None);
+
+        let node = graph.get_node_mut(id).expect("node should exist");
+        node.name = Some("modified".to_string());
+
+        assert_eq!(
+            graph.get_node(id).expect("node should exist").name,
+            Some("modified".to_string())
+        );
+    }
+
+    // ── Operation node tests ──
+
+    #[test]
+    fn test_add_operation_node() {
+        let mut graph = ComputationGraph::new();
+        let a = Tensor::scalar(1.0).expect("tensor operation failed");
+        let b = Tensor::scalar(2.0).expect("tensor operation failed");
+        let c = a.add(&b).expect("Addition failed");
+
+        let node_a = graph.add_node(a, true, None);
+        let node_b = graph.add_node(b, true, None);
+        let node_c = graph
+            .add_operation_node(c, OperationType::Add, vec![node_a, node_b], true, None)
+            .expect("operation failed in test");
+
+        let op_node = graph.get_node(node_c).expect("node should exist");
+        assert!(!op_node.is_leaf);
+        assert_eq!(op_node.operation, Some(OperationType::Add));
+        assert_eq!(op_node.parents, vec![node_a, node_b]);
+    }
+
+    #[test]
+    fn test_add_operation_node_nonexistent_parent() {
+        let mut graph = ComputationGraph::new();
+        let tensor = Tensor::scalar(1.0).expect("tensor operation failed");
+        let result = graph.add_operation_node(tensor, OperationType::Add, vec![999], true, None);
+        assert!(result.is_err());
+    }
+
+    // ── Topological ordering tests ──
+
+    #[test]
+    fn test_topological_order_linear_chain() {
+        let mut graph = ComputationGraph::new();
+        let a = Tensor::scalar(1.0).expect("tensor operation failed");
+        let b = a.add(&a).expect("Addition failed");
+        let c = b.add(&b).expect("Addition failed");
+
+        let node_a = graph.add_node(a.clone(), true, Some("a".to_string()));
+        let node_b = graph
+            .add_operation_node(
+                b,
+                OperationType::Add,
+                vec![node_a, node_a],
+                true,
+                Some("b".to_string()),
+            )
+            .expect("operation failed in test");
+        let node_c = graph
+            .add_operation_node(
+                c,
+                OperationType::Add,
+                vec![node_b, node_b],
+                true,
+                Some("c".to_string()),
+            )
+            .expect("operation failed in test");
+
+        graph.compute_topological_order().expect("operation failed in test");
+        let order = graph.get_topological_order();
+
+        let a_pos = order.iter().position(|&id| id == node_a).expect("a not found");
+        let b_pos = order.iter().position(|&id| id == node_b).expect("b not found");
+        let c_pos = order.iter().position(|&id| id == node_c).expect("c not found");
+
+        assert!(a_pos < b_pos);
+        assert!(b_pos < c_pos);
+    }
+
+    #[test]
+    fn test_topological_order_single_node() {
+        let mut graph = ComputationGraph::new();
+        let tensor = Tensor::scalar(1.0).expect("tensor operation failed");
+        graph.add_node(tensor, true, None);
+
+        graph.compute_topological_order().expect("operation failed in test");
+        assert_eq!(graph.get_topological_order().len(), 1);
+    }
+
+    #[test]
+    fn test_topological_order_idempotent() {
+        let mut graph = ComputationGraph::new();
+        let tensor = Tensor::scalar(1.0).expect("tensor operation failed");
+        graph.add_node(tensor, true, None);
+
+        graph.compute_topological_order().expect("operation failed in test");
+        let order1 = graph.get_topological_order().to_vec();
+        graph.compute_topological_order().expect("operation failed in test");
+        let order2 = graph.get_topological_order().to_vec();
+        assert_eq!(order1, order2);
+    }
+
+    // ── Backward pass additional tests ──
+
+    #[test]
+    fn test_backward_subtraction() {
+        let mut graph = ComputationGraph::new();
+        let a = Tensor::scalar(5.0).expect("tensor operation failed");
+        let b = Tensor::scalar(3.0).expect("tensor operation failed");
+        let c = a.sub(&b).expect("Subtraction failed");
+
+        let node_a = graph.add_node(a.clone(), true, Some("a".to_string()));
+        let node_b = graph.add_node(b.clone(), true, Some("b".to_string()));
+        let node_c = graph
+            .add_operation_node(c, OperationType::Subtract, vec![node_a, node_b], true, None)
+            .expect("operation failed in test");
+
+        graph.backward(node_c, None).expect("operation failed in test");
+
+        let grad_a = graph.get_gradient(node_a).expect("gradient should exist");
+        let grad_b = graph.get_gradient(node_b).expect("gradient should exist");
+
+        assert_eq!(
+            grad_a.to_vec_f32().expect("operation failed in test")[0],
+            1.0
+        );
+        assert_eq!(
+            grad_b.to_vec_f32().expect("operation failed in test")[0],
+            -1.0
+        );
+    }
+
+    #[test]
+    fn test_backward_nonexistent_output() {
+        let mut graph = ComputationGraph::new();
+        let tensor = Tensor::scalar(1.0).expect("tensor operation failed");
+        graph.add_node(tensor, true, None);
+
+        let result = graph.backward(999, None);
+        assert!(result.is_err());
+    }
+
+    // ── GraphNode tests ──
+
+    #[test]
+    fn test_graph_node_clone() {
+        let tensor = Tensor::scalar(std::f32::consts::PI).expect("tensor operation failed");
+        let node = GraphNode {
+            id: 0,
+            value: tensor,
+            gradient: None,
+            operation: Some(OperationType::Add),
+            parents: vec![1, 2],
+            children: vec![3],
+            requires_grad: true,
+            is_leaf: false,
+            name: Some("test".to_string()),
+            shape: vec![1],
+        };
+        let cloned = node.clone();
+        assert_eq!(cloned.id, 0);
+        assert_eq!(cloned.parents, vec![1, 2]);
+        assert_eq!(cloned.name, Some("test".to_string()));
+    }
+
+    // ── OperationType tests ──
+
+    #[test]
+    fn test_operation_type_eq() {
+        assert_eq!(OperationType::Add, OperationType::Add);
+        assert_ne!(OperationType::Add, OperationType::Subtract);
+    }
+
+    #[test]
+    fn test_operation_type_variants() {
+        let _add = OperationType::Add;
+        let _sub = OperationType::Subtract;
+        let _mul = OperationType::Multiply;
+        let _div = OperationType::Divide;
+        let _mm = OperationType::MatrixMultiply;
+        let _neg = OperationType::Negate;
+        let _rec = OperationType::Reciprocal;
+        let _sq = OperationType::Square;
+        let _sqrt = OperationType::Sqrt;
+        let _log = OperationType::Log;
+        let _exp = OperationType::Exp;
+        let _sig = OperationType::Sigmoid;
+        let _tnh = OperationType::Tanh;
+        let _relu = OperationType::ReLU;
+        let _lrelu = OperationType::LeakyReLU(0.01);
+        let _smax = OperationType::Softmax;
+        let _lsmax = OperationType::LogSoftmax;
+        let _resh = OperationType::Reshape(vec![2, 3]);
+        let _sum = OperationType::Sum(None);
+        let _mean = OperationType::Mean(Some(vec![0]));
+        let _ln = OperationType::LayerNorm(1e-5);
+        let _drop = OperationType::Dropout(0.1);
+        let _cust = OperationType::Custom("test".to_string());
+    }
+
+    #[test]
+    fn test_operation_type_clone() {
+        let op = OperationType::LeakyReLU(0.01);
+        let cloned = op.clone();
+        assert_eq!(op, cloned);
+    }
+
+    // ── No requires_grad tests ──
+
+    #[test]
+    fn test_no_grad_node_skipped_in_backward() {
+        let mut graph = ComputationGraph::new();
+        let a = Tensor::scalar(2.0).expect("tensor operation failed");
+        let b = Tensor::scalar(3.0).expect("tensor operation failed");
+        let c = a.mul(&b).expect("Multiplication failed");
+
+        let node_a = graph.add_node(a.clone(), true, Some("a".to_string()));
+        let node_b = graph.add_node(b.clone(), false, Some("b".to_string())); // no grad
+        let node_c = graph
+            .add_operation_node(c, OperationType::Multiply, vec![node_a, node_b], true, None)
+            .expect("operation failed in test");
+
+        graph.backward(node_c, None).expect("operation failed in test");
+
+        // a should have gradient (b=3)
+        let grad_a = graph.get_gradient(node_a).expect("gradient should exist");
+        assert_eq!(
+            grad_a.to_vec_f32().expect("operation failed in test")[0],
+            3.0
+        );
+
+        // b should NOT have gradient
+        assert!(graph.get_gradient(node_b).is_none());
+    }
+
+    // ── Graph reset tests ──
+
+    #[test]
+    fn test_reset_gradients() {
+        let mut graph = ComputationGraph::new();
+        let a = Tensor::scalar(2.0).expect("tensor operation failed");
+        let b = Tensor::scalar(3.0).expect("tensor operation failed");
+        let c = a.mul(&b).expect("Multiplication failed");
+
+        let node_a = graph.add_node(a.clone(), true, Some("a".to_string()));
+        let node_b = graph.add_node(b.clone(), true, Some("b".to_string()));
+        let node_c = graph
+            .add_operation_node(c, OperationType::Multiply, vec![node_a, node_b], true, None)
+            .expect("operation failed in test");
+
+        graph.backward(node_c, None).expect("operation failed in test");
+        assert!(graph.get_gradient(node_a).is_some());
+
+        graph.zero_gradients();
+        assert!(graph.get_gradient(node_a).is_none());
+    }
+
+    // ── Division backward test ──
+
+    #[test]
+    fn test_backward_division() {
+        let mut graph = ComputationGraph::new();
+        let a = Tensor::scalar(6.0).expect("tensor operation failed");
+        let b = Tensor::scalar(3.0).expect("tensor operation failed");
+        let c = a.div(&b).expect("Division failed");
+
+        let node_a = graph.add_node(a.clone(), true, Some("a".to_string()));
+        let node_b = graph.add_node(b.clone(), true, Some("b".to_string()));
+        let node_c = graph
+            .add_operation_node(c, OperationType::Divide, vec![node_a, node_b], true, None)
+            .expect("operation failed in test");
+
+        graph.backward(node_c, None).expect("operation failed in test");
+
+        // dc/da = 1/b = 1/3
+        let grad_a = graph.get_gradient(node_a).expect("gradient should exist");
+        let ga = grad_a.to_vec_f32().expect("operation failed in test")[0];
+        assert!((ga - 1.0 / 3.0).abs() < 1e-5);
+
+        // dc/db = -a/(b*b) = -6/9 = -2/3
+        let grad_b = graph.get_gradient(node_b).expect("gradient should exist");
+        let gb = grad_b.to_vec_f32().expect("operation failed in test")[0];
+        assert!((gb - (-2.0 / 3.0)).abs() < 1e-5);
+    }
+}

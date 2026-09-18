@@ -1,0 +1,110 @@
+# OxiGeo Jupyter Docker Image
+# Jupyter notebook environment with oxigeo-python bindings
+# Author: COOLJAPAN OU (Team Kitasan)
+
+# Build stage for Python bindings
+FROM rust:1.89-slim-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    python3-dev \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Install maturin for building Python wheels
+RUN pip3 install --no-cache-dir maturin
+
+# Build Python wheel
+RUN cd crates/oxigeo-python && \
+    maturin build --release --strip && \
+    ls -la target/wheels/
+
+# Jupyter runtime stage
+FROM python:3.12-slim-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/bash jupyter
+
+# Install Jupyter and scientific Python packages
+RUN pip install --no-cache-dir \
+    jupyter \
+    jupyterlab \
+    numpy \
+    pandas \
+    matplotlib \
+    seaborn \
+    geopandas \
+    rasterio \
+    shapely \
+    folium \
+    ipywidgets \
+    ipyleaflet \
+    plotly \
+    scikit-learn \
+    scipy
+
+# Copy and install oxigeo-python wheel
+COPY --from=builder /build/crates/oxigeo-python/target/wheels/*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
+
+# Create directories
+RUN mkdir -p /notebooks /data && \
+    chown -R jupyter:jupyter /notebooks /data
+
+# `docker COPY` is not shell-interpreted, so it cannot express a "copy if exists" fallback;
+# there is no committed examples/notebooks/ directory of Python-compatible notebooks to copy
+# unconditionally (crates/oxigeo-jupyter/examples/notebooks/ holds Rust evcxr snippets, not
+# .ipynb notebooks for this Python/oxigeo-python image). /notebooks is left empty for
+# operators to bind-mount their own notebooks over, e.g.
+# `-v ./my-notebooks:/notebooks`.
+
+# Switch to non-root user
+USER jupyter
+WORKDIR /notebooks
+
+# Expose Jupyter port
+EXPOSE 8888
+
+# Set environment variables
+ENV RUST_LOG=info \
+    JUPYTER_ENABLE_LAB=yes \
+    JUPYTER_TOKEN=oxigeo
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8888/api || exit 1
+
+# Start Jupyter Lab
+CMD ["jupyter", "lab", \
+     "--ip=0.0.0.0", \
+     "--port=8888", \
+     "--no-browser", \
+     "--allow-root", \
+     "--NotebookApp.token=oxigeo"]
+
+# Build-time version, defaulting to the last released version; see docker/build.sh.
+ARG OXIGEO_VERSION=0.2.0
+
+LABEL org.opencontainers.image.title="OxiGeo Jupyter" \
+      org.opencontainers.image.description="Jupyter notebook environment with OxiGeo Python bindings" \
+      org.opencontainers.image.vendor="COOLJAPAN OU (Team Kitasan)" \
+      org.opencontainers.image.source="https://github.com/cool-japan/oxigeo" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${OXIGEO_VERSION}"

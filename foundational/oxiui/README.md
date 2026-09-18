@@ -1,0 +1,145 @@
+# OxiUI
+
+**v0.2.2 released 2026-08-06** | v0.2.1 released 2026-07-30 | v0.2.0 released 2026-06-23
+
+OxiUI is the COOLJAPAN-blessed Pure Rust UI layer: no GTK (C), no Qt (C++), no
+SDL (C), no system widgets, no raw AppKit / Win32 / Cocoa bindings. It is a
+thin, opinionated facade over **egui** (immediate-mode) and **iced**
+(Elm-architecture), rendered through **wgpu** (or **softbuffer** for headless),
+windowed through **winit**, with all text shaped through **OxiText** +
+**OxiFont**. OxiUI exists so that any GUI app in the COOLJAPAN ecosystem can
+build with a single `cargo build` in a fresh `rust:slim` container, with no
+`libgtk-dev`, `libqt-dev`, or `libsdl2-dev` choreography.
+
+## Status: v0.2.2 released 2026-08-06 — Pure Rust Policy v2
+
+All planned milestones through M6 are done:
+
+| Milestone | Description | Status |
+|-----------|-------------|--------|
+| M0 | Workspace skeleton, `oxiui-core` traits, `deny.toml`, ffi-audit | ✓ |
+| M1 | egui + wgpu + COOLJAPAN theme + OxiText/OxiFont integration | ✓ |
+| M2 | iced adapter + theme bridge | ✓ |
+| M3 | `oxiui-table` virtualized rows + iced facade `run()` fully wired | ✓ |
+| M4 | accesskit a11y + wasm32 entry point + IME CJK events | ✓ |
+| M5 | softbuffer headless stable + high-contrast WCAG-AAA + slint/dioxus adapters | ✓ |
+| M6 | `oxiui-compute-wgpu` + `oxiui-render-wgpu` published to crates.io | ✓ |
+
+## What's new in 0.2.1
+
+- **Lifecycle hooks are live** — `on_close` / `on_resize` / `on_focus` now
+  actually fire on both the egui and iced backends (previously wired but
+  dormant).
+- **`EguiRunner` / `IcedRunner` are real `BackendRunner`s** — they own the
+  live `eframe::run_native` / `iced::application` event loop instead of
+  returning immediately.
+- **`with_persistent_state` now genuinely persists** — state is written to
+  disk from the `on_close` hook instead of being silently discarded.
+- **Two `oxiui-render-soft` security hardening fixes** — an integer-overflow
+  bounds-check bypass in `composite_into`, and an unbounded-iteration DoS in
+  the scanline/blend rasterizer paths, both closed with checked arithmetic
+  and framebuffer-clamped iteration.
+
+No breaking changes in 0.2.1. See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+## Breaking changes in 0.2.0
+
+- **`tray` feature removed from `oxiui` facade** — system-tray support is now in the
+  `oxiui-tray` quarantine crate (pulls GTK on Linux). Depend on `oxiui-tray` directly
+  with the `tray` feature if you need a system tray.
+- **`slint` feature removed from `oxiui` facade** — `oxiui-slint` is a known-non-pure
+  adapter; use it directly instead.
+- **`hot-reload` feature removed from `oxiui-compute-wgpu`** — WGSL hot-reload is now
+  in the `oxiui-hot-reload-notify` quarantine crate (pulls inotify/fsevent-sys).
+
+## Quick start
+
+```toml
+[dependencies]
+# Default: egui + wgpu (GPU path)
+oxiui = "0.2.3"
+
+# Headless / CI / ffi-audit path (no GPU stack):
+oxiui = { version = "0.2.3", default-features = false, features = ["software"] }
+
+# iced backend:
+oxiui = { version = "0.2.3", features = ["iced"] }
+```
+
+```rust
+use oxiui::{App, theme};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    App::new("My App")
+        .theme(theme::cooljapan_default())
+        .content(|ui| {
+            ui.heading("Hello from OxiUI");
+        })
+        .run()?;
+    Ok(())
+}
+```
+
+## Crates in this workspace
+
+| Crate | Default feature | Description |
+|-------|-----------------|-------------|
+| `oxiui-core` | (no deps) | Traits, types, reactive state, constraint solver, paint/draw-list, geometry |
+| `oxiui-text` | `text` | OxiText + OxiFont bridge — shaping, raster, IME, truncation, word-wrap |
+| `oxiui-theme` | optional | Dark/light/high-contrast palettes, `DesignTokens`, `TypographyScale`, `theme_picker` |
+| `oxiui-render-wgpu` | `gpu` | wgpu GPU render surface — atlas, batcher, clip-stack, quality presets |
+| `oxiui-render-soft` | `software` | CPU scanline rasteriser — AA, Bézier, blend modes, PNG export, headless |
+| `oxiui-egui` | `egui` | egui + eframe adapter — palette→Visuals, `StatefulEguiAdapter`, font injection |
+| `oxiui-iced` | `iced` | iced 0.14 adapter — `IcedUiCtx`, palette→`iced::Theme`, button/label/input |
+| `oxiui-table` | `table` | Virtualized table — `RowSource` trait, egui + iced backends, sorting/filtering |
+| `oxiui-accessibility` | `a11y` | accesskit a11y tree — `A11yNode`, `A11yTree`, headless unit-testable |
+| `oxiui-web` | `web` | wasm32 entry point — `mount()` on `<canvas>`, key mapping, non-wasm stubs |
+| `oxiui-slint` | `slint` | slint 1.17.0 optional adapter — `SlintCtx`, headless collection mode |
+| `oxiui-dioxus` | `dioxus` | dioxus 0.7 optional adapter — `DioxusCtx` reactive bridge |
+| `oxiui-tray` | (quarantine) | §5 system-tray adapter — `tray` feature pulls GTK on Linux; opt-in only |
+| `oxiui-hot-reload-notify` | (quarantine) | §5 WGSL hot-reload via `notify` — pulls inotify/fsevent-sys; opt-in only |
+| `oxiui` | facade | `App` builder, `Backend::{Egui,Iced,Slint,Dioxus}`, reactive re-exports |
+
+## Tests
+
+2024 tests across 16 crates — all pass
+(`cargo nextest run --all-features --workspace`). 5 tests skipped (GPU/display-required).
+
+## Replaces (FFI being eliminated)
+
+- `gtk-rs` / `gtk4` — links GTK C
+- `qt-*` / `qmetaobject` — links Qt C++
+- `sdl2` / `sdl2-sys` — links SDL C
+- raw `cocoa-rs` / `objc-foundation` (for windowing — use `winit`)
+- raw `windows-rs` (for windowing — use `winit`)
+
+## Anchor crates (Pure Rust, OS-drivers at runtime)
+
+- `egui` + `eframe` — immediate-mode widgets; the **default Pure adapter**.
+- `iced` — Elm-architecture retained-mode; **opt-in alternative** adapter.
+- `wgpu` — cross-platform GPU API (Vulkan / Metal / DX12 / WebGPU); OS-driver
+  line — NOT linked at build time, per GOVERNANCE §8.
+- `winit` — windowing + event loop + IME + clipboard.
+- `softbuffer` — CPU framebuffer fallback / headless path.
+- `slint`, `dioxus` — experimental optional adapters (M5).
+
+## Inter-Oxi
+
+- **Depends on:** `oxitext` (text shaping), `oxifont` (font loading + raster).
+- **Depended on by (all OPTIONAL):** oxieda (data UI), oximedia previewer,
+  oxiphoton viewer, oxirag chat UI, oxify settings panel.
+
+## Note on GPU drivers
+
+Vulkan / Metal / DX12 drivers (under `wgpu`) and OS windowing (Wayland / X11 /
+Cocoa / Win32 under `winit`) are the unavoidable OS boundary — Pure Rust at the
+Rust crate layer, OS-side at the syscall. Per GOVERNANCE §8 non-goals, this is
+acceptable.
+
+## Blueprint
+
+`../phase3/oxiui_blueprint.md`
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

@@ -1,0 +1,17 @@
+{
+  "confidence": 0.9,
+  "container": "Mp4",
+  "file": "<stripped>",
+  "file_name": "fixture.mp4",
+  "file_size_bytes": 0,
+  "streams": [
+    {
+      "bitrate": null,
+      "codec": "unknown",
+      "codec_type": "video",
+      "index": 0,
+      "language": null,
+      "resolution": "unknown"
+    }
+  ]
+}

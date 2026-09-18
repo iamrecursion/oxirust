@@ -1,0 +1,768 @@
+{
+  "data/amaters": {
+    "url": "git@github.com:cool-japan/amaters.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "701968d2709b42a199bba23c6277e5de9cd61641",
+    "commitDate": "2026-09-12T21:05:20+07:00",
+    "fetched": "2026-09-18T15:58:51+00:00",
+    "resolvedRef": "0.2.3"
+  },
+  "data/fop": {
+    "url": "git@github.com:cool-japan/fop.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "c320e249f5873f65f499b24e07d49147c9a9aa2b",
+    "commitDate": "2026-09-12T21:05:42+07:00",
+    "fetched": "2026-09-18T15:58:50+00:00",
+    "resolvedRef": "0.1.3"
+  },
+  "data/numrs": {
+    "url": "git@github.com:cool-japan/numrs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "707c486c33576190bcef80bb27ab1fc264c1587b",
+    "commitDate": "2026-09-12T21:07:03+07:00",
+    "fetched": "2026-09-18T15:58:51+00:00",
+    "resolvedRef": "0.4.2"
+  },
+  "data/oxiaudio": {
+    "url": "git@github.com:cool-japan/oxiaudio.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "bcce0adbc57cec2005397c24be9b00e7077d5047",
+    "commitDate": "2026-08-06T19:09:37+07:00",
+    "fetched": "2026-09-18T15:58:51+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "data/oxicode": {
+    "url": "git@github.com:cool-japan/oxicode.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "016b414901182bae98ef584c46592b8145c39656",
+    "commitDate": "2026-10-06T05:38:53+07:00",
+    "fetched": "2026-10-15T11:07:07+00:00",
+    "resolvedRef": "0.2.7"
+  },
+  "data/oxigeo": {
+    "url": "git@github.com:cool-japan/oxigeo.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "docs/media",
+        "demo/geovault/data/*.tif"
+      ]
+    },
+    "commit": "c76ec2ac5dfb8d024c95ea95b3e8200d9d0b42a2",
+    "commitDate": "2026-09-16T08:24:01+07:00",
+    "fetched": "2026-10-27T21:07:05+00:00",
+    "resolvedRef": "0.2.5"
+  },
+  "data/oxih5": {
+    "url": "git@github.com:cool-japan/oxih5.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "241663b1023aae78ba46b0cb39cf13723943837d",
+    "commitDate": "2026-09-12T21:06:24+07:00",
+    "fetched": "2026-09-18T15:58:55+00:00",
+    "resolvedRef": "0.2.4"
+  },
+  "data/oximedia": {
+    "url": "git@github.com:cool-japan/oximedia.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "f976c2192e97837dbc0ca691ccb7542b9a85252a",
+    "commitDate": "2026-09-16T08:23:50+07:00",
+    "fetched": "2026-09-18T15:59:03+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "data/oxisql": {
+    "url": "git@github.com:cool-japan/oxisql.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "79027d1a8cfaa16f9c82c47b6a9a1efc4f88248f",
+    "commitDate": "2026-09-12T21:06:33+07:00",
+    "fetched": "2026-09-18T15:58:58+00:00",
+    "resolvedRef": "0.4.2"
+  },
+  "data/oxistore": {
+    "url": "git@github.com:cool-japan/oxistore.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "64a17ba824704d75d58cecd9dcdc94f2d9963be9",
+    "commitDate": "2026-09-12T21:06:35+07:00",
+    "fetched": "2026-09-18T15:58:59+00:00",
+    "resolvedRef": "0.3.1"
+  },
+  "data/oxixml": {
+    "url": "git@github.com:cool-japan/oxixml.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "1f26a63ac5f65a1781b3394c37e24ec3fab5350a",
+    "commitDate": "2026-09-15T04:11:40+07:00",
+    "fetched": "2026-10-15T11:27:49+00:00",
+    "resolvedRef": "0.1.3"
+  },
+  "data/pandrs": {
+    "url": "git@github.com:cool-japan/pandrs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "ece4e4f6821752e2750f4465c77736219f40391c",
+    "commitDate": "2026-09-12T21:10:22+07:00",
+    "fetched": "2026-09-18T15:59:02+00:00",
+    "resolvedRef": "0.4.2"
+  },
+  "data/rs3gw": {
+    "url": "git@github.com:cool-japan/rs3gw.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "rust_out"
+      ]
+    },
+    "commit": "d34198a09764037bcf4d215975ebef741676c03f",
+    "commitDate": "2026-09-16T08:21:48+07:00",
+    "fetched": "2026-10-27T21:07:02+00:00",
+    "resolvedRef": "0.2.3"
+  },
+  "foundational/celers": {
+    "url": "git@github.com:cool-japan/celers.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "bf6b7617da9cc282597b4f53fec57ad85ee8252b",
+    "commitDate": "2026-09-12T21:05:31+07:00",
+    "fetched": "2026-09-18T15:59:04+00:00",
+    "resolvedRef": "0.3.1"
+  },
+  "foundational/kizzasi": {
+    "url": "git@github.com:cool-japan/kizzasi.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "5b973aa10784783c8780e3a70d824cf3d46b10f1",
+    "commitDate": "2026-08-31T12:52:34+07:00",
+    "fetched": "2026-09-18T15:59:06+00:00",
+    "resolvedRef": "0.2.4"
+  },
+  "foundational/mielin": {
+    "url": "git@github.com:cool-japan/mielin.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "ca53b651c48f930f288d5f81cb8ec79ee9bd13f7",
+    "commitDate": "2026-09-16T07:19:38+07:00",
+    "fetched": "2026-09-18T15:59:07+00:00",
+    "resolvedRef": "0.1.0"
+  },
+  "foundational/oxiarc": {
+    "url": "git@github.com:cool-japan/oxiarc.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "255eb0efd2f5bb3170c2e2feb9f3cdfe32872f0c",
+    "commitDate": "2026-10-06T05:38:46+07:00",
+    "fetched": "2026-10-15T11:07:12+00:00",
+    "resolvedRef": "0.4.3"
+  },
+  "foundational/oxiblas": {
+    "url": "git@github.com:cool-japan/oxiblas.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "476ecdf278d5b4beb9e33883a9de3cd78fd3d0c0",
+    "commitDate": "2026-09-15T03:01:57+07:00",
+    "fetched": "2026-09-18T15:59:08+00:00",
+    "resolvedRef": "0.2.3"
+  },
+  "foundational/oxicrypto": {
+    "url": "git@github.com:cool-japan/oxicrypto.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "0283253bfb528ed2e0ed8dc81ffb5d3ac43a6979",
+    "commitDate": "2026-10-05T18:31:54+07:00",
+    "fetched": "2026-10-15T11:07:11+00:00",
+    "resolvedRef": "0.3.1"
+  },
+  "foundational/oxifft": {
+    "url": "git@github.com:cool-japan/oxifft.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "oxifft/pkg_simd/*.wasm"
+      ]
+    },
+    "commit": "c793a9b90fbabb47055967fb15515195a2f002b5",
+    "commitDate": "2026-08-13T22:18:06+07:00",
+    "fetched": "2026-10-27T21:07:06+00:00",
+    "resolvedRef": "0.4.3"
+  },
+  "foundational/oxifont": {
+    "url": "git@github.com:cool-japan/oxifont.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "84a44e7916bee75d128d26d6adf934ea28343286",
+    "commitDate": "2026-09-12T21:06:21+07:00",
+    "fetched": "2026-09-18T15:59:12+00:00",
+    "resolvedRef": "0.2.3"
+  },
+  "foundational/oxinum": {
+    "url": "git@github.com:cool-japan/oxinum.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "289c86a9a6c166ac546dabace808e2a3d364c93c",
+    "commitDate": "2026-08-06T16:53:57+07:00",
+    "fetched": "2026-09-18T15:59:11+00:00",
+    "resolvedRef": "0.1.5"
+  },
+  "foundational/oxirs": {
+    "url": "git@github.com:cool-japan/oxirs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "engine/oxirs-arq/debug_tokens"
+      ]
+    },
+    "commit": "b64a73e2926ca440befa1807c498244e8b44f278",
+    "commitDate": "2026-09-12T21:10:18+07:00",
+    "fetched": "2026-10-27T21:07:15+00:00",
+    "resolvedRef": "0.4.2"
+  },
+  "foundational/oxisound": {
+    "url": "git@github.com:cool-japan/oxisound.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "805a20b371faf7839db154999e04fbc3ff6a8acd",
+    "commitDate": "2026-08-06T22:16:45+07:00",
+    "fetched": "2026-09-18T15:59:14+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "foundational/oxitext": {
+    "url": "git@github.com:cool-japan/oxitext.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "6b67c4a8c76fc28720ca135ea107fa3c4c89dde4",
+    "commitDate": "2026-09-12T21:06:38+07:00",
+    "fetched": "2026-09-18T15:59:15+00:00",
+    "resolvedRef": "0.2.4"
+  },
+  "foundational/oxiui": {
+    "url": "git@github.com:cool-japan/oxiui.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "0351cb181731791737eb8b507eac9caffc135b10",
+    "commitDate": "2026-08-12T08:07:12+07:00",
+    "fetched": "2026-09-18T15:59:15+00:00",
+    "resolvedRef": "0.2.3"
+  },
+  "fv/oxieml": {
+    "url": "git@github.com:cool-japan/oxieml.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "bf9194d9b18fdcf5afe81c4698d3595e72dd1ce9",
+    "commitDate": "2026-10-09T03:33:54+07:00",
+    "fetched": "2026-10-15T11:07:15+00:00",
+    "resolvedRef": "0.1.4"
+  },
+  "fv/oxilean": {
+    "url": "git@github.com:cool-japan/oxilean.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "web/verify-demo/pkg/*.wasm",
+        "verify/differential/slices/*.ndjson"
+      ]
+    },
+    "commit": "86227a87264110ec1a22123e50a487fa4c94359e",
+    "commitDate": "2026-10-09T03:34:06+07:00",
+    "fetched": "2026-10-27T21:07:14+00:00",
+    "resolvedRef": "0.1.4"
+  },
+  "fv/oxiz": {
+    "url": "git@github.com:cool-japan/oxiz.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "24d7cdfad9cc35144364041212962e85ee3b2629",
+    "commitDate": "2026-10-09T03:45:31+07:00",
+    "fetched": "2026-10-15T11:07:18+00:00",
+    "resolvedRef": "0.3.5"
+  },
+  "fv/phop": {
+    "url": "git@github.com:cool-japan/phop.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "a3154ba3e5ede4c5a042e173455a1dd0d2f1729d",
+    "commitDate": "2026-08-31T12:52:39+07:00",
+    "fetched": "2026-09-18T15:59:21+00:00",
+    "resolvedRef": "0.1.1"
+  },
+  "ml/mecrab": {
+    "url": "git@github.com:cool-japan/mecrab.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "docs/*.png"
+      ]
+    },
+    "commit": "a9a805231df9f6a4048318ad4e248aedaf8aa8cc",
+    "commitDate": "2026-10-05T18:28:09+07:00",
+    "fetched": "2026-10-27T21:07:12+00:00",
+    "resolvedRef": "0.2.0"
+  },
+  "ml/optirs": {
+    "url": "git@github.com:cool-japan/optirs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "411bc1149f3546915324ed80daa2b439ea84cef3",
+    "commitDate": "2026-09-16T08:21:04+07:00",
+    "fetched": "2026-09-18T15:59:24+00:00",
+    "resolvedRef": "0.3.3"
+  },
+  "ml/oxibonsai": {
+    "url": "git@github.com:cool-japan/oxibonsai.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "2b003d1158803203f50f018fde87e6ec9ab4eaa1",
+    "commitDate": "2026-10-08T15:46:54+07:00",
+    "fetched": "2026-10-15T11:07:20+00:00",
+    "resolvedRef": "0.2.4"
+  },
+  "ml/oxicuda": {
+    "url": "git@github.com:cool-japan/oxicuda.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "562f969d5964ab6fc116f9febf04b217568aa9b3",
+    "commitDate": "2026-09-16T07:25:13+07:00",
+    "fetched": "2026-09-18T15:59:28+00:00",
+    "resolvedRef": "0.5.6"
+  },
+  "ml/oxify": {
+    "url": "git@github.com:cool-japan/oxify.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "libsvg.rlib"
+      ]
+    },
+    "commit": "7e4ca43597ffb2ebea0760606d7287a7419aaa26",
+    "commitDate": "2026-09-16T08:21:14+07:00",
+    "fetched": "2026-10-27T21:07:16+00:00",
+    "resolvedRef": "0.2.0"
+  },
+  "ml/oxigaf": {
+    "url": "git@github.com:cool-japan/oxigaf.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "2ba961e9d3b39dc5293140e9f32c06b31b2a5b80",
+    "commitDate": "2026-09-12T21:08:40+07:00",
+    "fetched": "2026-09-18T15:59:29+00:00",
+    "resolvedRef": "0.1.3"
+  },
+  "ml/oxillama": {
+    "url": "git@github.com:cool-japan/oxillama.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "6e7ec757198c6c109eb94ac4f5d43f665b4f6a3a",
+    "commitDate": "2026-08-17T20:53:54+07:00",
+    "fetched": "2026-09-18T15:59:29+00:00",
+    "resolvedRef": "0.1.5"
+  },
+  "ml/oxionnx": {
+    "url": "git@github.com:cool-japan/oxionnx.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "docs/images/*.jpg"
+      ]
+    },
+    "commit": "c9e5c9b47f38664151168f3f05acba51c4991e74",
+    "commitDate": "2026-09-15T03:04:26+07:00",
+    "fetched": "2026-10-27T21:07:18+00:00",
+    "resolvedRef": "0.1.8"
+  },
+  "ml/oxirag": {
+    "url": "git@github.com:cool-japan/oxirag.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "819b725b56e3dac4b142c797bee793e260a7543a",
+    "commitDate": "2026-10-09T03:34:50+07:00",
+    "fetched": "2026-10-15T11:07:24+00:00",
+    "resolvedRef": "0.2.0"
+  },
+  "ml/oxiwhisper": {
+    "url": "git@github.com:cool-japan/oxiwhisper.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "6ec22cafc52042f2e9b48e40ac633fc6380f08b3",
+    "commitDate": "2026-08-14T01:10:31+07:00",
+    "fetched": "2026-09-18T15:59:32+00:00",
+    "resolvedRef": "0.2.0"
+  },
+  "ml/sklears": {
+    "url": "git@github.com:cool-japan/sklears.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "crates/sklears-simd/src/vector/intrinsics",
+        "crates/sklears-model-selection/test_modules",
+        "*.rlib"
+      ]
+    },
+    "commit": "562332d1bb95e4e7e9cca290f007a3766e59d50a",
+    "commitDate": "2026-09-15T03:03:35+07:00",
+    "fetched": "2026-10-27T21:07:24+00:00",
+    "resolvedRef": "0.2.1"
+  },
+  "ml/tenflowers": {
+    "url": "git@github.com:cool-japan/tenflowers.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "98a407e3f1a84eec2683d40955692a88ea19204a",
+    "commitDate": "2026-09-12T21:11:48+07:00",
+    "fetched": "2026-09-18T15:59:34+00:00",
+    "resolvedRef": "0.2.1"
+  },
+  "ml/tenrso": {
+    "url": "git@github.com:cool-japan/tenrso.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "7f364791657702e2106c72506df51d6c248f09f4",
+    "commitDate": "2026-10-06T19:25:36+07:00",
+    "fetched": "2026-10-15T11:07:25+00:00",
+    "resolvedRef": "0.1.0"
+  },
+  "ml/tensorlogic": {
+    "url": "git@github.com:cool-japan/tensorlogic.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "c4710023014ad1daa0ece0cbe058dcfaa24583c4",
+    "commitDate": "2026-09-16T08:22:55+07:00",
+    "fetched": "2026-09-18T15:59:37+00:00",
+    "resolvedRef": "0.1.3"
+  },
+  "ml/torsh": {
+    "url": "git@github.com:cool-japan/torsh.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "95b17a85d76e6ac8eecf6d03dff578455a7c60e0",
+    "commitDate": "2026-09-12T21:12:10+07:00",
+    "fetched": "2026-09-18T15:59:41+00:00",
+    "resolvedRef": "0.2.1"
+  },
+  "ml/trustformers": {
+    "url": "git@github.com:cool-japan/trustformers.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "719ce2a8217c592a99dc09fcc3a40f65dfe7b030",
+    "commitDate": "2026-09-15T03:03:52+07:00",
+    "fetched": "2026-09-18T15:59:45+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "ml/voirs": {
+    "url": "git@github.com:cool-japan/voirs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "dba29ff7314ef18c19ce5b406521af93b9366274",
+    "commitDate": "2026-09-16T08:23:25+07:00",
+    "fetched": "2026-09-18T15:59:46+00:00",
+    "resolvedRef": "0.1.0"
+  },
+  "networking/chie": {
+    "url": "git@github.com:cool-japan/chie.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "3c8e79dac8406296c124cf1e13b451e10c3cdd54",
+    "commitDate": "2026-09-16T07:19:08+07:00",
+    "fetched": "2026-09-18T15:59:42+00:00",
+    "resolvedRef": "0.3.0"
+  },
+  "networking/ipfrs": {
+    "url": "git@github.com:cool-japan/ipfrs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "03e8b26056c2e6f95d8d1bc86f8246127d50d95a",
+    "commitDate": "2026-09-12T21:05:55+07:00",
+    "fetched": "2026-09-18T15:59:46+00:00",
+    "resolvedRef": "0.2.1"
+  },
+  "networking/oxihttp": {
+    "url": "git@github.com:cool-japan/oxihttp.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "1f24a5380f26e9a5a9f0e55c1d88f959d1d0c501",
+    "commitDate": "2026-09-12T21:06:26+07:00",
+    "fetched": "2026-09-18T15:59:45+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "networking/oxiproto": {
+    "url": "git@github.com:cool-japan/oxiproto.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "21549a8f1148dffe223170a380c7cb4533019dc2",
+    "commitDate": "2026-08-06T17:11:42+07:00",
+    "fetched": "2026-09-18T15:59:48+00:00",
+    "resolvedRef": "0.1.6"
+  },
+  "networking/oxiquic": {
+    "url": "git@github.com:cool-japan/oxiquic.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "0a1e4db48eee9235f0b24df1e47a633d880c8c02",
+    "commitDate": "2026-08-07T00:26:14+07:00",
+    "fetched": "2026-09-18T15:59:49+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "networking/oxirouter": {
+    "url": "git@github.com:cool-japan/oxirouter.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "4205106f36f9fd712be0a00927fade6466a3af6f",
+    "commitDate": "2026-09-15T04:11:04+07:00",
+    "fetched": "2026-09-18T15:59:49+00:00",
+    "resolvedRef": "0.1.1"
+  },
+  "networking/oxirpc": {
+    "url": "git@github.com:cool-japan/oxirpc.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "f03532c8c22f2b2c552cd903552b8053c0da2ee2",
+    "commitDate": "2026-09-12T21:06:29+07:00",
+    "fetched": "2026-09-18T15:59:50+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "networking/oxitls": {
+    "url": "git@github.com:cool-japan/oxitls.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "ac5a99ec4e947e74fdb7d0d75d6edd5d7f70f6b3",
+    "commitDate": "2026-09-12T21:15:48+07:00",
+    "fetched": "2026-09-18T15:59:52+00:00",
+    "resolvedRef": "0.3.1"
+  },
+  "runtime/oxictl": {
+    "url": "git@github.com:cool-japan/oxictl.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "5a89f43cd8e6a9c824b89959ad80a0a2fb777219",
+    "commitDate": "2026-09-16T07:22:51+07:00",
+    "fetched": "2026-09-18T15:59:53+00:00",
+    "resolvedRef": "0.1.2"
+  },
+  "science/oxiephemeris": {
+    "url": "git@github.com:cool-japan/oxiephemeris.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "12229c66a4a97a60e58d23c7b34e4cb5c3453632",
+    "commitDate": "2026-08-10T12:12:01+07:00",
+    "fetched": "2026-09-18T15:59:53+00:00",
+    "resolvedRef": "0.1.2"
+  },
+  "science/quantrs": {
+    "url": "git@github.com:cool-japan/quantrs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "examples/src/bin/ultrathink_simple_demo",
+        "py/.coverage"
+      ]
+    },
+    "commit": "28ed356c5597fb82684e38f3f68d996f1e028c0f",
+    "commitDate": "2026-09-16T07:20:49+07:00",
+    "fetched": "2026-10-27T21:07:31+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "science/scirs": {
+    "url": "git@github.com:cool-japan/scirs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "scirs2-neural/src/layers/test_neural_network_demo",
+        "scirs2-neural/src/layers/test_dense_layer",
+        "*.coverage",
+        "scirs2-io/compressed_data.h5",
+        "mnist_model.json"
+      ]
+    },
+    "commit": "bb3f2bc0fa36618163c650dfc5eeba55c85d70bb",
+    "commitDate": "2026-10-09T03:35:32+07:00",
+    "fetched": "2026-10-27T21:07:39+00:00",
+    "resolvedRef": "0.6.6"
+  },
+  "simulation/oxigrid": {
+    "url": "git@github.com:cool-japan/oxigrid.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "766d9f45020433b6a956e2f4a661fdebc14796c4",
+    "commitDate": "2026-07-03T21:16:01+07:00",
+    "fetched": "2026-09-18T15:59:57+00:00",
+    "resolvedRef": "0.1.3"
+  },
+  "simulation/oxihuman": {
+    "url": "git@github.com:cool-japan/oxihuman.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "docs/media",
+        "assets/packs/*.ohpk"
+      ]
+    },
+    "commit": "a6a6f1f055fe6462146cc287a74bc41ab2bd0f7b",
+    "commitDate": "2026-09-12T21:09:01+07:00",
+    "fetched": "2026-10-27T21:07:32+00:00",
+    "resolvedRef": "0.2.2"
+  },
+  "simulation/oxiphoton": {
+    "url": "git@github.com:cool-japan/oxiphoton.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "6b340e5e300ea6cafa3d9622e28d192a234290f8",
+    "commitDate": "2026-09-16T07:22:57+07:00",
+    "fetched": "2026-09-18T16:00:15+00:00",
+    "resolvedRef": "0.1.3"
+  },
+  "simulation/oxiphysics": {
+    "url": "git@github.com:cool-japan/oxiphysics.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "scratchpad/*.log",
+        "scratchpad/*.rmeta"
+      ]
+    },
+    "commit": "b43b70eb200ec3ebd41ef1660ad22ee5b88e32a0",
+    "commitDate": "2026-10-27T03:32:01+07:00",
+    "fetched": "2026-10-27T21:07:39+00:00",
+    "resolvedRef": "0.1.3"
+  },
+  "simulation/spintronics": {
+    "url": "git@github.com:cool-japan/spintronics.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "commit": "5d47106eef3525057f0881b6c03b95dd2da06454",
+    "commitDate": "2026-09-16T07:25:24+07:00",
+    "fetched": "2026-09-18T16:01:23+00:00",
+    "resolvedRef": "0.3.3"
+  },
+  "tools/legalis": {
+    "url": "git@github.com:cool-japan/legalis.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "crates/legalis-core/target"
+      ]
+    },
+    "commit": "28d3cd0908b13c591694445825e55d6267ab5571",
+    "commitDate": "2026-10-09T03:32:42+07:00",
+    "fetched": "2026-10-27T21:07:39+00:00",
+    "resolvedRef": "0.1.7"
+  },
+  "tools/oxigis": {
+    "url": "git@github.com:cool-japan/oxigis.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": {
+      "exclude": [
+        "docs/*.gif"
+      ]
+    },
+    "commit": "779eb18ce108fbded96d0cbf7bba1087926383a7",
+    "commitDate": "2026-09-12T21:08:54+07:00",
+    "fetched": "2026-10-27T21:07:37+00:00",
+    "resolvedRef": "0.1.1"
+  },
+  "tools/splitrs": {
+    "url": "git@github.com:cool-japan/splitrs.git",
+    "ref": null,
+    "submodules": true,
+    "lfs": true,
+    "paths": null,
+    "commit": "5dbf44982d9ad0656619674b87754a9f3555c510",
+    "commitDate": "2026-10-09T03:35:36+07:00",
+    "fetched": "2026-10-15T11:07:35+00:00",
+    "resolvedRef": "0.4.0"
+  }
+}

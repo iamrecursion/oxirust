@@ -1,0 +1,40 @@
+services:
+  trustformers-server:
+    build:
+      context: ../..
+      dockerfile: examples/server/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      - MAX_MODELS=10
+      - MODEL_CACHE_DIR=/var/cache/trustformers
+      # Loads one checkpoint at startup instead of requiring a POST /models
+      # call first. All three of these are read for real (see src/main.rs);
+      # uncomment and point PRELOAD_MODEL_NAME at a real local checkpoint
+      # directory under the mounted volume below (config.json +
+      # model.safetensors + tokenizer files).
+      # - PRELOAD_MODEL_NAME=my-model
+      # - PRELOAD_MODEL_TASK=text-classification
+      # - PRELOAD_NUM_LABELS=2
+    volumes:
+      # Mount a host directory of real checkpoints here and refer to each by
+      # its subdirectory name in `POST /models`'s `model_name` field — this
+      # server never downloads model *weights* on its own (only `config.json`
+      # falls back to a hub lookup; see README.md).
+      - ./models:/var/cache/trustformers
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+        reservations:
+          cpus: "2"
+          memory: 4G

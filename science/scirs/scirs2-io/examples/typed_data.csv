@@ -1,0 +1,4 @@
+Name,Age,Height,Active,Weight
+Alice,25,168.5,true,NA
+Bob,32,175,false,72.8
+Charlie,41,NA,true,90.5

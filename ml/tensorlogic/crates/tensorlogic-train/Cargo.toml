@@ -1,0 +1,82 @@
+[package]
+name = "tensorlogic-train"
+version.workspace = true
+description = "Training loops, loss composition, and optimization schedules for TensorLogic"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tensorlogic-train"
+readme = "README.md"
+keywords = ["tensor", "logic", "training", "optimization", "machine-learning"]
+categories = ["science", "algorithms", "mathematics"]
+
+[dependencies]
+# Core tensorlogic crates
+tensorlogic-ir.workspace = true
+tensorlogic-infer.workspace = true
+tensorlogic-scirs-backend.workspace = true
+
+# SciRS2 dependencies for training
+scirs2-core.workspace = true
+scirs2-autograd.workspace = true
+scirs2-optimize.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Data structures
+indexmap.workspace = true
+
+# Logging
+log.workspace = true
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# Serialization (for checkpoints)
+serde.workspace = true
+serde_json.workspace = true
+
+# Compression for checkpoints
+oxiarc-deflate.workspace = true
+
+# Time for TensorBoard timestamps
+chrono.workspace = true
+
+# CRC for TensorBoard event format
+crc32fast.workspace = true
+
+# Byte order utilities
+byteorder.workspace = true
+
+# Hostname for TensorBoard filenames
+hostname.workspace = true
+
+[features]
+default = []
+structured-logging = ["tracing", "tracing-subscriber"]
+
+[dev-dependencies]
+criterion.workspace = true
+approx.workspace = true
+
+[[bench]]
+name = "training_performance"
+harness = false
+
+[[bench]]
+name = "scheduler_performance"
+harness = false
+
+[[bench]]
+name = "loss_performance"
+harness = false
+
+[[bench]]
+name = "callback_overhead"
+harness = false
+
+[[bench]]
+name = "metrics_performance"
+harness = false

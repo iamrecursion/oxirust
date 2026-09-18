@@ -1,0 +1,28 @@
+[package]
+name = "oxixml-langtag"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "BCP 47 language-tag parsing and validation (replaces oxilangtag)."
+keywords = ["bcp47", "language-tag", "rfc5646", "i18n", "locale"]
+categories = ["internationalization", "parser-implementations", "text-processing"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["std"]
+# Enables the `std::error::Error` implementation for `LanguageTagParseError`. Nothing else in
+# the crate needs `std`, so turning this off makes it usable on `no_std` (`alloc`) targets.
+std = []
+
+[dependencies]
+
+[lints]
+workspace = true

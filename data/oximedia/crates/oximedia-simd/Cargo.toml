@@ -1,0 +1,289 @@
+[package]
+name = "oximedia-simd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hand-written assembly SIMD kernels for OxiMedia video codec"
+keywords = ["simd", "performance", "codec", "video", "multimedia"]
+categories = ["multimedia", "algorithms"]
+readme = "README.md"
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[build-dependencies]
+cc = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = "0.8"
+proptest = { workspace = true }
+
+[[bench]]
+name = "simd_benchmarks"
+harness = false
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -2 }
+pedantic = { level = "warn", priority = -1 }
+
+# ── Documentation lints ──────────────────────────────────────────────────────
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+doc_link_with_quotes = "allow"
+doc_overindented_list_items = "allow"
+ignore_without_reason = "allow"
+ignored_unit_patterns = "allow"
+
+# ── Must-use / return value lints ────────────────────────────────────────────
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+unnecessary_wraps = "allow"
+
+# ── Float comparison ─────────────────────────────────────────────────────────
+float_cmp = "allow"
+float_cmp_const = "allow"
+approx_constant = "allow"
+
+# ── Casting lints (intentional precision tradeoffs in media processing) ───────
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+unnecessary_cast = "allow"
+
+# ── Naming / style pedantic ──────────────────────────────────────────────────
+similar_names = "allow"
+unreadable_literal = "allow"
+many_single_char_names = "allow"
+struct_excessive_bools = "allow"
+fn_params_excessive_bools = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+items_after_statements = "allow"
+needless_pass_by_value = "allow"
+trivially_copy_pass_by_ref = "allow"
+module_name_repetitions = "allow"
+struct_field_names = "allow"
+type_complexity = "allow"
+implicit_hasher = "allow"
+comparison_chain = "allow"
+if_not_else = "allow"
+needless_continue = "allow"
+single_match_else = "allow"
+large_enum_variant = "allow"
+large_futures = "allow"
+borrowed_box = "allow"
+
+# ── String / format style ────────────────────────────────────────────────────
+format_push_string = "allow"
+uninlined_format_args = "allow"
+format_collect = "allow"
+
+# ── Method / function style ──────────────────────────────────────────────────
+unused_self = "allow"
+unused_async = "allow"
+match_same_arms = "allow"
+redundant_closure_for_method_calls = "allow"
+redundant_closure = "allow"
+field_reassign_with_default = "allow"
+manual_range_contains = "allow"
+no_effect_underscore_binding = "allow"
+manual_div_ceil = "allow"
+manual_let_else = "allow"
+map_unwrap_or = "allow"
+manual_clamp = "allow"
+assigning_clones = "allow"
+should_implement_trait = "allow"
+derivable_impls = "allow"
+only_used_in_recursion = "allow"
+or_fun_call = "allow"
+unwrap_or_default = "allow"
+manual_strip = "allow"
+manual_abs_diff = "allow"
+manual_midpoint = "allow"
+manual_is_multiple_of = "allow"
+
+# ── Import / wildcard style ───────────────────────────────────────────────────
+wildcard_imports = "allow"
+ptr_arg = "allow"
+redundant_field_names = "allow"
+redundant_slicing = "allow"
+
+# ── Iterator / collection style ───────────────────────────────────────────────
+useless_vec = "allow"
+needless_range_loop = "allow"
+explicit_iter_loop = "allow"
+cloned_instead_of_copied = "allow"
+iter_without_into_iter = "allow"
+double_ended_iterator_last = "allow"
+single_char_pattern = "allow"
+len_zero = "allow"
+unnested_or_patterns = "allow"
+
+# ── Pattern / binding style ───────────────────────────────────────────────────
+used_underscore_binding = "allow"
+bool_to_int_with_if = "allow"
+bool_assert_comparison = "allow"
+match_wildcard_for_single_variants = "allow"
+
+# ── Unnecessary operations ────────────────────────────────────────────────────
+unnecessary_sort_by = "allow"
+unnecessary_join = "allow"
+unnecessary_map_or = "allow"
+unnecessary_literal_bound = "allow"
+
+# ── Miscellaneous style ───────────────────────────────────────────────────────
+case_sensitive_file_extension_comparisons = "allow"
+default_trait_access = "allow"
+needless_raw_string_hashes = "allow"
+legacy_numeric_constants = "allow"
+string_lit_as_bytes = "allow"
+ip_constant = "allow"
+if_same_then_else = "allow"
+await_holding_lock = "allow"
+unchecked_time_subtraction = "allow"
+upper_case_acronyms = "allow"
+enum_variant_names = "allow"
+missing_docs_in_private_items = "allow"
+# Vec init patterns
+vec_init_then_push = "allow"
+# Operation with no effect - intentional
+no_effect = "allow"
+# MSRV-gated lints
+incompatible_msrv = "allow"
+# Lifetimes
+needless_lifetimes = "allow"
+useless_format = "allow"
+# Default struct construction
+default_constructed_unit_structs = "allow"
+# Must use on already must-use type
+double_must_use = "allow"
+# For-each vs loops
+needless_for_each = "allow"
+# while let loop
+while_let_loop = "allow"
+# Items after test module
+items_after_test_module = "allow"
+# Collapsed if
+collapsible_if = "allow"
+# Return binding
+let_and_return = "allow"
+# Redundant else
+redundant_else = "allow"
+# Copy types to_* methods
+wrong_self_convention = "allow"
+# Logic bug in bool expression - may be intentional
+nonminimal_bool = "allow"
+# Assertion always true - may be intentional
+assertions_on_constants = "allow"
+# Option ref
+option_as_ref_deref = "allow"
+# Filling slice
+manual_memcpy = "allow"
+# Excessive precision float
+excessive_precision = "allow"
+# Equality with false/true
+bool_comparison = "allow"
+# format with debug
+use_debug = "allow"
+# debug_assert
+debug_assert_with_mut_call = "allow"
+# Must use unused
+must_use_unit = "allow"
+# digit grouping
+inconsistent_digit_grouping = "allow"
+# item has both inner and outer attributes
+mixed_attributes_style = "allow"
+# match_like_matches_macro
+match_like_matches_macro = "allow"
+# Calling default
+new_without_default = "allow"
+# Contains instead of any
+search_is_some = "allow"
+# Iterator map + some
+option_map_unit_fn = "allow"
+# Sort on primitive
+stable_sort_primitive = "allow"
+useless_conversion = "allow"
+# Unused return values
+# Unused variables handled by rustc -A unused
+# Boolean logic bug - intentional
+# io::Error::other
+io_other_error = "allow"
+# inline always
+inline_always = "allow"
+# Debug format in format
+dbg_macro = "allow"
+# unnecessary get
+# Unused variable
+# Unneeded return statement
+needless_return = "allow"
+# Option and_then some
+option_map_or_none = "allow"
+# Decimal for bit op
+decimal_literal_representation = "allow"
+# Option ref
+ref_option = "allow"
+# for_kv_map
+for_kv_map = "allow"
+# Remaining lint suppressions
+bind_instead_of_map = "allow"
+borrow_as_ptr = "allow"
+collapsible_match = "allow"
+decimal_bitwise_operands = "allow"
+doc_lazy_continuation = "allow"
+duplicated_attributes = "allow"
+eq_op = "allow"
+erasing_op = "allow"
+explicit_auto_deref = "allow"
+explicit_counter_loop = "allow"
+identity_op = "allow"
+implicit_saturating_sub = "allow"
+inefficient_to_string = "allow"
+inherent_to_string = "allow"
+inherent_to_string_shadow_display = "allow"
+iter_cloned_collect = "allow"
+manual_contains = "allow"
+manual_map = "allow"
+manual_slice_fill = "allow"
+manual_split_once = "allow"
+manual_string_new = "allow"
+missing_fields_in_debug = "allow"
+needless_bool_assign = "allow"
+needless_borrows_for_generic_args = "allow"
+overly_complex_bool_expr = "allow"
+range_plus_one = "allow"
+result_unit_err = "allow"
+same_item_push = "allow"
+self_named_constructors = "allow"
+self_only_used_in_recursion = "allow"
+to_string_in_format_args = "allow"
+unnecessary_debug_formatting = "allow"
+unnecessary_get_then_check = "allow"
+unnecessary_literal_unwrap = "allow"
+unnecessary_to_owned = "allow"
+unusual_byte_groupings = "allow"
+while_let_on_iterator = "allow"
+never_loop = "allow"
+
+
+[features]
+default = ["runtime-dispatch"]
+runtime-dispatch = []
+native-asm = ["cc"]
+force-avx2 = []
+# Marker feature for AVX-512 code paths.  The actual execution path is always
+# selected at runtime via is_x86_feature_detected!, so this feature merely
+# signals intent and can be used for conditional compilation in dependents.
+avx512 = []
+force-avx512 = []
+force-neon = []

@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="660" viewBox="0 0 960 660" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <style>
+      .ink{fill:#e6edf3} .muted{fill:#9aa7b4} .accent{fill:#6ea8fe} .good{fill:#3fb950}
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace} .b{font-weight:600}
+    </style>
+  </defs>
+  <rect width="960" height="660" fill="#0e1116"/>
+
+  <!-- header -->
+  <rect x="0" y="0" width="960" height="116" fill="#171c24"/>
+  <line x1="0" y1="116" x2="960" y2="116" stroke="#2a323d"/>
+  <text x="28" y="44" font-size="24" class="b"><tspan class="accent mono">phop</tspan><tspan class="ink"> — discover &amp; prove scientific laws, in your browser</tspan></text>
+  <text x="28" y="70" font-size="13.5" class="muted">Paste data → a closed-form law is discovered, canonicalized, range/root-certified, and its properties proved by an SMT solver — all in pure Rust + WebAssembly.</text>
+  <!-- pledge chips -->
+  <g font-size="12.5">
+    <rect x="28" y="84" width="232" height="22" rx="11" fill="#1f2630" stroke="#2a323d"/>
+    <text x="40" y="99"><tspan class="good b">No server.</tspan><tspan class="ink"> Discovery &amp; proofs run here.</tspan></text>
+    <rect x="270" y="84" width="150" height="22" rx="11" fill="#1f2630" stroke="#2a323d"/>
+    <text x="282" y="99"><tspan class="good b">No install.</tspan><tspan class="ink"> Just a browser.</tspan></text>
+    <rect x="430" y="84" width="270" height="22" rx="11" fill="#1f2630" stroke="#2a323d"/>
+    <text x="442" y="99"><tspan class="good b">No trace.</tspan><tspan class="ink"> Close the tab and nothing remains.</tspan></text>
+  </g>
+
+  <!-- capability chips -->
+  <g font-size="12.5">
+    <rect x="28" y="136" width="124" height="26" rx="6" fill="#142a18" stroke="#2f6b39"/>
+    <text x="40" y="153"><tspan class="good">✓ </tspan><tspan class="ink">CAS analysis</tspan></text>
+    <rect x="160" y="136" width="166" height="26" rx="6" fill="#142a18" stroke="#2f6b39"/>
+    <text x="172" y="153"><tspan class="good">✓ </tspan><tspan class="ink">certified range/root</tspan></text>
+    <rect x="334" y="136" width="160" height="26" rx="6" fill="#142a18" stroke="#2f6b39"/>
+    <text x="346" y="153"><tspan class="good">✓ </tspan><tspan class="ink">e-graph canonical</tspan></text>
+    <rect x="502" y="136" width="176" height="26" rx="6" fill="#142a18" stroke="#2f6b39"/>
+    <text x="514" y="153"><tspan class="good">✓ </tspan><tspan class="ink">SMT proofs (OxiZ)</tspan></text>
+  </g>
+
+  <text x="28" y="190" font-size="13" class="muted">Example: <tspan class="ink">Exponential growth  y = eˣ</tspan>  ·  done in 41 ms — entirely in your browser.</text>
+
+  <!-- result card -->
+  <rect x="28" y="204" width="904" height="424" rx="12" fill="#171c24" stroke="#2a323d"/>
+  <!-- badges -->
+  <rect x="46" y="222" width="46" height="20" rx="10" fill="#0e1116" stroke="#2c4a78"/>
+  <text x="56" y="236" font-size="11.5" class="accent">eml</text>
+  <rect x="100" y="222" width="74" height="20" rx="10" fill="#0e1116" stroke="#2f6b39"/>
+  <text x="110" y="236" font-size="11.5" class="good">symbolic</text>
+  <!-- law -->
+  <text x="46" y="276" font-size="26" class="ink">e<tspan font-size="17" dy="-9">x₀</tspan></text>
+  <!-- metrics -->
+  <text x="46" y="306" font-size="13.5" class="muted">R² = <tspan class="ink b">1.000000</tspan>   ·   MSE = <tspan class="ink b">3.6e-31</tspan>   ·   complexity = <tspan class="ink b">3</tspan></text>
+  <!-- pretty src -->
+  <rect x="46" y="318" width="868" height="26" rx="6" fill="#0e1116" stroke="#2a323d"/>
+  <text x="58" y="335" font-size="12.5" class="muted mono">eml(x0, 1)</text>
+
+  <!-- verification rows -->
+  <g font-size="13.5">
+    <line x1="46" y1="360" x2="914" y2="360" stroke="#2a323d"/>
+    <text x="46" y="380" class="muted">d/dx₀ (CAS)</text><text x="230" y="380" class="ink mono" font-size="12.5">e^{x_0}</text>
+
+    <line x1="46" y1="394" x2="914" y2="394" stroke="#2a323d"/>
+    <text x="46" y="414" class="muted">canonical (e-graph)</text><text x="230" y="414" class="ink mono" font-size="12.5">e^{x_0}</text>
+
+    <line x1="46" y1="428" x2="914" y2="428" stroke="#2a323d"/>
+    <text x="46" y="448" class="muted">certified range</text><text x="230" y="448" class="good mono" font-size="12.5">f(x) ∈ [1.00000, 20.0855]</text>
+
+    <line x1="46" y1="462" x2="914" y2="462" stroke="#2a323d"/>
+    <text x="46" y="482" class="muted">certified root (x₀)</text><text x="230" y="482" class="good mono" font-size="12">RootCertificate { … status: NoRoot }</text>
+
+    <line x1="46" y1="496" x2="914" y2="496" stroke="#2a323d"/>
+    <text x="46" y="516" class="muted">SMT: no root in box</text><text x="230" y="516" class="good mono b" font-size="13">Proven</text>
+
+    <line x1="46" y1="530" x2="914" y2="530" stroke="#2a323d"/>
+    <text x="46" y="550" class="muted">SMT: ≡ true law</text><text x="230" y="550" class="good mono b" font-size="13">Proven</text>
+
+    <line x1="46" y1="564" x2="914" y2="564" stroke="#2a323d"/>
+    <text x="46" y="588" font-size="12" class="muted">Discovery (oxieml) + CAS + e-graph (scirs2-symbolic) + SMT (OxiZ) — all compiled to WebAssembly, executed in this tab.</text>
+    <text x="46" y="608" font-size="12" class="muted">Verified runtime output; the SMT verdicts above are produced by the OxiZ solver running inside the browser's WASM engine.</text>
+  </g>
+</svg>

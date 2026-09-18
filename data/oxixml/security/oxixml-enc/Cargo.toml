@@ -1,0 +1,25 @@
+[package]
+name = "oxixml-enc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "XML Encryption (XMLEnc 1.1) structure model and pure-Rust AES/GCM/Key-Wrap/RSA primitives."
+keywords = ["xml", "encryption", "xmlenc", "aes", "crypto"]
+categories = ["cryptography", "parser-implementations", "encoding"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-dom = { workspace = true }
+oxixml-text = { workspace = true }
+
+[lints]
+workspace = true

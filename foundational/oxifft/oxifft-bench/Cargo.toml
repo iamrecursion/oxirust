@@ -1,0 +1,88 @@
+[package]
+name = "oxifft-bench"
+description = "Benchmarks and FFTW comparison tests for OxiFFT"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+oxifft.workspace = true
+num-complex.workspace = true
+criterion.workspace = true
+# rustfft is optional and feature-gated (mirroring `fftw` below), but stays
+# on-by-default via the `rustfft-compare` feature so the out-of-the-box
+# `cargo bench -p oxifft-bench` experience (rustfft comparison benchmarks) is
+# unchanged. Pass `--no-default-features` to build without it.
+rustfft = { workspace = true, optional = true }
+# FFTW is optional and feature-gated
+fftw = { workspace = true, optional = true }
+num-traits.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+oxifft-codegen.workspace = true
+
+[features]
+default = ["rustfft-compare"]
+# Enable rustfft comparison benchmarks/utilities (`utils::rustfft_forward`,
+# `utils::rustfft_inverse`, the `fft_comparison` bench). On by default; the
+# COOLJAPAN dependency-ban exception for `rustfft` (see the workspace
+# `deny.toml`) is scoped to this crate, which is `publish = false`.
+rustfft-compare = ["dep:rustfft"]
+# Enable FFTW comparison tests. By default FFTW is built from the fftw crate's
+# bundled `fftw-src` source, so results are reproducible regardless of what is
+# installed on the host.
+fftw-compare = ["dep:fftw"]
+# Link the pre-installed system libfftw3 (via pkg-config, e.g. a Homebrew
+# build) instead of compiling the bundled source, so ratio-report numbers are
+# attributable to a specific, documented FFTW build. Implies `fftw-compare`.
+#
+# NOTE: for `system` to fully replace the bundled `source` build, the fftw
+# dependency must be resolved with default features off. The workspace-level
+# `fftw` dependency should therefore be declared as
+# `fftw = { version = "0.8", default-features = false }`; until then enabling
+# this feature additionally activates the fftw crate's `system` backend, which
+# the fftw-src build script prefers over the source build.
+fftw-system = ["fftw-compare", "fftw/system"]
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "fft_comparison"
+harness = false
+required-features = ["rustfft-compare"]
+
+[[bench]]
+name = "codelet_perf"
+harness = false
+
+[[bench]]
+name = "dct_dst"
+harness = false
+
+[[bench]]
+name = "r2c_c2r"
+harness = false
+
+[[bench]]
+name = "fftw_parity_gates"
+harness = false
+required-features = ["fftw-compare"]
+
+[[bin]]
+name = "fftw_ratio_report"
+path = "src/bin/fftw_ratio_report.rs"
+required-features = ["fftw-compare"]
+
+[[test]]
+name = "fftw_comparison"
+required-features = ["fftw-compare"]
+
+[[test]]
+name = "fftw_parity_smoke"
+required-features = ["fftw-compare"]

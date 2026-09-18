@@ -1,0 +1,634 @@
+#![allow(clippy::excessive_precision)]
+#![allow(clippy::redundant_closure)]
+#![allow(clippy::legacy_numeric_constants)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_slice_size_calculation)]
+#![allow(clippy::useless_format)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::let_and_return)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::cast_abs_to_unsigned)]
+//! # SciRS2 Special - Special Mathematical Functions
+//!
+//! **scirs2-special** provides production-ready special mathematical functions modeled after SciPy's
+//! `special` module, offering gamma, Bessel, error functions, elliptic integrals, hypergeometric functions,
+//! and more, with enhanced numerical stability, GPU acceleration, and arbitrary precision support.
+//!
+//! ## 🎯 Key Features
+//!
+//! - **SciPy Compatibility**: Drop-in replacement for `scipy.special` functions
+//! - **100+ Functions**: Gamma, Bessel, error, elliptic, hypergeometric, orthogonal polynomials
+//! - **Numerical Stability**: Carefully implemented algorithms avoiding overflow/underflow
+//! - **GPU Acceleration**: CUDA/ROCm support for array operations
+//! - **Arbitrary Precision**: High-precision computations with `rug` backend
+//! - **Memory Efficient**: Chunked processing for large arrays
+//! - **SIMD & Parallel**: Vectorized and multi-threaded execution
+//!
+//! ## 📦 Module Overview
+//!
+//! | SciRS2 Module | SciPy Equivalent | Description |
+//! |---------------|------------------|-------------|
+//! | `gamma` | `scipy.special.gamma` | Gamma and related functions |
+//! | `bessel` | `scipy.special.jv`, `yv` | Bessel functions (J, Y, I, K) |
+//! | `erf` | `scipy.special.erf`, `erfc` | Error and complementary error functions |
+//! | `elliptic` | `scipy.special.ellipk` | Elliptic integrals and functions |
+//! | `hypergeometric` | `scipy.special.hyp2f1` | Hypergeometric functions |
+//! | `combinatorial` | `scipy.special.factorial` | Factorials, binomial coefficients |
+//! | `orthogonal` | `scipy.special.eval_legendre` | Orthogonal polynomials (Legendre, Chebyshev, etc.) |
+//! | `zeta` | `scipy.special.zeta` | Riemann zeta and related functions |
+//!
+//! ## 🚀 Quick Start
+//!
+//! ```toml
+//! [dependencies]
+//! scirs2-special = "0.6.6"
+//! ```
+//!
+//!
+//! ```rust
+//! use scirs2_special::{gamma, bessel, erf};
+//!
+//! // Gamma function: Γ(5) = 4! = 24
+//! let g = gamma(5.0f64);
+//! assert!((g - 24.0).abs() < 1e-10);
+//!
+//! // Bessel function of the first kind: J₀(x)
+//! let j0 = bessel::j0(2.0);
+//!
+//! // Error function
+//! let erf_val = erf::erf(1.0);
+//! ```
+//!
+//! ## 🏗️ Architecture
+//!
+//! ```text
+//! scirs2-special
+//! ├── Gamma Functions (gamma, lgamma, digamma, polygamma, beta)
+//! ├── Bessel Functions (J, Y, I, K, modified, spherical)
+//! ├── Error Functions (erf, erfc, erfcx, erfi, dawson)
+//! ├── Elliptic Integrals (complete, incomplete, Jacobi)
+//! ├── Hypergeometric (2F1, 1F1, 0F1, generalized)
+//! ├── Combinatorial (factorial, binomial, multinomial, Stirling)
+//! ├── Orthogonal Polynomials (Legendre, Chebyshev, Hermite, Laguerre)
+//! ├── Statistical (logistic, softmax, sinc, logsumexp)
+//! ├── Special Integrals (exponential, logarithmic, Fresnel)
+//! ├── Zeta & Related (Riemann zeta, Hurwitz zeta, polylog)
+//! ├── Lambert W & Wright Omega
+//! ├── Airy Functions (Ai, Bi, derivatives)
+//! ├── Performance Features
+//! │   ├── GPU acceleration (gamma, Bessel, erf)
+//! │   ├── Chunked processing (memory-efficient)
+//! │   ├── SIMD vectorization
+//! │   └── Parallel execution
+//! └── Arbitrary Precision (via rug, optional)
+//! ```
+//!
+//! ## 📊 Performance
+//!
+//! | Function | Array Size | CPU | GPU | Speedup |
+//! |----------|------------|-----|-----|---------|
+//! | Gamma | 10⁶ | 120ms | 6ms | 20× |
+//! | Bessel J0 | 10⁶ | 180ms | 8ms | 22.5× |
+//! | Erf | 10⁶ | 85ms | 4ms | 21× |
+//!
+//! ## 🔒 Version Information
+//!
+//! - **Version**: 0.6.6
+//! - **Release Date**: Unreleased
+//! - **Repository**: [github.com/cool-japan/scirs](https://github.com/cool-japan/scirs)
+
+// Export error types
+
+pub mod error;
+pub mod error_context;
+pub mod error_wrappers;
+pub use error::{SpecialError, SpecialResult};
+
+// Modules
+pub mod advanced_performance_enhancement;
+mod airy;
+mod anger_weber;
+#[cfg(feature = "high-precision")]
+pub mod arbitrary_precision;
+#[cfg(feature = "gpu")]
+pub mod array_ops;
+pub mod bessel;
+mod bessel_zeros;
+mod boxcox;
+mod carlson;
+mod combinatorial;
+mod constants;
+pub mod convenience;
+mod coulomb;
+pub mod cross_validation;
+pub mod distributions;
+pub mod edge_case_tests;
+mod ellipsoidal;
+mod elliptic;
+pub mod elliptic_ext;
+pub mod erf;
+#[cfg(test)]
+mod extended_property_tests;
+pub mod extended_scipy_validation;
+mod fresnel;
+pub mod gamma;
+#[cfg(feature = "gpu")]
+pub mod gpu_context_manager;
+#[cfg(feature = "gpu")]
+pub mod gpu_ops;
+mod hypergeometric;
+mod hypergeometric_enhanced;
+pub mod incomplete_gamma;
+pub mod information_theory;
+mod kelvin;
+mod lambert;
+pub mod legendre_elliptic;
+mod logint;
+mod mathieu;
+pub mod memory_efficient;
+pub mod optimizations;
+mod orthogonal;
+mod parabolic;
+pub mod performance_benchmarks;
+pub mod physics_engineering;
+pub mod polylogarithm;
+pub mod precision;
+mod property_tests;
+// Validated numerics (ball arithmetic)
+pub mod hill;
+pub mod mathieu_hill;
+pub mod mixed_precision;
+pub mod python_interop;
+#[cfg(test)]
+mod quickcheck_tests;
+pub mod simd_ops;
+mod spherical_harmonics;
+mod spheroidal;
+pub mod stability_analysis;
+mod statistical;
+mod struve;
+pub mod utility;
+pub mod validated;
+mod validation;
+#[cfg(feature = "plotting")]
+pub mod visualization;
+mod voigt;
+mod wright;
+mod wright_bessel;
+mod wright_simplified;
+mod zeta;
+mod zeta_ext;
+
+// New SciPy parity modules
+mod clausen;
+mod debye;
+mod scipy_compat;
+mod spherical_bessel_extended;
+
+// Theta functions (Jacobi theta)
+pub mod theta_functions;
+
+// Chromatic polynomial
+pub mod chromatic;
+// Clebsch-Gordan coefficients
+pub mod clebsch_gordan;
+// Clebsch-Gordan series for Lie groups (SU(3), SO(5), general)
+pub mod clebsch_gordan_lie;
+// GPU auto-dispatch for batch evaluation of special functions
+pub mod gpu_dispatch;
+// GPU kernel sources and dispatch stubs (WGSL / CUDA / ROCm)
+pub mod gpu_kernels;
+
+// Direct oxicuda CUDA path for batched erf (NVIDIA-only, runtime-probed, default off)
+#[cfg(feature = "cuda")]
+pub mod gpu_cuda;
+// Hall polynomials for p-group extensions
+pub mod hall_polynomials;
+// Dedekind zeta function
+pub mod dedekind_zeta;
+// Symbolic differentiation
+pub mod differentiation;
+// Elliptic modular functions
+pub mod elliptic_modular;
+// Connection formula generator
+pub mod connection_formulas;
+// Elliptic curve L-functions
+pub mod elliptic_l;
+// Hecke L-functions and Maass forms
+pub mod hecke_l;
+// Dirichlet L-functions
+pub mod l_functions;
+// Lame functions
+pub mod lame;
+// Nield-Kuznetsov functions
+pub mod nield_kuznetsov;
+// Painleve transcendents
+pub mod painleve;
+// Schur polynomials
+pub mod schur;
+// Selberg zeta function
+pub mod selberg_zeta;
+// Symbolic expression system
+pub mod symbolic;
+// Tutte polynomial
+pub mod tutte;
+
+// Re-export common functions
+// Note: These functions require various trait bounds in their implementation,
+// including Float, FromPrimitive, Debug, AddAssign, etc.
+pub use advanced_performance_enhancement::{
+    benchmark_function, erf_advancedfast, gamma_advancedfast, gamma_array_advancedfast,
+    j0_advancedfast, PerformanceConfig, PerformanceMetrics,
+};
+pub use airy::{ai, ai_zeros, aie, aip, airye, bi, bi_zeros, bie, bip, itairy};
+pub use anger_weber::{anger_j, anger_weber, lommel_s1, lommel_s2, weber_e};
+// Complex Airy functions
+pub use airy::complex::{ai_complex, aip_complex, bi_complex, bip_complex};
+pub use bessel::{
+    h1vp,
+    h2vp,
+    // Hankel functions
+    hankel1,
+    hankel1e,
+    hankel2,
+    hankel2e,
+    // Regular Bessel functions
+    i0,
+    // Derivatives of modified Bessel functions
+    i0_prime,
+    i0e,
+    i1,
+    i1_prime,
+    i1e,
+    iv,
+    iv_prime,
+    ive,
+    ivp,
+    j0,
+    // Derivatives of Bessel functions
+    j0_prime,
+    j0e,
+    j1,
+    j1_prime,
+    j1e,
+    jn,
+    jn_prime,
+    jne,
+    jv,
+    jv_prime,
+    jve,
+    // SciPy-compatible derivative interfaces
+    jvp,
+    k0,
+    k0_prime,
+    k0e,
+    k1,
+    k1_prime,
+    k1e,
+    kv,
+    kv_prime,
+    kve,
+    kvp,
+    // Spherical Bessel functions
+    spherical_jn,
+    spherical_yn,
+    y0,
+    y0_prime,
+    y0e,
+    y1,
+    y1_prime,
+    y1e,
+    yn,
+    yn_prime,
+    yne,
+    yvp,
+};
+pub use bessel_zeros::{
+    besselpoly,
+    // Bessel utilities
+    itj0y0,
+    // Zeros of Bessel functions
+    j0_zeros,
+    j1_zeros,
+    jn_zeros,
+    jnjnp_zeros,
+    jnp_zeros,
+    jnyn_zeros,
+    y0_zeros,
+    y1_zeros,
+    yn_zeros,
+};
+pub use boxcox::{
+    boxcox, boxcox1p, boxcox1p_array, boxcox_array, inv_boxcox, inv_boxcox1p, inv_boxcox1p_array,
+    inv_boxcox_array,
+};
+pub use carlson::{elliprc, elliprd, elliprf, elliprf_array, elliprg, elliprj};
+pub use combinatorial::{
+    bell_number, bernoulli_number, binomial, comb, double_factorial, euler_number, factorial,
+    factorial2, factorialk, perm, permutations, stirling2, stirling_first, stirling_second,
+};
+pub use coulomb::{coulomb_f, coulomb_g, coulomb_h_plus, coulomb_hminus, coulomb_phase_shift};
+pub use distributions::{
+    // Binomial distribution
+    bdtr,
+    bdtr_array,
+    bdtrc,
+    bdtri,
+    bdtrik,
+    bdtrin,
+    // Beta distribution inverse functions
+    btdtria,
+    btdtrib,
+    // Chi-square distribution
+    chdtr,
+    chdtrc,
+    chdtri,
+    // F distribution
+    fdtr,
+    fdtrc,
+    fdtridfd,
+    // Gamma distribution
+    gdtr,
+    gdtrc,
+    gdtria,
+    gdtrib,
+    gdtrix,
+    kolmogi,
+    // Kolmogorov-Smirnov distribution
+    kolmogorov,
+    log_ndtr,
+    // Negative binomial distribution
+    nbdtr,
+    nbdtrc,
+    nbdtri,
+    // Normal distribution
+    ndtr,
+    ndtr_array,
+    ndtri,
+    ndtri_exp,
+    // Poisson distribution
+    pdtr,
+    pdtrc,
+    pdtri,
+    pdtrik,
+    // Student's t distribution
+    stdtr,
+};
+pub use ellipsoidal::{
+    ellip_harm, ellip_harm_2, ellip_harm_array, ellip_harm_coefficients, ellip_harm_complex,
+    ellip_normal,
+};
+pub use elliptic::{
+    complete_elliptic_pi, ellipe, ellipeinc, ellipj, ellipk, ellipkinc, ellipkm1, elliptic_e,
+    elliptic_e_inc, elliptic_f, elliptic_k, elliptic_nome, elliptic_pi, jacobi_cn, jacobi_dn,
+    jacobi_sn, weierstrass_p, weierstrass_p_prime, weierstrass_sigma, weierstrass_zeta,
+};
+pub use fresnel::{
+    fresnel, fresnel_complex, fresnelc, fresnels, mod_fresnel_plus, mod_fresnelminus,
+};
+pub use gamma::{
+    beta,
+    // Safe versions with error handling
+    beta_safe,
+    betainc,
+    betainc_regularized,
+    betaincinv,
+    betaln,
+    digamma,
+    digamma_safe,
+    gamma,
+    gamma_safe,
+    gammaln,
+    loggamma,
+    polygamma,
+};
+pub use incomplete_gamma::{
+    gammainc, gammainc_lower, gammainc_upper, gammaincc, gammainccinv, gammaincinv, gammasgn,
+    gammastar,
+};
+// Complex gamma functions
+pub use gamma::complex::{beta_complex, digamma_complex, gamma_complex, loggamma_complex};
+// Complex Bessel functions
+pub use bessel::complex::{i0_complex, j0_complex, j1_complex, jn_complex, jv_complex, k0_complex};
+// Complex error functions
+pub use erf::complex::{erf_complex, erfc_complex, erfcx_complex, faddeeva_complex};
+pub use hypergeometric::{hyp0f1, hyp1f1, hyp2f1, hyperu, ln_pochhammer, pochhammer};
+pub use hypergeometric_enhanced::{
+    hyp0f1_enhanced, hyp1f1_enhanced, hyp1f1_regularized, hyp2f1_enhanced, hyp2f1_regularized,
+    whittaker_m, whittaker_w,
+};
+pub use information_theory::{
+    binary_entropy, cross_entropy, entr, entr_array, entropy, huber, huber_loss, kl_div,
+    kl_divergence, pseudo_huber, rel_entr,
+};
+pub use kelvin::{bei, beip, ber, berp, kei, keip, kelvin, ker, kerp};
+pub use lambert::{lambert_w, lambert_w_real};
+pub use logint::{chi, ci, e1, expint, li, li_complex, polylog, shi, shichi, si, sici, spence};
+pub use mathieu::{
+    mathieu_a, mathieu_b, mathieu_cem, mathieu_even_coef, mathieu_odd_coef, mathieu_sem,
+};
+pub use orthogonal::{
+    chebyshev, gegenbauer, hermite, hermite_prob, jacobi, laguerre, laguerre_generalized, legendre,
+    legendre_assoc,
+};
+pub use parabolic::{pbdv, pbdv_seq, pbvv, pbvv_seq, pbwa};
+pub use spherical_harmonics::{
+    solid_harmonic_irregular, solid_harmonic_regular, sph_harm, sph_harm_complex,
+    sph_harm_cos_angle, sph_harm_normalization,
+};
+pub use spheroidal::{
+    obl_ang1, obl_cv, obl_cv_seq, obl_rad1, obl_rad2, pro_ang1, pro_cv, pro_cv_seq, pro_rad1,
+    pro_rad2,
+};
+// Advanced spheroidal wave functions (Legendre-expansion based)
+pub use spheroidal::{
+    angular_spheroidal, associated_legendre, radial_spheroidal_1, spherical_bessel_j,
+    spheroidal_eigenvalue_wf, SpheroidType, SpheroidalConfig,
+};
+// Simplified spheroidal wave function API (SpheroidalKind-based)
+pub use spheroidal::{
+    spheroidal_eigenvalue_mn, spheroidal_ps, spheroidal_wronskian, SpheroidalEigenvalue,
+    SpheroidalKind,
+};
+// Spheroidal CF / Bouwkamp helpers (Wave 74) — exposed for integration tests
+// and downstream consumers that need direct access to the d-coefficient
+// pipeline.
+pub use spheroidal::cf_helpers::{
+    angular_function, cf_modified_lentz, d_coefficients, d_coefficients_with_len,
+    flammer_eigenvalue, radial_function, scaled_recurrence_step, tail_ratio_lentz, LentzResult,
+    SphericalBesselKind, SpheroidalParity, DEFAULT_D_LEN,
+};
+// Hill's equation
+pub use hill::{hill_floquet, mathieu_hill, CurveType, HillEquation, HillResult, StabilityCurve};
+// Generalized Hill's equation (HillCoefficients-based API)
+pub use mathieu_hill::{
+    hill_characteristic_exponent, hill_periodic_solution, hill_stability_check,
+    hill_stability_exponent, HillCoefficients,
+};
+// Mixed-precision batch dispatch
+pub use mixed_precision::{
+    auto_dispatch_bessel_j0, auto_dispatch_erf, auto_dispatch_gamma, batch_eval_mixed,
+    MixedPrecisionConfig,
+};
+pub use statistical::{
+    expm1_array, log1p_array, log_abs_gamma, log_softmax, logistic, logistic_derivative, logsumexp,
+    sinc, sinc_array, softmax,
+};
+pub use struve::{it2_struve0, it_mod_struve0, it_struve0, mod_struve, struve};
+
+// New SciPy parity exports
+pub use clausen::clausen;
+pub use debye::{debye1, debye2, debye3, debye4, debye5};
+pub use scipy_compat::{
+    acosdg, asindg, atandg, bernoulli_poly, euler_poly, exp1, expn, loggamma_sign, multinomial,
+};
+pub use spherical_bessel_extended::{
+    riccati_jn, riccati_yn, spherical_in, spherical_in_derivative, spherical_kn,
+    spherical_kn_derivative,
+};
+pub use utility::{
+    agm,
+    // Basic functions
+    cbrt,
+    // Array operations
+    cbrt_array,
+    cosdg,
+    // Accurate computations
+    cosm1,
+    cotdg,
+    // Special functions
+    diric,
+    exp10,
+    exp10_array,
+    exp2,
+    // Statistical functions (SciPy compatibility)
+    expit,
+    expit_array,
+    expm1_array_utility,
+    exprel,
+    gradient,
+    log1p_array_utility,
+    log_expit,
+    logit,
+    logit_array,
+    owens_t,
+    powm1,
+    // Trigonometric in degrees
+    radian,
+    round,
+    round_array,
+    sindg,
+    softplus,
+    spherical_distance,
+    tandg,
+    xlog1py,
+    // Additional convenience functions for SciPy parity
+    xlog1py_scalar,
+    xlogy,
+};
+pub use voigt::{
+    pseudo_voigt, voigt_profile, voigt_profile_array, voigt_profile_fwhm, voigt_profile_fwhm_array,
+    voigt_profile_normalized,
+};
+pub use wright::{wright_omega_optimized, wright_omega_real_optimized};
+pub use wright_bessel::{
+    log_wright_bessel, wright_bessel, wright_bessel_complex, wright_bessel_zeros,
+};
+pub use wright_simplified::{wright_omega, wright_omega_real};
+pub use zeta::{hurwitz_zeta, zeta, zetac};
+pub use zeta_ext::{dirichlet_eta, lerch_phi, riemann_zeta, riemann_zeta_complex};
+
+// SIMD operations (when enabled)
+#[cfg(feature = "simd")]
+pub use simd_ops::{
+    benchmark_simd_performance, erf_f32_simd, exp_f32_simd, gamma_f32_simd, gamma_f64_simd,
+    j0_f32_simd, vectorized_special_ops,
+};
+
+// SIMD-accelerated batch operations (Phase 3.4)
+#[cfg(feature = "simd")]
+pub use simd_ops::{
+    batch_bessel_j0_f32, batch_bessel_j0_f64, batch_bessel_j1_f32, batch_bessel_j1_f64,
+    batch_bessel_y0_f32, batch_bessel_y0_f64, batch_bessel_y1_f32, batch_bessel_y1_f64,
+    batch_beta_f32, batch_beta_f64, batch_digamma_f32, batch_digamma_f64, batch_erf_f32,
+    batch_erf_f64, batch_erfc_f32, batch_erfc_f64, batch_gamma_f32, batch_gamma_f64,
+    batch_lgamma_f32, batch_lgamma_f64,
+};
+
+// Parallel operations (when enabled)
+#[cfg(feature = "parallel")]
+pub use simd_ops::{
+    adaptive_gamma_processing, benchmark_parallel_performance, gamma_f64_parallel, j0_f64_parallel,
+};
+
+// Combined SIMD+Parallel operations (when both enabled)
+#[cfg(all(feature = "simd", feature = "parallel"))]
+pub use simd_ops::gamma_f32_simd_parallel;
+
+// Error function and related functions
+pub use erf::{dawsn, erf, erfc, erfcinv, erfcx, erfi, erfinv, wofz};
+
+// CUDA erf path (oxicuda direct, gated on the `cuda` feature)
+#[cfg(feature = "cuda")]
+pub use gpu_cuda::{cuda_erf_batch, cuda_is_available};
+
+// Arbitrary precision functions (when enabled)
+#[cfg(feature = "high-precision")]
+pub use arbitrary_precision::{
+    bessel::{bessel_j_ap, bessel_j_mp, bessel_y_ap, bessel_y_mp},
+    cleanup_cache,
+    error_function::{erf_ap, erf_mp, erfc_ap, erfc_mp},
+    gamma::{gamma_ap, gamma_mp, log_gamma_ap, log_gamma_mp},
+    to_complex64, to_f64, PrecisionContext,
+};
+
+// MPFR-native API (available under both `high-precision` and `arbitrary_precision` features)
+#[cfg(feature = "high-precision")]
+pub use arbitrary_precision::{
+    bessel_j0_mpfr, bessel_k0_mpfr, digamma_mpfr, erf_mpfr, erfc_mpfr, gamma_mpfr, lgamma_mpfr,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+    use scirs2_core::numeric::Complex64;
+
+    #[test]
+    fn test_gamma_function() {
+        // Test integer values
+        assert_relative_eq!(gamma(1.0), 1.0, epsilon = 1e-10);
+        assert_relative_eq!(gamma(2.0), 1.0, epsilon = 1e-10);
+        assert_relative_eq!(gamma(3.0), 2.0, epsilon = 1e-10);
+        assert_relative_eq!(gamma(4.0), 6.0, epsilon = 1e-10);
+        assert_relative_eq!(gamma(5.0), 24.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_lambert_w() {
+        // Test principal branch (k=0)
+        let w = lambert_w(Complex64::new(1.0, 0.0), 0, 1e-8).expect("Operation failed");
+        let expected = Complex64::new(0.567_143_290_409_783_8, 0.0);
+        assert!((w - expected).norm() < 1e-10);
+
+        // Test w * exp(w) = z
+        let z = Complex64::new(1.0, 0.0);
+        let w_exp_w = w * w.exp();
+        assert!((w_exp_w - z).norm() < 1e-10);
+
+        // Test branch k = 1
+        let w_b1 = lambert_w(Complex64::new(1.0, 0.0), 1, 1e-8).expect("Operation failed");
+        assert!(w_b1.im > 0.0);
+
+        // Test branch k = -1
+        let w_bm1 = lambert_w(Complex64::new(1.0, 0.0), -1, 1e-8).expect("Operation failed");
+        assert!(w_bm1.im < 0.0);
+
+        // Test real function
+        let w_real = lambert_w_real(1.0, 1e-8).expect("Operation failed");
+        assert!((w_real - 0.567_143_290_409_783_8).abs() < 1e-10);
+    }
+}

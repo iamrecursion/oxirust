@@ -1,0 +1,75 @@
+# HLS (M3U8) playlist dictionary for fuzzing
+# Contains common HLS tags and patterns
+
+# Required header
+"#EXTM3U"
+
+# Version tags
+"#EXT-X-VERSION:1"
+"#EXT-X-VERSION:3"
+"#EXT-X-VERSION:4"
+"#EXT-X-VERSION:7"
+
+# Master playlist tags
+"#EXT-X-STREAM-INF:"
+"BANDWIDTH="
+"RESOLUTION="
+"CODECS="
+"FRAME-RATE="
+"AVERAGE-BANDWIDTH="
+"AUDIO="
+"VIDEO="
+"SUBTITLES="
+
+# Media playlist tags
+"#EXT-X-TARGETDURATION:"
+"#EXTINF:"
+"#EXT-X-BYTERANGE:"
+"#EXT-X-DISCONTINUITY"
+"#EXT-X-KEY:"
+"#EXT-X-MAP:"
+"#EXT-X-PROGRAM-DATE-TIME:"
+"#EXT-X-DATERANGE:"
+"#EXT-X-ENDLIST"
+"#EXT-X-PLAYLIST-TYPE:"
+
+# Media tags
+"#EXT-X-MEDIA:"
+"TYPE="
+"GROUP-ID="
+"NAME="
+"DEFAULT="
+"AUTOSELECT="
+"URI="
+
+# Encryption
+"METHOD=AES-128"
+"METHOD=SAMPLE-AES"
+"METHOD=NONE"
+"IV="
+"KEYFORMAT="
+"KEYFORMATVERSIONS="
+
+# Playlist types
+"EVENT"
+"VOD"
+
+# Common codecs
+"\"avc1.64001f\""
+"\"mp4a.40.2\""
+"\"av01.0.05M.08\""
+"\"vp09.00.41.08\""
+"\"opus\""
+
+# URLs
+"http://"
+"https://"
+".m3u8"
+".ts"
+".mp4"
+".aac"
+
+# Attributes
+","
+"="
+"\""

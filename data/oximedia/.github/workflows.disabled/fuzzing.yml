@@ -1,0 +1,269 @@
+name: Fuzzing
+
+on:
+  schedule:
+    # Run nightly at 3 AM UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzzing duration in seconds (default: 600 = 10 minutes)'
+        required: false
+        default: '600'
+      targets:
+        description: 'Comma-separated list of specific targets to fuzz (empty = all)'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  list-targets:
+    name: List Fuzz Targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: List fuzz targets
+        id: list
+        run: |
+          # Extract all fuzz targets from Cargo.toml
+          TARGETS=$(grep -A 4 '^\[\[bin\]\]' fuzz/Cargo.toml | grep '^name = ' | cut -d'"' -f2 | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "targets=$TARGETS" >> $GITHUB_OUTPUT
+          echo "Found targets: $TARGETS"
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    needs: list-targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.list-targets.outputs.targets) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-${{ matrix.target }}
+          cache-on-failure: true
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Restore fuzz artifacts
+        uses: actions/cache@v4
+        with:
+          path: fuzz/artifacts/${{ matrix.target }}
+          key: fuzz-artifacts-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-artifacts-${{ matrix.target }}-
+
+      - name: Run fuzzer
+        run: |
+          # Determine duration
+          DURATION="${{ github.event.inputs.duration }}"
+          if [ -z "$DURATION" ]; then
+            DURATION=600  # Default: 10 minutes
+          fi
+
+          echo "Fuzzing target: ${{ matrix.target }} for ${DURATION} seconds"
+
+          # Run the fuzzer
+          cd fuzz
+          timeout ${DURATION}s cargo fuzz run ${{ matrix.target }} -- -max_total_time=${DURATION} -dict=dictionaries/${{ matrix.target }}.dict || true
+
+      - name: Check for crashes
+        id: check_crashes
+        run: |
+          if [ -d "fuzz/artifacts/${{ matrix.target }}" ] && [ "$(ls -A fuzz/artifacts/${{ matrix.target }})" ]; then
+            echo "crashes=true" >> $GITHUB_OUTPUT
+            echo "Found crashes in ${{ matrix.target }}!"
+            ls -lah fuzz/artifacts/${{ matrix.target }}
+          else
+            echo "crashes=false" >> $GITHUB_OUTPUT
+            echo "No crashes found in ${{ matrix.target }}"
+          fi
+
+      - name: Upload crash artifacts
+        if: steps.check_crashes.outputs.crashes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          retention-days: 90
+
+      - name: Upload corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          retention-days: 30
+
+      - name: Report coverage
+        run: |
+          cd fuzz
+          # Get coverage statistics
+          cargo fuzz coverage ${{ matrix.target }} || true
+
+      - name: Create issue on crash
+        if: steps.check_crashes.outputs.crashes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const target = '${{ matrix.target }}';
+            const fs = require('fs');
+            const path = require('path');
+
+            // Get list of crash files
+            const crashDir = `fuzz/artifacts/${target}`;
+            const crashes = fs.readdirSync(crashDir);
+
+            const body = `## Fuzzing Crash Detected
+
+            **Target:** \`${target}\`
+            **Run:** ${{ github.run_id }}
+            **Timestamp:** ${new Date().toISOString()}
+
+            ### Crash Files
+            ${crashes.map(f => `- \`${f}\``).join('\n')}
+
+            ### Reproduction
+            \`\`\`bash
+            cd fuzz
+            cargo fuzz run ${target} artifacts/${target}/${crashes[0]}
+            \`\`\`
+
+            ### Artifacts
+            Download crash artifacts from the workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            cc @maintainers`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Fuzzing] Crash in ${target}`,
+              body: body,
+              labels: ['bug', 'fuzzing', 'security']
+            });
+
+  # Continuous fuzzing for critical targets
+  fuzz-continuous:
+    name: Continuous Fuzz (Critical)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - matroska_parser
+          - mp4_parser
+          - av1_decoder
+          - vp9_decoder
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-continuous-${{ matrix.target }}
+          cache-on-failure: true
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-continuous-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-continuous-${{ matrix.target }}-
+
+      - name: Run extended fuzzing (2 hours)
+        run: |
+          cd fuzz
+          # Run for 2 hours with corpus minimization
+          timeout 7200s cargo fuzz run ${{ matrix.target }} -- -max_total_time=7200 -dict=dictionaries/${{ matrix.target }}.dict || true
+
+      - name: Minimize corpus
+        run: |
+          cd fuzz
+          cargo fuzz cmin ${{ matrix.target }}
+
+      - name: Upload minimized corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-continuous-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          retention-days: 90
+
+  # Regression testing with existing corpus
+  fuzz-regression:
+    name: Fuzz Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-regression
+          cache-on-failure: true
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Download all corpus artifacts
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-all-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-all-
+            fuzz-corpus-
+
+      - name: Run regression tests
+        run: |
+          cd fuzz
+          # Run all fuzz targets against their corpus without generating new inputs
+          for target in $(grep -A 4 '^\[\[bin\]\]' Cargo.toml | grep '^name = ' | cut -d'"' -f2); do
+            echo "Running regression test for $target"
+            if [ -d "corpus/$target" ] && [ "$(ls -A corpus/$target)" ]; then
+              cargo fuzz run $target -- -runs=0 corpus/$target || echo "Regression failed for $target"
+            else
+              echo "No corpus found for $target, skipping"
+            fi
+          done

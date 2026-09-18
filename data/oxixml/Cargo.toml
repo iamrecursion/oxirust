@@ -1,0 +1,116 @@
+[workspace]
+resolver = "3"
+members = [
+    "support/oxixml-support",
+    "support/oxixml-unicode",
+    "support/oxixml-encoding",
+    "support/oxixml-text",
+    "support/oxixml-regex",
+    "atoms/oxixml-iri",
+    "atoms/oxixml-langtag",
+    "atoms/oxixml-xsd",
+    "atoms/oxixml-qname",
+    "xml/oxixml-xml",
+    "xml/oxixml-quickxml-compat",
+    "trees/oxixml-dom",
+    "trees/oxixml-sax",
+    "trees/oxixml-infoset",
+    "trees/oxixml-html",
+    "trees/oxixml-svg",
+    "validation/oxixml-dtd",
+    "validation/oxixml-schema",
+    "validation/oxixml-relaxng",
+    "validation/oxixml-schematron",
+    "validation/oxixml-catalog",
+    "validation/oxixml-xinclude",
+    "query/oxixml-fn",
+    "query/oxixml-xpath",
+    "query/oxixml-xquery",
+    "query/oxixml-xslt",
+    "security/oxixml-c14n",
+    "security/oxixml-dsig",
+    "security/oxixml-enc",
+    "security/oxixml-fo",
+    "rdf/oxixml-model",
+    "rdf/oxixml-json",
+    "rdf/oxixml-turtle",
+    "rdf/oxixml-rdfxml",
+    "rdf/oxixml-jsonld",
+    "rdf/oxixml-rdfa",
+    "rdf/oxixml-trix",
+    "rdf/oxixml-hdt",
+    "rdf/oxixml-canon",
+    "rdf/oxixml-io",
+    "rdf/oxixml-vocab",
+    "sparql/oxixml-sparql-results",
+    "sparql/oxixml-sparql-syntax",
+    "crates/oxixml",
+    "tools/oxixml-cli",
+    "testsuite/oxixml-testsuite",
+]
+
+[workspace.package]
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Team KitaSan"]
+repository = "https://github.com/cool-japan/oxixml"
+homepage = "https://github.com/cool-japan/oxixml"
+
+[workspace.dependencies]
+oxixml-support = { version = "0.1.3", path = "support/oxixml-support" }
+oxixml-unicode = { version = "0.1.3", path = "support/oxixml-unicode" }
+oxixml-encoding = { version = "0.1.3", path = "support/oxixml-encoding" }
+oxixml-text = { version = "0.1.3", path = "support/oxixml-text" }
+oxixml-regex = { version = "0.1.3", path = "support/oxixml-regex" }
+oxixml-iri = { version = "0.1.3", path = "atoms/oxixml-iri" }
+oxixml-langtag = { version = "0.1.3", path = "atoms/oxixml-langtag" }
+oxixml-xsd = { version = "0.1.3", path = "atoms/oxixml-xsd" }
+oxixml-qname = { version = "0.1.3", path = "atoms/oxixml-qname" }
+oxixml-xml = { version = "0.1.3", path = "xml/oxixml-xml" }
+oxixml-quickxml-compat = { version = "0.1.3", path = "xml/oxixml-quickxml-compat" }
+oxixml-dom = { version = "0.1.3", path = "trees/oxixml-dom" }
+oxixml-sax = { version = "0.1.3", path = "trees/oxixml-sax" }
+oxixml-infoset = { version = "0.1.3", path = "trees/oxixml-infoset" }
+oxixml-html = { version = "0.1.3", path = "trees/oxixml-html" }
+oxixml-svg = { version = "0.1.3", path = "trees/oxixml-svg" }
+oxixml-dtd = { version = "0.1.3", path = "validation/oxixml-dtd" }
+oxixml-schema = { version = "0.1.3", path = "validation/oxixml-schema" }
+oxixml-relaxng = { version = "0.1.3", path = "validation/oxixml-relaxng" }
+oxixml-schematron = { version = "0.1.3", path = "validation/oxixml-schematron" }
+oxixml-catalog = { version = "0.1.3", path = "validation/oxixml-catalog" }
+oxixml-xinclude = { version = "0.1.3", path = "validation/oxixml-xinclude" }
+oxixml-fn = { version = "0.1.3", path = "query/oxixml-fn" }
+oxixml-xpath = { version = "0.1.3", path = "query/oxixml-xpath" }
+oxixml-xquery = { version = "0.1.3", path = "query/oxixml-xquery" }
+oxixml-xslt = { version = "0.1.3", path = "query/oxixml-xslt" }
+oxixml-c14n = { version = "0.1.3", path = "security/oxixml-c14n" }
+oxixml-dsig = { version = "0.1.3", path = "security/oxixml-dsig" }
+oxixml-enc = { version = "0.1.3", path = "security/oxixml-enc" }
+oxixml-fo = { version = "0.1.3", path = "security/oxixml-fo" }
+oxixml-model = { version = "0.1.3", path = "rdf/oxixml-model" }
+oxixml-json = { version = "0.1.3", path = "rdf/oxixml-json" }
+oxixml-turtle = { version = "0.1.3", path = "rdf/oxixml-turtle" }
+oxixml-rdfxml = { version = "0.1.3", path = "rdf/oxixml-rdfxml" }
+oxixml-jsonld = { version = "0.1.3", path = "rdf/oxixml-jsonld" }
+oxixml-rdfa = { version = "0.1.3", path = "rdf/oxixml-rdfa" }
+oxixml-trix = { version = "0.1.3", path = "rdf/oxixml-trix" }
+oxixml-hdt = { version = "0.1.3", path = "rdf/oxixml-hdt" }
+oxixml-canon = { version = "0.1.3", path = "rdf/oxixml-canon" }
+oxixml-io = { version = "0.1.3", path = "rdf/oxixml-io" }
+oxixml-vocab = { version = "0.1.3", path = "rdf/oxixml-vocab" }
+oxixml-sparql-results = { version = "0.1.3", path = "sparql/oxixml-sparql-results" }
+oxixml-sparql-syntax = { version = "0.1.3", path = "sparql/oxixml-sparql-syntax" }
+oxixml = { version = "0.1.3", path = "crates/oxixml" }
+
+# External crates: allowed ONLY behind off-by-default features (foundation purity).
+serde = { version = "1.0.229", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false }
+arbitrary = { version = "1.4.2", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"

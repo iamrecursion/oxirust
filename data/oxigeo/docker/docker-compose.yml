@@ -1,0 +1,216 @@
+# OxiGeo Docker Compose - Production Configuration
+# Multi-service composition for production deployment
+# Author: COOLJAPAN OU (Team Kitasan)
+
+version: '3.9'
+
+services:
+  # OxiGeo tile server - WMS/WMTS/WFS
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    image: oxigeo/server:latest
+    container_name: oxigeo-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"  # HTTP server
+      - "8081:8081"  # Metrics endpoint
+    volumes:
+      - data:/data:ro  # Read-only data volume
+      - cache:/cache   # Cache volume
+      - ./config/server.toml:/config/server.toml:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+      - OXIGEO_HOST=0.0.0.0
+      - OXIGEO_PORT=8080
+      - OXIGEO_DATA_DIR=/data
+      - OXIGEO_CACHE_DIR=/cache
+      # NOTE: OXIGEO_CACHE_SIZE / OXIGEO_MAX_TILE_AGE are not currently read by
+      # crates/oxigeo-server (its CLI only binds OXIGEO_HOST/PORT/WORKERS/LOG_LEVEL/CONFIG
+      # via clap's `env` attribute - see src/main.rs). Cache sizing/TTL is controlled by
+      # [cache] in the mounted server.toml (docker/config/server.toml) instead; these two
+      # vars are kept here as documentation of intent pending that CLI gap being closed.
+      - OXIGEO_CACHE_SIZE=${OXIGEO_CACHE_SIZE:-1024}
+      - OXIGEO_MAX_TILE_AGE=${OXIGEO_MAX_TILE_AGE:-3600}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - oxigeo-network
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  # PostgreSQL with PostGIS for vector data
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: oxigeo-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-oxigeo}
+      - POSTGRES_USER=${POSTGRES_USER:-oxigeo}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oxigeo}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oxigeo-network
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    container_name: oxigeo-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - oxigeo-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: oxigeo-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - oxigeo-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: oxigeo-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana-dashboard.json:/etc/grafana/provisioning/dashboards/oxigeo.json:ro
+      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    networks:
+      - oxigeo-network
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: oxigeo-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/ssl:/etc/nginx/ssl:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - server
+    networks:
+      - oxigeo-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+networks:
+  oxigeo-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  data:
+    driver: local
+    driver_opts:
+      type: none
+      device: ${DATA_PATH:-./data}
+      o: bind
+  cache:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  nginx-logs:
+    driver: local

@@ -1,0 +1,63 @@
+[package]
+name = "oximedia-captions"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional closed captioning and subtitle authoring system for OxiMedia"
+keywords = ["captions", "subtitle", "srt", "vtt", "multimedia"]
+categories = ["multimedia", "parser-implementations"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-container.workspace = true
+oximedia-graphics.workspace = true
+oximedia-timeline.workspace = true
+oximedia-timecode.workspace = true
+
+thiserror.workspace = true
+bytes.workspace = true
+nom.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+bitflags.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# Parallel processing
+rayon.workspace = true
+
+# Text processing
+regex.workspace = true
+unicode-segmentation = { workspace = true }
+unicode-normalization = "0.1"
+unicode-width = "0.2"
+
+# XML parsing for TTML/DFXP
+quick-xml = { workspace = true }
+
+# Encoding detection and conversion
+encoding_rs = { workspace = true }
+
+# Language detection
+whatlang = "0.18"
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion = { workspace = true }
+
+[features]
+default = ["all-formats"]
+all-formats = ["cea", "broadcast", "web", "professional"]
+cea = []  # CEA-608/708 support
+broadcast = []  # Teletext, ARIB, DVB
+web = []  # WebVTT, TTML, DFXP
+professional = []  # SCC, STL, iTunes Timed Text

@@ -1,0 +1,64 @@
+# AV1 bitstream dictionary for fuzzing
+# Contains OBU headers and common patterns
+
+# OBU types (in header byte)
+"\x08"
+"\x10"
+"\x18"
+"\x20"
+"\x28"
+"\x30"
+"\x38"
+"\x40"
+"\x48"
+"\x50"
+"\x58"
+"\x60"
+"\x68"
+"\x70"
+
+# Sequence header patterns
+"\x0A\x0B\x00"
+"\x0A\x0D\x00"
+
+# Frame header patterns
+"\x32"
+"\x12"
+
+# Tile patterns
+"\x2A"
+
+# Metadata patterns
+"\x3A"
+
+# Level IDC values
+"\x00"
+"\x01"
+"\x02"
+"\x03"
+"\x04"
+"\x05"
+"\x06"
+"\x07"
+
+# Profile values
+"\x00"
+"\x01"
+"\x02"
+
+# Color config
+"\x01\x00\x00"
+"\x01\x01\x00"
+
+# Timing info
+"\x00\x00\x00\x01"
+"\x00\x00\x00\x1E"
+"\x00\x00\x00\x3C"
+
+# Common resolutions (encoded)
+"\x00\x02\x80"
+"\x00\x01\xE0"
+"\x00\x05\x00"
+"\x00\x02\xD0"
+"\x00\x07\x80"
+"\x00\x04\x38"

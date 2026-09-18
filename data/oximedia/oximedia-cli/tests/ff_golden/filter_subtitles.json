@@ -1,0 +1,9 @@
+{
+  "name": "filter_subtitles",
+  "args": ["-i", "in.mkv", "-vf", "subtitles=sub.srt", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "video_filters": 1
+  }
+}

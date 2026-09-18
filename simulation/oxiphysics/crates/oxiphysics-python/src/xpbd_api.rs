@@ -1,0 +1,258 @@
+// Copyright 2026 COOLJAPAN OU (Team KitaSan)
+// SPDX-License-Identifier: Apache-2.0
+
+//! Python bindings for the oxiphysics xpbd module.
+//!
+//! Exposes the Extended Position-Based Dynamics integrator to Python.
+
+use oxiphysics::xpbd::{XpbdConstraint, XpbdSolver};
+use pyo3::prelude::*;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PyXpbdSolver
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// XPBD solver with particles and constraints.
+#[pyclass(name = "XpbdSolver")]
+pub struct PyXpbdSolver {
+    inner: XpbdSolver,
+}
+
+impl Default for PyXpbdSolver {
+    fn default() -> Self {
+        Self {
+            inner: XpbdSolver::new(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyXpbdSolver {
+    /// Create a new empty XPBD solver with default gravity (0, -9.81, 0).
+    #[new]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set gravity.
+    pub fn set_gravity(&mut self, gx: f64, gy: f64, gz: f64) {
+        self.inner.gravity = [gx, gy, gz];
+    }
+
+    /// Set number of substeps.
+    pub fn set_substeps(&mut self, substeps: usize) {
+        self.inner.substeps = substeps;
+    }
+
+    /// Add a particle at `pos` with inverse mass `inv_mass` (0 = pinned). Returns particle index.
+    pub fn add_particle(&mut self, pos: [f64; 3], inv_mass: f64) -> usize {
+        self.inner.add_particle(pos, inv_mass)
+    }
+
+    /// Pin a particle (set inv_mass = 0).
+    pub fn pin_particle(&mut self, idx: usize) {
+        self.inner.pin_particle(idx);
+    }
+
+    /// Add a distance constraint between particles `a` and `b`.
+    pub fn add_distance_constraint(
+        &mut self,
+        a: usize,
+        b: usize,
+        rest_length: f64,
+        compliance: f64,
+    ) -> usize {
+        self.inner.add_constraint(XpbdConstraint::Distance {
+            a,
+            b,
+            rest_length,
+            compliance,
+        })
+    }
+
+    /// Add an angle constraint at apex `b` between particles `a` and `c`.
+    pub fn add_angle_constraint(
+        &mut self,
+        a: usize,
+        b: usize,
+        c: usize,
+        rest_angle: f64,
+        compliance: f64,
+    ) -> usize {
+        self.inner.add_constraint(XpbdConstraint::Angle {
+            a,
+            b,
+            c,
+            rest_angle,
+            compliance,
+        })
+    }
+
+    /// Advance the simulation by `dt` seconds.
+    pub fn step(&mut self, dt: f64) {
+        self.inner.step(dt);
+    }
+
+    /// Get the position of particle `idx`, or None if out of bounds.
+    pub fn particle_position(&self, idx: usize) -> Option<[f64; 3]> {
+        self.inner.particles.get(idx).map(|p| p.pos)
+    }
+
+    /// Velocity of particle `idx` at the end of the most recent `step`.
+    ///
+    /// The solver divides the displacement of the last substep by the substep
+    /// size it recorded, so the result is the physical velocity for any
+    /// substep count (a particle in free fall for `t` seconds reads `g t`).
+    /// `dt` is ignored; it is accepted only so that existing calls
+    /// `particle_velocity(idx, dt)` keep working. Returns `(0, 0, 0)` for an
+    /// unknown or pinned particle and before the first `step`.
+    #[pyo3(signature = (idx, dt=None))]
+    pub fn particle_velocity(&self, idx: usize, dt: Option<f64>) -> [f64; 3] {
+        self.inner.particle_velocity(idx, dt.unwrap_or(0.0))
+    }
+
+    /// Number of particles.
+    pub fn particle_count(&self) -> usize {
+        self.inner.particles.len()
+    }
+
+    /// Number of constraints.
+    pub fn constraint_count(&self) -> usize {
+        self.inner.constraints.len()
+    }
+
+    /// Get all particle positions as a flat list `[x0, y0, z0, x1, y1, z1, ...]`.
+    pub fn all_positions(&self) -> Vec<f64> {
+        self.inner
+            .particles
+            .iter()
+            .flat_map(|p| [p.pos[0], p.pos[1], p.pos[2]])
+            .collect()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Module registration
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyXpbdSolver>()?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xpbd_solver_instantiation() {
+        let mut solver = PyXpbdSolver::new();
+        assert_eq!(solver.particle_count(), 0);
+        let i0 = solver.add_particle([0.0, 5.0, 0.0], 1.0);
+        let i1 = solver.add_particle([1.0, 5.0, 0.0], 1.0);
+        assert_eq!(solver.particle_count(), 2);
+        let _cid = solver.add_distance_constraint(i0, i1, 1.0, 0.0);
+        assert_eq!(solver.constraint_count(), 1);
+    }
+
+    #[test]
+    fn test_xpbd_solver_step() {
+        let mut solver = PyXpbdSolver::new();
+        // A pendulum: a particle pinned at the origin and a free particle one
+        // rod length to its side, so that gravity acts across the rod.
+        let i0 = solver.add_particle([0.0, 0.0, 0.0], 0.0); // pinned
+        let i1 = solver.add_particle([1.0, 0.0, 0.0], 1.0); // free
+        solver.add_distance_constraint(i0, i1, 1.0, 0.0);
+        solver.step(1.0 / 60.0);
+        let p0 = solver.particle_position(i0).expect("p0 should exist");
+        let p1 = solver.particle_position(i1).expect("p1 should exist");
+        // The pinned particle does not move.
+        assert_eq!(p0, [0.0, 0.0, 0.0]);
+        // The free particle falls (about g t^2 / 2 = 1.4e-3 in one step) ...
+        assert!(p1[1] < -1.0e-3, "pendulum bob y = {}", p1[1]);
+        assert!(p1[2].abs() < 1e-12, "no motion out of the plane");
+        // ... while the rod keeps its length, so the bob swings along the circle.
+        let rod_length = (p1[0] * p1[0] + p1[1] * p1[1] + p1[2] * p1[2]).sqrt();
+        assert!(
+            (rod_length - 1.0).abs() < 1e-9,
+            "rod length {rod_length} must stay 1"
+        );
+        assert!(p1[0] < 1.0, "the bob moves inwards along the circle");
+    }
+
+    #[test]
+    fn test_xpbd_rod_along_gravity_holds_the_particle_in_place() {
+        // A rigid rod standing on the pin: gravity pushes the free particle
+        // into the rod, which restores the distance exactly.
+        let mut solver = PyXpbdSolver::new();
+        let i0 = solver.add_particle([0.0, 0.0, 0.0], 0.0);
+        let i1 = solver.add_particle([0.0, 1.0, 0.0], 1.0);
+        solver.add_distance_constraint(i0, i1, 1.0, 0.0);
+        solver.step(1.0 / 60.0);
+        let p1 = solver.particle_position(i1).expect("p1 should exist");
+        assert!((p1[1] - 1.0).abs() < 1e-9, "bob y = {}", p1[1]);
+    }
+
+    #[test]
+    fn test_xpbd_particle_velocity_is_gravity_times_time() {
+        // The velocity used to be divided by the outer dt although the stored
+        // displacement covers one substep: 10x too small at 10 substeps.
+        let mut solver = PyXpbdSolver::new();
+        let idx = solver.add_particle([0.0, 100.0, 0.0], 1.0);
+        solver.set_substeps(10);
+        solver.step(0.1);
+        let v = solver.particle_velocity(idx, Some(0.1));
+        assert!(
+            (v[1] + 0.981).abs() < 1e-9,
+            "vy = {} (the underestimate read -0.0981)",
+            v[1]
+        );
+        assert!(v[0].abs() < 1e-12 && v[2].abs() < 1e-12, "v = {v:?}");
+    }
+
+    #[test]
+    fn test_xpbd_particle_velocity_dt_is_optional_and_ignored() {
+        let mut solver = PyXpbdSolver::new();
+        let idx = solver.add_particle([0.0, 100.0, 0.0], 1.0);
+        solver.step(0.1);
+        let reference = solver.particle_velocity(idx, None);
+        assert!((reference[1] + 0.981).abs() < 1e-9, "vy = {}", reference[1]);
+        for dt in [0.1, 1.0 / 60.0, 0.0, 250.0] {
+            assert_eq!(solver.particle_velocity(idx, Some(dt)), reference);
+        }
+    }
+
+    #[test]
+    fn test_xpbd_particle_velocity_does_not_depend_on_the_substep_count() {
+        for substeps in [1_usize, 5, 10, 40] {
+            let mut solver = PyXpbdSolver::new();
+            let idx = solver.add_particle([0.0, 100.0, 0.0], 1.0);
+            solver.set_substeps(substeps);
+            for _ in 0..4 {
+                solver.step(0.25);
+            }
+            let vy = solver.particle_velocity(idx, None)[1];
+            assert!(
+                (vy + 9.81).abs() < 1e-9,
+                "substeps = {substeps}: vy = {vy}, expected g t = -9.81"
+            );
+        }
+    }
+
+    #[test]
+    fn test_xpbd_particle_velocity_of_pinned_unknown_and_unstepped_particles_is_zero() {
+        let mut solver = PyXpbdSolver::new();
+        let falling = solver.add_particle([0.0, 100.0, 0.0], 1.0);
+        let pinned = solver.add_particle([1.0, 100.0, 0.0], 1.0);
+        assert_eq!(solver.particle_velocity(falling, None), [0.0; 3]);
+        solver.step(0.1);
+        solver.pin_particle(pinned);
+        assert!(solver.particle_velocity(falling, None)[1] < -0.9);
+        assert_eq!(solver.particle_velocity(pinned, None), [0.0; 3]);
+        assert_eq!(solver.particle_velocity(99, None), [0.0; 3]);
+    }
+}

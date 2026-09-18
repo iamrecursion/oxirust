@@ -1,0 +1,172 @@
+[package]
+name = "oxirs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Command-line interface for OxiRS - import, export, migration, and benchmarking tools"
+keywords = ["cli", "sparql", "rdf", "command-line", "semantic-web"]
+categories = ["command-line-utilities", "database", "development-tools"]
+readme = "README.md"
+rust-version.workspace = true
+
+# End-user CLI application (not a library). Kept off crates.io so it can consume
+# publish=false quarantine adapters
+# without putting C FFI on the published Pure-Rust surface. Ships as a release binary.
+publish = false
+
+[dependencies]
+scirs2-core = { workspace = true }
+# SCIRS2 POLICY: Full use of SciRS2 ecosystem for advanced analytics
+scirs2-graph = { workspace = true }  # Graph algorithms (betweenness, closeness, etc.)
+# scirs2-linalg, scirs2-optimize will be added when needed
+oxirs-core.workspace = true
+oxirs-arq.workspace = true
+oxirs-ttl.workspace = true
+oxirs-fuseki.workspace = true
+oxirs-tdb.workspace = true
+oxirs-rule.workspace = true
+oxirs-samm.workspace = true
+oxirs-shacl.workspace = true
+# `oxirs modbus` wiring: TCP + the real in-process mock server only (no
+# `rtu`), which keeps the Pure-Rust `tokio-serial` -> serialport C/udev
+# dependency chain out of the default build entirely — RTU commands report
+# an explicit "not yet supported" error instead of silently pulling that
+# dependency in. `testing` gates oxirs_modbus::testing::MockModbusServer,
+# the real backend for `oxirs modbus mock-server` (not a dev-only feature).
+oxirs-modbus = { workspace = true, default-features = false, features = ["tcp", "testing"] }
+# `oxirs canbus` wiring: DBC parsing / frame decode / SAMM generation only
+# (no live SocketCAN interface access, which is Linux-only upstream).
+oxirs-canbus.workspace = true
+indexmap.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true  # HTTP client for triplestore migrations
+# Install the Pure Rust crypto provider (oxitls) as the rustls process default in main.
+rustls.workspace = true
+oxitls.workspace = true
+# rand functionality now provided by scirs2-core (use scirs2_core::random)
+uuid.workspace = true
+sysinfo = { workspace = true }    # System information
+tempfile.workspace = true    # Temporary file handling
+
+# Enhanced CLI features
+indicatif.workspace = true  # Progress bars
+colored = "3.1"     # Colored output
+prettytable-rs = "0.10"  # Table formatting
+rustyline = "18.0"  # Interactive mode
+rustyline-derive = "0.12"  # Helper derive macros
+strsim = "0.11"     # String similarity for suggestions
+regex.workspace = true
+once_cell.workspace = true
+url.workspace = true
+dirs = "6.0"        # Platform-specific directories
+clap_complete = "4.6"  # Shell completion support
+textwrap = "0.16"   # Text wrapping for help
+unicode-width = "0.2"  # Unicode text width
+terminal_size = "0.4"  # Terminal dimensions
+shlex = "2.0"       # Shell-like parsing
+# OxiCrypto (Pure Rust) — replaces `ring` for AEAD, hashing, and KDF
+oxicrypto-core.workspace = true   # Aead/Hash/StreamingHash traits + CryptoError
+oxicrypto-aead.workspace = true   # AES-256-GCM (seal_to_vec / open_to_vec)
+oxicrypto-hash.workspace = true   # SHA-256 one-shot + streaming
+oxicrypto-kdf.workspace = true    # PBKDF2-HMAC-SHA256 key derivation
+aes-gcm.workspace = true
+argon2.workspace = true
+chrono.workspace = true
+dialoguer = "0.12"  # Interactive prompts
+oxiarc-deflate.workspace = true  # DEFLATE/gzip compression (Pure Rust)
+oxiarc-bzip2.workspace = true    # BZip2 compression (Pure Rust)
+oxiarc-archive.workspace = true  # XZ container compression (Pure Rust; also ZIP/TAR/LZH support)
+hostname = "0.4"    # System hostname for test reports
+md5.workspace = true
+hex.workspace = true         # Hex encoding for checksums
+rust_xlsxwriter = { workspace = true, optional = true }  # Excel XLSX file generation (feature-gated for Pure Rust policy)
+keyring-core = { workspace = true, optional = true }  # System keyring integration (platform-specific, feature-gated)
+inferno = "0.12"    # Flame graph generation for profiling
+printpdf = { version = "0.11", optional = true }    # PDF generation for reports (feature-gated; requires pdf-export feature)
+handlebars.workspace = true  # Template engine for custom output formats
+oxilangtag.workspace = true  # BCP-47 language tag validation and normalization
+quick-xml.workspace = true   # XML parsing for SPARQL Results XML (SRX) format
+
+# macOS Keychain backend for the `system-keyring` feature. Must stay
+# target-gated: the crate pulls `security-framework` -> `core-foundation`,
+# which is `std::os::unix` / Apple-only and fails to compile on Windows and
+# Linux (e.g. `cargo test --all-features` on windows-msvc). `secrets.rs`
+# already `#[cfg(target_os = "macos")]`-gates every use and falls back to the
+# `keyring-core` sample store elsewhere, so dropping the dep off non-Apple
+# targets changes no behaviour.
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+wiremock.workspace = true
+# `serve --graphql` regression test: drive the fuseki production router
+# in-process via `tower::ServiceExt::oneshot` (no socket bind).
+axum.workspace = true
+tower = { workspace = true, features = ["util"] }
+
+[features]
+default = []
+# The full recommended CLI feature set. Named `full-cli` rather than
+# `all-features` because it is not parity with `cargo build --all-features`:
+# `text` is in the bundle for historical reasons even though it leaves the
+# default Pure-Rust build (Tantivy pulls C `zstd-sys`).
+full-cli = [
+    "text",
+    "geo",
+    "pdf-export",
+    "excel-export",
+    "system-keyring"
+]
+excel-export = ["rust_xlsxwriter"]
+pdf-export = ["dep:printpdf"]
+# Enable OS-level secret storage. On macOS this binds the real Keychain via the
+# target-gated `apple-native-keyring-store` below; on Windows/Linux there is no
+# native backend wired up yet, so `secrets.rs` falls back to the `keyring-core`
+# sample store. `dep:apple-native-keyring-store` is a no-op off Apple targets.
+system-keyring = ["dep:keyring-core", "dep:apple-native-keyring-store"]
+# Propagate the non-default `full-text-search` gate to oxirs-tdb and oxirs-fuseki.
+# Enables Tantivy-backed full-text search (pulls C `zstd-sys`); off by default
+# per the COOLJAPAN Pure Rust default policy. `oxirs` itself does not use Tantivy
+# directly, so no direct `tantivy` dependency is required here.
+text = ["oxirs-tdb/full-text-search", "oxirs-fuseki/full-text-search"]
+geo = []
+
+# oxirs-tsdb is a mandatory (non-optional) Pure-Rust dependency: `oxirs tsdb
+# query/insert/stats/export/benchmark` are wired to its real ColumnarStore /
+# SeriesIndex APIs (see commands/tsdb.rs), not a placeholder.
+[dependencies.oxirs-tsdb]
+workspace = true
+
+[package.metadata.docs.rs]
+# Use minimal features for docs.rs build (avoid features with system dependencies)
+features = ["geo"]
+# Exclude: text (tantivy build issues)
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-machete]
+# prettytable-rs is used as `prettytable` (lib name differs from package name),
+# which cargo-machete cannot match against the dependency key.
+ignored = ["prettytable-rs"]
+
+[[bin]]
+name = "oxirs"
+path = "src/main.rs"
+
+[[bench]]
+name = "cli_performance"
+harness = false
+
+[[bench]]
+name = "cli_enhancements"
+harness = false

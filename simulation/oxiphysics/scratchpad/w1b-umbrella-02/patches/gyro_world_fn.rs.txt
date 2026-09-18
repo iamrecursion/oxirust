@@ -1,0 +1,88 @@
+/// Maximum number of damped Newton iterations of the implicit gyroscopic step.
+///
+/// The iteration normally converges in two or three steps; the surplus only matters for the very
+/// large `|ω| dt` of fast spinners on coarse time steps.
+const MAX_NEWTON_ITERATIONS: usize = 8;
+
+/// Residual, relative to the characteristic torque `‖I_w‖ |ω| (|ω| + 1/dt)` of the step, below which
+/// the gyroscopic equation counts as solved.
+const NEWTON_TOLERANCE: f64 = 1e-12;
+
+/// Smallest fraction of a Newton step the backtracking line search falls back to.
+const MIN_STEP_FRACTION: f64 = 1.0 / 64.0;
+
+/// Implicit gyroscopic integration step in the **world** frame for a full inertia tensor.
+///
+/// A torque-free rigid body obeys Euler's equation `d(I_w ω)/dt = 0`. With the world-space
+/// inertia tensor `I_w = R I Rᵀ` frozen at its start-of-step value this is the backward-Euler
+/// problem
+///
+/// ```text
+/// f(ω₁) = I_w (ω₁ − ω₀)/dt + ω₁ × (I_w ω₁) = 0
+/// ```
+///
+/// with the analytic Jacobian `J = I_w/dt + [ω₁]× I_w − [I_w ω₁]×` (Catto, GDC 2015). The equation
+/// is written with `I_w` itself, so the tensor may be any symmetric positive semi-definite matrix
+/// and does **not** have to be diagonal in the body frame: convex hulls, triangle meshes and merged
+/// bodies have products of inertia.
+///
+/// The root is found with a Newton iteration started at `ω₀` (typically two or three iterations;
+/// a backtracking line search keeps it convergent for large `|ω| dt`). For the exact
+/// backward-Euler solution `ω₁ · I_w ω₁ = ω₁ · I_w ω₀`, so the kinetic energy cannot increase: the
+/// step is first-order accurate and slightly dissipative, and a result that would gain kinetic
+/// energy is never returned.
+///
+/// `omega` is returned unchanged when
+/// * `dt` is not a positive finite number or `omega` is not finite;
+/// * `ω₀ × (I_w ω₀)` is negligible (body at rest, isotropic, or spinning about a principal axis),
+///   where `ω₀` already is the solution;
+/// * the iteration cannot reduce the residual, or its result is not finite or would increase the
+///   kinetic energy (a step so large that no root is reachable): the angular velocity is then left
+///   as it is instead of being corrupted.
+pub fn gyroscopic_implicit_step_world(omega: Vec3, inertia_world: &Mat3, dt: Real) -> Vec3 {
+    if !(dt > 0.0 && dt.is_finite()) || !omega.iter().all(|c| c.is_finite()) {
+        return omega;
+    }
+    let residual =
+        |w1: &Vec3| -> Vec3 { inertia_world * (w1 - omega) / dt + w1.cross(&(inertia_world * w1)) };
+    let omega_norm = omega.norm();
+    let scale = inertia_world.norm() * omega_norm * (omega_norm + 1.0 / dt);
+    let initial_residual = residual(&omega).norm();
+    if !(initial_residual > NEWTON_TOLERANCE * scale) {
+        return omega;
+    }
+    let mut w1 = omega;
+    let mut current_residual = initial_residual;
+    for _ in 0..MAX_NEWTON_ITERATIONS {
+        if current_residual <= NEWTON_TOLERANCE * scale {
+            break;
+        }
+        let momentum = inertia_world * w1;
+        let jacobian =
+            inertia_world / dt + w1.cross_matrix() * inertia_world - momentum.cross_matrix();
+        let Some(inverse) = jacobian.try_inverse() else {
+            break;
+        };
+        let newton_step = -(inverse * residual(&w1));
+        let mut fraction = 1.0;
+        let mut candidate = w1 + newton_step;
+        let mut candidate_residual = residual(&candidate).norm();
+        while !(candidate_residual < current_residual) && fraction > MIN_STEP_FRACTION {
+            fraction *= 0.5;
+            candidate = w1 + newton_step * fraction;
+            candidate_residual = residual(&candidate).norm();
+        }
+        if !(candidate_residual < current_residual) {
+            break;
+        }
+        w1 = candidate;
+        current_residual = candidate_residual;
+    }
+    let kinetic_energy = |w: &Vec3| w.dot(&(inertia_world * w));
+    let energy_not_increased = kinetic_energy(&w1) <= kinetic_energy(&omega) * (1.0 + 1e-12);
+    if current_residual < initial_residual && energy_not_increased {
+        w1
+    } else {
+        omega
+    }
+}

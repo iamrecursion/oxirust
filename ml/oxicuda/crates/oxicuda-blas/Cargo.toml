@@ -1,0 +1,67 @@
+[package]
+name = "oxicuda-blas"
+description = "OxiCUDA BLAS - GPU-accelerated BLAS operations (cuBLAS equivalent)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "blas", "gpu", "linear-algebra", "gemm"]
+categories = ["mathematics", "science", "hardware-support"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+oxicuda-memory.workspace = true
+oxicuda-launch.workspace = true
+oxicuda-ptx.workspace = true
+oxicuda-autotune = { workspace = true, optional = true }
+thiserror.workspace = true
+half = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[features]
+default = []
+f16 = ["dep:half"]
+tensor-core = []
+all-precisions = ["f16"]
+# On-device GPU validation tests (`src/gpu_tests.rs`). Enables `f16` so the
+# Ampere `mma.sync.m16n8k16` HMMA path can be launched with real `half::f16`
+# host buffers. Requires a CUDA driver + device at runtime; every test skips
+# gracefully when none is present.
+gpu-tests = ["f16"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "gemm_f16_4096"
+harness = false
+required-features = ["f16"]
+
+[[bench]]
+name = "gemm_f32_4096"
+harness = false
+
+[[bench]]
+name = "gemm_f64_4096"
+harness = false
+
+[[bench]]
+name = "batched_gemm_256"
+harness = false
+
+[[bench]]
+name = "softmax_4096"
+harness = false
+
+[[bench]]
+name = "axpy_10m_f32"
+harness = false

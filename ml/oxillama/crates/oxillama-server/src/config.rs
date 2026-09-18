@@ -1,0 +1,132 @@
+//! Server configuration.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+/// Configuration for the OxiLLaMa API server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    // ── JWT authentication ────────────────────────────────────────────────
+    /// JWT verifier configuration (not serialized — set programmatically
+    /// at startup from file paths / environment variables).
+    ///
+    /// When `Some`, JWT verification is enabled and takes priority over
+    /// `api_keys` bearer-token auth.  When `None`, the existing bearer-key
+    /// path is used.
+    #[serde(skip)]
+    #[cfg(feature = "jwt")]
+    pub jwt: Option<crate::jwt_auth::JwtConfig>,
+    /// Host address to bind to.
+    pub host: String,
+    /// Port number.
+    pub port: u16,
+    /// Maximum concurrent requests.
+    pub max_concurrent: usize,
+    /// Request timeout in seconds.
+    pub timeout_secs: u64,
+    /// Enable CORS headers.
+    pub cors_enabled: bool,
+    /// API keys for authentication (empty = no auth).
+    pub api_keys: Vec<String>,
+    /// Rate limit: maximum burst capacity (0.0 = no limit).
+    pub rate_limit_capacity: f64,
+    /// Rate limit: tokens per second refill rate.
+    pub rate_limit_rate: f64,
+    /// Maximum request body size in bytes (0 = no limit).
+    pub body_limit_bytes: usize,
+    /// Enable the /metrics Prometheus endpoint.
+    pub metrics_enabled: bool,
+    /// Enable structured request tracing middleware.
+    pub structured_tracing: bool,
+
+    // ── Router (multi-model pool) ─────────────────────────────────────────
+    /// Maximum number of concurrently loaded models (0 = 1, single-model mode).
+    pub router_capacity: usize,
+    /// Memory budget for the model pool in MiB (0 = unlimited).
+    pub router_mem_budget_mb: usize,
+    /// Model IDs to pre-load at startup.
+    pub router_preload: Vec<String>,
+
+    // ── Admin API ─────────────────────────────────────────────────────────
+    /// Bearer token required for all `/admin/*` routes.
+    ///
+    /// `None` = token-less mode (admin only accessible from loopback).
+    pub admin_bearer_token: Option<String>,
+    /// Address the admin interface is expected to listen on.
+    /// Used for the startup safety check: non-loopback + no token → fatal error.
+    pub admin_listen: String,
+
+    // ── Batch disk spool ──────────────────────────────────────────────────
+    /// Directory for disk-spooled batch jobs.
+    /// Defaults to `$TMPDIR/oxillama_batch_spool`.
+    pub batch_spool_dir: Option<String>,
+    /// Maximum pending bytes across all queued batch jobs.
+    pub batch_max_pending_bytes: usize,
+
+    // ── Per-API-key rate limiting ─────────────────────────────────────────
+    /// Per-key override map: `api_key → (capacity, rate_per_second)`.
+    ///
+    /// When a request carries an API key that appears in this map, the
+    /// override `(capacity, rate)` pair is used instead of the server
+    /// defaults.  Keys absent from this map use `rate_limit_capacity` and
+    /// `rate_limit_rate` as their bucket parameters.
+    ///
+    /// `None` (the default) disables per-key rate limiting entirely.
+    pub per_key_rate_limits: Option<HashMap<String, (f64, f64)>>,
+
+    // ── Admin path allow-listing (D1) ───────────────────────────────────────
+    /// Directories that `path` fields in admin requests
+    /// (`POST /admin/models/load`'s model path, `POST /admin/loras`'s
+    /// adapter path) are allowed to resolve into.
+    ///
+    /// A supplied path is rejected (400) unless its canonicalized form is
+    /// contained in at least one of these directories (after they are
+    /// themselves canonicalized). This closes off the admin API as a path
+    /// traversal / arbitrary-file-read primitive — without it, an admin
+    /// caller (which may be less trusted than "the operator who started
+    /// the process", e.g. behind a shared bearer token) can ask the server
+    /// to `mmap`/read any file on disk the process has permission to open.
+    ///
+    /// **Empty (the default) disables this check** — no allow-list is
+    /// enforced, matching the pre-fix behavior, so existing deployments
+    /// are not broken by upgrading. Operators should populate this to
+    /// actually get the protection.
+    #[serde(default)]
+    pub allowed_model_dirs: Vec<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "jwt")]
+            jwt: None,
+
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            max_concurrent: 64,
+            timeout_secs: 300,
+            cors_enabled: true,
+            api_keys: Vec::new(),
+            rate_limit_capacity: 0.0,
+            rate_limit_rate: 10.0,
+            body_limit_bytes: 10 * 1024 * 1024,
+            metrics_enabled: true,
+            structured_tracing: true,
+
+            router_capacity: 1,
+            router_mem_budget_mb: 0,
+            router_preload: Vec::new(),
+
+            admin_bearer_token: None,
+            admin_listen: "127.0.0.1:8081".to_string(),
+
+            batch_spool_dir: None,
+            batch_max_pending_bytes: 1024 * 1024 * 1024, // 1 GiB
+
+            per_key_rate_limits: None,
+
+            allowed_model_dirs: Vec::new(),
+        }
+    }
+}

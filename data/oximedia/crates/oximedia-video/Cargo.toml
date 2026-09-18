@@ -1,0 +1,25 @@
+[package]
+name = "oximedia-video"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Professional video processing operations for OxiMedia — motion compensation, frame interpolation, and deinterlacing"
+keywords = ["video", "multimedia", "processing", "frame", "filter"]
+categories = ["multimedia::video"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

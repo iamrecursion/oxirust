@@ -1,0 +1,35 @@
+[package]
+name = "oxicuda-ot"
+description = "Optimal Transport primitives for OxiCUDA — Sinkhorn (log-stabilized), Sinkhorn divergence, network simplex (exact OT), EMD, Wasserstein-1/2, Sliced/Max-Sliced, Gromov-Wasserstein, Fused-GW, Unbalanced OT, JKO scheme, Schrödinger Bridge, Wasserstein barycenters, multi-marginal, Wasserstein k-means, OT-based domain adaptation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+license.workspace = true
+homepage = "https://github.com/cool-japan/oxicuda"
+repository.workspace = true
+keywords = ["gpu", "optimal-transport", "sinkhorn", "wasserstein", "pure-rust"]
+categories = ["science", "algorithms"]
+
+[lints]
+workspace = true
+
+[features]
+# Enables on-device GPU tests that JIT-compile the hand-written PTX kernels,
+# launch them on a real CUDA device, and assert numerical equivalence to the
+# crate's CPU references. The tests skip gracefully when no GPU is present, so
+# this feature is safe to enable on CPU-only machines.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name = "ot_ops"
+harness = false

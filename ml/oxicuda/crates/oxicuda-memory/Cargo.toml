@@ -1,0 +1,39 @@
+[package]
+name = "oxicuda-memory"
+description = "OxiCUDA Memory - Type-safe GPU memory management with Rust ownership semantics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "memory", "device", "buffer"]
+categories = ["hardware-support", "memory-management"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+tracing.workspace = true
+half = { workspace = true, optional = true }
+
+[features]
+default = []
+gpu-tests = ["oxicuda-driver/gpu-tests"]
+# `StagingPod` impls for `half::f16` / `half::bf16` so reduced-precision
+# tensors can use `StagingBuffer`'s in-place fast paths.
+half = ["dep:half"]
+pool = []
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "bandwidth_copy"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

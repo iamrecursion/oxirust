@@ -1,0 +1,495 @@
+[workspace]
+resolver = "2"
+members = [
+    "core/oxirs-core",
+    "core/oxirs-gpu-monitor",
+    "server/oxirs-fuseki",
+    "server/oxirs-gql",
+    "engine/oxirs-arq",
+    "engine/oxirs-geosparql",
+    "engine/oxirs-rule",
+    "engine/oxirs-samm",
+    "engine/oxirs-shacl",
+    "engine/oxirs-star",
+    "engine/oxirs-ttl",
+    "engine/oxirs-vec",
+    "engine/oxirs-vec-adapter-cuda",
+    "storage/oxirs-tdb",
+    "storage/oxirs-cluster",
+    "stream/oxirs-stream",
+    "stream/oxirs-stream-adapter-pulsar",
+    "stream/oxirs-federate",
+    "ai/oxirs-embed",
+    "ai/oxirs-shacl-ai",
+    "ai/oxirs-chat",
+    "ai/oxirs-physics",
+    "ai/oxirs-graphrag",
+    "security/oxirs-did",
+    "platforms/oxirs-wasm",
+    "stream/oxirs-modbus",
+    "storage/oxirs-tsdb",
+    "stream/oxirs-canbus",
+    "tools/oxirs",
+    "desktop/oxirs-tauri",
+    "performance_validation",
+]
+
+# The quarantine adapters below are real workspace members — `-p <name>` and
+# `--workspace` still reach them — but they are kept out of the *default* build
+# set because each needs an external toolchain that a plain checkout will not
+# have (CUDA headers for the GPU adapter, `protoc` for pulsar's build script).
+# Without this, a bare `cargo test --all-features` fails on a machine that is
+# perfectly capable of building everything oxirs actually publishes. This mirrors
+# `publish = false` at the build layer: the C-FFI adapters are opt-in on both.
+#
+#   cargo test --all-features                          # Pure-Rust surface
+#   $env:PROTOC = "$env:USERPROFILE\.cargo\bin\oxiproto-protoc.exe"
+#   cargo build -p oxirs-stream-adapter-pulsar         # opt in to Pulsar
+#   cargo build -p oxirs-vec-adapter-cuda              # opt in to CUDA
+default-members = [
+    "core/oxirs-core",
+    "core/oxirs-gpu-monitor",
+    "server/oxirs-fuseki",
+    "server/oxirs-gql",
+    "engine/oxirs-arq",
+    "engine/oxirs-geosparql",
+    "engine/oxirs-rule",
+    "engine/oxirs-samm",
+    "engine/oxirs-shacl",
+    "engine/oxirs-star",
+    "engine/oxirs-ttl",
+    "engine/oxirs-vec",
+    "storage/oxirs-tdb",
+    "storage/oxirs-cluster",
+    "stream/oxirs-stream",
+    "stream/oxirs-federate",
+    "ai/oxirs-embed",
+    "ai/oxirs-shacl-ai",
+    "ai/oxirs-chat",
+    "ai/oxirs-physics",
+    "ai/oxirs-graphrag",
+    "security/oxirs-did",
+    "platforms/oxirs-wasm",
+    "stream/oxirs-modbus",
+    "storage/oxirs-tsdb",
+    "stream/oxirs-canbus",
+    "tools/oxirs",
+    "desktop/oxirs-tauri",
+    "performance_validation",
+]
+exclude = [
+    "engine/oxirs-geosparql/fuzz",
+    "engine/oxirs-ttl/fuzz",
+]
+
+[workspace.package]
+version = "0.4.2"
+authors = ["KitaSan <info@kitasan.io>"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxirs"
+homepage = "https://github.com/cool-japan/oxirs"
+description = "A Rust-native, modular platform for Semantic Web, SPARQL 1.2, GraphQL, and AI-augmented reasoning"
+keywords = ["sparql", "rdf", "semantic-web", "graphql", "knowledge-graph"]
+categories = ["database", "web-programming", "science"]
+rust-version = "1.70"
+
+[workspace.lints.clippy]
+# Allow certain patterns common in large, evolving codebases
+let_and_return = "allow"
+new_without_default = "allow"
+uninlined_format_args = "allow"
+manual_clamp = "allow"
+unwrap_or_default = "allow"
+# The declared rust-version (1.70) is conservative; the project runs on Rust 1.82+
+incompatible_msrv = "allow"
+
+[workspace.lints.rust]
+# Allow dead code as this is a large project with code written for future use
+dead_code = "allow"
+unused_imports = "allow"
+unused_variables = "allow"
+noop_method_call = "allow"
+unsafe_code = "warn"
+
+[workspace.dependencies]
+# Internal OxiRS crates (version inherited from workspace.package)
+oxirs-core = { version = "0.4.2", path = "core/oxirs-core" }
+# Quarantined NVML telemetry adapter (publish = false; no version — never published)
+oxirs-gpu-monitor = { path = "core/oxirs-gpu-monitor" }
+oxirs-fuseki = { version = "0.4.2", path = "server/oxirs-fuseki" }
+oxirs-gql = { version = "0.4.2", path = "server/oxirs-gql" }
+oxirs-arq = { version = "0.4.2", path = "engine/oxirs-arq" }
+oxirs-geosparql = { version = "0.4.2", path = "engine/oxirs-geosparql" }
+oxirs-rule = { version = "0.4.2", path = "engine/oxirs-rule" }
+oxirs-samm = { version = "0.4.2", path = "engine/oxirs-samm" }
+oxirs-shacl = { version = "0.4.2", path = "engine/oxirs-shacl" }
+oxirs-star = { version = "0.4.2", path = "engine/oxirs-star" }
+oxirs-ttl = { version = "0.4.2", path = "engine/oxirs-ttl" }
+oxirs-vec = { version = "0.4.2", path = "engine/oxirs-vec" }
+# Quarantined CUDA GPU-acceleration adapter (publish = false; no version — never
+# published). Holds the cuda-runtime-sys C FFI kept off oxirs-vec's published
+# Pure-Rust --all-features surface (Pure Rust Policy v2).
+oxirs-vec-adapter-cuda = { path = "engine/oxirs-vec-adapter-cuda" }
+oxirs-tdb = { version = "0.4.2", path = "storage/oxirs-tdb" }
+oxirs-cluster = { version = "0.4.2", path = "storage/oxirs-cluster" }
+oxirs-stream = { version = "0.4.2", path = "stream/oxirs-stream" }
+# Quarantined Pulsar backend adapter (publish = false; no version — never published).
+# Holds the native-tls/lz4-sys C FFI kept off oxirs-stream's published Pure-Rust
+# surface (Pure Rust Policy v2). Its `pulsar` build script needs `protoc`; point
+# PROTOC at `oxiproto-protoc` (see the adapter's README).
+oxirs-stream-adapter-pulsar = { path = "stream/oxirs-stream-adapter-pulsar" }
+oxirs-federate = { version = "0.4.2", path = "stream/oxirs-federate" }
+oxirs-chat = { version = "0.4.2", path = "ai/oxirs-chat" }
+oxirs-embed = { version = "0.4.2", path = "ai/oxirs-embed" }
+oxirs-shacl-ai = { version = "0.4.2", path = "ai/oxirs-shacl-ai" }
+oxirs-physics = { version = "0.4.2", path = "ai/oxirs-physics" }
+oxirs-graphrag = { version = "0.4.2", path = "ai/oxirs-graphrag" }
+oxirs-did = { version = "0.4.2", path = "security/oxirs-did" }
+oxirs-wasm = { version = "0.4.2", path = "platforms/oxirs-wasm" }
+oxirs-modbus = { version = "0.4.2", path = "stream/oxirs-modbus", default-features = false }
+oxirs-tsdb = { version = "0.4.2", path = "storage/oxirs-tsdb" }
+oxirs-canbus = { version = "0.4.2", path = "stream/oxirs-canbus" }
+
+# Core RDF and SPARQL functionality (native OxiRS implementations)
+# oxigraph = "0.4.11"  # REMOVED: Replaced with native implementations
+# oxjsonld = "0.1.0"   # REMOVED: Replaced with native implementations
+# oxrdf = "0.2.0"      # REMOVED: Replaced with native implementations
+# rio_api/rio_turtle/rio_xml = "0.8"  # REMOVED: Unused (zero member references)
+
+# RDF parser dependencies (OxiXML, Pure Rust). Kept under their historical keys via
+# Cargo's package-rename form so every `use oxttl::...` / `use oxrdf::...` path is unchanged.
+oxttl = { package = "oxixml-turtle", version = "0.1.2" }                              # Turtle, N-Triples, N-Quads, TriG, N3 parsers
+oxrdfxml = { package = "oxixml-rdfxml", version = "0.1.2", features = ["async-tokio"] } # RDF/XML parser
+oxjsonld = { package = "oxixml-jsonld", version = "0.1.2", features = ["async-tokio"] } # JSON-LD parser
+oxrdf = { package = "oxixml-model", version = "0.1.2" }                               # RDF data model (required by parsers)
+
+# High-performance validation dependencies from the same OxiXML foundation
+oxiri = { package = "oxixml-iri", version = "0.1.2" }         # Fast IRI validation and parsing
+oxilangtag = { package = "oxixml-langtag", version = "0.1.2" } # Fast language tag validation
+oxsdatatypes = { package = "oxixml-xsd", version = "0.1.2" }  # Fast XSD datatype validation and parsing
+
+# Async runtime and HTTP
+tokio = { version = "1.53.0", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+hyper = { version = "1.10.1", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+
+# GraphQL
+juniper = "0.17"
+juniper_hyper = "0.10"
+async-graphql = "7.2"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml = "0.9"
+rmp-serde = "1.3"
+toml = "1.1"
+ciborium = "0.2"
+
+# Error handling and logging
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Text search (upgraded to 0.25 for lru security fix)
+tantivy = "0.26"
+
+# Streaming
+# NOTE: no `rdkafka`. The Kafka backend was removed in 0.4.1 — it required a C
+# toolchain (librdkafka via rdkafka-sys, plus libz-sys) and, being quarantined in
+# a publish=false adapter, was never reachable from a crates.io release anyway.
+async-nats = "0.49"
+
+# Clustering
+# `serde` feature is required so OpenRaft's RPC types (AppendEntriesRequest,
+# VoteRequest, Entry, etc.) derive Serialize/Deserialize — oxirs-cluster's
+# `raft_network` transport wire-serializes them directly (via oxicode).
+openraft = { version = "0.9", features = ["serde"] }
+
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+
+# Testing
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1.11"
+tempfile = "3.27"
+tokio-test = "0.4"
+wiremock = "0.6"
+
+# HTTP framework and TLS
+axum = { version = "0.8", features = ["ws", "multipart"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+# `default-features = false` drops tokio-rustls's default `aws_lc_rs` provider feature
+# (which otherwise turns on `rustls/aws_lc_rs` → aws-lc-sys for the whole graph). TLS
+# uses the process-default Pure Rust provider installed via `oxitls::pure_provider()`.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+rustls-pemfile = "2.2"
+webpki-roots = "1.0"
+rcgen = "0.14"
+
+# Data structures and utilities
+blake3 = { version = "1.8", features = ["pure"] }  # Pure Rust (no C/asm via cc) per COOLJAPAN Pure Rust Policy
+bumpalo = "3.20"
+num-complex = "0.4"
+indicatif = "0.18"
+async-stream = "0.3"
+handlebars = "6.4"
+config = "0.15"
+image = "0.25"
+rust_xlsxwriter = "0.96"
+
+# Rate limiting, metrics, caching
+governor = "0.10"
+prometheus = "0.14"
+metrics = "0.24"
+moka = { version = "0.12", features = ["future"] }
+
+# Kubernetes
+kube = { version = "4.0", default-features = false, features = ["client", "config", "runtime", "derive"] }
+# NOTE (cargo-upgrade sweep, 2026-07-02): k8s-openapi 0.28.0 dropped the `v1_31`
+# k8s-API-schema-snapshot feature (only `v1_32` ships now) -- this is a required,
+# mechanical companion change of the k8s-openapi 0.27->0.28 major bump itself (the
+# old `v1_31` feature name unconditionally broke workspace-wide dependency
+# resolution, same failure mode regardless of whether oxirs-fuseki's optional `k8s`
+# feature is enabled). server/oxirs-fuseki/src/k8s_operator.rs only references
+# stable/GA resource types (apps/v1::Deployment, core/v1::{Container,Service,...},
+# autoscaling/v2::HorizontalPodAutoscaler, meta/v1::{ObjectMeta,LabelSelector}) whose
+# generated shape does not change between adjacent k8s schema snapshots, so this is
+# expected to be source-compatible -- left for phase 2 to give oxirs-fuseki's `k8s`
+# feature a dedicated build/test pass to confirm.
+k8s-openapi = { version = "0.28", default-features = false, features = ["v1_32"] }
+
+# Additional dependencies
+async-trait = "0.1"
+uuid = { version = "1.24", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form", "query", "multipart", "http2"] }
+bytes = "1.12.1"  # HTTP body handling - CVE-2026-25541 fix
+http = "1.4"    # HTTP types
+
+# Arrow crates (temporarily disabled due to chrono compatibility issues)
+# arrow = "53.4.0"
+# arrow-array = "53.4.0"
+# arrow-buffer = "53.4.0"
+# arrow-data = "53.4.0"
+# arrow-arith = "53.4.0"
+# arrow-cast = "53.4.0"
+# arrow-csv = "53.4.0"
+# arrow-ipc = "53.4.0"
+# arrow-json = "53.4.0"
+# arrow-ord = "53.4.0"
+# arrow-row = "53.4.0"
+# arrow-select = "53.4.0"
+# arrow-string = "53.4.0"
+# arrow-schema = "53.4.0"
+# parquet = "53.4.0"
+# DataFusion compatible with arrow 53.4.0
+# datafusion = "43.0.0"
+# datafusion-common = "43.0.0"
+# datafusion-expr = "43.0.0"
+# datafusion-physical-expr = "43.0.0"
+# datafusion-physical-plan = "43.0.0"
+# datafusion-optimizer = "43.0.0"
+# datafusion-sql = "43.0.0"
+
+# WebSocket support for GraphQL subscriptions
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+futures = "0.3"
+
+# Rand and numerical computing now provided by scirs2-core
+# Direct rand and ndarray usage removed per SciRS2 integration policy
+# Use scirs2-core::random and scirs2-core::ndarray_ext instead
+
+# SciRS2 dependencies (Scientific Computing Library) - crates.io
+# Note: scirs2 meta crate removed - we only use specific sub-crates as needed
+scirs2-core = { version = "0.6.5", features = ["random"] }
+scirs2-linalg = "0.6.5"
+scirs2-stats = "0.6.5"
+scirs2-neural = "0.6.5"
+scirs2-graph = "0.6.5"
+scirs2-integrate = "0.6.5"
+# array! macro is now in scirs2-core, scirs2-autograd not needed
+
+# Proc-macro utilities (used by oxirs-core api_surface module)
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
+
+# OxiSQL - Pure Rust SQLite-compatible engine (replaces rusqlite per COOLJAPAN Policy)
+oxisql-core = "0.4.1"
+oxisql-sqlite-compat = "0.4.1"
+
+# OxiCode - modern binary serialization (replaces bincode per COOLJAPAN Policy)
+oxicode = { version = "0.2.6", features = ["serde", "derive"] }
+
+# OxiArc - Pure Rust archive handling (replaces zip crate per COOLJAPAN Policy)
+oxiarc-archive = "0.4.2"
+
+# System utilities
+ctor = "1.0"  # Pre-main constructors (pure Rust) — used to install process-default rustls CryptoProvider
+rand = "0.10"
+url = { version = "2.5.8", features = ["serde"] }
+rayon = "1.12"
+once_cell = "1.21"
+sysinfo = "0.39"  # System information for memory/CPU monitoring
+regex = "1.13.1"
+fastrand = "2.4.1"
+
+# Tauri desktop application framework
+tauri = { version = "2.11.5", default-features = false }
+tauri-build = { version = "2.6.3" }
+parking_lot = "0.12"
+seahash = "4.1"
+dashmap = "6.2"
+libc = "0.2"
+
+# Cranelift JIT compilation (optional, feature-gated)
+cranelift-codegen = { version = "0.133.1", default-features = false, features = ["std", "host-arch"] }
+cranelift-frontend = { version = "0.133.1" }
+cranelift-jit = { version = "0.133.1" }
+cranelift-module = { version = "0.133.1" }
+cranelift-native = { version = "0.133.1" }
+
+# Compression libraries
+oxiarc-zstd = "0.4.2"  # Zstandard compression (Pure Rust)
+oxiarc-lz4 = "0.4.2"  # LZ4 compression (Pure Rust)
+oxiarc-lzma = "0.4.2"  # LZMA/LZMA2 compression (Pure Rust, replaces xz2/lzma-sys)
+oxiarc-brotli  = "0.4.2"  # Brotli compression (Pure Rust)
+oxiarc-snappy  = "0.4.2"  # Snappy compression (Pure Rust)
+oxiarc-deflate = "0.4.2"  # DEFLATE compression (Pure Rust)
+oxiarc-bzip2 = "0.4.2"  # BZip2 compression (Pure Rust, replaces the `bzip2` C-FFI crate)
+
+# Memory and data structures
+memmap2 = "0.9"
+indexmap = "2.14"
+nalgebra = "0.35"
+
+# XML parsing (OxiXML's Pure-Rust drop-in shim for quick-xml 0.41)
+quick-xml = { package = "oxixml-quickxml-compat", version = "0.1.2" }
+
+# Geospatial libraries (GeoSPARQL support)
+geo = "0.33"       # Geospatial algorithms
+rstar = "0.13"     # R*-tree spatial indexing
+geojson = "1.0"   # GeoJSON serialization
+wkt = "0.14"       # Well-Known Text parsing
+
+# Caching
+redis = { version = "1.4", features = ["tokio-comp"] }
+lru = "0.18.1"
+
+# Cryptography
+sha2 = { version = "0.11", features = ["oid"] }
+sha1 = "0.11"
+md5 = "0.8"
+hmac = "0.13.0"
+hex = "0.4.3"
+base64 = "0.22"
+oxicrypto-core = "0.3.0"  # Aead/Rng traits + CryptoError (OxiCrypto subcrate)
+oxicrypto-aead = "0.3.0"  # AES-256-GCM / ChaCha20-Poly1305 (OxiCrypto subcrate)
+oxicrypto-rand = "0.3.0"  # CSPRNG: random_bytes / random_nonce (OxiCrypto subcrate)
+oxicrypto-mac  = "0.3.0"  # HMAC-SHA256/384 (OxiCrypto subcrate)
+oxicrypto-hash = "0.3.0"  # SHA-256/384/512 incremental hashing (OxiCrypto subcrate)
+oxicrypto-kdf  = "0.3.0"  # PBKDF2-SHA256 (OxiCrypto subcrate)
+oxitls         = { version = "0.3.0", features = ["pure", "webpki-roots"] }  # Pure Rust TLS facade
+oxitls-rcgen   = "0.3.0"  # Pure Rust certificate generation for OxiTLS
+jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
+aes-gcm = "0.11"
+argon2 = "0.5"
+ed25519-dalek = { version = "3.0", features = ["rand_core", "serde", "alloc"] }
+curve25519-dalek = { version = "5", features = ["rand_core", "serde"] }
+bs58 = "0.5"
+p256 = { version = "0.14.0", features = ["ecdsa", "sha256"] }
+rsa = { version = "0.9.10", features = ["sha2"] }
+bls12_381_plus = { version = "0.8.18" }
+sha3 = "0.12"
+# Post-quantum cryptography (C-backed, must be feature-gated per Pure Rust Policy)
+pqcrypto-dilithium = { version = "0.5", default-features = false, features = ["std"] }
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
+pqcrypto-sphincsplus = { version = "0.7", default-features = false, features = ["std"] }
+pqcrypto-kyber = { version = "0.8", default-features = false, features = ["std"] }
+pqcrypto-traits = { version = "0.3", default-features = false, features = ["std"] }
+# System keyring (platform-specific, must be feature-gated per Pure Rust Policy)
+keyring-core = { version = "1.0", features = ["sample"] }
+apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
+
+# Graph algorithms (GraphRAG)
+petgraph = "0.8"
+
+# Phase D: Industrial Connectivity Dependencies
+tokio-serial = "5.5"      # Modbus RTU serial port support
+socketcan = "3.6"         # Linux CAN interface
+bit-vec = "0.10"           # Bit manipulation for Gorilla compression
+arrow = "59"              # Apache Arrow for zero-copy Python integration
+parquet = "59"            # Apache Parquet columnar storage format
+duckdb = "1.10504"        # DuckDB embedded analytics engine (C-deps, must be feature-gated per Pure Rust Policy)
+crc32fast = "1.5"         # Fast SIMD-accelerated CRC32 checksum
+humantime-serde = "1.1"   # Human-readable duration serialization
+
+# WASM support
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console", "Window", "Performance"] }
+console_error_panic_hook = "0.1"
+
+# OpenTelemetry for observability
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio"] }
+opentelemetry-semantic-conventions = "0.32"
+
+[patch.crates-io]
+# pathfinder_simd 0.5.6 uses simd_minimum_number_nsz/simd_maximum_number_nsz
+# which were removed in Rust nightly; patched locally to use simd_fmin/simd_fmax
+pathfinder_simd = { path = "patches/pathfinder_simd" }
+# Pure-Rust patch: replace the C-FFI `zstd` (zstd-sys) with a pure shim backed by
+# oxiarc-zstd; tantivy/parquet/pulsar/wasmtime are the consumers (COOLJAPAN Pure Rust v2).
+zstd = { path = "crates/zstd-shim" }
+
+[workspace.metadata.docs.rs]
+# Note: Individual crates override with [package.metadata.docs.rs] to exclude
+# features with system dependencies (rdkafka, lmdb, kube, etc.)
+# See individual crate Cargo.toml files for specific exclusions
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Feature flags to keep optional dependencies out of default builds
+
+# ============================================================================
+# Build Profiles - Optimized for CUDA environments to reduce disk usage
+# ============================================================================
+
+[profile.dev]
+incremental = true
+debug = 1                      # Line-tables-only (smaller than full debug info)
+split-debuginfo = "unpacked"   # macOS: skip dsymutil, avoid large .dSYM bundles
+strip = "debuginfo"            # Strip debug info from output binaries
+
+[profile.dev.package."*"]
+debug = 0                      # No debug info for dependencies (major space savings)
+opt-level = 1                  # Slight optimization reduces dependency binary size
+
+[profile.dev.build-override]
+opt-level = 0
+debug = false                  # No debug info for build scripts
+
+[profile.test]
+incremental = true
+debug = 1
+split-debuginfo = "unpacked"   # macOS: skip dsymutil, avoid large .dSYM bundles
+strip = "debuginfo"            # Strip debug info from output test binaries
+
+[profile.test.package."*"]
+debug = 0
+opt-level = 1                  # Slight optimization reduces dependency binary size
+
+# Release profile optimizations
+[profile.release]
+lto = "thin"                   # Link-time optimization (smaller binaries)
+codegen-units = 1              # Better optimization
+strip = "symbols"              # Strip symbols from release binaries
+

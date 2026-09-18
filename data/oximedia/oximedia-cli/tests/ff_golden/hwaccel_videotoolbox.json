@@ -1,0 +1,8 @@
+{
+  "name": "hwaccel_videotoolbox",
+  "args": ["-hwaccel", "videotoolbox", "-i", "in.mkv", "out.mkv"],
+  "expect": {
+    "jobs": 1,
+    "hwaccel": "VideoToolbox"
+  }
+}

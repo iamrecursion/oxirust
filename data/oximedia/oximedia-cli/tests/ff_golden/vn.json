@@ -1,0 +1,9 @@
+{
+  "name": "vn",
+  "args": ["-i", "in.mkv", "-vn", "audio.ogg"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "no_video": true
+  }
+}

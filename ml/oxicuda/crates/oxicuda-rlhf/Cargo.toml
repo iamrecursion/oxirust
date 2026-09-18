@@ -1,0 +1,34 @@
+[package]
+name = "oxicuda-rlhf"
+description = "RLHF and alignment algorithm primitives for OxiCUDA — DPO, IPO, KTO, ORPO, SimPO, reward modelling, PPO-RLHF"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["gpu", "rlhf", "reinforcement", "alignment", "pure-rust"]
+categories = ["science", "algorithms"]
+
+[lints]
+workspace = true
+
+[features]
+# Enables on-device GPU tests that JIT-compile the hand-written PTX kernels,
+# launch them on a real CUDA device, and assert numerical equivalence to the
+# crate's CPU references. The tests skip gracefully when no GPU is present, so
+# this feature is safe to enable on CPU-only machines.
+gpu-tests = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[[bench]]
+name = "rlhf_ops"
+harness = false

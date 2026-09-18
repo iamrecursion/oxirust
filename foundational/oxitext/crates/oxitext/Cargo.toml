@@ -1,0 +1,74 @@
+[package]
+name = "oxitext"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Pure-Rust text rendering pipeline (facade): shape → layout → raster"
+keywords = ["text", "rendering", "typography", "oxitext", "cooljapan"]
+categories = ["graphics", "text-processing", "rendering"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["pure"]
+pure = [
+    "dep:oxitext-shape",
+    "dep:oxitext-raster",
+]
+sdf         = ["dep:oxitext-sdf"]
+icu         = ["dep:oxitext-icu", "oxitext-layout/icu"]
+simd        = ["oxitext-raster/simd"]
+parallel    = ["pure", "dep:rayon"]
+## `RenderResult::to_png`. Backed by `oxitext-core`'s own PNG writer (the
+## `oxiarc` deflate stack), so it adds no banned `flate2`/`miniz_oxide` edge.
+png-output  = ["oxitext-core/png-encode"]
+font-subset = ["dep:oxifont-subset"]
+## Decode PNG-compressed CBDT/sbix colour-bitmap strikes (e.g. the CBDT builds
+## of NotoColorEmoji, and every `sbix` strike -- Apple's table only stores
+## PNG).
+##
+## Deny-clean: decoding goes through `oxitext-core`'s own `png_decode` module,
+## built on the pure-Rust `oxiarc-deflate` inflater, so no `png`/`flate2`/
+## `miniz_oxide` edge is added (all three are banned by `deny.toml`). It is
+## off by default only so builds that never draw bitmap emoji do not compile
+## the decoder. COLRv0/v1 vector emoji and the uncompressed CBDT strike formats
+## (mono/gray2/gray4/gray8/BGRA32) are reached by
+## `Pipeline::render`/`render_to_image` through
+## `oxitext_raster::render_cbdt_glyph` in the default build already; this
+## feature extends that same code path to PNG-encoded strikes.
+color-bitmap-fonts = ["pure", "oxitext-raster/png-bitmap"]
+## Render OpenType `SVG ` table (SVG-in-font) colour glyphs through the
+## pipeline, via `oxitext-raster`'s `svg-backend` (`resvg` + `usvg` +
+## `tiny-skia`). Off by default: NOT deny-clean and cannot be made so
+## in-tree -- `usvg` pulls `flate2` -> `miniz_oxide` unconditionally for
+## `.svgz` support, banned by `deny.toml`. See the `svg-backend` feature doc
+## comment in `oxitext-raster`'s `Cargo.toml` for the full explanation. This
+## is a deliberate, documented trade-off for SVG color-glyph support.
+svg-glyphs  = ["pure", "oxitext-raster/svg-backend"]
+
+[dependencies]
+oxitext-core   = { workspace = true }
+# oxitext-layout is always required: M2 bidi/linebreak/vertical re-exports are unconditional.
+oxitext-layout = { workspace = true }
+oxitext-shape  = { workspace = true, optional = true }
+oxitext-raster = { workspace = true, optional = true }
+oxitext-sdf    = { workspace = true, optional = true }
+oxitext-icu    = { workspace = true, optional = true }
+rayon          = { workspace = true, optional = true }
+oxifont-subset = { workspace = true, optional = true }
+ttf-parser     = { workspace = true }
+oxifont        = { workspace = true }
+
+[dev-dependencies]
+# Used by integration tests (color_emoji.rs) to inspect font tables directly.
+ttf-parser      = { workspace = true }
+oxitext-raster  = { path = "../oxitext-raster", features = ["ab-glyph-backend"] }
+# Used by integration tests to provide a deterministic bundled font fallback,
+# eliminating reliance on system fonts for reproducible CI results.
+oxifont-bundled = { workspace = true }

@@ -1,0 +1,99 @@
+[package]
+name = "oxigeo-edge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxigeo-edge"
+readme = "README.md"
+description = "Edge computing platform for OxiGeo with offline-first architecture and minimal footprint"
+keywords = ["edge", "iot", "embedded", "offline", "science"]
+categories = ["embedded", "science::geo", "network-programming"]
+
+[dependencies]
+# Core dependencies
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+
+# Async runtime (minimal features)
+tokio = { workspace = true, features = ["rt", "sync", "time", "io-util"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Compression (optimized for edge)
+oxiarc-deflate = { workspace = true }
+oxiarc-lz4 = { workspace = true }
+oxiarc-snappy = { workspace = true }
+
+# Time handling
+chrono = { workspace = true }
+
+# Logging (minimal)
+tracing = { workspace = true }
+
+# Additional utilities
+ahash = { workspace = true, features = ["std", "runtime-rng"] }
+parking_lot = { workspace = true }
+blake3 = { workspace = true }
+lru = { workspace = true }
+
+# Host CPU sampling for resource-based admission control
+sysinfo = { workspace = true }
+
+# Real HTTP/REST SyncProtocol backend (non-default `http-sync` feature only;
+# see the Pure Rust Policy note on `HttpSyncProtocol` in sync/protocol.rs --
+# reqwest's rustls backend pulls aws-lc-sys, same accepted trade-off as
+# oxigeo-cloud's optional `http`/`s3`/`azure-blob`/`gcs` features).
+reqwest = { workspace = true, optional = true, features = ["json", "query"] }
+
+# CRDT support for conflict resolution
+# SECURITY NOTE: sled 0.34.7 uses unmaintained dependencies:
+#   - RUSTSEC-2025-0057 (fxhash 0.2.1)
+#   - RUSTSEC-2024-0384 (instant 0.1.13 via parking_lot 0.11)
+# Risk: Low (stable code, no known vulnerabilities)
+# Future: Consider migrating to redb for major version bump
+sled = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+fastrand.workspace = true
+
+[features]
+default = ["std"]
+std = []
+offline = ["std"]
+sync = ["std"]
+compression = ["std"]
+# Real HTTP/REST-backed `SyncProtocol` (`HttpSyncProtocol`). NOT part of
+# `default`/`all`: reqwest's rustls backend pulls aws-lc-sys (C + asm crypto),
+# so this intentionally steps outside the pure-Rust default closure.
+http-sync = ["sync", "dep:reqwest"]
+# Exposes `MockSyncProtocol` outside of `cfg(test)` (e.g. for downstream
+# integration tests). Never enable this in a production build.
+test-utils = []
+all = ["offline", "sync", "compression"]
+
+[[bench]]
+name = "edge_bench"
+harness = false
+
+[lints]
+workspace = true
+
+# `all-features = true` would also turn on `http-sync`, which pulls
+# `reqwest`'s rustls backend -> `aws-lc-sys` (C + assembly crypto) -- see the
+# Pure Rust Policy note on `http-sync` above. Excluding it here keeps the
+# docs.rs build on the same Pure-Rust closure as the default feature set
+# (mirrors the pattern in oxigeo-cloud-enhanced).
+[package.metadata.docs.rs]
+features = ["std", "offline", "sync", "compression", "test-utils"]
+rustdoc-args = ["--cfg", "docsrs"]

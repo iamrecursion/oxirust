@@ -1,0 +1,71 @@
+[package]
+name = "oxiui-web"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiUI wasm32 entry point — mounts an OxiUI app on an HTML canvas"
+readme = "README.md"
+categories = ["gui", "wasm"]
+keywords = ["gui", "wasm", "cooljapan", "oxiui", "wasm-bindgen"]
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The default feature set includes all opt-in DOM modules so that users get a
+# working integration out of the box.  Downstream crates that need a minimal
+# wasm binary can disable default features and opt in individually.
+default = ["drag-drop", "service-worker", "font-loading", "fullscreen"]
+
+# Optional DOM API modules — disable to reduce wasm binary size (tree-shaking).
+
+## Drag-and-drop: wires dragenter/over/leave/drop DOM listeners.
+drag-drop = []
+
+## Service worker registration/unregistration helpers.
+service-worker = []
+
+## Web Font Loading API: load fonts via the CSS FontFace API.
+font-loading = []
+
+## Fullscreen API: request/exit/query fullscreen.
+fullscreen = []
+
+## Generic marker feature — bundler-level tree shaking experiments.
+web = []
+
+# wasm-bindgen, web-sys, eframe WebRunner, serde_json, and oxiui-theme are only
+# needed on the wasm32 target.  They MUST NOT appear in [dependencies] — only
+# here, so that native builds (including --all-features) never attempt to
+# compile them.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen             = { workspace = true }
+wasm-bindgen-futures     = { workspace = true }
+# Base web-sys feature set — core DOM APIs always present on wasm32.
+# Optional feature-specific APIs (drag-drop, service-worker) are added below.
+web-sys                  = { workspace = true }
+js-sys.workspace = true
+eframe                   = { workspace = true }
+egui                     = { workspace = true }
+serde_json               = { workspace = true }
+console_error_panic_hook.workspace = true
+# `set_theme`'s high-contrast palette (only reachable inside a
+# `#[cfg(target_arch = "wasm32")]` block — the live egui::Context to apply it
+# to only exists on wasm32).
+oxiui-theme              = { workspace = true }
+
+# Drag-and-drop: extra web-sys features needed only with the `drag-drop` gate.
+# These are already included in the workspace web-sys feature list; adding
+# the dep here as a separate item with conditional features is not supported
+# by Cargo workspace resolution.  Instead we rely on the `#[cfg(feature)]`
+# gates in the Rust source and the workspace web-sys bringing all features.
+# The `drag-drop` and `service-worker` modules are already gated in lib.rs via
+# `#[cfg(feature = "drag-drop")]` / `#[cfg(feature = "service-worker")]`.
+
+[dependencies]
+oxiui-core = { workspace = true, features = ["serde"] }
+oxiui-egui = { workspace = true }

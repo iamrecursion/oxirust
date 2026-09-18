@@ -1,0 +1,63 @@
+# cargo-deny configuration for the OxiXML workspace.
+#
+# OxiXML is a foundation-pure workspace: 0 external crates in default features.
+# This file enforces that the upstream XML/RDF crates OxiXML replaces can never
+# re-enter the dependency graph, and that any future optional dependency stays
+# Pure Rust and appropriately licensed.
+#
+# Run: cargo deny check bans
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "warn"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+# `syn` appears twice only in the DEV-dependency graph: tokio-macros (pulled in by the
+# off-by-default `async-tokio` feature's dev-deps) still uses syn 2.x while serde's derive
+# uses syn 3.x. Neither reaches a default-feature build, so this duplicate is benign.
+skip = [{ crate = "syn", reason = "dev-only duplicate: tokio-macros (syn 2.x) vs serde_derive (syn 3.x); absent from default-feature builds" }]
+# The upstream crates OxiXML supersedes. Use the COOLJAPAN oxixml-* crates instead.
+deny = [
+    { crate = "quick-xml", use-instead = "oxixml-xml" },
+    { crate = "oxrdf", use-instead = "oxixml-model" },
+    { crate = "oxttl", use-instead = "oxixml-turtle" },
+    { crate = "oxrdfxml", use-instead = "oxixml-rdfxml" },
+    { crate = "oxjsonld", use-instead = "oxixml-jsonld" },
+    { crate = "oxrdfio", use-instead = "oxixml-io" },
+    { crate = "oxiri", use-instead = "oxixml-iri" },
+    { crate = "oxilangtag", use-instead = "oxixml-langtag" },
+    { crate = "oxsdatatypes", use-instead = "oxixml-xsd" },
+    { crate = "json-event-parser", use-instead = "oxixml-json" },
+    { crate = "sparesults", use-instead = "oxixml-sparql-results" },
+    { crate = "spargebra", use-instead = "oxixml-sparql-syntax" },
+    { crate = "sparopt", use-instead = "oxixml-sparql-syntax" },
+    { crate = "svg", use-instead = "oxixml-svg" },
+    { crate = "svgtypes", use-instead = "oxixml-svg" },
+    # Common non-Pure-Rust XML stacks OxiXML replaces.
+    { crate = "libxml", use-instead = "oxixml-xml" },
+    { crate = "libxslt", use-instead = "oxixml-xslt" },
+    { crate = "xml5ever", use-instead = "oxixml-xml" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

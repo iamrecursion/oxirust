@@ -1,0 +1,49 @@
+use ag::tensor_ops::*;
+use scirs2_autograd as ag;
+use scirs2_core::ndarray::array;
+
+#[allow(dead_code)]
+fn main() {
+    ag::run(|g| {
+        // Test 2x2 matrix
+        let matrix = array![[4.0, 3.0], [0.0, -1.0]];
+        let matrix_tensor = convert_to_tensor(matrix, g);
+
+        // Test QR decomposition
+        println!("Testing QR decomposition...");
+        let (q, r) = qr(matrix_tensor);
+        println!(
+            "Q shape: {:?}",
+            q.eval(g).expect("Operation failed").shape()
+        );
+        println!(
+            "R shape: {:?}",
+            r.eval(g).expect("Operation failed").shape()
+        );
+
+        // Verify Q*R = original matrix
+        let reconstructed = matmul(q, r);
+        println!("Original matrix:");
+        println!("{:?}", matrix_tensor.eval(g).expect("Operation failed"));
+        println!("Q*R reconstruction:");
+        println!("{:?}", reconstructed.eval(g).expect("Operation failed"));
+
+        // Test SVD decomposition
+        println!("\nTesting SVD decomposition...");
+        let (u, s, vt) = svd(matrix_tensor);
+        println!(
+            "U shape: {:?}",
+            u.eval(g).expect("Operation failed").shape()
+        );
+        println!(
+            "S shape: {:?}",
+            s.eval(g).expect("Operation failed").shape()
+        );
+        println!(
+            "Vt shape: {:?}",
+            vt.eval(g).expect("Operation failed").shape()
+        );
+
+        println!("\nDecomposition tests completed successfully!");
+    });
+}

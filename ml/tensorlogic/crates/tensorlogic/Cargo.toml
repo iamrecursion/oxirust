@@ -1,0 +1,72 @@
+[package]
+name = "tensorlogic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tensorlogic"
+description = "Logic-as-Tensor planning layer - meta crate re-exporting all TensorLogic components"
+keywords = ["logic", "tensor", "neural-symbolic", "differentiable", "machine-learning"]
+categories = ["science", "algorithms", "mathematics"]
+readme = "README.md"
+
+[features]
+default = ["full"]
+full = ["train", "oxirs", "quantrs", "sklears", "trustformers"]
+minimal = []
+train = ["dep:tensorlogic-train"]
+oxirs = ["dep:tensorlogic-oxirs-bridge"]
+quantrs = ["dep:tensorlogic-quantrs-hooks"]
+sklears = ["dep:tensorlogic-sklears-kernels"]
+trustformers = ["dep:tensorlogic-trustformers"]
+sparse = ["dep:tensorlogic-oxicuda-sparse"]
+solver = ["dep:tensorlogic-oxicuda-solver"]
+rng    = ["dep:tensorlogic-oxicuda-rng"]
+full-advanced = ["full", "sparse", "solver", "rng"]
+
+[dependencies]
+# Core planning layer (engine-agnostic) — mandatory
+tensorlogic-ir.workspace = true
+tensorlogic-compiler.workspace = true
+tensorlogic-infer.workspace = true
+tensorlogic-adapters.workspace = true
+
+# Execution layer — scirs-backend is mandatory; train is optional
+tensorlogic-scirs-backend.workspace = true
+tensorlogic-train = { workspace = true, optional = true }
+
+# Integration layer — all optional, gated by feature flags
+tensorlogic-oxirs-bridge = { workspace = true, optional = true }
+tensorlogic-sklears-kernels = { workspace = true, optional = true }
+tensorlogic-quantrs-hooks = { workspace = true, optional = true }
+tensorlogic-trustformers = { workspace = true, optional = true }
+
+# Round 5 sub-feature crates
+tensorlogic-oxicuda-sparse = { workspace = true, optional = true }
+tensorlogic-oxicuda-solver = { workspace = true, optional = true }
+tensorlogic-oxicuda-rng    = { workspace = true, optional = true }
+
+# Utilities (for examples)
+anyhow.workspace = true
+
+[[example]]
+name = "00_minimal_rule"
+path = "examples/00_minimal_rule/main.rs"
+
+[[example]]
+name = "01_exists_reduce"
+path = "examples/01_exists_reduce/main.rs"
+
+[[example]]
+name = "02_scirs2_execution"
+path = "examples/02_scirs2_execution/main.rs"
+
+[[example]]
+name = "03_rdf_integration"
+path = "examples/03_rdf_integration/main.rs"
+required-features = ["oxirs"]
+
+[[example]]
+name = "04_compilation_strategies"
+path = "examples/04_compilation_strategies/main.rs"

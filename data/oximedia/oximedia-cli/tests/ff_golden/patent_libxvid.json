@@ -1,0 +1,10 @@
+{
+  "name": "patent_libxvid",
+  "args": ["-i", "in.mp4", "-c:v", "libxvid", "out.mkv"],
+  "expect": {
+    "contains_diagnostic_kinds": ["PatentCodecSubstituted"],
+    "contains_diagnostic_messages": ["libxvid"],
+    "jobs": 1,
+    "video_codec": "av1"
+  }
+}

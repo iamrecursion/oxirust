@@ -1,0 +1,76 @@
+[package]
+name = "oxitls-adapter-aws-lc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiTLS adapter: aws-lc-rs backed rustls CryptoProvider"
+readme = "README.md"
+categories = ["cryptography", "network-programming"]
+keywords = ["tls", "rustls", "aws-lc-rs", "cooljapan", "oxitls"]
+
+[features]
+default = []
+# Enables the aws-lc-rs CryptoProvider via rustls's built-in aws_lc_rs feature.
+# This feature-gates C/FFI code — the default closure remains Pure Rust.
+aws-lc = ["rustls/aws_lc_rs", "dep:aws-lc-rs"]
+# NOTE: oxihttp-test feature intentionally absent — wave9_https.rs depends on
+# oxihttp-server which is disabled pending a diamond-dep resolution on oxitls-core.
+# Re-add both this feature and the oxihttp-server dev-dep together when oxihttp
+# publishes a version that depends on oxitls ^0.2.0+.
+
+[dependencies]
+oxitls-core = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
+aws-lc-rs = { workspace = true, optional = true }
+
+[[bench]]
+name    = "handshake"
+harness = false
+
+[[bench]]
+name    = "provider_construction"
+harness = false
+
+[[bench]]
+name    = "throughput"
+harness = false
+
+[dev-dependencies]
+criterion    = { workspace = true }
+rcgen        = { workspace = true, features = ["crypto", "pem", "ring"] }
+rustls       = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio        = { workspace = true, features = ["full", "macros", "test-util"] }
+tokio-rustls = { workspace = true }
+oxitls-adapter-rustls-rustcrypto = { path = "../oxitls-adapter-rustls-rustcrypto" }
+oxitls-rcgen = { path = "../oxitls-rcgen" }
+aws-lc-rs    = { workspace = true }
+p256         = { workspace = true }
+# wave9 HTTPS integration test: disabled for 0.1.3 publish — oxihttp-server 0.1.2 creates
+# a diamond dep conflict on oxitls-core. Re-enable when oxihttp publishes a version that
+# depends on oxitls ^0.1.3+.
+# oxihttp-server = { version = "0.1.2", features = ["tls"] }
+hyper          = { workspace = true }
+hyper-util     = { workspace = true }
+http-body-util = { workspace = true }
+bytes          = { workspace = true }
+# wave10 PKCS#11 hybrid integration test: real SoftHSM2 key + aws-lc-rs bulk crypto
+# dev-deps with path = are stripped on cargo publish, so this is safe for a published crate.
+oxitls-adapter-pkcs11 = { path = "../oxitls-adapter-pkcs11", features = ["pkcs11"] }
+secrecy = { workspace = true }
+# wave8 coexistence integration test: oxitls + oxicrypto aws-lc-rs adapters in one binary.
+# dev-deps are stripped on cargo publish, so cross-workspace registry deps are safe here.
+oxicrypto-adapter-aws-lc = { workspace = true, features = ["aws-lc"] }
+oxicrypto-core           = { workspace = true }
+
+[lints.rust]
+# oxihttp-test is a parked integration-test feature: the dep is commented out until
+# oxihttp ships a version that depends on oxitls ^0.2.x (diamond dep blocker).
+# check-cfg teaches rustc that this cfg value is intentional, without adding it to
+# [features] (which would activate it under --all-features and break compilation).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("oxihttp-test"))'] }

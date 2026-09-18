@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>phop — discover &amp; prove scientific laws in your browser</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #171c24; --panel2: #1f2630; --ink: #e6edf3;
+    --muted: #9aa7b4; --accent: #6ea8fe; --good: #3fb950; --warn: #d29922;
+    --bad: #f85149; --line: #2a323d; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header { padding: 28px 24px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { margin: 0 0 4px; font-size: 26px; letter-spacing: -0.3px; }
+  h1 .eml { color: var(--accent); font-family: var(--mono); }
+  .tag { color: var(--muted); font-size: 14px; max-width: 70ch; }
+  .pledge { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .pledge span {
+    font-size: 12.5px; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 999px; padding: 4px 11px; color: var(--ink);
+  }
+  .pledge span b { color: var(--good); }
+  main { max-width: 1080px; margin: 0 auto; padding: 22px 24px 60px; }
+  .caps { display: flex; gap: 10px; flex-wrap: wrap; margin: 4px 0 22px; }
+  .cap {
+    font-size: 12.5px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--muted);
+  }
+  .cap.on { color: var(--ink); border-color: #2f6b39; background: #142a18; }
+  .cap.on::before { content: "✓ "; color: var(--good); }
+  .cap.off::before { content: "– "; }
+  .grid { display: grid; grid-template-columns: 1fr 320px; gap: 20px; align-items: start; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 5px; }
+  textarea, select {
+    width: 100%; background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 13px;
+  }
+  textarea { min-height: 200px; resize: vertical; white-space: pre; }
+  .examples { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 13px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #08111f; font-weight: 600; border-color: var(--accent); width: 100%; padding: 12px; margin-top: 16px; font-size: 15px; }
+  button.primary:disabled { opacity: 0.55; cursor: default; }
+  .opt { display: flex; align-items: center; gap: 8px; margin: 7px 0; font-size: 13.5px; color: var(--ink); }
+  .opt input { width: auto; }
+  .side { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .side h3 { margin: 4px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
+  #status { margin: 18px 0 6px; color: var(--muted); min-height: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin: 14px 0; }
+  .card .top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .badge { font-size: 11.5px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .badge.eml { color: var(--accent); border-color: #2c4a78; }
+  .badge.affine { color: #c08cff; border-color: #4a3a78; }
+  .badge.sym { color: var(--good); border-color: #2f6b39; }
+  .law { font-size: 20px; margin: 12px 0 4px; line-height: 1.5; }
+  .law sub { font-size: 0.72em; } .law sup { font-size: 0.72em; }
+  .metrics { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .metrics b { color: var(--ink); }
+  .src { font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; overflow-x: auto; }
+  .vrow { display: flex; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); font-size: 13.5px; align-items: baseline; }
+  .vrow .k { color: var(--muted); min-width: 150px; flex-shrink: 0; }
+  .vrow .v { font-family: var(--mono); font-size: 12.5px; word-break: break-word; }
+  .verdict-proven { color: var(--good); font-weight: 600; }
+  .verdict-refuted { color: var(--bad); font-weight: 600; }
+  .verdict-unknown { color: var(--warn); }
+  .err { color: var(--bad); background: #2a1416; border: 1px solid #5b2326; border-radius: 8px; padding: 12px; }
+  footer { color: var(--muted); font-size: 12.5px; margin-top: 30px; border-top: 1px solid var(--line); padding-top: 14px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="eml">phop</span> — discover &amp; prove scientific laws, in your browser</h1>
+  <div class="tag">
+    Paste data → a closed-form law is <b>discovered</b>, then <b>canonicalized</b>, range- and
+    root-<b>certified</b>, and its properties <b>proved by an SMT solver</b> — the whole pipeline in
+    pure Rust + WebAssembly. The Julia/Python symbolic-regression stack can't ship this client-side.
+  </div>
+  <div class="pledge">
+    <span><b>No server.</b> Discovery &amp; proofs run on this page.</span>
+    <span><b>No install.</b> Just a browser.</span>
+    <span><b>No trace.</b> Close the tab and nothing remains.</span>
+  </div>
+</header>
+<main>
+  <div class="caps" id="caps" aria-label="verification capabilities"></div>
+  <div class="grid">
+    <section>
+      <label>Examples</label>
+      <div class="examples" id="examples"></div>
+      <label for="csv">Data (CSV — header row, last column is the target)</label>
+      <textarea id="csv" spellcheck="false"></textarea>
+      <button class="primary" id="run">Discover &amp; Verify</button>
+      <div id="status"></div>
+      <div id="results"></div>
+    </section>
+    <aside class="side">
+      <h3>Method</h3>
+      <select id="method">
+        <option value="enumerate">enumerate — fast, exact-shallow</option>
+        <option value="auto">auto — EML + rich-leaf ensemble</option>
+        <option value="rich">rich — products / powers / ratios</option>
+      </select>
+      <h3 style="margin-top:16px">Verify</h3>
+      <div class="opt"><input type="checkbox" id="analyze" checked><label for="analyze" style="margin:0">CAS derivative / integral</label></div>
+      <div class="opt"><input type="checkbox" id="canonical" checked><label for="canonical" style="margin:0">e-graph canonical form</label></div>
+      <div class="opt"><input type="checkbox" id="certify" checked><label for="certify" style="margin:0">certified range + root</label></div>
+      <div class="opt"><input type="checkbox" id="prove_no_root" checked><label for="prove_no_root" style="margin:0">SMT: prove no root</label></div>
+      <div class="opt"><input type="checkbox" id="equiv" checked><label for="equiv" style="margin:0">SMT: prove ≡ true law</label></div>
+      <h3 style="margin-top:16px">Top-k</h3>
+      <select id="topk"><option>1</option><option selected>3</option><option>5</option></select>
+    </aside>
+  </div>
+  <footer>
+    Built with <a href="https://github.com/cool-japan/phop">phop</a> (Pure Rust) · EML operator
+    <span class="src" style="display:inline-block;padding:1px 6px">eml(x,y)=exp(x)−ln(y)</span> ·
+    discovery + CAS (oxieml) + SMT (OxiZ) + e-graph (scirs2-symbolic), all compiled to WebAssembly.
+  </footer>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

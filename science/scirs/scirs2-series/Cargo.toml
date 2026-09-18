@@ -1,0 +1,64 @@
+[package]
+name = "scirs2-series"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Time series analysis module for SciRS2 (scirs2-series)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["time-series", "forecasting", "scientific", "ai", "machine-learning"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["linalg", "array", "random"] }
+scirs2-linalg = { workspace = true }
+scirs2-fft = { workspace = true, features = ["oxifft"] }
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+num_cpus = { workspace = true }
+
+# WASM dependencies
+wasm-bindgen = { workspace = true, optional = true }
+web-sys = { workspace = true, features = ["console"], optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+serde-wasm-bindgen = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+
+statrs.workspace = true
+
+# Future dependency for PandRS with appropriate abstractions
+# pandrs_wrapper = { path = "../wrappers/pandrs_wrapper", optional = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+
+[features]
+default = []
+# Serialization support
+serde = ["dep:serde"]
+# Enable external ML library wrappers
+# pandrs = ["dep:pandrs_wrapper"]
+# WASM support for browser-based time series analysis
+wasm = ["dep:wasm-bindgen", "dep:web-sys", "serde", "dep:serde_json", "dep:serde-wasm-bindgen", "dep:console_error_panic_hook"]
+# Python interoperability via scirs2-core conversion utilities
+python = ["scirs2-core/python"]
+# R integration for R ecosystem compatibility
+r = []
+# SIMD-accelerated time series operations
+simd = ["scirs2-core/simd"]
+
+[[bench]]
+name = "comprehensive_benchmarks"
+harness = false

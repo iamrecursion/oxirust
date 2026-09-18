@@ -1,0 +1,12 @@
+[package]
+name = "minpo-710-damages-builder"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "minpo-710-damages-builder"
+path = "src/main.rs"
+
+[dependencies]
+legalis-jp = { path = "../../jurisdictions/jp" }

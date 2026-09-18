@@ -1,0 +1,26 @@
+[package]
+name = "oximedia-web-color"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Exposure, contrast, saturation, tone-mapping (Reinhard/Filmic/ACES) and gamut conversion for WebAssembly"
+keywords = ["multimedia", "video", "wasm", "color", "hdr"]
+categories = ["multimedia::video", "wasm", "visualization"]
+publish = false
+
+# Speed-tuned wasm-opt: this module runs a fused per-pixel colour chain on
+# every frame, and -O3 recovers loop optimisations the size-tuned workspace
+# rustc profile forgoes. The module stays far under its 200 KiB gzip budget.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O3", "--strip-debug"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+oximedia-web-core = { path = "../oximedia-web-core" }
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+# web-sys.workspace = true

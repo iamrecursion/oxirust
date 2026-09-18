@@ -1,0 +1,401 @@
+//! Multi-camera synchronization and switching for `OxiMedia`.
+//!
+//! This crate provides comprehensive multi-camera production capabilities:
+//!
+//! # Synchronization
+//!
+//! The [`sync`] module provides temporal synchronization:
+//!
+//! - **Temporal Sync** - Frame-accurate synchronization across cameras
+//! - **Audio Sync** - Cross-correlation based audio synchronization
+//! - **Timecode Sync** - LTC/VITC/SMPTE timecode-based sync
+//! - **Visual Sync** - Flash/clapper-based synchronization
+//! - **Genlock Simulation** - Virtual genlock for post-production
+//! - **Drift Correction** - Detect and correct sync drift over time
+//!
+//! # Multi-angle Editing
+//!
+//! The [`edit`] module provides multi-angle editing capabilities:
+//!
+//! - **Timeline** - Multi-angle timeline with angle switching
+//! - **Switching** - Automatic and manual camera angle switching
+//! - **Transitions** - Smooth transitions between camera angles
+//!
+//! # Automatic Switching
+//!
+//! The [`auto`] module provides AI-based camera selection:
+//!
+//! - **Camera Selection** - Intelligent angle selection
+//! - **Rules Engine** - Speaker detection, action following
+//! - **Scoring** - Score camera angles based on multiple criteria
+//!
+//! # Manual Control
+//!
+//! The [`manual`] module provides manual switching control:
+//!
+//! - **Control** - Manual switching interface
+//! - **Preview** - Preview all camera angles simultaneously
+//!
+//! # Composition
+//!
+//! The [`composite`] module provides multi-view layouts:
+//!
+//! - **Picture-in-Picture** - PIP composition with corner insets
+//! - **Split-screen** - Side-by-side, quad-split layouts
+//! - **Grid** - 2x2, 3x3, 4x4 grid layouts
+//!
+//! # Color Matching
+//!
+//! The [`color`] module matches colors across cameras:
+//!
+//! - **Color Match** - Match color appearance across angles
+//! - **White Balance** - Normalize white balance across cameras
+//!
+//! # Spatial Alignment
+//!
+//! The [`spatial`] module provides spatial alignment:
+//!
+//! - **Alignment** - Align overlapping camera views
+//! - **Stitching** - Stitch overlapping views into panoramas
+//!
+//! # Metadata
+//!
+//! The [`metadata`] module tracks per-angle metadata:
+//!
+//! - **Track** - Per-angle metadata and properties
+//! - **Markers** - Sync markers and cue points
+//!
+//! # Example: Multi-camera Timeline
+//!
+//! ```
+//! use oximedia_multicam::edit::MultiCamTimeline;
+//! use oximedia_multicam::sync::SyncMethod;
+//! use oximedia_multicam::composite::Layout;
+//!
+//! # fn example() -> oximedia_multicam::Result<()> {
+//! // Create a multi-camera timeline with 3 angles
+//! let mut timeline = MultiCamTimeline::new(3);
+//!
+//! // Add camera angles
+//! // timeline.add_angle(0, video_track_0, audio_track_0)?;
+//! // timeline.add_angle(1, video_track_1, audio_track_1)?;
+//! // timeline.add_angle(2, video_track_2, audio_track_2)?;
+//!
+//! // Synchronize using audio cross-correlation
+//! // timeline.synchronize(SyncMethod::Audio)?;
+//!
+//! // Set composition layout
+//! // timeline.set_layout(Layout::PictureInPicture { main: 0, inset: 1 })?;
+//!
+//! // Switch to different angle at specific time
+//! // timeline.add_switch(time, 2)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Example: Automatic Switching
+//!
+//! ```
+//! use oximedia_multicam::auto::{AutoSwitcher, SwitchingRule};
+//! use oximedia_multicam::auto::SelectionCriteria;
+//!
+//! # fn example() -> oximedia_multicam::Result<()> {
+//! // Create auto-switcher with rules
+//! let mut switcher = AutoSwitcher::new();
+//!
+//! // Add switching rules
+//! switcher.add_rule(SwitchingRule::SpeakerDetection { sensitivity: 0.8 });
+//! switcher.add_rule(SwitchingRule::ActionFollowing { smoothness: 0.7 });
+//! switcher.add_rule(SwitchingRule::ShotVariety { min_duration_ms: 2000 });
+//!
+//! // Configure selection criteria
+//! let criteria = SelectionCriteria {
+//!     face_detection: true,
+//!     composition_quality: true,
+//!     audio_activity: true,
+//!     motion_detection: true,
+//!     speaker_detection: true,
+//!     min_confidence: 0.7,
+//! };
+//!
+//! // Analyze frames and get recommended angle
+//! // let angle = switcher.select_angle(&frames, &criteria)?;
+//! # Ok(())
+//! # }
+//! ```
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod angle;
+pub mod angle_group;
+pub mod angle_priority;
+pub mod angle_score;
+pub mod angle_sync;
+pub mod angle_sync_ext;
+pub mod audio_selection;
+pub mod auto;
+pub mod auto_frame;
+pub mod bank_ctrl;
+pub mod bank_system;
+pub mod cam_label;
+pub mod cam_metadata;
+pub mod clip_split;
+pub mod color;
+pub mod composite;
+pub mod coverage_map;
+pub mod cut_analysis;
+/// EDL cut-list export from multi-camera timeline.
+pub mod cut_export;
+pub mod cut_point;
+pub mod edit;
+pub mod edit_decision;
+pub mod error;
+/// FCP XML export for multi-camera projects.
+pub mod fcp_xml;
+pub mod framing_suggest;
+pub mod genlock;
+pub mod genlock_master;
+pub mod highlight;
+pub mod highlight_detect;
+pub mod iso_file_sync;
+pub mod iso_record;
+pub mod iso_recording;
+pub mod iso_sync;
+pub mod manual;
+pub mod metadata;
+pub mod multicam_export;
+pub mod proxy;
+pub mod proxy_gen;
+pub mod proxy_generator;
+pub mod replay_buffer;
+pub mod spatial;
+pub mod sub_frame_sync;
+pub mod switch_list;
+pub mod switcher;
+pub mod sync;
+pub mod sync_points;
+pub mod sync_report;
+pub mod sync_verify;
+/// Parallel synchronization verification across all camera angles.
+pub mod sync_verify_parallel;
+pub mod tally_system;
+pub mod timecode_sync;
+/// VISCA protocol camera control for PTZ cameras.
+pub mod visca;
+
+// Re-exports
+pub use error::{MultiCamError, Result};
+
+/// Camera angle identifier
+pub type AngleId = usize;
+
+/// Frame number in timeline
+pub type FrameNumber = u64;
+
+/// Camera information
+#[derive(Debug, Clone)]
+pub struct CameraInfo {
+    /// Camera identifier
+    pub id: AngleId,
+    /// Camera name/label
+    pub name: String,
+    /// Camera position in space
+    pub position: Option<CameraPosition>,
+    /// Camera sensor information
+    pub sensor: Option<SensorInfo>,
+    /// Lens information
+    pub lens: Option<LensInfo>,
+}
+
+/// Camera position in 3D space
+#[derive(Debug, Clone, Copy)]
+pub struct CameraPosition {
+    /// X coordinate (meters)
+    pub x: f64,
+    /// Y coordinate (meters)
+    pub y: f64,
+    /// Z coordinate (meters)
+    pub z: f64,
+    /// Pan angle (degrees)
+    pub pan: f64,
+    /// Tilt angle (degrees)
+    pub tilt: f64,
+    /// Roll angle (degrees)
+    pub roll: f64,
+}
+
+/// Camera sensor information
+#[derive(Debug, Clone)]
+pub struct SensorInfo {
+    /// Sensor width (mm)
+    pub width_mm: f64,
+    /// Sensor height (mm)
+    pub height_mm: f64,
+    /// Sensor type (e.g., "Super 35", "Full Frame")
+    pub sensor_type: String,
+}
+
+/// Lens information
+#[derive(Debug, Clone)]
+pub struct LensInfo {
+    /// Focal length (mm)
+    pub focal_length: f64,
+    /// Maximum aperture (f-stop)
+    pub max_aperture: f64,
+    /// Lens model
+    pub model: String,
+}
+
+/// Synchronization status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+    /// Not synchronized
+    NotSynced,
+    /// Synchronization in progress
+    Syncing,
+    /// Synchronized
+    Synced,
+    /// Sync lost/drifted
+    Drifted,
+}
+
+/// Multi-camera session configuration
+#[derive(Debug, Clone)]
+pub struct MultiCamConfig {
+    /// Number of camera angles
+    pub angle_count: usize,
+    /// Frame rate (fps)
+    pub frame_rate: f64,
+    /// Target frame rate for output
+    pub output_frame_rate: f64,
+    /// Enable audio synchronization
+    pub enable_audio_sync: bool,
+    /// Enable timecode synchronization
+    pub enable_timecode_sync: bool,
+    /// Enable visual marker synchronization
+    pub enable_visual_sync: bool,
+    /// Sync drift tolerance (frames)
+    pub drift_tolerance: u32,
+    /// Automatic color matching
+    pub auto_color_match: bool,
+}
+
+impl Default for MultiCamConfig {
+    fn default() -> Self {
+        Self {
+            angle_count: 2,
+            frame_rate: 25.0,
+            output_frame_rate: 25.0,
+            enable_audio_sync: true,
+            enable_timecode_sync: false,
+            enable_visual_sync: false,
+            drift_tolerance: 2,
+            auto_color_match: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = MultiCamConfig::default();
+        assert_eq!(config.angle_count, 2);
+        assert_eq!(config.frame_rate, 25.0);
+        assert!(config.enable_audio_sync);
+        assert!(config.auto_color_match);
+    }
+
+    #[test]
+    fn test_camera_position() {
+        let pos = CameraPosition {
+            x: 0.0,
+            y: 1.5,
+            z: -5.0,
+            pan: 0.0,
+            tilt: -10.0,
+            roll: 0.0,
+        };
+        assert_eq!(pos.y, 1.5);
+        assert_eq!(pos.tilt, -10.0);
+    }
+
+    // ── Required integration tests ────────────────────────────────────────────
+
+    /// FFT cross-correlation must recover a 100-sample offset.
+    #[test]
+    fn test_fft_cross_correlate_offset() {
+        use std::f32::consts::PI;
+        use sync::cross_correlate::{fft_cross_correlate, find_sync_offset};
+
+        let sample_rate = 48_000_u32;
+        let n = 4_096_usize;
+        let offset = 100_usize;
+
+        // Non-periodic AM signal for a unique cross-correlation peak.
+        let a: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                let env = 0.5 + 0.5 * (2.0 * PI * 50.0 * t).sin();
+                env * (2.0 * PI * 1_000.0 * t).sin() + 0.3 * (2.0 * PI * 1_337.0 * t).sin()
+            })
+            .collect();
+
+        // Build b = a delayed by `offset` samples.
+        let mut b = vec![0.0_f32; n];
+        b[offset..].copy_from_slice(&a[..n - offset]);
+
+        // Verify that the correlation vector is non-empty.
+        let xcorr = fft_cross_correlate(&a, &b);
+        assert!(
+            !xcorr.is_empty(),
+            "fft_cross_correlate returned empty vector"
+        );
+
+        // find_sync_offset should recover ~100 samples.
+        let detected = find_sync_offset(&a, &b, sample_rate);
+        assert!(
+            (detected - offset as i64).abs() <= 20,
+            "Expected offset ≈ {offset}, got {detected}"
+        );
+    }
+
+    /// dissolve_blend at alpha=0.5 must average both frames.
+    #[test]
+    fn test_dissolve_blend_midpoint() {
+        use edit::transition::dissolve_blend;
+
+        // Two 4-pixel RGBA frames (16 bytes each).
+        let a = vec![0u8; 16];
+        let b = vec![200u8; 16];
+
+        let blended = dissolve_blend(&a, &b, 0.5);
+        assert_eq!(blended.len(), 16, "Output length mismatch");
+        for &px in &blended {
+            // 0.5*0 + 0.5*200 = 100
+            assert!((px as i32 - 100).abs() <= 1, "Expected ~100, got {px}");
+        }
+    }
+
+    /// A uniform grayscale frame should score approximately 0.5 for rule of thirds.
+    #[test]
+    fn test_rule_of_thirds_uniform() {
+        use angle_score::score_rule_of_thirds;
+
+        let width = 64_u32;
+        let height = 64_u32;
+        // Uniform frame: every pixel = 128 → no gradient anywhere.
+        let frame = vec![128u8; (width * height) as usize];
+
+        let score = score_rule_of_thirds(&frame, width, height);
+        // A featureless frame has no gradient at intersections OR anywhere
+        // → the function returns the neutral 0.5.
+        assert!(
+            (score - 0.5).abs() <= 0.1,
+            "Expected score ≈ 0.5 for uniform frame, got {score}"
+        );
+    }
+}

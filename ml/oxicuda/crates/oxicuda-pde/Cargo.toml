@@ -1,0 +1,34 @@
+[package]
+name = "oxicuda-pde"
+description = "OxiCUDA: Numerical PDE solvers (FDM, FEM, Spectral, DG, multigrid, time stepping)"
+categories = ["mathematics", "science", "simulation"]
+keywords = ["pde", "finite-element", "finite-difference", "multigrid", "gpu"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+thiserror.workspace = true
+
+[features]
+# On-device GPU validation of the hand-written PTX kernels. The harness skips
+# gracefully when no CUDA device is present, so this feature is safe to enable
+# on CPU-only machines.
+gpu-tests = []
+
+[dev-dependencies]
+criterion.workspace = true
+oxicuda-driver = { path = "../oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda-memory" }
+oxicuda-launch = { path = "../oxicuda-launch" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "pde_ops"
+harness = false

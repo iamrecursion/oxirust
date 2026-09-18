@@ -1,0 +1,38 @@
+[package]
+name = "oximedia-stream"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Adaptive streaming pipeline, segment lifecycle management, and stream health monitoring for OxiMedia"
+readme = "README.md"
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords = ["streaming", "adaptive", "hls", "dash", "media"]
+categories = ["multimedia", "network-programming"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables async manifest serialization (`write_async`) using `tokio` for I/O.
+async = ["dep:tokio"]
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+quick-xml = { workspace = true }
+oximedia-container = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["full"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[[example]]
+name = "live_streaming_pipeline"

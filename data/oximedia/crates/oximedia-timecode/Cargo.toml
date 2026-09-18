@@ -1,0 +1,30 @@
+[package]
+name = "oximedia-timecode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "LTC and VITC timecode reading and writing for OxiMedia"
+keywords = ["timecode", "ltc", "vitc", "broadcast", "multimedia"]
+categories = ["multimedia", "parser-implementations"]
+readme = "README.md"
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core.workspace = true
+oximedia-audio.workspace = true
+serde = { workspace = true }
+
+[dev-dependencies]
+
+[features]
+default = []
+
+[lib]
+name = "oximedia_timecode"
+path = "src/lib.rs"

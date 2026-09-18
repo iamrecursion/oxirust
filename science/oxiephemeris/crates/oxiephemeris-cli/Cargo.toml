@@ -1,0 +1,40 @@
+[package]
+name = "oxiephemeris-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+authors.workspace = true
+repository.workspace = true
+description = "oxieph: CLI for the OxiEphemeris Pure Rust ephemeris engine"
+keywords = ["ephemeris", "astronomy", "cli"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "oxieph"
+path = "src/main.rs"
+
+[dependencies]
+oxiephemeris-core = { workspace = true, features = ["std"] }
+oxiephemeris-de = { workspace = true, features = ["std"] }
+oxiephemeris-bodies = { workspace = true, features = ["std"] }
+oxiephemeris-astro = { workspace = true, features = ["std"] }
+oxiephemeris-chart.workspace = true
+oxiephemeris-rdf.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Dev-only: `tests/cli.rs` cross-checks `oxieph houses --sidereal` against
+# `oxiephemeris-compat`'s `Context::houses_ex(SEFLG_SIDEREAL)` at the same
+# epoch, as a real (non-tautological) proof that the two stacks' sidereal
+# formulas agree.
+[dev-dependencies]
+oxiephemeris-compat = { path = "../oxiephemeris-compat", features = ["std"] }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

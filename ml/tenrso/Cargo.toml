@@ -1,0 +1,101 @@
+[workspace]
+members = [
+  "crates/tenrso",
+  "crates/tenrso-core",
+  "crates/tenrso-kernels",
+  "crates/tenrso-decomp",
+  "crates/tenrso-sparse",
+  "crates/tenrso-planner",
+  "crates/tenrso-ooc",
+  "crates/tenrso-exec",
+  "crates/tenrso-ad",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/tenrso"
+homepage   = "https://github.com/cool-japan/tenrso"
+rust-version = "1.90"
+
+[workspace.dependencies]
+anyhow = "1.0.103"
+thiserror = "2.0.18"
+log = "0.4.33"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+indexmap = "2.14.0"
+smallvec = "1.15.2"
+arrow = { version = "59.0.0", default-features = false, features = ["ipc"] }
+parquet = "59.0.0"
+memmap2 = "0.9.11"
+oxiarc-lz4 = "0.4.2"
+oxiarc-zstd = "0.4.2"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.11"
+rayon = "1.12"
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["tokio"] }
+opentelemetry-semantic-conventions = "0.32.1"
+prometheus = "0.14.0"
+tokio = { version = "1.52.3", features = ["rt", "macros"] }
+parking_lot = "0.12.5"
+lazy_static = "1.5.0"
+tikv-jemallocator = "0.7.0"
+tikv-jemalloc-ctl = "0.7.0"
+mimalloc = { version = "0.1.52", default-features = false }
+num_cpus = "1.17.0"
+# Raw libc/syscall bindings. Used ONLY for the Linux NUMA memory-policy syscalls
+# (mbind/get_mempolicy/getcpu), which glibc does not export as functions.
+# This is a pure-Rust syscall binding crate, not a C library: the Pure Rust
+# policy (no BLAS/LAPACK) is unaffected.
+libc = "0.2.186"
+crossbeam = "0.8.4"
+dashmap = "6.2.1"
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-build = "0.14.6"
+prost = "0.14.4"
+oxicode = { version = "0.2.6", features = ["serde"] }
+bytes = "1.12.0"
+futures = "0.3.32"
+crc32fast = "1.5.0"
+xxhash-rust = { version = "0.8.16", features = ["xxh64"] }
+blake3 = "1.8.5"
+
+# OxiCUDA — pure-Rust NVIDIA CUDA family (driver/memory/BLAS). Used ONLY by
+# tenrso-ooc's optional, default-OFF `cuda-compute` feature to run real
+# elementwise ops on an NVIDIA GPU. NO nvcc/CUDA SDK is required at build time
+# (PTX is generated in pure Rust and JIT-loaded at runtime via libcuda); these
+# never link unless `cuda-compute` is enabled, so the Pure-Rust default build is
+# unaffected. Version 0.4.1 matches what scirs2-fft / torsh already lock, so a
+# downstream lockfile keeps a single copy. Optional-ness is declared per member
+# crate (Workspace Policy: no version pin in member Cargo.toml).
+oxicuda-driver = "0.5.5"
+oxicuda-memory = "0.5.5"
+oxicuda-blas = "0.5.5"
+
+# SciRS2 ecosystem (MANDATORY - see SCIRS2_INTEGRATION_POLICY.md)
+scirs2-core = { version = "0.6.5", features = ["array", "random", "parallel"] }
+scirs2-linalg = { version = "0.6.5" }
+scirs2-fft = { version = "0.6.5" }
+
+# Tensorlogic (optional, default-off; enabled by tenrso-ad's `tensorlogic` feature)
+tensorlogic-infer = { version = "0.1.2", default-features = false }
+tensorlogic-ir = { version = "0.1.2", default-features = false }
+
+# TenRSo internal crates
+tenrso = { version = "0.1.0", path = "crates/tenrso" }
+tenrso-core = { version = "0.1.0", path = "crates/tenrso-core" }
+tenrso-kernels = { version = "0.1.0", path = "crates/tenrso-kernels" }
+tenrso-decomp = { version = "0.1.0", path = "crates/tenrso-decomp" }
+tenrso-sparse = { version = "0.1.0", path = "crates/tenrso-sparse" }
+tenrso-planner = { version = "0.1.0", path = "crates/tenrso-planner" }
+tenrso-ooc = { version = "0.1.0", path = "crates/tenrso-ooc" }
+tenrso-exec = { version = "0.1.0", path = "crates/tenrso-exec" }
+tenrso-ad = { version = "0.1.0", path = "crates/tenrso-ad" }
+

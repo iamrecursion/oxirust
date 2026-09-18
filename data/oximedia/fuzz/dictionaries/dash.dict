@@ -1,0 +1,124 @@
+# DASH (MPD) dictionary for fuzzing
+# Contains common MPD XML elements and attributes
+
+# XML declaration
+"<?xml version=\"1.0\"?>"
+"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+
+# MPD namespace
+"xmlns=\"urn:mpeg:dash:schema:mpd:2011\""
+"xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""
+
+# Root element
+"<MPD>"
+"</MPD>"
+
+# MPD attributes
+"type=\"static\""
+"type=\"dynamic\""
+"mediaPresentationDuration=\"PT"
+"minBufferTime=\"PT"
+"profiles=\""
+
+# Profile values
+"urn:mpeg:dash:profile:isoff-main:2011"
+"urn:mpeg:dash:profile:isoff-live:2011"
+"urn:mpeg:dash:profile:isoff-on-demand:2011"
+
+# Period
+"<Period>"
+"</Period>"
+"id=\""
+"start=\"PT"
+"duration=\"PT"
+
+# AdaptationSet
+"<AdaptationSet>"
+"</AdaptationSet>"
+"mimeType=\""
+"codecs=\""
+"contentType=\""
+"segmentAlignment=\""
+"startWithSAP=\""
+"lang=\""
+
+# MIME types
+"video/mp4"
+"audio/mp4"
+"text/vtt"
+"application/mp4"
+
+# Codecs
+"avc1.64001f"
+"mp4a.40.2"
+"av01.0.05M.08"
+"vp09.00.41.08"
+"opus"
+
+# Representation
+"<Representation>"
+"</Representation>"
+"bandwidth=\""
+"width=\""
+"height=\""
+"frameRate=\""
+"audioSamplingRate=\""
+
+# SegmentTemplate
+"<SegmentTemplate>"
+"</SegmentTemplate>"
+"initialization=\""
+"media=\""
+"timescale=\""
+"startNumber=\""
+"$Number$"
+"$Time$"
+"$Bandwidth$"
+"$RepresentationID$"
+
+# SegmentTimeline
+"<SegmentTimeline>"
+"</SegmentTimeline>"
+"<S "
+"d=\""
+"r=\""
+"t=\""
+
+# SegmentList
+"<SegmentList>"
+"</SegmentList>"
+
+# SegmentBase
+"<SegmentBase>"
+"</SegmentBase>"
+
+# BaseURL
+"<BaseURL>"
+"</BaseURL>"
+
+# ContentProtection (DRM)
+"<ContentProtection>"
+"</ContentProtection>"
+"schemeIdUri=\""
+"value=\""
+
+# Common durations
+"PT10S"
+"PT1H"
+"PT1M30S"
+"PT0.5S"
+
+# Common numbers
+"1920"
+"1080"
+"1280"
+"720"
+"640"
+"480"
+"30"
+"60"
+"24"
+"48000"
+"44100"
+"1000000"
+"5000000"

@@ -1,0 +1,9 @@
+{
+  "name": "seek_to",
+  "args": ["-i", "in.mkv", "-to", "00:01:00", "out.mkv"],
+  "expect": {
+    "contains_diagnostic_kinds": ["UnknownOptionIgnored"],
+    "contains_diagnostic_messages": ["-to"],
+    "jobs": 1
+  }
+}

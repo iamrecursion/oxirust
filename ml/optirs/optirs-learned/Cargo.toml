@@ -1,0 +1,75 @@
+[package]
+name = "optirs-learned"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "OptiRS learned optimizers and meta-learning"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["meta-learning", "learned-optimizers", "transformer", "lstm", "neural"]
+categories = ["science", "algorithms"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# Core dependencies
+optirs-core = { workspace = true }
+scirs2-core = { workspace = true }
+
+# ❌ FORBIDDEN DEPENDENCIES REMOVED - Use SciRS2-Core abstractions instead
+# ndarray - Use scirs2_core::ndarray
+# num-traits - Use scirs2_core::numeric
+
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+# Random generation - REMOVED: Use scirs2_core::random instead
+# rand = { workspace = true }
+# rand_distr = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+
+# Integration tests that exercise a feature-gated module. Declared explicitly so
+# `cargo test --no-default-features` skips them instead of failing to compile.
+# Auto-discovery still picks up every other file in `tests/`.
+[[test]]
+name = "lstm_layers"
+required-features = ["lstm"]
+
+[[test]]
+name = "lstm_meta_training"
+required-features = ["lstm"]
+
+[[test]]
+name = "adaptive_enhancement"
+required-features = ["transformer"]
+
+[[test]]
+name = "xavier_initialization"
+required-features = ["lstm", "transformer"]
+
+[features]
+# All three optimizer families are on by default so the crate's public surface
+# is unchanged from a plain `optirs-learned = "0.3"` dependency. Each feature
+# actually gates its modules (see `src/lib.rs`), so `--no-default-features`
+# plus a single family is a real, smaller build.
+default = ["transformer", "lstm", "meta_learning"]
+
+# Transformer-based learned optimizers: `transformer`, `transformer_based_optimizer`
+# and the `adaptive` architecture-adaptation layer that is written against them.
+transformer = []
+
+# LSTM-based learned optimizer and its BPTT meta-trainer: `lstm`.
+lstm = []
+
+# Gradient-based meta-learning framework (MAML / Reptile / Meta-SGD): `meta_learning`.
+meta_learning = []

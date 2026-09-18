@@ -1,0 +1,207 @@
+#version 430
+
+// Ultra-adaptive step size control with ML-enhanced prediction
+// Includes memory-aware optimization and neural network-based step prediction
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Error estimates from multiple previous steps
+layout(std430, binding = 0) buffer ErrorHistoryBuffer {
+    float error_history[];  // Last 8 error estimates per system
+};
+
+// Step size history
+layout(std430, binding = 1) buffer StepHistoryBuffer {
+    float step_history[];   // Last 8 step sizes per system
+};
+
+// Problem characteristics
+layout(std430, binding = 2) buffer ProblemCharBuffer {
+    float problem_char[];   // [stiffness, nonlinearity, sparsity, dimension_factor]
+};
+
+// Neural network weights for step prediction
+layout(std430, binding = 3) buffer NeuralWeightsBuffer {
+    float nn_weights[];     // Pre-trained NN weights for step prediction
+};
+
+// Output: new step sizes
+layout(std430, binding = 4) buffer NewStepSizeBuffer {
+    float new_step_size[];
+};
+
+// Step acceptance flags
+layout(std430, binding = 5) buffer AcceptanceBuffer {
+    int accepted[];
+};
+
+// Memory usage tracking
+layout(std430, binding = 6) buffer MemoryUsageBuffer {
+    float memory_usage[];   // Current GPU memory usage per system
+};
+
+// Performance metrics
+layout(std430, binding = 7) buffer PerformanceBuffer {
+    float performance_metrics[];  // [throughput, cache_hit_rate, bandwidth_util]
+};
+
+uniform float safety_factor;
+uniform float min_factor;
+uniform float max_factor;
+uniform float error_tolerance;
+uniform float pi_alpha;
+uniform float pi_beta;
+uniform int num_systems;
+uniform float memory_pressure_threshold;  // Trigger memory-aware optimization
+uniform bool enable_neural_prediction;    // Enable ML-based prediction
+uniform bool enable_memory_optimization;  // Enable memory-aware step sizing
+
+// Shared memory for neural network computation
+shared float shared_nn_input[64 * 16];  // Input features
+shared float shared_nn_hidden[64 * 8];  // Hidden layer
+shared float shared_nn_output[64];      // Output predictions
+
+// Simple neural network forward pass
+float neural_network_predict(uint system_id, float features[12]) {
+    uint tid = gl_LocalInvocationID.x;
+    
+    // Input layer to hidden layer
+    for (int h = 0; h < 8; h++) {
+        float sum = 0.0;
+        for (int i = 0; i < 12; i++) {
+            float weight = nn_weights[h * 12 + i];
+            sum += features[i] * weight;
+        }
+        // ReLU activation
+        shared_nn_hidden[tid * 8 + h] = max(0.0, sum + nn_weights[96 + h]); // bias
+    }
+    
+    barrier();
+    
+    // Hidden layer to output
+    float output = 0.0;
+    for (int h = 0; h < 8; h++) {
+        float weight = nn_weights[104 + h];  // output weights start at index 104
+        output += shared_nn_hidden[tid * 8 + h] * weight;
+    }
+    
+    // Sigmoid activation for step size factor
+    output = 1.0 / (1.0 + exp(-output));
+    
+    return output;
+}
+
+// Memory-aware step size adjustment
+float memory_aware_adjustment(uint system_id, float base_factor) {
+    if (!enable_memory_optimization) return base_factor;
+    
+    float mem_usage = memory_usage[system_id];
+    float throughput = performance_metrics[system_id * 3 + 0];
+    float cache_hit_rate = performance_metrics[system_id * 3 + 1];
+    float bandwidth_util = performance_metrics[system_id * 3 + 2];
+    
+    // Memory pressure factor (reduce step size when memory is constrained)
+    float memory_factor = 1.0;
+    if (mem_usage > memory_pressure_threshold) {
+        memory_factor = 0.5 + 0.5 * (1.0 - mem_usage);
+    }
+    
+    // Performance-based adjustment
+    float perf_factor = 1.0;
+    if (cache_hit_rate < 0.8) {
+        perf_factor *= 0.9;  // Reduce step size for poor cache performance
+    }
+    if (bandwidth_util > 0.9) {
+        perf_factor *= 0.8;  // Reduce step size when bandwidth saturated
+    }
+    
+    return base_factor * memory_factor * perf_factor;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    
+    if (index >= num_systems) return;
+    
+    // Get current error and step size
+    float current_error = error_history[index * 8 + 7];  // Most recent error
+    float current_step = step_history[index * 8 + 7];    // Most recent step
+    
+    // Check if step should be accepted
+    bool accept_step = current_error <= error_tolerance;
+    accepted[index] = accept_step ? 1 : 0;
+    
+    float factor = safety_factor;
+    
+    if (enable_neural_prediction && current_error > 0.0) {
+        // Prepare features for neural network
+        float features[12];
+        
+        // Error history features (last 4 errors)
+        for (int i = 0; i < 4; i++) {
+            features[i] = error_history[index * 8 + 4 + i];
+        }
+        
+        // Step size history features (last 4 steps)
+        for (int i = 0; i < 4; i++) {
+            features[4 + i] = step_history[index * 8 + 4 + i];
+        }
+        
+        // Problem characteristics
+        for (int i = 0; i < 4; i++) {
+            features[8 + i] = problem_char[index * 4 + i];
+        }
+        
+        // Get neural network prediction
+        float nn_factor = neural_network_predict(index, features);
+        
+        // Combine traditional PI controller with neural prediction
+        float error_ratio = current_error / error_tolerance;
+        float pi_factor = safety_factor * pow(1.0 / error_ratio, pi_alpha);
+        
+        // Add integral term
+        if (error_history[index * 8 + 6] > 0.0) {
+            float prev_error_ratio = error_history[index * 8 + 6] / error_tolerance;
+            float integral_term = pow(error_ratio / prev_error_ratio, pi_beta);
+            pi_factor *= integral_term;
+        }
+        
+        // Weighted combination of PI controller and neural prediction
+        float nn_weight = 0.3;  // 30% neural network, 70% traditional controller
+        factor = (1.0 - nn_weight) * pi_factor + nn_weight * nn_factor;
+        
+    } else {
+        // Traditional PI controller
+        float error_ratio = current_error / error_tolerance;
+        factor = safety_factor * pow(1.0 / error_ratio, pi_alpha);
+        
+        // Add integral term
+        if (error_history[index * 8 + 6] > 0.0) {
+            float prev_error_ratio = error_history[index * 8 + 6] / error_tolerance;
+            float integral_term = pow(error_ratio / prev_error_ratio, pi_beta);
+            factor *= integral_term;
+        }
+    }
+    
+    // Apply memory-aware adjustments
+    factor = memory_aware_adjustment(index, factor);
+    
+    // Clamp the factor to reasonable bounds
+    factor = clamp(factor, min_factor, max_factor);
+    
+    // Special handling for rejected steps
+    if (!accept_step) {
+        factor = min(factor, 0.5);
+    }
+    
+    // Compute new step size
+    float new_step = current_step * factor;
+    
+    // Additional safety checks
+    float min_step = current_step * 0.001;  // Don't reduce by more than 1000x
+    float max_step = current_step * 20.0;   // Don't increase by more than 20x
+    
+    new_step = clamp(new_step, min_step, max_step);
+    
+    new_step_size[index] = new_step;
+}

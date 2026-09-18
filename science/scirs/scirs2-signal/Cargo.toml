@@ -1,0 +1,61 @@
+[package]
+name = "scirs2-signal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Signal processing module for SciRS2 (scirs2-signal)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["signal-processing", "filter", "scientific", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies
+scirs2-core = { workspace = true, features = ["array", "random", "parallel", "simd"] }
+thiserror = { workspace = true }
+# BLAS dependencies handled through scirs2-core
+
+# Signal processing specific dependencies
+# oxifft (Pure Rust FFT, COOLJAPAN Policy) is declared per-target below:
+# threading (rayon) is not supported on wasm32-unknown-unknown.
+scirs2-fft = { workspace = true, features = ["oxifft"] }
+scirs2-linalg = { workspace = true }
+scirs2-special = { workspace = true }
+rand_chacha = { workspace = true }
+statrs = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+oxicode = { workspace = true }  # Weight serialization (oxicode format)
+chrono = { workspace = true }
+num_cpus = { workspace = true }
+approx = { workspace = true }
+# BLAS dependencies removed - using core abstractions
+# ndarray-linalg = { workspace = true }
+# Optional rayon dependency for parallel processing - now handled by scirs2-core
+# rayon = { workspace = true, optional = true }
+
+[features]
+default = ["parallel"]
+parallel = ["scirs2-core/parallel"]  # Use scirs2-core parallel abstractions
+unstable_avx512 = []  # Experimental AVX-512 support
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# threading (rayon) is not supported on wasm32-unknown-unknown - keep std only
+oxifft = { version = "0.4.2", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+plotly = { workspace = true }
+ndarray-rand = { workspace = true }

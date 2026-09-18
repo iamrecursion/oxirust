@@ -1,0 +1,85 @@
+[package]
+name = "oxirs-gql"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "GraphQL façade for OxiRS with automatic schema generation from RDF ontologies"
+keywords = ["graphql", "rdf", "semantic-web", "api", "federation"]
+categories = ["web-programming", "api-bindings", "database"]
+readme = "README.md"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# oxigraph.workspace = true  # REMOVED: Using oxirs-core instead
+oxirs-core.workspace = true
+scirs2-core.workspace = true
+juniper.workspace = true
+juniper_hyper.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+regex.workspace = true
+fastrand.workspace = true
+sysinfo.workspace = true
+
+# Distributed caching
+redis.workspace = true
+lru.workspace = true
+oxiarc-deflate.workspace = true
+oxiarc-brotli.workspace = true
+
+# WebSocket support for subscriptions
+tokio-tungstenite.workspace = true
+tokio-stream.workspace = true
+futures-util.workspace = true
+futures.workspace = true
+
+# Cryptography for APQ and JWT
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+base64.workspace = true
+
+# Pure-Rust authenticated encryption (OxiCrypto) for the distributed cache
+oxicrypto-core.workspace = true
+oxicrypto-aead.workspace = true
+oxicrypto-rand.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[features]
+default = []
+graphiql = []
+
+[[bench]]
+name = "gql_benchmarks"
+path = "benches/gql_benchmarks.rs"
+harness = false
+
+[[bin]]
+name = "oxirs-gql"
+path = "src/main.rs"
+
+[[bin]]
+name = "generate-docs"
+path = "src/bin/generate_docs.rs"
+

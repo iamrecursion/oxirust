@@ -1,0 +1,1171 @@
+// Fault Tolerance for TPU Pod Coordination
+//
+// This module provides comprehensive fault tolerance functionality for TPU pod coordination,
+// including failure detection, recovery strategies, redundancy management, and checkpointing.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use super::DeviceId;
+use crate::error::{OptimError, Result};
+use scirs2_core::error::ErrorContext;
+
+/// Compute the SHA-256 hex digest of `bytes`.
+///
+/// Used to fingerprint checkpoint payloads so restores can detect corruption.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Serializable snapshot persisted to disk for a checkpoint.
+///
+/// Real TPU program/optimizer state requires the vendor runtime; without
+/// hardware the honest persistable state is the coordination bookkeeping:
+/// the monitored device roster, the checkpoint identity/type, and metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CheckpointPayload {
+    /// Logical checkpoint identifier.
+    checkpoint_id: String,
+    /// Wall-clock creation time, milliseconds since the UNIX epoch.
+    created_at_unix_millis: u128,
+    /// Checkpoint kind, e.g. `"Full"`.
+    checkpoint_type: String,
+    /// Monitored device ids captured in this checkpoint.
+    device_ids: Vec<usize>,
+    /// Free-form metadata.
+    metadata: HashMap<String, String>,
+}
+
+/// On-disk record for a persisted checkpoint: where it lives and its content
+/// hash, so a restore can locate the payload and verify its integrity.
+#[derive(Debug, Clone)]
+struct CheckpointRecord {
+    /// Path to the serialized payload on disk.
+    path: PathBuf,
+    /// SHA-256 hex digest of the payload bytes, recorded at creation time.
+    sha256: String,
+    /// Serialized payload size in bytes.
+    size_bytes: usize,
+}
+
+/// Types of failures
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailureType {
+    DeviceFailure,
+    NetworkFailure,
+    MemoryFailure,
+    ComputeFailure,
+    SoftwareFailure,
+    DataCorruption,
+}
+
+/// Recovery strategies
+#[derive(Debug, Clone)]
+pub enum RecoveryStrategy {
+    Restart,
+    Migrate,
+    Replicate,
+    Rollback,
+    Isolate,
+    Graceful,
+}
+
+/// Failure detection algorithms
+#[derive(Debug, Clone, Copy)]
+pub enum FailureDetectionAlgorithm {
+    Timeout,
+    HeartbeatMissing,
+    PerformanceDegradation,
+    ErrorRate,
+    Consensus,
+    Adaptive,
+}
+
+/// Device status for fault tolerance
+#[derive(Debug, Clone, Copy)]
+pub enum DeviceStatus {
+    Active,
+    Idle,
+    Busy,
+    Failed,
+    Recovering,
+    Offline,
+}
+
+/// Failure information
+#[derive(Debug, Clone)]
+pub struct FailureInfo {
+    /// Failure type
+    pub failure_type: FailureType,
+
+    /// Failed device
+    pub device_id: DeviceId,
+
+    /// Detection timestamp
+    pub detected_at: Instant,
+
+    /// Failure severity (0.0 to 1.0)
+    pub severity: f64,
+
+    /// Error message
+    pub error_message: String,
+
+    /// Recovery attempts
+    pub recovery_attempts: usize,
+
+    /// Status
+    pub status: FailureStatus,
+}
+
+/// Failure status
+#[derive(Debug, Clone, Copy)]
+pub enum FailureStatus {
+    Detected,
+    Analyzing,
+    Recovering,
+    Recovered,
+    Permanent,
+}
+
+/// Recovery action
+#[derive(Debug, Clone)]
+pub struct RecoveryAction {
+    /// Action type
+    pub action_type: RecoveryStrategy,
+
+    /// Target devices
+    pub target_devices: Vec<DeviceId>,
+
+    /// Estimated completion time
+    pub estimated_completion: Duration,
+
+    /// Priority
+    pub priority: RecoveryPriority,
+
+    /// Required resources
+    pub required_resources: Vec<String>,
+}
+
+/// Recovery priority
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecoveryPriority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Checkpoint information
+#[derive(Debug, Clone)]
+pub struct CheckpointInfo {
+    /// Checkpoint ID
+    pub checkpoint_id: String,
+
+    /// Creation timestamp
+    pub created_at: Instant,
+
+    /// Size in bytes
+    pub size_bytes: usize,
+
+    /// Associated devices
+    pub devices: Vec<DeviceId>,
+
+    /// Checkpoint type
+    pub checkpoint_type: CheckpointType,
+
+    /// Metadata
+    pub metadata: HashMap<String, String>,
+}
+
+/// Checkpoint types
+#[derive(Debug, Clone, Copy)]
+pub enum CheckpointType {
+    Full,
+    Incremental,
+    Differential,
+    Log,
+}
+
+/// Redundancy configuration
+#[derive(Debug, Clone)]
+pub struct RedundancyConfig {
+    /// Replication factor
+    pub replication_factor: usize,
+
+    /// Redundancy strategy
+    pub strategy: RedundancyStrategy,
+
+    /// Consistency level
+    pub consistency_level: ConsistencyLevel,
+
+    /// Failure tolerance
+    pub failure_tolerance: usize,
+}
+
+/// Redundancy strategies
+#[derive(Debug, Clone, Copy)]
+pub enum RedundancyStrategy {
+    Replication,
+    ErasureCoding,
+    Hybrid,
+    Adaptive,
+}
+
+/// Consistency levels
+#[derive(Debug, Clone, Copy)]
+pub enum ConsistencyLevel {
+    Eventual,
+    Strong,
+    Causal,
+    Sequential,
+    Linearizable,
+}
+
+/// Type aliases for managers
+type HeartbeatManager = HashMap<DeviceId, Instant>;
+/// Index of persisted checkpoints, keyed by checkpoint id.
+type CheckpointingSystem = HashMap<String, CheckpointRecord>;
+
+/// Fault tolerance statistics
+pub type FaultToleranceStatistics = HashMap<String, f64>;
+
+/// Failure detector
+#[derive(Debug)]
+pub struct FailureDetector {
+    /// Monitored devices
+    monitored_devices: HashSet<DeviceId>,
+
+    /// Heartbeat manager
+    heartbeat_manager: HeartbeatManager,
+
+    /// Failure threshold
+    failure_threshold: Duration,
+
+    /// Detection algorithm
+    detection_algorithm: FailureDetectionAlgorithm,
+
+    /// Failure history
+    failure_history: Vec<FailureInfo>,
+
+    /// Detection configuration
+    detection_config: DetectionConfig,
+}
+
+/// Detection configuration
+#[derive(Debug, Clone)]
+pub struct DetectionConfig {
+    /// Heartbeat interval
+    pub heartbeat_interval: Duration,
+
+    /// Timeout threshold
+    pub timeout_threshold: Duration,
+
+    /// Performance degradation threshold
+    pub performance_threshold: f64,
+
+    /// Error rate threshold
+    pub error_rate_threshold: f64,
+
+    /// Consensus threshold
+    pub consensus_threshold: usize,
+}
+
+impl FailureDetector {
+    /// Create a new failure detector
+    pub fn new(config: DetectionConfig) -> Self {
+        Self {
+            monitored_devices: HashSet::new(),
+            heartbeat_manager: HashMap::new(),
+            failure_threshold: config.timeout_threshold,
+            detection_algorithm: FailureDetectionAlgorithm::Timeout,
+            failure_history: Vec::new(),
+            detection_config: config,
+        }
+    }
+
+    /// Add device to monitoring
+    pub fn add_device(&mut self, device_id: DeviceId) {
+        self.monitored_devices.insert(device_id);
+        self.heartbeat_manager.insert(device_id, Instant::now());
+    }
+
+    /// Remove device from monitoring
+    pub fn remove_device(&mut self, device_id: DeviceId) {
+        self.monitored_devices.remove(&device_id);
+        self.heartbeat_manager.remove(&device_id);
+    }
+
+    /// Update heartbeat for device
+    pub fn update_heartbeat(&mut self, device_id: DeviceId) {
+        if self.monitored_devices.contains(&device_id) {
+            self.heartbeat_manager.insert(device_id, Instant::now());
+        }
+    }
+
+    /// Check for failures
+    pub fn check_failures(&mut self) -> Vec<FailureInfo> {
+        let mut detected_failures = Vec::new();
+        let now = Instant::now();
+
+        for &device_id in &self.monitored_devices {
+            if let Some(&last_heartbeat) = self.heartbeat_manager.get(&device_id) {
+                let time_since_heartbeat = now.duration_since(last_heartbeat);
+
+                if time_since_heartbeat > self.failure_threshold {
+                    let failure = FailureInfo {
+                        failure_type: FailureType::DeviceFailure,
+                        device_id,
+                        detected_at: now,
+                        severity: self.calculate_failure_severity(time_since_heartbeat),
+                        error_message: format!(
+                            "Device {} failed to send heartbeat for {:?}",
+                            device_id.0, time_since_heartbeat
+                        ),
+                        recovery_attempts: 0,
+                        status: FailureStatus::Detected,
+                    };
+
+                    detected_failures.push(failure.clone());
+                    self.failure_history.push(failure);
+                }
+            }
+        }
+
+        detected_failures
+    }
+
+    /// Calculate failure severity based on detection algorithm
+    fn calculate_failure_severity(&self, time_since_heartbeat: Duration) -> f64 {
+        match self.detection_algorithm {
+            FailureDetectionAlgorithm::Timeout => {
+                let ratio =
+                    time_since_heartbeat.as_secs_f64() / self.failure_threshold.as_secs_f64();
+                (ratio - 1.0).clamp(0.0, 1.0)
+            }
+            FailureDetectionAlgorithm::HeartbeatMissing
+                if time_since_heartbeat > self.detection_config.heartbeat_interval * 3 =>
+            {
+                1.0
+            }
+            _ => 0.5, // Default severity for other algorithms
+        }
+    }
+
+    /// Get failure statistics
+    pub fn get_failure_statistics(&self) -> HashMap<String, f64> {
+        let mut stats = HashMap::new();
+
+        stats.insert(
+            "monitored_devices".to_string(),
+            self.monitored_devices.len() as f64,
+        );
+
+        stats.insert(
+            "total_failures".to_string(),
+            self.failure_history.len() as f64,
+        );
+
+        // Calculate failure rate
+        let recent_failures = self
+            .failure_history
+            .iter()
+            .filter(|f| f.detected_at.elapsed() < Duration::from_secs(3600))
+            .count();
+        stats.insert("recent_failure_rate".to_string(), recent_failures as f64);
+
+        // Calculate average recovery time
+        let avg_recovery_time = if self.failure_history.is_empty() {
+            0.0
+        } else {
+            self.failure_history
+                .iter()
+                .filter(|f| matches!(f.status, FailureStatus::Recovered))
+                .map(|f| f.detected_at.elapsed().as_secs_f64())
+                .sum::<f64>()
+                / self.failure_history.len() as f64
+        };
+        stats.insert("avg_recovery_time_secs".to_string(), avg_recovery_time);
+
+        stats
+    }
+
+    /// Set detection algorithm
+    pub fn set_detection_algorithm(&mut self, algorithm: FailureDetectionAlgorithm) {
+        self.detection_algorithm = algorithm;
+    }
+
+    /// Get monitored devices
+    pub fn get_monitored_devices(&self) -> &HashSet<DeviceId> {
+        &self.monitored_devices
+    }
+
+    /// Get failure history
+    pub fn get_failure_history(&self) -> &[FailureInfo] {
+        &self.failure_history
+    }
+}
+
+/// Fault tolerance manager
+#[derive(Debug)]
+pub struct FaultToleranceManager {
+    /// Failure detector
+    failure_detector: FailureDetector,
+
+    /// Recovery strategies
+    recovery_strategies: HashMap<FailureType, RecoveryStrategy>,
+
+    /// Checkpointing system: checkpoint id -> on-disk record
+    ///
+    /// There is no separate redundancy or rollback map beside it. Both used to
+    /// be declared here as empty `HashMap` aliases that nothing ever wrote to or
+    /// read from, while replication and rollback both actually go through this
+    /// same SHA-256-verified checkpoint path (see
+    /// [`Self::replicate_checkpoint`] and [`Self::rollback_to_checkpoint`]).
+    checkpointing_system: CheckpointingSystem,
+
+    /// Active recovery actions
+    active_recoveries: HashMap<DeviceId, RecoveryAction>,
+
+    /// Redundancy configuration
+    redundancy_config: RedundancyConfig,
+
+    /// Checkpoint configuration
+    checkpoint_config: CheckpointConfig,
+
+    /// Id of the most recently created checkpoint, if any.
+    last_checkpoint_id: Option<String>,
+}
+
+/// Checkpoint configuration
+#[derive(Debug, Clone)]
+pub struct CheckpointConfig {
+    /// Checkpoint interval
+    pub interval: Duration,
+
+    /// Maximum checkpoints to keep
+    pub max_checkpoints: usize,
+
+    /// Compression enabled
+    pub compression_enabled: bool,
+
+    /// Encryption enabled
+    pub encryption_enabled: bool,
+
+    /// Storage path
+    pub storage_path: String,
+}
+
+impl FaultToleranceManager {
+    /// Create a new fault tolerance manager
+    pub fn new(
+        detection_config: DetectionConfig,
+        redundancy_config: RedundancyConfig,
+        checkpoint_config: CheckpointConfig,
+    ) -> Result<Self> {
+        let failure_detector = FailureDetector::new(detection_config);
+
+        // Set up default recovery strategies
+        let mut recovery_strategies = HashMap::new();
+        recovery_strategies.insert(FailureType::DeviceFailure, RecoveryStrategy::Migrate);
+        recovery_strategies.insert(FailureType::NetworkFailure, RecoveryStrategy::Restart);
+        recovery_strategies.insert(FailureType::MemoryFailure, RecoveryStrategy::Rollback);
+        recovery_strategies.insert(FailureType::ComputeFailure, RecoveryStrategy::Restart);
+        recovery_strategies.insert(FailureType::SoftwareFailure, RecoveryStrategy::Restart);
+        recovery_strategies.insert(FailureType::DataCorruption, RecoveryStrategy::Rollback);
+
+        Ok(Self {
+            failure_detector,
+            recovery_strategies,
+            checkpointing_system: HashMap::new(),
+            active_recoveries: HashMap::new(),
+            redundancy_config,
+            checkpoint_config,
+            last_checkpoint_id: None,
+        })
+    }
+
+    /// Id of the most recently created checkpoint, if one exists.
+    fn latest_checkpoint_id(&self) -> Option<String> {
+        self.last_checkpoint_id
+            .as_ref()
+            .filter(|id| self.checkpointing_system.contains_key(*id))
+            .cloned()
+    }
+
+    /// Replicate a checkpoint to `replication_factor` replica entries for
+    /// redundancy, verifying each copy round-trips the source bytes.
+    ///
+    /// Returns the ids of the replica entries created.
+    fn replicate_checkpoint(&mut self, checkpoint_id: &str) -> Result<Vec<String>> {
+        let source = self
+            .checkpointing_system
+            .get(checkpoint_id)
+            .cloned()
+            .ok_or_else(|| {
+                OptimError::InvalidState(ErrorContext::new(format!(
+                    "cannot replicate checkpoint {checkpoint_id}: not found"
+                )))
+            })?;
+
+        // Read the source payload once and confirm it still matches the hash
+        // recorded at creation time before propagating copies.
+        let data = std::fs::read(&source.path).map_err(|e| {
+            OptimError::ComputationError(ErrorContext::new(format!(
+                "failed to read checkpoint {} for replication: {e}",
+                source.path.display()
+            )))
+        })?;
+        if sha256_hex(&data) != source.sha256 {
+            return Err(OptimError::ComputationError(ErrorContext::new(format!(
+                "source checkpoint {checkpoint_id} is corrupt; refusing to replicate"
+            ))));
+        }
+
+        let dir = Path::new(&self.checkpoint_config.storage_path);
+        let factor = self.redundancy_config.replication_factor.max(1);
+        let mut replicas = Vec::with_capacity(factor);
+        for i in 0..factor {
+            let replica_id = format!("{checkpoint_id}.replica{i}");
+            let replica_path = dir.join(format!("{replica_id}.ckpt"));
+            std::fs::write(&replica_path, &data).map_err(|e| {
+                OptimError::ComputationError(ErrorContext::new(format!(
+                    "failed to write checkpoint replica {}: {e}",
+                    replica_path.display()
+                )))
+            })?;
+            // Verify the replica round-trips the source bytes and hash.
+            let copy = std::fs::read(&replica_path).map_err(|e| {
+                OptimError::ComputationError(ErrorContext::new(format!(
+                    "failed to read back checkpoint replica {}: {e}",
+                    replica_path.display()
+                )))
+            })?;
+            if copy != data || sha256_hex(&copy) != source.sha256 {
+                return Err(OptimError::ComputationError(ErrorContext::new(format!(
+                    "checkpoint replica {replica_id} failed integrity verification"
+                ))));
+            }
+            let replica_hash_path = dir.join(format!("{replica_id}.sha256"));
+            std::fs::write(&replica_hash_path, source.sha256.as_bytes()).map_err(|e| {
+                OptimError::ComputationError(ErrorContext::new(format!(
+                    "failed to write replica hash {}: {e}",
+                    replica_hash_path.display()
+                )))
+            })?;
+            self.checkpointing_system.insert(
+                replica_id.clone(),
+                CheckpointRecord {
+                    path: replica_path,
+                    sha256: source.sha256.clone(),
+                    size_bytes: data.len(),
+                },
+            );
+            replicas.push(replica_id);
+        }
+        Ok(replicas)
+    }
+
+    /// Monitor device for failures
+    pub fn monitor_device(&mut self, device_id: DeviceId) {
+        self.failure_detector.add_device(device_id);
+    }
+
+    /// Stop monitoring device
+    pub fn stop_monitoring(&mut self, device_id: DeviceId) {
+        self.failure_detector.remove_device(device_id);
+    }
+
+    /// Update device heartbeat
+    pub fn update_heartbeat(&mut self, device_id: DeviceId) {
+        self.failure_detector.update_heartbeat(device_id);
+    }
+
+    /// Check for failures and initiate recovery
+    pub async fn check_and_recover(&mut self) -> Result<Vec<RecoveryAction>> {
+        let failures = self.failure_detector.check_failures();
+        let mut recovery_actions = Vec::new();
+
+        for failure in failures {
+            if let Some(strategy) = self.recovery_strategies.get(&failure.failure_type) {
+                let recovery_action = self.create_recovery_action(&failure, strategy.clone())?;
+                self.initiate_recovery(&failure, &recovery_action).await?;
+                recovery_actions.push(recovery_action);
+            }
+        }
+
+        Ok(recovery_actions)
+    }
+
+    /// Create recovery action for failure
+    fn create_recovery_action(
+        &self,
+        failure: &FailureInfo,
+        strategy: RecoveryStrategy,
+    ) -> Result<RecoveryAction> {
+        let priority = match failure.severity {
+            s if s > 0.8 => RecoveryPriority::Critical,
+            s if s > 0.6 => RecoveryPriority::High,
+            s if s > 0.3 => RecoveryPriority::Medium,
+            _ => RecoveryPriority::Low,
+        };
+
+        let estimated_completion = match strategy {
+            RecoveryStrategy::Restart => Duration::from_secs(30),
+            RecoveryStrategy::Migrate => Duration::from_secs(120),
+            RecoveryStrategy::Replicate => Duration::from_secs(60),
+            RecoveryStrategy::Rollback => Duration::from_secs(45),
+            RecoveryStrategy::Isolate => Duration::from_secs(10),
+            RecoveryStrategy::Graceful => Duration::from_secs(90),
+        };
+
+        Ok(RecoveryAction {
+            action_type: strategy,
+            target_devices: vec![failure.device_id],
+            estimated_completion,
+            priority,
+            required_resources: vec!["compute".to_string(), "memory".to_string()],
+        })
+    }
+
+    /// Initiate recovery for failure
+    async fn initiate_recovery(
+        &mut self,
+        failure: &FailureInfo,
+        recovery_action: &RecoveryAction,
+    ) -> Result<()> {
+        log::info!(
+            "initiating recovery for device {:?} using strategy {:?}",
+            failure.device_id,
+            recovery_action.action_type
+        );
+
+        match recovery_action.action_type {
+            RecoveryStrategy::Restart => {
+                self.restart_device(failure.device_id).await?;
+            }
+            RecoveryStrategy::Migrate => {
+                self.migrate_workload(failure.device_id).await?;
+            }
+            RecoveryStrategy::Replicate => {
+                self.replicate_data(failure.device_id).await?;
+            }
+            RecoveryStrategy::Rollback => {
+                self.rollback_state(failure.device_id).await?;
+            }
+            RecoveryStrategy::Isolate => {
+                self.isolate_device(failure.device_id).await?;
+            }
+            RecoveryStrategy::Graceful => {
+                self.graceful_recovery(failure.device_id).await?;
+            }
+        }
+
+        self.active_recoveries
+            .insert(failure.device_id, recovery_action.clone());
+
+        Ok(())
+    }
+
+    /// Restart a failed device.
+    ///
+    /// Restarting real TPU silicon requires the vendor runtime, which is not
+    /// present. What *is* real here is the bookkeeping: the device's heartbeat
+    /// is refreshed so the failure detector stops reporting it as dead.
+    async fn restart_device(&mut self, device_id: DeviceId) -> Result<()> {
+        log::info!("resetting failure-detector state for device {device_id:?}");
+        self.failure_detector.update_heartbeat(device_id);
+        Ok(())
+    }
+
+    /// Migrate workload from a failed device.
+    ///
+    /// Moving in-flight work between TPU cores requires the device runtime to
+    /// quiesce, checkpoint and re-enqueue executing programs. None of that is
+    /// available without hardware, and reporting success would hide a
+    /// still-failed device, so this is refused explicitly.
+    async fn migrate_workload(&mut self, device_id: DeviceId) -> Result<()> {
+        Err(OptimError::NotImplementedError(ErrorContext::new(format!(
+            "workload migration from device {device_id:?} requires a TPU runtime to quiesce and \
+             re-enqueue executing programs; no TPU hardware is present. Use \
+             RecoveryStrategy::Rollback (restores a real checkpoint) or Isolation instead."
+        ))))
+    }
+
+    /// Replicate the most recent checkpoint for redundancy.
+    ///
+    /// This is real: the newest checkpoint is copied to `replication_factor`
+    /// replica files and each copy's content hash is verified.
+    async fn replicate_data(&mut self, device_id: DeviceId) -> Result<()> {
+        let checkpoint_id = self.latest_checkpoint_id().ok_or_else(|| {
+            OptimError::InvalidState(ErrorContext::new(format!(
+                "cannot replicate data for device {device_id:?}: no checkpoint has been created"
+            )))
+        })?;
+
+        let replicas = self.replicate_checkpoint(&checkpoint_id)?;
+        log::info!(
+            "replicated checkpoint {checkpoint_id} to {} replica(s) for device {device_id:?}",
+            replicas.len()
+        );
+        Ok(())
+    }
+
+    /// Roll back to the most recent checkpoint.
+    ///
+    /// This is real: it restores through the same verified path as
+    /// [`Self::restore_checkpoint`], so a corrupted checkpoint fails loudly.
+    async fn rollback_state(&mut self, device_id: DeviceId) -> Result<()> {
+        let checkpoint_id = self.latest_checkpoint_id().ok_or_else(|| {
+            OptimError::InvalidState(ErrorContext::new(format!(
+                "cannot roll back device {device_id:?}: no checkpoint has been created"
+            )))
+        })?;
+
+        self.restore_checkpoint(&checkpoint_id).await?;
+        log::info!("rolled device {device_id:?} back to checkpoint {checkpoint_id}");
+        Ok(())
+    }
+
+    /// Isolate a failed device by removing it from monitoring and scheduling.
+    async fn isolate_device(&mut self, device_id: DeviceId) -> Result<()> {
+        log::warn!("isolating device {device_id:?}");
+        self.failure_detector.remove_device(device_id);
+        Ok(())
+    }
+
+    /// Graceful recovery: roll back to a checkpoint, then resume monitoring.
+    async fn graceful_recovery(&mut self, device_id: DeviceId) -> Result<()> {
+        self.rollback_state(device_id).await?;
+        self.failure_detector.update_heartbeat(device_id);
+        log::info!("graceful recovery completed for device {device_id:?}");
+        Ok(())
+    }
+
+    /// Create a checkpoint by serializing the current coordination state to
+    /// disk under [`CheckpointConfig::storage_path`] and recording a SHA-256
+    /// content hash for later integrity verification.
+    ///
+    /// The payload is the honest, hardware-free snapshot: the monitored device
+    /// roster plus checkpoint identity/type. Real TPU program and optimizer
+    /// state requires the vendor runtime, which is not present.
+    pub async fn create_checkpoint(&mut self, checkpoint_id: String) -> Result<CheckpointInfo> {
+        let created_at = Instant::now();
+        let devices: Vec<DeviceId> = self
+            .failure_detector
+            .get_monitored_devices()
+            .iter()
+            .cloned()
+            .collect();
+
+        let created_at_unix_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| {
+                OptimError::InvalidState(ErrorContext::new(format!(
+                    "system clock is before the UNIX epoch: {e}"
+                )))
+            })?
+            .as_millis();
+
+        let payload = CheckpointPayload {
+            checkpoint_id: checkpoint_id.clone(),
+            created_at_unix_millis,
+            checkpoint_type: format!("{:?}", CheckpointType::Full),
+            device_ids: devices.iter().map(|d| d.0).collect(),
+            metadata: HashMap::new(),
+        };
+
+        // Serialize the real state and fingerprint it.
+        let bytes = serde_json::to_vec(&payload).map_err(|e| {
+            OptimError::ComputationError(ErrorContext::new(format!(
+                "failed to serialize checkpoint {checkpoint_id}: {e}"
+            )))
+        })?;
+        let sha256 = sha256_hex(&bytes);
+        let size_bytes = bytes.len();
+
+        // Persist the payload and a sidecar hash under the configured path.
+        let dir = Path::new(&self.checkpoint_config.storage_path);
+        std::fs::create_dir_all(dir).map_err(|e| {
+            OptimError::ComputationError(ErrorContext::new(format!(
+                "failed to create checkpoint directory {}: {e}",
+                dir.display()
+            )))
+        })?;
+        let path = dir.join(format!("{checkpoint_id}.ckpt"));
+        std::fs::write(&path, &bytes).map_err(|e| {
+            OptimError::ComputationError(ErrorContext::new(format!(
+                "failed to write checkpoint {}: {e}",
+                path.display()
+            )))
+        })?;
+        let hash_path = dir.join(format!("{checkpoint_id}.sha256"));
+        std::fs::write(&hash_path, sha256.as_bytes()).map_err(|e| {
+            OptimError::ComputationError(ErrorContext::new(format!(
+                "failed to write checkpoint hash {}: {e}",
+                hash_path.display()
+            )))
+        })?;
+
+        self.checkpointing_system.insert(
+            checkpoint_id.clone(),
+            CheckpointRecord {
+                path,
+                sha256: sha256.clone(),
+                size_bytes,
+            },
+        );
+        self.last_checkpoint_id = Some(checkpoint_id.clone());
+
+        let checkpoint_info = CheckpointInfo {
+            checkpoint_id,
+            created_at,
+            size_bytes,
+            devices,
+            checkpoint_type: CheckpointType::Full,
+            metadata: HashMap::new(),
+        };
+
+        log::info!(
+            "created checkpoint {} ({} bytes, sha256={})",
+            checkpoint_info.checkpoint_id,
+            size_bytes,
+            sha256
+        );
+        Ok(checkpoint_info)
+    }
+
+    /// Restore from a checkpoint: load the serialized payload back from disk,
+    /// verify it against the SHA-256 recorded at creation time, then apply the
+    /// restored state (re-establishing the monitored device roster).
+    ///
+    /// A corrupted or truncated checkpoint fails loudly rather than silently
+    /// "succeeding".
+    pub async fn restore_checkpoint(&mut self, checkpoint_id: &str) -> Result<()> {
+        let record = self
+            .checkpointing_system
+            .get(checkpoint_id)
+            .cloned()
+            .ok_or_else(|| {
+                OptimError::ComputationError(ErrorContext::new(format!(
+                    "Checkpoint {checkpoint_id} not found"
+                )))
+            })?;
+
+        let bytes = std::fs::read(&record.path).map_err(|e| {
+            OptimError::ComputationError(ErrorContext::new(format!(
+                "failed to read checkpoint {}: {e}",
+                record.path.display()
+            )))
+        })?;
+
+        // Cheap length check before the hash: a truncated or grown payload is
+        // already known-bad from the size recorded at creation time, and saying
+        // so names the actual problem rather than reporting a hash mismatch.
+        if bytes.len() != record.size_bytes {
+            return Err(OptimError::ComputationError(ErrorContext::new(format!(
+                "checkpoint {checkpoint_id} is {} bytes on disk but {} were recorded at creation",
+                bytes.len(),
+                record.size_bytes
+            ))));
+        }
+
+        // Integrity check against the recorded hash.
+        let actual = sha256_hex(&bytes);
+        if actual != record.sha256 {
+            return Err(OptimError::ComputationError(ErrorContext::new(format!(
+                "checkpoint {checkpoint_id} failed integrity check: expected sha256 {}, got {}",
+                record.sha256, actual
+            ))));
+        }
+
+        let payload: CheckpointPayload = serde_json::from_slice(&bytes).map_err(|e| {
+            OptimError::ComputationError(ErrorContext::new(format!(
+                "failed to deserialize checkpoint {checkpoint_id}: {e}"
+            )))
+        })?;
+
+        // Apply the restored state: re-establish the monitored device roster.
+        for &device in &payload.device_ids {
+            self.failure_detector.add_device(DeviceId(device));
+        }
+
+        log::info!(
+            "restored checkpoint {checkpoint_id} ({} device(s), {} bytes)",
+            payload.device_ids.len(),
+            bytes.len()
+        );
+        Ok(())
+    }
+
+    /// Set recovery strategy for failure type
+    pub fn set_recovery_strategy(&mut self, failure_type: FailureType, strategy: RecoveryStrategy) {
+        self.recovery_strategies.insert(failure_type, strategy);
+    }
+
+    /// Get fault tolerance statistics
+    pub fn get_statistics(&self) -> FaultToleranceStatistics {
+        let mut stats = self.failure_detector.get_failure_statistics();
+
+        stats.insert(
+            "active_recoveries".to_string(),
+            self.active_recoveries.len() as f64,
+        );
+
+        stats.insert(
+            "checkpoints_count".to_string(),
+            self.checkpointing_system.len() as f64,
+        );
+
+        stats.insert(
+            "redundancy_level".to_string(),
+            self.redundancy_config.replication_factor as f64,
+        );
+
+        // Calculate system reliability
+        let total_devices = self.failure_detector.get_monitored_devices().len() as f64;
+        let failed_devices = self.active_recoveries.len() as f64;
+        let reliability = if total_devices > 0.0 {
+            (total_devices - failed_devices) / total_devices
+        } else {
+            1.0
+        };
+        stats.insert("system_reliability".to_string(), reliability);
+
+        stats
+    }
+
+    /// Get active recovery actions
+    pub fn get_active_recoveries(&self) -> &HashMap<DeviceId, RecoveryAction> {
+        &self.active_recoveries
+    }
+
+    /// Complete recovery for device
+    pub fn complete_recovery(&mut self, device_id: DeviceId) -> Result<()> {
+        if self.active_recoveries.remove(&device_id).is_some() {
+            log::info!("recovery completed for device {device_id:?}");
+            // Re-add device to monitoring if it was isolated
+            self.failure_detector.add_device(device_id);
+            Ok(())
+        } else {
+            Err(OptimError::ComputationError(ErrorContext::new(format!(
+                "No active recovery for device {:?}",
+                device_id
+            ))))
+        }
+    }
+
+    /// Update redundancy configuration
+    pub fn update_redundancy_config(&mut self, config: RedundancyConfig) {
+        self.redundancy_config = config;
+    }
+
+    /// Update checkpoint configuration
+    pub fn update_checkpoint_config(&mut self, config: CheckpointConfig) {
+        self.checkpoint_config = config;
+    }
+}
+
+// Default implementations
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_secs(5),
+            timeout_threshold: Duration::from_secs(30),
+            performance_threshold: 0.1,
+            error_rate_threshold: 0.05,
+            consensus_threshold: 3,
+        }
+    }
+}
+
+impl Default for RedundancyConfig {
+    fn default() -> Self {
+        Self {
+            replication_factor: 3,
+            strategy: RedundancyStrategy::Replication,
+            consistency_level: ConsistencyLevel::Strong,
+            failure_tolerance: 1,
+        }
+    }
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(300), // 5 minutes
+            max_checkpoints: 10,
+            compression_enabled: true,
+            encryption_enabled: false,
+            storage_path: "/tmp/checkpoints".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_failure_detector_creation() {
+        let config = DetectionConfig::default();
+        let detector = FailureDetector::new(config);
+        assert_eq!(detector.get_monitored_devices().len(), 0);
+    }
+
+    #[test]
+    fn test_device_monitoring() {
+        let config = DetectionConfig::default();
+        let mut detector = FailureDetector::new(config);
+
+        let device_id = DeviceId(0);
+        detector.add_device(device_id);
+
+        assert!(detector.get_monitored_devices().contains(&device_id));
+    }
+
+    #[test]
+    fn test_fault_tolerance_manager_creation() {
+        let detection_config = DetectionConfig::default();
+        let redundancy_config = RedundancyConfig::default();
+        let checkpoint_config = CheckpointConfig::default();
+
+        let manager =
+            FaultToleranceManager::new(detection_config, redundancy_config, checkpoint_config);
+
+        assert!(manager.is_ok());
+    }
+
+    /// Build a checkpoint config pointing at a unique temporary directory so
+    /// tests never collide or pollute a shared path.
+    fn temp_checkpoint_config(tag: &str) -> CheckpointConfig {
+        let mut dir = std::env::temp_dir();
+        let unique = format!(
+            "optirs_tpu_ckpt_{tag}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        dir.push(unique);
+        CheckpointConfig {
+            storage_path: dir.to_string_lossy().into_owned(),
+            ..CheckpointConfig::default()
+        }
+    }
+
+    fn test_manager(tag: &str) -> FaultToleranceManager {
+        FaultToleranceManager::new(
+            DetectionConfig::default(),
+            RedundancyConfig::default(),
+            temp_checkpoint_config(tag),
+        )
+        .expect("manager construction should succeed")
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_creation() {
+        let mut manager = test_manager("creation");
+        manager.monitor_device(DeviceId(3));
+        manager.monitor_device(DeviceId(7));
+
+        let info = manager
+            .create_checkpoint("test_checkpoint".to_string())
+            .await
+            .expect("checkpoint creation should succeed");
+
+        assert_eq!(info.checkpoint_id, "test_checkpoint");
+        // Real serialized size, not a fabricated constant.
+        assert!(info.size_bytes > 0);
+        assert_ne!(info.size_bytes, 1024 * 1024);
+
+        // The payload and its sidecar hash must actually exist on disk.
+        let record = manager
+            .checkpointing_system
+            .get("test_checkpoint")
+            .expect("record should be indexed");
+        assert!(record.path.exists(), "checkpoint file must be written");
+        assert_eq!(record.size_bytes, info.size_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_restore_roundtrip() {
+        let mut manager = test_manager("roundtrip");
+        manager.monitor_device(DeviceId(11));
+        manager.monitor_device(DeviceId(12));
+
+        manager
+            .create_checkpoint("roundtrip".to_string())
+            .await
+            .expect("create should succeed");
+
+        // Restore verifies the on-disk hash and re-applies device roster.
+        manager
+            .restore_checkpoint("roundtrip")
+            .await
+            .expect("restore of a valid checkpoint should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_restore_missing_checkpoint_errors() {
+        let mut manager = test_manager("missing");
+        let err = manager.restore_checkpoint("does_not_exist").await;
+        assert!(err.is_err(), "restoring an unknown checkpoint must fail");
+    }
+
+    #[tokio::test]
+    async fn test_restore_detects_corruption() {
+        let mut manager = test_manager("corruption");
+        manager.monitor_device(DeviceId(1));
+        manager
+            .create_checkpoint("corrupt_me".to_string())
+            .await
+            .expect("create should succeed");
+
+        // Tamper with the on-disk payload; the recorded hash no longer matches.
+        let path = manager
+            .checkpointing_system
+            .get("corrupt_me")
+            .expect("record")
+            .path
+            .clone();
+        std::fs::write(&path, b"tampered-bytes").expect("overwrite payload");
+
+        let result = manager.restore_checkpoint("corrupt_me").await;
+        assert!(
+            result.is_err(),
+            "a corrupted checkpoint must fail the integrity check"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replicate_data_creates_verified_replicas() {
+        let mut manager = test_manager("replicate");
+        manager.monitor_device(DeviceId(5));
+        manager
+            .create_checkpoint("primary".to_string())
+            .await
+            .expect("create should succeed");
+
+        // replicate_data replicates the newest checkpoint with hash verification.
+        manager
+            .replicate_data(DeviceId(5))
+            .await
+            .expect("replication should succeed");
+
+        let factor = manager.redundancy_config.replication_factor.max(1);
+        for i in 0..factor {
+            let replica_id = format!("primary.replica{i}");
+            let record = manager
+                .checkpointing_system
+                .get(&replica_id)
+                .expect("replica should be indexed");
+            assert!(record.path.exists(), "replica file must exist on disk");
+        }
+    }
+}

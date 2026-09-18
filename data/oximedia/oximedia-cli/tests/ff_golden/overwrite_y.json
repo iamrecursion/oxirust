@@ -1,0 +1,9 @@
+{
+  "name": "overwrite_y",
+  "args": ["-y", "-i", "in.mkv", "out.mkv"],
+  "expect": {
+    "diagnostic_count": 0,
+    "jobs": 1,
+    "overwrite": true
+  }
+}

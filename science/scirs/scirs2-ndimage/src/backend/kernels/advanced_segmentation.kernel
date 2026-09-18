@@ -1,0 +1,411 @@
+// Advanced segmentation kernels for GPU execution
+// Includes watershed, region growing, and level set methods
+
+__kernel void watershed_labels_init_2d(
+    __global const float* gradient_magnitude,
+    __global int* labels,
+    __global float* distances,
+    const float threshold,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    float mag = gradient_magnitude[idx];
+    
+    // Initialize seeds (local minima below threshold)
+    bool is_local_minimum = true;
+    if (mag < threshold) {
+        // Check 8-neighborhood
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                
+                int nx = clamp(x + dx, 0, width - 1);
+                int ny = clamp(y + dy, 0, height - 1);
+                
+                if (gradient_magnitude[ny * width + nx] < mag) {
+                    is_local_minimum = false;
+                    break;
+                }
+            }
+            if (!is_local_minimum) break;
+        }
+        
+        if (is_local_minimum) {
+            labels[idx] = idx + 1; // Unique label for each seed
+            distances[idx] = 0.0f;
+        } else {
+            labels[idx] = 0; // Unlabeled
+            distances[idx] = INFINITY;
+        }
+    } else {
+        labels[idx] = 0; // Unlabeled
+        distances[idx] = INFINITY;
+    }
+}
+
+__kernel void watershed_propagation_2d(
+    __global const float* gradient_magnitude,
+    __global int* labels,
+    __global float* distances,
+    __global int* changed,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    
+    if (labels[idx] != 0) return; // Already labeled
+    
+    int best_label = 0;
+    float min_distance = INFINITY;
+    
+    // Check 8-neighborhood
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            
+            int nx = clamp(x + dx, 0, width - 1);
+            int ny = clamp(y + dy, 0, height - 1);
+            int nidx = ny * width + nx;
+            
+            if (labels[nidx] > 0) { // Neighbor is labeled
+                float edge_weight = fmax(gradient_magnitude[idx], gradient_magnitude[nidx]);
+                float new_distance = distances[nidx] + edge_weight;
+                
+                if (new_distance < min_distance) {
+                    min_distance = new_distance;
+                    best_label = labels[nidx];
+                }
+            }
+        }
+    }
+    
+    if (best_label > 0) {
+        labels[idx] = best_label;
+        distances[idx] = min_distance;
+        *changed = 1;
+    }
+}
+
+__kernel void region_growing_2d(
+    __global const float* input,
+    __global int* labels,
+    __global int* seeds,
+    const float threshold,
+    const int num_seeds,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    
+    if (labels[idx] > 0) return; // Already labeled
+    
+    float pixel_value = input[idx];
+    
+    // Check if pixel should be added to any region
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            
+            int nx = clamp(x + dx, 0, width - 1);
+            int ny = clamp(y + dy, 0, height - 1);
+            int nidx = ny * width + nx;
+            
+            if (labels[nidx] > 0) { // Neighbor is labeled
+                float neighbor_value = input[nidx];
+                
+                if (fabs(pixel_value - neighbor_value) < threshold) {
+                    labels[idx] = labels[nidx];
+                    return;
+                }
+            }
+        }
+    }
+}
+
+__kernel void mean_shift_2d(
+    __global const float* input,
+    __global float* output,
+    const int height,
+    const int width,
+    const float spatial_bandwidth,
+    const float color_bandwidth,
+    const int max_iterations
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    // Current mode (spatial and color)
+    float mode_x = x;
+    float mode_y = y;
+    float mode_color = input[y * width + x];
+    
+    int spatial_radius = (int)(3 * spatial_bandwidth);
+    
+    for (int iter = 0; iter < max_iterations; iter++) {
+        float sum_x = 0.0f, sum_y = 0.0f, sum_color = 0.0f;
+        float weight_sum = 0.0f;
+        
+        // Compute weighted mean in neighborhood
+        for (int dy = -spatial_radius; dy <= spatial_radius; dy++) {
+            for (int dx = -spatial_radius; dx <= spatial_radius; dx++) {
+                int sample_x = clamp((int)(mode_x + dx), 0, width - 1);
+                int sample_y = clamp((int)(mode_y + dy), 0, height - 1);
+                
+                float sample_color = input[sample_y * width + sample_x];
+                
+                // Spatial distance
+                float spatial_dist = sqrt(dx * dx + dy * dy);
+                float spatial_weight = exp(-0.5f * (spatial_dist / spatial_bandwidth) * (spatial_dist / spatial_bandwidth));
+                
+                // Color distance
+                float color_dist = fabs(sample_color - mode_color);
+                float color_weight = exp(-0.5f * (color_dist / color_bandwidth) * (color_dist / color_bandwidth));
+                
+                float weight = spatial_weight * color_weight;
+                
+                sum_x += sample_x * weight;
+                sum_y += sample_y * weight;
+                sum_color += sample_color * weight;
+                weight_sum += weight;
+            }
+        }
+        
+        if (weight_sum > 0) {
+            float new_mode_x = sum_x / weight_sum;
+            float new_mode_y = sum_y / weight_sum;
+            float new_mode_color = sum_color / weight_sum;
+            
+            // Check convergence
+            float shift = sqrt((new_mode_x - mode_x) * (new_mode_x - mode_x) +
+                             (new_mode_y - mode_y) * (new_mode_y - mode_y) +
+                             (new_mode_color - mode_color) * (new_mode_color - mode_color));
+            
+            mode_x = new_mode_x;
+            mode_y = new_mode_y;
+            mode_color = new_mode_color;
+            
+            if (shift < 0.1f) break; // Converged
+        }
+    }
+    
+    output[y * width + x] = mode_color;
+}
+
+__kernel void level_set_evolution_2d(
+    __global float* phi,
+    __global const float* speed_function,
+    const float dt,
+    const float dx,
+    const float dy,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    
+    // Compute spatial derivatives using upwind schemes
+    float phi_x_plus = 0.0f, phi_x_minus = 0.0f;
+    float phi_y_plus = 0.0f, phi_y_minus = 0.0f;
+    
+    // Forward differences
+    if (x < width - 1) {
+        phi_x_plus = (phi[(y) * width + (x + 1)] - phi[idx]) / dx;
+    }
+    if (y < height - 1) {
+        phi_y_plus = (phi[(y + 1) * width + x] - phi[idx]) / dy;
+    }
+    
+    // Backward differences
+    if (x > 0) {
+        phi_x_minus = (phi[idx] - phi[(y) * width + (x - 1)]) / dx;
+    }
+    if (y > 0) {
+        phi_y_minus = (phi[idx] - phi[(y - 1) * width + x]) / dy;
+    }
+    
+    // Upwind scheme based on speed function sign
+    float speed = speed_function[idx];
+    float grad_magnitude;
+    
+    if (speed > 0) {
+        // Use backward differences
+        float phi_x = phi_x_minus;
+        float phi_y = phi_y_minus;
+        grad_magnitude = sqrt(phi_x * phi_x + phi_y * phi_y);
+    } else {
+        // Use forward differences
+        float phi_x = phi_x_plus;
+        float phi_y = phi_y_plus;
+        grad_magnitude = sqrt(phi_x * phi_x + phi_y * phi_y);
+    }
+    
+    // Evolution equation: ∂φ/∂t + F|∇φ| = 0
+    phi[idx] = phi[idx] - dt * speed * grad_magnitude;
+}
+
+__kernel void chan_vese_energy_2d(
+    __global const float* image,
+    __global const float* phi,
+    __global float* energy_terms,
+    const float c1,
+    const float c2,
+    const float lambda1,
+    const float lambda2,
+    const float mu,
+    const int height,
+    const int width
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    float phi_val = phi[idx];
+    float image_val = image[idx];
+    
+    // Heaviside function (smooth approximation)
+    float epsilon = 1.0f;
+    float H_phi = 0.5f * (1.0f + (2.0f / M_PI) * atan(phi_val / epsilon));
+    
+    // Dirac delta (derivative of Heaviside)
+    float delta_phi = (1.0f / M_PI) * (epsilon / (epsilon * epsilon + phi_val * phi_val));
+    
+    // Data terms
+    float data_term = lambda1 * (image_val - c1) * (image_val - c1) * H_phi +
+                     lambda2 * (image_val - c2) * (image_val - c2) * (1.0f - H_phi);
+    
+    // Curvature term (simplified)
+    float curvature = 0.0f;
+    if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
+        float phi_xx = phi[y * width + (x + 1)] - 2.0f * phi_val + phi[y * width + (x - 1)];
+        float phi_yy = phi[(y + 1) * width + x] - 2.0f * phi_val + phi[(y - 1) * width + x];
+        curvature = phi_xx + phi_yy;
+    }
+    
+    energy_terms[idx] = delta_phi * (data_term + mu * curvature);
+}
+
+__kernel void active_contour_evolution_2d(
+    __global float* contour_x,
+    __global float* contour_y,
+    __global const float* gradient_magnitude,
+    __global const float* gradient_direction,
+    const float alpha,      // Elastic energy weight
+    const float beta,       // Bending energy weight
+    const float gamma,      // External energy weight
+    const float dt,
+    const int num_points,
+    const int height,
+    const int width
+) {
+    int i = get_global_id(0);
+    
+    if (i >= num_points) return;
+    
+    int prev = (i - 1 + num_points) % num_points;
+    int next = (i + 1) % num_points;
+    int next2 = (i + 2) % num_points;
+    int prev2 = (i - 2 + num_points) % num_points;
+    
+    float x = contour_x[i];
+    float y = contour_y[i];
+    
+    // Elastic force (first derivative)
+    float elastic_x = contour_x[next] - contour_x[prev];
+    float elastic_y = contour_y[next] - contour_y[prev];
+    
+    // Bending force (second derivative)
+    float bending_x = contour_x[prev] - 2.0f * contour_x[i] + contour_x[next];
+    float bending_y = contour_y[prev] - 2.0f * contour_y[i] + contour_y[next];
+    
+    // External force from image gradient
+    int img_x = clamp((int)x, 0, width - 1);
+    int img_y = clamp((int)y, 0, height - 1);
+    
+    float grad_mag = gradient_magnitude[img_y * width + img_x];
+    float grad_dir = gradient_direction[img_y * width + img_x];
+    
+    float external_x = grad_mag * cos(grad_dir);
+    float external_y = grad_mag * sin(grad_dir);
+    
+    // Update contour point
+    float force_x = -alpha * elastic_x + beta * bending_x - gamma * external_x;
+    float force_y = -alpha * elastic_y + beta * bending_y - gamma * external_y;
+    
+    contour_x[i] = x + dt * force_x;
+    contour_y[i] = y + dt * force_y;
+    
+    // Keep contour within image bounds
+    contour_x[i] = clamp(contour_x[i], 0.0f, (float)(width - 1));
+    contour_y[i] = clamp(contour_y[i], 0.0f, (float)(height - 1));
+}
+
+__kernel void superpixel_slic_2d(
+    __global const float* image,
+    __global int* labels,
+    __global float* cluster_centers,
+    const int height,
+    const int width,
+    const int num_clusters,
+    const float spatial_weight,
+    const float color_weight
+) {
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    float pixel_color = image[idx];
+    
+    float min_distance = INFINITY;
+    int best_cluster = 0;
+    
+    // Find nearest cluster center
+    for (int k = 0; k < num_clusters; k++) {
+        float cluster_x = cluster_centers[k * 3 + 0];
+        float cluster_y = cluster_centers[k * 3 + 1];
+        float cluster_color = cluster_centers[k * 3 + 2];
+        
+        // Spatial distance
+        float spatial_dist = sqrt((x - cluster_x) * (x - cluster_x) + 
+                                (y - cluster_y) * (y - cluster_y));
+        
+        // Color distance
+        float color_dist = fabs(pixel_color - cluster_color);
+        
+        // Combined distance
+        float distance = sqrt(color_weight * color_dist * color_dist + 
+                             spatial_weight * spatial_dist * spatial_dist);
+        
+        if (distance < min_distance) {
+            min_distance = distance;
+            best_cluster = k;
+        }
+    }
+    
+    labels[idx] = best_cluster;
+}

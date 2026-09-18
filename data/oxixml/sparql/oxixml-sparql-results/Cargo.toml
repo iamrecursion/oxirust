@@ -1,0 +1,44 @@
+[package]
+name = "oxixml-sparql-results"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SPARQL results I/O (XML/JSON/CSV/TSV; replaces sparesults)."
+keywords = ["sparql", "results", "xml", "json", "csv"]
+categories = ["parser-implementations", "encoding"]
+readme = "README.md"
+
+[features]
+default = []
+# RDF 1.2 (RDF-star): embedded triple terms and directional language-tagged
+# strings in the XML/JSON result formats, mirroring `sparesults`' `sparql-12`.
+rdf-12 = ["oxixml-model/rdf-12"]
+
+## Enables asynchronous parsing and serialization on top of `tokio`'s
+## `AsyncRead` / `AsyncWrite`, mirroring `sparesults`' `async-tokio` feature:
+## `QueryResultsParser::for_tokio_async_reader`,
+## `QueryResultsSerializer::serialize_boolean_to_tokio_async_write` and
+## `QueryResultsSerializer::serialize_solutions_to_tokio_async_write`. Off by
+## default, so the crate stays third-party-free in its default configuration.
+async-tokio = ["dep:tokio", "oxixml-xml/async-tokio", "oxixml-json/async-tokio"]
+
+[dependencies]
+oxixml-support = { workspace = true }
+oxixml-model = { workspace = true }
+oxixml-xml = { workspace = true }
+oxixml-json = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

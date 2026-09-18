@@ -1,0 +1,10 @@
+{
+  "name": "oxiephemeris-wasm-node-tests",
+  "private": true,
+  "type": "module",
+  "description": "Node smoke tests for the OxiEphemeris WebAssembly bindings.",
+  "scripts": {
+    "build": "wasm-pack build .. --release --target nodejs --out-dir tests/node/pkg",
+    "test": "node --test"
+  }
+}

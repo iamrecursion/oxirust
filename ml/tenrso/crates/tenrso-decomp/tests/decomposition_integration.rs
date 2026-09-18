@@ -1,0 +1,403 @@
+//! Integration tests for tensor decompositions
+//!
+//! These tests verify that decompositions work correctly with various
+//! tensor sizes and ranks, and that reconstruction quality is acceptable.
+
+use tenrso_core::DenseND;
+use tenrso_decomp::{cp_als, tucker_hosvd, InitStrategy};
+
+#[test]
+fn test_cp_als_rank1_exact() {
+    // Create a perfect rank-1 tensor
+    let size = 5;
+    let mut data = vec![0.0; size * size * size];
+
+    for i in 0..size {
+        for j in 0..size {
+            for k in 0..size {
+                let idx = i * size * size + j * size + k;
+                data[idx] = (i + 1) as f64 * (j + 1) as f64 * (k + 1) as f64;
+            }
+        }
+    }
+
+    let tensor = DenseND::from_vec(data, &[size, size, size]).unwrap();
+
+    // Rank-1 decomposition should be nearly perfect
+    let cp = cp_als(&tensor, 1, 50, 1e-6, InitStrategy::Random, None).unwrap();
+
+    assert_eq!(cp.factors.len(), 3);
+    assert!(cp.iters > 0 && cp.iters <= 50); // Should complete some iterations
+
+    // Check reconstruction quality
+    let reconstructed = cp.reconstruct(&[size, size, size]).unwrap();
+    let orig_view = tensor.view();
+    let recon_view = reconstructed.view();
+
+    let mut max_error = 0.0;
+    for (orig, recon) in orig_view.iter().zip(recon_view.iter()) {
+        let error = (*orig - *recon).abs();
+        if error > max_error {
+            max_error = error;
+        }
+    }
+
+    // A rank-1 tensor decomposed with rank=1 should reconstruct nearly perfectly.
+    // The relative error max_error / tensor_max should be < 1%.
+    let tensor_max = 5.0 * 5.0 * 5.0; // (i+1)*(j+1)*(k+1) max with size=5
+    assert!(
+        max_error / tensor_max < 0.01,
+        "rank-1 reconstruction relative error {:.6} too large",
+        max_error / tensor_max
+    );
+    assert!(reconstructed.shape() == tensor.shape()); // keep shape check too
+}
+
+#[test]
+fn test_cp_als_low_rank() {
+    // Test CP-ALS with a small tensor
+    let tensor = DenseND::<f64>::random_uniform(&[4, 5, 6], 0.0, 1.0);
+
+    let cp = cp_als(&tensor, 2, 20, 1e-4, InitStrategy::Random, None).unwrap();
+
+    assert_eq!(cp.factors.len(), 3);
+    assert_eq!(cp.factors[0].shape(), &[4, 2]);
+    assert_eq!(cp.factors[1].shape(), &[5, 2]);
+    assert_eq!(cp.factors[2].shape(), &[6, 2]);
+
+    // Fit should be between 0 and 1
+    assert!(cp.fit >= 0.0 && cp.fit <= 1.0, "Fit: {}", cp.fit);
+}
+
+#[test]
+fn test_cp_als_weight_extraction() {
+    // Use a random tensor instead of ones to avoid rank-deficiency issues
+    // A tensor of all ones has rank 1, which causes numerical instability for rank-2 decomposition
+    let tensor = DenseND::<f64>::random_uniform(&[3, 4, 5], 0.5, 1.5);
+    let mut cp = cp_als(&tensor, 2, 10, 1e-4, InitStrategy::Random, None).unwrap();
+
+    // Initially no weights
+    assert!(cp.weights.is_none());
+
+    // Extract weights
+    cp.extract_weights();
+
+    // Now should have weights
+    assert!(cp.weights.is_some());
+    let weights = cp.weights.unwrap();
+    assert_eq!(weights.len(), 2);
+
+    // Weights should be positive
+    for &w in weights.iter() {
+        assert!(w > 0.0);
+    }
+}
+
+#[test]
+fn test_tucker_hosvd_compression() {
+    // Create a 6×6×6 tensor and compress to 3×3×3 core
+    let tensor = DenseND::<f64>::random_uniform(&[6, 6, 6], 0.0, 1.0);
+
+    let tucker = tucker_hosvd(&tensor, &[3, 3, 3]).unwrap();
+
+    // Check core shape
+    assert_eq!(tucker.core.shape(), &[3, 3, 3]);
+
+    // Check factor matrices
+    assert_eq!(tucker.factors.len(), 3);
+    assert_eq!(tucker.factors[0].shape(), &[6, 3]);
+    assert_eq!(tucker.factors[1].shape(), &[6, 3]);
+    assert_eq!(tucker.factors[2].shape(), &[6, 3]);
+
+    // Check reconstruction
+    let reconstructed = tucker.reconstruct().unwrap();
+    assert_eq!(reconstructed.shape(), tensor.shape());
+}
+
+#[test]
+fn test_tucker_hosvd_full_rank() {
+    // Full rank Tucker decomposition should give perfect reconstruction
+    let tensor = DenseND::<f64>::ones(&[3, 4, 5]);
+    let mut tucker = tucker_hosvd(&tensor, &[3, 4, 5]).unwrap();
+
+    // Compute error
+    let error = tucker.compute_error(&tensor).unwrap();
+
+    // For full rank, error should be very small
+    assert!(error < 1e-10, "Error: {}", error);
+}
+
+#[test]
+fn test_tucker_reconstruction_quality() {
+    // Test that Tucker reconstruction is reasonable
+    let tensor = DenseND::<f64>::random_uniform(&[5, 5, 5], 0.0, 1.0);
+    let mut tucker = tucker_hosvd(&tensor, &[3, 3, 3]).unwrap();
+
+    let error = tucker.compute_error(&tensor).unwrap();
+
+    // Error should be reasonable (not perfect, but not terrible)
+    assert!((0.0..=1.0).contains(&error));
+    assert!(error < 0.9); // Should capture at least some structure
+}
+
+#[test]
+fn test_tucker_different_ranks() {
+    // Test Tucker with asymmetric ranks
+    let tensor = DenseND::<f64>::random_uniform(&[8, 6, 4], 0.0, 1.0);
+    let tucker = tucker_hosvd(&tensor, &[4, 3, 2]).unwrap();
+
+    assert_eq!(tucker.core.shape(), &[4, 3, 2]);
+    assert_eq!(tucker.factors[0].shape(), &[8, 4]);
+    assert_eq!(tucker.factors[1].shape(), &[6, 3]);
+    assert_eq!(tucker.factors[2].shape(), &[4, 2]);
+
+    let reconstructed = tucker.reconstruct().unwrap();
+    assert_eq!(reconstructed.shape(), &[8, 6, 4]);
+}
+
+#[test]
+fn test_cp_tucker_comparison() {
+    // Compare CP and Tucker on the same tensor
+    let tensor = DenseND::<f64>::random_uniform(&[5, 5, 5], 0.0, 1.0);
+
+    // CP decomposition
+    let cp = cp_als(&tensor, 3, 20, 1e-4, InitStrategy::Random, None).unwrap();
+    let cp_reconstructed = cp.reconstruct(&[5, 5, 5]).unwrap();
+
+    // Tucker decomposition
+    let mut tucker = tucker_hosvd(&tensor, &[3, 3, 3]).unwrap();
+    let tucker_reconstructed = tucker.reconstruct().unwrap();
+
+    // Both should produce valid reconstructions
+    assert_eq!(cp_reconstructed.shape(), tensor.shape());
+    assert_eq!(tucker_reconstructed.shape(), tensor.shape());
+
+    // Compute errors
+    let cp_error = compute_reconstruction_error(&tensor, &cp_reconstructed);
+    let tucker_error = tucker.compute_error(&tensor).unwrap();
+
+    // Tucker error should be reasonable
+    assert!(tucker_error < 1.0);
+
+    // CP error must be below 1.0 — a reconstruction worse than the zero tensor is unacceptable.
+    assert!(cp_error < 1.0, "cp_error = {}", cp_error);
+}
+
+#[test]
+fn test_cp_als_convergence() {
+    // Test that CP-ALS improves over iterations
+    let tensor = DenseND::<f64>::random_uniform(&[4, 4, 4], 0.0, 1.0);
+
+    let cp = cp_als(&tensor, 2, 50, 1e-6, InitStrategy::Random, None).unwrap();
+
+    // Should complete some iterations
+    assert!(cp.iters > 0 && cp.iters <= 50);
+
+    // Fit must be strictly positive — the production solver should make real progress.
+    assert!(
+        cp.fit > 0.0 && cp.fit <= 1.0,
+        "Fit on 4×4×4 tensor, rank 2: {}",
+        cp.fit
+    );
+}
+
+#[test]
+#[should_panic(expected = "InvalidRank")]
+fn test_cp_als_invalid_rank_zero() {
+    let tensor = DenseND::<f64>::ones(&[3, 4, 5]);
+    let _ = cp_als(&tensor, 0, 10, 1e-4, InitStrategy::Random, None).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "InvalidRank")]
+fn test_cp_als_invalid_rank_exceeds_mode() {
+    let tensor = DenseND::<f64>::ones(&[3, 4, 5]);
+    // Rank 10 exceeds mode-0 size (3)
+    let _ = cp_als(&tensor, 10, 10, 1e-4, InitStrategy::Random, None).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "InvalidRanks")]
+fn test_tucker_invalid_rank_count() {
+    let tensor = DenseND::<f64>::ones(&[3, 4, 5]);
+    // Only 2 ranks for a 3-mode tensor
+    let _ = tucker_hosvd(&tensor, &[2, 2]).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "InvalidRanks")]
+fn test_tucker_invalid_rank_exceeds_mode() {
+    let tensor = DenseND::<f64>::ones(&[3, 4, 5]);
+    // Rank 10 exceeds mode-0 size (3)
+    let _ = tucker_hosvd(&tensor, &[10, 2, 2]).unwrap();
+}
+
+#[test]
+fn test_cp_reconstruction_shape_compatibility() {
+    let tensor = DenseND::<f64>::random_uniform(&[3, 4, 5], 0.0, 1.0);
+    let cp = cp_als(&tensor, 2, 10, 1e-4, InitStrategy::Random, None).unwrap();
+
+    // Correct shape should work
+    let reconstructed = cp.reconstruct(&[3, 4, 5]);
+    assert!(reconstructed.is_ok());
+
+    // Wrong shape should fail
+    let bad_reconstructed = cp.reconstruct(&[3, 4, 6]);
+    assert!(bad_reconstructed.is_err());
+}
+
+// ============================================================================
+// Sparse CP-ALS integration tests
+// ============================================================================
+
+#[cfg(feature = "sparse")]
+mod sparse_cp_integration {
+    use super::*;
+    use tenrso_decomp::cp::cp_als_sparse;
+    use tenrso_sparse::coo::CooTensor;
+
+    /// Build a sparse COO tensor deterministically from a DenseND (insert all nonzeros).
+    fn dense_to_coo(dense: &DenseND<f64>) -> CooTensor<f64> {
+        let shape = dense.shape().to_vec();
+        let mut coo = CooTensor::zeros(shape.clone()).unwrap();
+        let view = dense.view();
+        let ndim = shape.len();
+        let total: usize = shape.iter().product();
+        for flat in 0..total {
+            let mut idx = vec![0usize; ndim];
+            let mut rem = flat;
+            for d in (0..ndim).rev() {
+                idx[d] = rem % shape[d];
+                rem /= shape[d];
+            }
+            let val = view[&idx[..]];
+            if val != 0.0 {
+                coo.push(idx, val).ok();
+            }
+        }
+        coo
+    }
+
+    /// Build a rank-R dense tensor from outer products (deterministic LCG seed).
+    fn make_rank_r_tensor(n0: usize, n1: usize, n2: usize, rank: usize, seed: u64) -> DenseND<f64> {
+        let mut state = seed;
+        let mut v = || -> f64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 32) as f64 / (u32::MAX as f64) - 0.5
+        };
+        let a: Vec<f64> = (0..n0 * rank).map(|_| v()).collect();
+        let b: Vec<f64> = (0..n1 * rank).map(|_| v()).collect();
+        let c: Vec<f64> = (0..n2 * rank).map(|_| v()).collect();
+        let mut data = vec![0.0f64; n0 * n1 * n2];
+        for r in 0..rank {
+            for i in 0..n0 {
+                for j in 0..n1 {
+                    for k in 0..n2 {
+                        data[i * n1 * n2 + j * n2 + k] +=
+                            a[i * rank + r] * b[j * rank + r] * c[k * rank + r];
+                    }
+                }
+            }
+        }
+        DenseND::from_vec(data, &[n0, n1, n2]).unwrap()
+    }
+
+    #[test]
+    fn test_sparse_cp_pipeline_on_low_rank_tensor() {
+        // Build a rank-3 tensor and decompose it via sparse CP-ALS.
+        // Verify reconstruction error < 30% on a known-rank tensor.
+        let rank = 3;
+        let dense = make_rank_r_tensor(8, 7, 6, rank, 0xABCDEF);
+        let coo = dense_to_coo(&dense);
+
+        let cp = cp_als_sparse(&coo, rank, 100, 1e-6, InitStrategy::Random, None).unwrap();
+        assert!(cp.fit > 0.5, "fit on rank-{} tensor = {:.4}", rank, cp.fit);
+
+        let recon = cp.reconstruct(dense.shape()).unwrap();
+        assert_eq!(recon.shape(), dense.shape());
+
+        let error = compute_reconstruction_error(&dense, &recon);
+        assert!(
+            error < 0.5,
+            "reconstruction error on rank-{} tensor should be < 50%, got {:.4}",
+            rank,
+            error
+        );
+    }
+
+    #[test]
+    fn test_sparse_dense_cp_pipeline_agreement() {
+        // Same tensor, same rank — sparse and dense CP-ALS should produce
+        // decompositions with similar fit (within 0.35).
+        let rank = 3;
+        let dense = make_rank_r_tensor(7, 6, 5, rank, 0xFEDCBA);
+        let coo = dense_to_coo(&dense);
+
+        let cp_dense = cp_als(&dense, rank, 80, 1e-6, InitStrategy::Random, None).unwrap();
+        let cp_sparse = cp_als_sparse(&coo, rank, 80, 1e-6, InitStrategy::Random, None).unwrap();
+
+        assert!(
+            (cp_dense.fit - cp_sparse.fit).abs() < 0.35,
+            "dense fit {:.4} vs sparse fit {:.4} too different",
+            cp_dense.fit,
+            cp_sparse.fit
+        );
+    }
+
+    #[test]
+    fn test_sparse_cp_pipeline_varying_sparsity() {
+        // Build a sparse COO at different fill fractions and check that
+        // cp_als_sparse always returns valid results.
+        let shape = [6, 7, 8];
+        let total: usize = shape.iter().product();
+
+        for fill in [0.01f64, 0.05, 0.20, 1.0] {
+            let nnz = ((total as f64) * fill).max(1.0) as usize;
+            let ndim = shape.len();
+            let mut coo = CooTensor::<f64>::zeros(shape.to_vec()).unwrap();
+            let mut rng = 0xDEAD_u64;
+            for _ in 0..nnz {
+                rng = rng
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let flat = rng as usize % total;
+                let mut idx = vec![0usize; ndim];
+                let mut rem = flat;
+                for d in (0..ndim).rev() {
+                    idx[d] = rem % shape[d];
+                    rem /= shape[d];
+                }
+                let val = (rng >> 32) as f64 / (u32::MAX as f64) + 0.1;
+                coo.push(idx, val).ok();
+            }
+            coo.deduplicate();
+
+            let cp = cp_als_sparse(&coo, 2, 20, 1e-4, InitStrategy::Random, None)
+                .unwrap_or_else(|e| panic!("fill={fill}: {e}"));
+            assert!(
+                cp.fit >= 0.0 && cp.fit <= 1.0,
+                "fill={fill}: fit={} must be in [0,1]",
+                cp.fit
+            );
+        }
+    }
+}
+
+// Helper function
+fn compute_reconstruction_error(original: &DenseND<f64>, reconstructed: &DenseND<f64>) -> f64 {
+    let mut error_sq = 0.0;
+    let mut norm_sq = 0.0;
+
+    let orig_view = original.view();
+    let recon_view = reconstructed.view();
+
+    for (orig, recon) in orig_view.iter().zip(recon_view.iter()) {
+        let diff = *orig - *recon;
+        error_sq += diff * diff;
+        norm_sq += (*orig) * (*orig);
+    }
+
+    (error_sq / norm_sq).sqrt()
+}

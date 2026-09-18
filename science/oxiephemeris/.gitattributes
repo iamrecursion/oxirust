@@ -1,0 +1,10 @@
+# Enforce LF for all text files regardless of any clone's core.autocrlf
+# setting: shell scripts, Rust sources, and the committed test fixtures
+# (fixed-column Horizons/testpo parsing) all depend on exact LF endings.
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf

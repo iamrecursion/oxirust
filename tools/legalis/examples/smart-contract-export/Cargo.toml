@@ -1,0 +1,13 @@
+[package]
+name = "smart-contract-export"
+version.workspace = true
+edition.workspace = true
+description = "Example: Exporting statutes to smart contracts (Solidity, WASM, Ink!, Move)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+legalis-core = { path = "../../crates/legalis-core" }
+legalis-chain = { path = "../../crates/legalis-chain" }
+
+tokio = { version = "1", features = ["full"] }

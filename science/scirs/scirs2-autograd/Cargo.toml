@@ -1,0 +1,108 @@
+[package]
+name = "scirs2-autograd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Automatic differentiation module for SciRS2 (scirs2-autograd)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+keywords = ["autograd", "machine-learning", "scientific", "ai", "ml"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["parallel", "array", "random"] }
+scirs2-symbolic = { workspace = true, optional = true }
+approx = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+once_cell = { workspace = true }
+uuid = { workspace = true }
+rustc-hash = { workspace = true }
+libc = { workspace = true }
+matrixmultiply = { workspace = true }
+num-traits = { workspace = true }
+num-integer = { workspace = true }
+special = { workspace = true }
+parking_lot = { workspace = true }
+# Remove dependency on scirs2-linalg to avoid circular dependency
+# BLAS dependencies removed - using core abstractions
+# ndarray-linalg = { workspace = true, default-features = false }
+toml = { workspace = true }
+# cblas-sys removed - all BLAS operations now go through scirs2-core
+
+[features]
+default = []
+blas = ["scirs2-core/linalg"]  # BLAS/LAPACK via OxiBLAS (pure Rust)
+# NOTE: OpenBLAS/Netlib features removed - using pure Rust OxiBLAS for all platforms
+simd = ["scirs2-core/simd"]
+parallel = [] # Parallel processing support
+
+# v0.2.0 features
+gpu = ["scirs2-core/gpu"]  # GPU acceleration support
+higher_order = []  # Higher-order derivatives (Hessian, etc.)
+symbolic = ["dep:scirs2-symbolic"]  # Symbolic differentiation via scirs2-symbolic EML
+distributed = []  # Distributed training support
+v0_2_0 = ["gpu", "higher_order", "symbolic", "distributed"]
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+
+[[example]]
+name = "basic_autograd"
+path = "examples/basic_autograd.rs"
+
+[[example]]
+name = "simd_acceleration_test"
+path = "examples/simd_acceleration_test.rs"
+required-features = ["simd"]
+
+# Benchmark declarations
+[[bench]]
+name = "gradient_computation_bench"
+harness = false
+
+[[bench]]
+name = "high_performance_bench"
+harness = false
+
+[[bench]]
+name = "iterative_solvers_bench"
+harness = false
+
+[[bench]]
+name = "matmul_bench"
+harness = false
+
+[[bench]]
+name = "activation_bench"
+harness = false
+
+[[bench]]
+name = "optimizer_bench"
+harness = false
+
+[[bench]]
+name = "memory_efficiency_bench"
+harness = false
+
+[[bench]]
+name = "pytorch_comparison"
+harness = false
+
+[[bench]]
+name = "eml_vs_tape"
+harness = false
+required-features = ["symbolic"]
+
+[lib]
+doctest = true

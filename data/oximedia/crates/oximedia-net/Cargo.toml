@@ -1,0 +1,53 @@
+[package]
+name = "oximedia-net"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Network streaming for OxiMedia"
+keywords = ["streaming", "multimedia", "network", "video", "hls"]
+categories = ["multimedia", "network-programming"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+oximedia-core = { workspace = true }
+oximedia-container = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+hmac = { workspace = true }
+rustls = { workspace = true }
+rustls-rustcrypto = { workspace = true }
+tokio-rustls = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+flv = { workspace = true }
+aes-gcm = { workspace = true }
+aes = { workspace = true }
+# `ctr` is not a workspace.dependencies entry (root Cargo.toml is owned by
+# another workstream); pinned here to the exact version already resolved in
+# the workspace lockfile (transitively, via other crates), so this adds no
+# new crate to the dependency graph's trust surface. Provides real AES-CTR
+# (NIST SP 800-38A) for SRT payload encryption, replacing a homebrew cipher.
+ctr = "0.10"

@@ -1,0 +1,103 @@
+[package]
+name = "scirs2-stats"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Statistical functions module for SciRS2 (scirs2-stats)"
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/cool-japan/scirs"
+documentation = "https://docs.rs/scirs2-stats"
+keywords = ["statistics", "probability", "scientific", "scipy", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[lints]
+workspace = true
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+
+[dependencies]
+# Core dependencies - ALL numeric/array/random functionality from scirs2-core (SciRS2 POLICY)
+scirs2-core = { workspace = true, features = ["validation", "parallel", "simd", "linalg", "random", "array"] }
+scirs2-linalg = { workspace = true }
+scirs2-symbolic = { workspace = true, optional = true }
+thiserror = { workspace = true }
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+# CUDA backend (oxicuda-*, optional, off by default)
+oxicuda-driver = { workspace = true, optional = true }
+oxicuda-memory = { workspace = true, optional = true }
+oxicuda-launch = { workspace = true, optional = true }
+oxicuda-ptx = { workspace = true, optional = true }
+
+# Statistics specific dependencies
+statrs = { workspace = true }
+# Pure-Rust (musl-derived) erfc with ~1 ulp accuracy; statrs 0.18's erf/erfc are only ~1e-11
+libm = { workspace = true }
+num_cpus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+memmap2 = { workspace = true }
+quickcheck = { workspace = true }
+crossbeam = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+plotters = { workspace = true, default-features = false }
+quickcheck = { workspace = true }
+quickcheck_macros = { workspace = true }
+approx = { workspace = true }
+proptest = { workspace = true }
+scirs2-symbolic = { path = "../scirs2-symbolic" }
+
+[features]
+default = []
+# NOTE: OpenBLAS/Netlib features removed - using pure Rust OxiBLAS for all platforms
+# Memory mapping support for large files
+memmap = []
+# Parallel processing (delegates to scirs2-core/parallel which uses rayon)
+parallel = ["scirs2-core/parallel"]
+# Python bindings support
+python = ["scirs2-core/python"]
+# Symbolic MLE: gradient descent with exact symbolic gradients via scirs2-symbolic
+symbolic = ["dep:scirs2-symbolic"]
+# GPU abstraction layer (delegates to scirs2-core/gpu)
+gpu = ["scirs2-core/gpu"]
+# Pure-Rust wgpu compute kernels for batch distribution evaluation
+wgpu = ["gpu", "dep:wgpu", "dep:pollster", "scirs2-core/wgpu"]
+# Pure-Rust direct oxicuda CUDA path (NVIDIA-only, runtime-probed; default off)
+cuda = ["dep:oxicuda-driver", "dep:oxicuda-memory", "dep:oxicuda-launch", "dep:oxicuda-ptx"]
+# Real resident-memory (RSS) tracking for ScipyBenchmarkFramework's MemoryComparison,
+# via scirs2-core's Pure-Rust `profiling_memory` RSS profiler (Mach task_info on macOS,
+# /proc/self/statm on Linux). Opt-in to keep the default build lean.
+memory_tracking = ["scirs2-core/profiling_memory"]
+
+[[bench]]
+name = "distributions"
+harness = false
+
+[[bench]]
+name = "statistical_tests"
+harness = false
+
+[[bench]]
+name = "scipy_comparison"
+harness = false
+
+[[bench]]
+name = "comprehensive_scipy_comparison"
+harness = false
+
+[[bench]]
+name = "simd_correlation_bench"
+harness = false
+
+[[bench]]
+name = "v020_simd_comprehensive"
+harness = false
+
+

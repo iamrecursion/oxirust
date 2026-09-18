@@ -1,0 +1,264 @@
+#![cfg_attr(
+    all(target_arch = "aarch64", nightly_aarch64_prefetch),
+    feature(stdarch_aarch64_prefetch)
+)]
+
+//! # oxibonsai-kernels
+//!
+//! Sub-2-bit compute kernels for OxiBonsai.
+//!
+//! Provides dequantization and fused matrix-multiply operations optimized
+//! for PrismML's weight formats: 1-bit `Q1_0_g128`, ternary `TQ2_0_g128`, and
+//! the Bonsai 2 `PQ2_0` / `PTQ1_0` / group-64 `Q2_0`, next to the standard ggml
+//! formats, with Metal and CUDA backends beside the CPU tiers. The CPU kernels
+//! are organised in a tiered dispatch architecture that auto-selects the
+//! fastest implementation available on the current CPU:
+//!
+//! | Tier | Cargo feature (informational) | Instruction set |
+//! |------|-------------------------------|-----------------|
+//! | **Reference** | always | Pure scalar Rust (correctness baseline) |
+//! | **AVX2+FMA** | `simd-avx2` | 256-bit SIMD (x86-64) |
+//! | **AVX-512** | `simd-avx512` | 512-bit SIMD (x86-64) |
+//! | **NEON** | `simd-neon` | 128-bit SIMD (AArch64) |
+//!
+//! Runtime dispatch is handled by [`KernelDispatcher`] which queries
+//! SciRS2-Core's SIMD capability cache on construction.
+//!
+//! **The `simd-avx2` / `simd-avx512` / `simd-neon` Cargo features do NOT gate
+//! tier selection.** They are empty no-op features kept for compatibility; every
+//! tier is always compiled in and chosen purely at runtime via CPU feature
+//! detection. Omitting `simd-avx2`, for example, does not disable the AVX2 tier.
+//! The middle column above is therefore informational only.
+//!
+//! ## Key Kernels
+//!
+//! | Kernel | Description |
+//! |--------|-------------|
+//! | [`dequant::dequant_1bit_g128`] | Unpack 128 sign bits + FP16 scale → FP32 |
+//! | [`gemv::gemv_1bit_g128`] | 1-bit weight matrix × FP32 vector (single-token decode) |
+//! | [`gemm::gemm_1bit_g128`] | 1-bit weight matrix × FP32 matrix (multi-token prefill) |
+//! | [`gemv_ternary::gemv_tq2_0_g128`] | Ternary `TQ2_0_g128` weight matrix × FP32 vector |
+//! | [`gemv_ptq1::gemv_ptq1_0`] | Bonsai 2 `PTQ1_0` weight matrix × FP32 vector |
+//! | [`hadamard`], [`gated_delta_net`] | The blockwise Hadamard transform and the Gated-DeltaNet recurrence of the Bonsai 2 hybrid |
+//! | [`gemm_f32::gemm_f32`] | Dense FP32 weight matrix × FP32 matrix, bit-identical to [`gemv_f32::gemv_f32`] per row |
+//!
+//! ## Traits
+//!
+//! One kernel trait per weight format ([`OneBitKernel`], [`TernaryKernel`],
+//! [`PrismKernel`], [`StandardQuantKernel`], [`Fp8Kernel`]) gives callers a
+//! single interface that is agnostic to the underlying SIMD level.
+
+/// Emit an AArch64 software-prefetch hint, degrading to a no-op off-nightly.
+///
+/// `core::arch::aarch64::_prefetch` is gated behind the `stdarch_aarch64_prefetch`
+/// nightly feature. On nightly AArch64 this expands to the real intrinsic
+/// (identical codegen); on stable — or any non-AArch64 target — it expands to a
+/// no-op that merely consumes `$ptr`. Prefetch is a pure performance hint, so
+/// dropping it never changes any computed result (correctness/parity unaffected).
+///
+/// `$ptr` must be `*const i8`; `$rw` (0 = read, 1 = write) and `$loc`
+/// (0..=3 cache locality) must be const expressions, matching the intrinsic ABI.
+///
+/// `allow(unused_macros)`: every invocation lives in `#[cfg(target_arch =
+/// "aarch64")]` code (`prefetch.rs`, `simd_neon.rs`), so on x86_64 / other
+/// targets the macro is defined-but-unused. It is kept defined on all targets
+/// (rather than cfg-gated away) to preserve its cross-platform no-op contract.
+#[allow(unused_macros)]
+macro_rules! aarch64_prefetch {
+    ($ptr:expr, $rw:expr, $loc:expr) => {{
+        // SAFETY: prefetch is always safe — invalid addresses are silently
+        // ignored on ARM. `$rw`/`$loc` are const as required by the intrinsic.
+        // The macro is invoked from both safe fns (where the `unsafe` block is
+        // required) and `unsafe fn` bodies (where it is redundant), so
+        // `unused_unsafe` is allowed to keep both call sites warning-free.
+        #[cfg(all(target_arch = "aarch64", nightly_aarch64_prefetch))]
+        #[allow(unused_unsafe)]
+        unsafe {
+            core::arch::aarch64::_prefetch($ptr, $rw, $loc);
+        }
+        #[cfg(not(all(target_arch = "aarch64", nightly_aarch64_prefetch)))]
+        {
+            let _ = $ptr;
+        }
+    }};
+}
+#[allow(unused_imports)] // re-export unused on non-aarch64 targets (see macro doc above)
+pub(crate) use aarch64_prefetch;
+
+pub mod gpu_backend;
+#[cfg(feature = "gpu")]
+pub use gpu_backend::Scirs2Backend;
+pub use gpu_backend::{
+    gpu_gemv_1bit, gpu_matmul, select_backend, CpuBackend, DeviceBuffer, GpuBackend,
+    GpuBackendTrait, GpuError, LaunchConfig,
+};
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use gpu_backend::{
+    build_cached_weights, build_cached_weights_ternary_only, metal_fused_gate_up_swiglu_fp8_e4m3,
+    metal_fused_gate_up_swiglu_fp8_e5m2, metal_gemm_fp8_e4m3, metal_gemm_fp8_e4m3_residual,
+    metal_gemm_fp8_e5m2, metal_gemm_fp8_e5m2_residual, metal_gemv_fp8_e4m3, metal_gemv_fp8_e5m2,
+    metal_gemv_q2k, metal_gemv_q3k, metal_gemv_q4_0, metal_gemv_q4k, metal_gemv_q5k,
+    metal_gemv_q6k, metal_gemv_q8_0, metal_gemv_q8k, print_gpu_profile_summary, try_metal_ffn,
+    try_metal_forward_greedy_ternary, try_metal_full_forward, try_metal_full_forward_cached,
+    try_metal_full_forward_prefill, try_metal_full_forward_prefill_ternary,
+    try_metal_full_forward_prefill_verify, try_metal_full_forward_prefill_verify_ternary,
+    try_metal_full_forward_ternary, try_metal_full_layer, try_metal_prefill_ternary,
+    try_metal_prefill_verify_ternary, try_metal_qkv, CachedLayerWeights, CachedModelWeights,
+    FullForwardLayerParams, FullForwardLayerParamsTernary, MetalGraph, MetalGraphError,
+    MetalWeightHandle,
+};
+
+/// `MET-08`: the process-shared Metal device and the RAII session binding,
+/// nameable from outside the crate. Re-exported straight from the public
+/// `gpu_backend::metal_graph` module.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use gpu_backend::metal_graph::{MetalDevice, SessionScope};
+
+/// `MET-03` / `M-21`: the cached ternary weight shape and its entry points,
+/// plus the N-part fused TQ2 GEMV. Re-exported straight from the public
+/// `gpu_backend::metal_full_layer` module.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use gpu_backend::metal_full_layer::{
+    try_metal_forward_greedy_ternary_cached, try_metal_full_forward_prefill_ternary_cached,
+    try_metal_full_forward_prefill_verify_ternary_cached, try_metal_full_forward_ternary_cached,
+    try_metal_gemv_tq2_fused, try_metal_prefill_ternary_cached,
+    try_metal_prefill_verify_ternary_cached, CachedTernaryLayerWeights, CachedTernaryWeights,
+    LEGACY_MODEL_EPOCH,
+};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use gpu_backend::{
+    cuda_gemv_q2k, cuda_gemv_q3k, cuda_gemv_q4k, cuda_gemv_q5k, cuda_gemv_q6k, cuda_gemv_q8k,
+};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use gpu_backend::{
+    cuda_gemv_fp8_e4m3, cuda_gemv_fp8_e5m2, cuda_gemv_q4_0, cuda_gemv_q8_0,
+    cuda_prefill_gate_up_swiglu_q_std, cuda_prefill_gemm_q_std, cuda_prefill_gemv_q_std,
+    try_cuda_ffn, try_cuda_full_forward, try_cuda_full_forward_ternary,
+    try_cuda_full_forward_ternary_with_gpu_lm_head, try_cuda_full_forward_with_gpu_lm_head,
+    try_cuda_full_layer, try_cuda_prefill, try_cuda_prefill_q_std, try_cuda_prefill_ternary,
+    try_cuda_qkv, CudaCachedLayerWeights, CudaFullForwardLayerParams,
+    CudaFullForwardLayerParamsTernary, CudaGraph, CudaGraphError, CudaQStdPrefillLayerParams,
+    DitSingleBlockWeights, NativeCudaBackend,
+};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use gpu_backend::{try_cuda_prefill_k_quant, CudaKQuantPrefillLayerParams, KQuantFormat};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use gpu_backend::{try_cuda_prefill_fp8, CudaFP8PrefillLayerParams};
+
+pub mod dequant;
+pub mod dequant_fp8;
+pub mod dequant_prism;
+pub mod dequant_ternary;
+pub mod dispatch;
+pub mod dispatch_fp8;
+pub mod dispatch_int8;
+pub mod dispatch_log;
+pub mod dispatch_prism;
+pub mod dispatch_std_quant;
+pub mod error;
+pub mod fp8_lut;
+pub mod gated_delta_net;
+pub mod gated_delta_net_chunk;
+pub mod gemm;
+pub mod gemm_f32;
+pub mod gemm_fp8;
+pub mod gemm_onebit;
+pub mod gemm_ternary;
+pub mod gemv;
+pub mod gemv_f32;
+pub mod gemv_fp8;
+pub mod gemv_ptq1;
+pub mod gemv_q2k;
+pub mod gemv_q3k;
+pub mod gemv_q4_0;
+pub mod gemv_q4k;
+pub mod gemv_q5k;
+pub mod gemv_q6k;
+pub mod gemv_q8_0;
+pub mod gemv_q8k;
+pub mod gemv_ternary;
+pub mod hadamard;
+pub mod packing;
+pub mod parallel;
+pub mod parallel_tiled;
+pub mod quant_activation;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_avx2;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_avx512;
+pub mod simd_dot_int8;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_fp8_avx2;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_fp8_avx512;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_fp8_neon;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_hadamard_neon;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_neon;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_prism_avx2;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_prism_neon;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_q_std_avx2;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_q_std_avx512;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_q_std_neon;
+pub mod tier;
+pub mod tiled;
+pub mod traits;
+pub mod weight_cache;
+
+pub mod aligned;
+pub mod norms;
+pub mod prefetch;
+pub mod rope_mrope;
+pub mod simd_float_ops;
+pub mod ssm_ops;
+pub mod tuning;
+
+pub use aligned::{AlignedBlocks, AlignedBuffer};
+pub use dispatch::{cpu_kernel_tier, KernelDispatcher, KernelTier};
+pub use error::{KernelError, KernelResult};
+pub use gemm_f32::gemm_f32;
+pub use gemv_f32::{dot_f32, gemv_f32};
+pub use gemv_q2k::gemv_q2k;
+pub use gemv_q3k::gemv_q3k;
+pub use gemv_q4_0::gemv_q4_0;
+pub use gemv_q4k::gemv_q4k;
+pub use gemv_q5k::gemv_q5k;
+pub use gemv_q6k::gemv_q6k;
+pub use gemv_q8_0::gemv_q8_0;
+pub use gemv_q8k::gemv_q8k;
+pub use parallel::{
+    gemm_fp8_e4m3_par, gemm_fp8_e5m2_par, gemm_ternary_g128_par, gemv_fp8_e4m3_par,
+    gemv_fp8_e5m2_par, gemv_q4_0_par, gemv_q8_0_par, gemv_ternary_g128_par,
+};
+pub use parallel_tiled::{gemm_adaptive_ternary, gemv_adaptive, gemv_adaptive_ternary};
+pub use prefetch::{PrefetchConfig, PrefetchLocality, PrefetchStrategy};
+pub use simd_float_ops::{rms_norm_simd, rope_apply_simd, silu_simd, softmax_simd, swiglu_simd};
+pub use traits::{
+    Fp8Kernel, FusedKernel, OneBitKernel, PrismKernel, StandardQuantKernel, TernaryKernel,
+};
+pub use tuning::{PlatformProfile, TunedThresholds, TuningSummary};
+pub use weight_cache::GpuWeightHandle;

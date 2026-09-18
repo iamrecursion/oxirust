@@ -1,0 +1,49 @@
+[package]
+name = "amaters-cluster"
+description = "Consensus layer for AmateRS (Ukehi)"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["consensus", "raft", "distributed"]
+categories = ["algorithms", "database-implementations"]
+
+[dependencies]
+amaters-core = { workspace = true }
+# amaters-net = { workspace = true }  # TODO: Re-enable when needed
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+axum = { workspace = true }
+crc32fast = { workspace = true }
+chrono = { workspace = true }
+aes-gcm = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hkdf = { workspace = true }
+blake3 = { workspace = true }
+oxicode = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tracing-test = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "cluster_bench"
+harness = false
+
+[lints]
+workspace = true

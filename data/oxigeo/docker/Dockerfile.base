@@ -1,0 +1,114 @@
+# OxiGeo Base Docker Image
+# Multi-stage build for optimized production images
+# Author: COOLJAPAN OU (Team Kitasan)
+
+# Stage 1: Builder with full Rust toolchain
+FROM rust:1.89-slim-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /build
+
+# Copy workspace manifest first for better layer caching
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy source files for all crates to cache dependencies
+RUN mkdir -p crates/oxigeo-core/src \
+    crates/oxigeo-algorithms/src \
+    crates/oxigeo-proj/src \
+    crates/oxigeo-qc/src \
+    crates/oxigeo-drivers/geotiff/src \
+    crates/oxigeo-drivers/geojson/src \
+    crates/oxigeo-drivers/zarr/src \
+    crates/oxigeo-drivers/flatgeobuf/src \
+    crates/oxigeo-drivers/shapefile/src \
+    crates/oxigeo-drivers/netcdf/src \
+    crates/oxigeo-drivers/geoparquet/src \
+    crates/oxigeo-drivers/hdf5/src \
+    crates/oxigeo-drivers/vrt/src \
+    crates/oxigeo-drivers/grib/src \
+    crates/oxigeo-wasm/src \
+    crates/oxigeo-mobile/src \
+    crates/oxigeo-examples/src \
+    crates/oxigeo-cli/src \
+    crates/oxigeo-cloud/src \
+    crates/oxigeo-3d/src \
+    crates/oxigeo-server/src \
+    crates/oxigeo-postgis/src \
+    crates/oxigeo-analytics/src \
+    crates/oxigeo-temporal/src \
+    crates/oxigeo-rs3gw/src \
+    crates/oxigeo-distributed/src \
+    crates/oxigeo-python/src \
+    crates/oxigeo-stac/src \
+    crates/oxigeo-ml/src \
+    crates/oxigeo-metadata/src \
+    crates/oxigeo-ws/src \
+    crates/oxigeo-etl/src \
+    crates/oxigeo-gpu/src \
+    crates/oxigeo-bench/src \
+    crates/oxigeo-services/src \
+    benchmarks/src
+
+# Create minimal Cargo.toml files for dependency caching
+COPY crates/*/Cargo.toml crates/
+COPY crates/oxigeo-drivers/*/Cargo.toml crates/oxigeo-drivers/
+
+# Stage 2: Minimal runtime base
+FROM debian:bookworm-slim AS runtime-base
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN useradd -m -u 1000 -s /bin/bash oxigeo
+
+# Set environment variables
+ENV RUST_LOG=info \
+    RUST_BACKTRACE=1
+
+# Stage 3: Development base (includes build tools)
+FROM rust:1.89-bookworm AS dev-base
+
+# Install development dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    curl \
+    git \
+    vim \
+    tmux \
+    ripgrep \
+    fd-find \
+    bat \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install additional Rust tools
+RUN cargo install cargo-watch cargo-edit cargo-outdated cargo-audit
+
+# Create workspace directory
+WORKDIR /workspace
+
+# Set environment for development
+ENV RUST_LOG=debug \
+    RUST_BACKTRACE=full
+
+LABEL org.opencontainers.image.title="OxiGeo Base Images" \
+      org.opencontainers.image.description="Base Docker images for OxiGeo geospatial library" \
+      org.opencontainers.image.vendor="COOLJAPAN OU (Team Kitasan)" \
+      org.opencontainers.image.source="https://github.com/cool-japan/oxigeo" \
+      org.opencontainers.image.licenses="Apache-2.0"

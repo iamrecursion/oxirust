@@ -1,0 +1,150 @@
+[package]
+name = "oxigeo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+oxigeo-geotiff = { path = "../crates/oxigeo-drivers/geotiff" }
+oxigeo-jpeg2000 = { path = "../crates/oxigeo-drivers/jpeg2000" }
+oxigeo-grib = { path = "../crates/oxigeo-drivers/grib" }
+oxigeo-geoparquet = { path = "../crates/oxigeo-drivers/geoparquet" }
+oxigeo-shapefile = { path = "../crates/oxigeo-drivers/shapefile" }
+oxigeo-flatgeobuf = { path = "../crates/oxigeo-drivers/flatgeobuf" }
+oxigeo-zarr = { path = "../crates/oxigeo-drivers/zarr" }
+oxigeo-gpkg = { path = "../crates/oxigeo-gpkg" }
+oxigeo-mbtiles = { path = "../crates/oxigeo-mbtiles", features = ["sqlite"] }
+oxigeo-pmtiles = { path = "../crates/oxigeo-pmtiles" }
+oxigeo-copc = { path = "../crates/oxigeo-copc" }
+oxigeo-vrt = { path = "../crates/oxigeo-drivers/vrt" }
+oxigeo-geojson-stream = { path = "../crates/oxigeo-geojson" }
+oxigeo-proj = { path = "../crates/oxigeo-proj" }
+oxigeo-hdf5 = { path = "../crates/oxigeo-drivers/hdf5" }
+# Real Pure-Rust NetCDF-4/HDF5 engines, fuzzed directly (in-memory
+# `open_from_bytes` constructors, documented upstream as intended "for
+# testing and fuzzing") rather than through `oxigeo-netcdf`'s path-based
+# `NetCdfReader::open`, which has no in-memory entry point.
+oxinetcdf = "0.2.3"
+oxih5 = "0.2.3"
+
+# Prevent this crate from being included in normal workspace builds
+[workspace]
+
+[[bin]]
+name = "fuzz_geotiff_header"
+path = "fuzz_targets/fuzz_geotiff_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_jpeg2000_boxes"
+path = "fuzz_targets/fuzz_jpeg2000_boxes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_grib2_sections"
+path = "fuzz_targets/fuzz_grib2_sections.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_lerc_decode"
+path = "fuzz_targets/fuzz_lerc_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wkb_decode"
+path = "fuzz_targets/fuzz_wkb_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_shapefile_header"
+path = "fuzz_targets/fuzz_shapefile_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_flatgeobuf_root"
+path = "fuzz_targets/fuzz_flatgeobuf_root.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_zarr_metadata"
+path = "fuzz_targets/fuzz_zarr_metadata.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_gpkg_header"
+path = "fuzz_targets/fuzz_gpkg_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_mbtiles_header"
+path = "fuzz_targets/fuzz_mbtiles_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_pmtiles_header"
+path = "fuzz_targets/fuzz_pmtiles_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_copc_header"
+path = "fuzz_targets/fuzz_copc_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_netcdf_bytes"
+path = "fuzz_targets/fuzz_netcdf_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_hdf5_bytes"
+path = "fuzz_targets/fuzz_hdf5_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_vrt_xml"
+path = "fuzz_targets/fuzz_vrt_xml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_geojson_parse"
+path = "fuzz_targets/fuzz_geojson_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_jp2_codestream"
+path = "fuzz_targets/fuzz_jp2_codestream.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_dbf_records"
+path = "fuzz_targets/fuzz_dbf_records.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ntv2_grid"
+path = "fuzz_targets/fuzz_ntv2_grid.rs"
+test = false
+doc = false

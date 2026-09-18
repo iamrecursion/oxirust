@@ -1,0 +1,12 @@
+{
+  "name": "patent_libx264",
+  "args": ["-i", "in.mp4", "-c:v", "libx264", "-preset", "fast", "-crf", "23", "out.mkv"],
+  "expect": {
+    "contains_diagnostic_kinds": ["PatentCodecSubstituted"],
+    "contains_diagnostic_messages": ["libx264", "av1"],
+    "jobs": 1,
+    "video_codec": "av1",
+    "preset": "fast",
+    "crf": 23.0
+  }
+}

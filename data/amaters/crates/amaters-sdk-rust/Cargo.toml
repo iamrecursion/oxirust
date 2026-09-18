@@ -1,0 +1,59 @@
+[package]
+name = "amaters-sdk-rust"
+description = "Rust SDK for AmateRS"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["sdk", "client", "database"]
+categories = ["api-bindings", "database"]
+
+[dependencies]
+amaters-core = { workspace = true }
+amaters-net = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+parking_lot = { workspace = true }
+blake3 = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+uuid = { workspace = true }
+tfhe = { workspace = true, optional = true, features = ["boolean", "shortint", "integer"] }
+serde = { workspace = true, optional = true }
+oxicode = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-test = { workspace = true }
+anyhow = { workspace = true }
+criterion = { workspace = true, features = ["async_tokio"] }
+amaters-net = { workspace = true }
+amaters-core = { workspace = true }
+tokio-stream = { workspace = true }
+
+[[bench]]
+name = "client_bench"
+harness = false
+
+[features]
+default = []
+fhe = ["tfhe"]
+serialization = ["serde", "oxicode"]
+
+[lints]
+workspace = true

@@ -1,0 +1,1713 @@
+// Copyright 2026 COOLJAPAN OU (Team KitaSan)
+// SPDX-License-Identifier: Apache-2.0
+
+//! Membrane mechanics for soft body simulation.
+//!
+//! This module provides thin shell/membrane elements, tension-only behaviour,
+//! wrinkling detection (tension field theory), pneumatic pressure loading,
+//! membrane inflation, form-finding (force density method), cable-membrane
+//! interaction, and pre-stress models.
+//!
+//! All quantities are in SI units (Pa, m, N, ...) unless otherwise stated.
+//! Uses `[f64; 3]` arrays for vectors (no nalgebra dependency).
+
+use std::f64::consts::PI;
+
+// ---------------------------------------------------------------------------
+// Vector helpers (plain [f64; 3], no nalgebra)
+// ---------------------------------------------------------------------------
+
+/// Add two 3-vectors.
+#[inline]
+fn vec_add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+/// Subtract b from a.
+#[inline]
+fn vec_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// Scale a vector.
+#[inline]
+fn vec_scale(a: [f64; 3], s: f64) -> [f64; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+
+/// Dot product of two 3-vectors.
+#[inline]
+fn vec_dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Cross product of two 3-vectors.
+#[inline]
+fn vec_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Euclidean length of a 3-vector.
+#[inline]
+fn vec_len(a: [f64; 3]) -> f64 {
+    vec_dot(a, a).sqrt()
+}
+
+/// Normalize a 3-vector, returning zero if degenerate.
+#[inline]
+fn vec_normalize(a: [f64; 3]) -> [f64; 3] {
+    let len = vec_len(a);
+    if len < 1e-15 {
+        [0.0; 3]
+    } else {
+        vec_scale(a, 1.0 / len)
+    }
+}
+
+/// Negate a 3-vector.
+#[inline]
+fn vec_neg(a: [f64; 3]) -> [f64; 3] {
+    [-a[0], -a[1], -a[2]]
+}
+
+/// Zero 3-vector.
+#[inline]
+fn vec_zero() -> [f64; 3] {
+    [0.0; 3]
+}
+
+// ---------------------------------------------------------------------------
+// Membrane node
+// ---------------------------------------------------------------------------
+
+/// A node (vertex) in the membrane mesh.
+#[derive(Debug, Clone)]
+pub struct MembraneNode {
+    /// Current position (m).
+    pub position: [f64; 3],
+    /// Previous position (for Verlet integration).
+    pub prev_position: [f64; 3],
+    /// Velocity (m/s).
+    pub velocity: [f64; 3],
+    /// External force accumulator (N).
+    pub force: [f64; 3],
+    /// Inverse mass (1/kg). Zero for fixed nodes.
+    pub inv_mass: f64,
+}
+
+impl MembraneNode {
+    /// Create a new membrane node with given position and mass.
+    pub fn new(position: [f64; 3], mass: f64) -> Self {
+        Self {
+            position,
+            prev_position: position,
+            velocity: [0.0; 3],
+            force: [0.0; 3],
+            inv_mass: if mass > 0.0 { 1.0 / mass } else { 0.0 },
+        }
+    }
+
+    /// Create a fixed (static) membrane node.
+    pub fn new_fixed(position: [f64; 3]) -> Self {
+        Self {
+            position,
+            prev_position: position,
+            velocity: [0.0; 3],
+            force: [0.0; 3],
+            inv_mass: 0.0,
+        }
+    }
+
+    /// Returns true if the node is fixed (infinite mass).
+    pub fn is_fixed(&self) -> bool {
+        self.inv_mass == 0.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wrinkling state (tension field theory)
+// ---------------------------------------------------------------------------
+
+/// Wrinkling state of a membrane element based on tension field theory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrinklingState {
+    /// Both principal stresses are tensile -- fully taut.
+    Taut,
+    /// One principal stress is compressive -- wrinkled.
+    Wrinkled,
+    /// Both principal stresses are zero or compressive -- slack.
+    Slack,
+}
+
+/// Determine wrinkling state from the two in-plane principal stresses.
+///
+/// # Arguments
+/// * `sigma_1` -- first principal stress (Pa).
+/// * `sigma_2` -- second principal stress (Pa).
+///
+/// Returns the [`WrinklingState`].
+pub fn wrinkling_state(sigma_1: f64, sigma_2: f64) -> WrinklingState {
+    if sigma_1 > 0.0 && sigma_2 > 0.0 {
+        WrinklingState::Taut
+    } else if sigma_1 > 0.0 || sigma_2 > 0.0 {
+        WrinklingState::Wrinkled
+    } else {
+        WrinklingState::Slack
+    }
+}
+
+/// Compute wrinkle wavelength for a thin membrane under uniaxial tension.
+///
+/// `lambda = 2 * pi * (D / N)^0.25`
+///
+/// where D is bending stiffness and N is membrane tension per unit width.
+///
+/// # Arguments
+/// * `bending_stiffness` -- D = E*t^3 / (12*(1-nu^2)) (N m).
+/// * `tension_per_width` -- N (N/m).
+///
+/// Returns wrinkle wavelength (m).
+pub fn wrinkle_wavelength(bending_stiffness: f64, tension_per_width: f64) -> f64 {
+    if tension_per_width <= 0.0 {
+        return 0.0;
+    }
+    2.0 * PI * (bending_stiffness / tension_per_width).sqrt().sqrt()
+}
+
+/// Compute wrinkle amplitude from membrane strain and wavelength.
+///
+/// `A = lambda / pi * sqrt(epsilon_comp)`
+///
+/// where epsilon_comp is the compressive strain in the wrinkle direction.
+///
+/// # Arguments
+/// * `wavelength` -- wrinkle wavelength (m).
+/// * `compressive_strain` -- magnitude of compressive strain (positive value).
+///
+/// Returns wrinkle amplitude (m).
+pub fn wrinkle_amplitude(wavelength: f64, compressive_strain: f64) -> f64 {
+    if compressive_strain <= 0.0 || wavelength <= 0.0 {
+        return 0.0;
+    }
+    wavelength / PI * compressive_strain.sqrt()
+}
+
+// ---------------------------------------------------------------------------
+// Membrane triangle element
+// ---------------------------------------------------------------------------
+
+/// Symmetric 2x2 tensor expressed in the element-local frame (row-major).
+type Mat2 = [[f64; 2]; 2];
+
+/// Largest and smallest eigenvalue of a symmetric 2x2 tensor.
+fn principal_values(s: Mat2) -> (f64, f64) {
+    let mean = 0.5 * (s[0][0] + s[1][1]);
+    let radius = (0.5 * (s[0][0] - s[1][1])).hypot(s[0][1]);
+    (mean + radius, mean - radius)
+}
+
+/// Tension-field-theory relaxation of a symmetric 2x2 stress.
+///
+/// A membrane cannot carry compression, so negative principal stresses are
+/// set to zero while a tensile principal stress (if any) is kept along its own
+/// principal direction.
+fn tensile_part(s: Mat2) -> Mat2 {
+    let (s_max, s_min) = principal_values(s);
+    if s_min >= 0.0 {
+        return s;
+    }
+    if s_max <= 0.0 {
+        return [[0.0; 2]; 2];
+    }
+    // Direction of the larger eigenvalue: tan(2 phi) = 2 s01 / (s00 - s11).
+    // Here s_max > 0 > s_min, so the tensor is not isotropic and phi is well defined.
+    let phi = 0.5 * (2.0 * s[0][1]).atan2(s[0][0] - s[1][1]);
+    let (sin_phi, cos_phi) = phi.sin_cos();
+    [
+        [s_max * cos_phi * cos_phi, s_max * cos_phi * sin_phi],
+        [s_max * cos_phi * sin_phi, s_max * sin_phi * sin_phi],
+    ]
+}
+
+/// Inverse of the 2x2 reference edge matrix `Dm = [d1 d2]` of a rest triangle.
+///
+/// `d1`, `d2` are the edges `p1 - p0` and `p2 - p0` written in the in-plane
+/// orthonormal frame `(u, w)` with `u = (p1 - p0) / |p1 - p0|` and
+/// `w = n x u` (`n` the unit normal). Returns `None` for a degenerate triangle.
+fn reference_edge_inverse(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> Option<Mat2> {
+    let e1 = vec_sub(p1, p0);
+    let e2 = vec_sub(p2, p0);
+    let l1 = vec_len(e1);
+    let cross = vec_cross(e1, e2);
+    let twice_area = vec_len(cross);
+    if l1 <= 0.0 || twice_area <= 1e-12 * l1 * vec_len(e2) {
+        return None;
+    }
+    let u = vec_scale(e1, 1.0 / l1);
+    let w = vec_cross(vec_scale(cross, 1.0 / twice_area), u);
+    let d2x = vec_dot(e2, u);
+    let d2y = vec_dot(e2, w);
+    // Dm = [[l1, d2x], [0, d2y]].
+    Some([[1.0 / l1, -d2x / (l1 * d2y)], [0.0, 1.0 / d2y]])
+}
+
+/// A constant-strain triangle (CST) membrane element.
+///
+/// The element stores the inverse of its rest edge matrix `Dm` (in its own
+/// plane) and measures the deformation gradient `F = Ds Dm^-1` from the current
+/// edge matrix `Ds`. The material is plane-stress St. Venant-Kirchhoff: with the
+/// Green-Lagrange strain `E = (F^T F - I) / 2`, the second Piola-Kirchhoff
+/// stress is `S = lambda_bar tr(E) I + 2 mu E + S0`, where
+/// `lambda_bar = E_Y nu / (1 - nu^2)`, `mu = E_Y / (2 (1 + nu))` and `S0` is
+/// the pre-stress diagonal tensor. Using the finite Green-Lagrange strain keeps
+/// the geometric stiffness that a stretched flat sheet needs to carry
+/// out-of-plane load. Nodal forces follow from the strain energy
+/// `W = A0 t (lambda_bar tr(E)^2 / 2 + mu E:E + S0:E)` as `f = -dW/dx`, so they
+/// sum to zero (and are torque free) for any deformation.
+///
+/// With `tension_only` the compressive principal stresses are removed
+/// (tension-field theory), which lets the element wrinkle instead of resisting
+/// compression.
+#[derive(Debug, Clone)]
+pub struct MembraneTriangle {
+    /// Node indices (into a global node array).
+    pub nodes: [usize; 3],
+    /// Thickness (m).
+    pub thickness: f64,
+    /// Young's modulus (Pa).
+    pub youngs_modulus: f64,
+    /// Poisson's ratio.
+    pub poissons_ratio: f64,
+    /// Pre-stress along the local x axis, the direction of the first edge
+    /// (node 0 to node 1) in the rest configuration (Pa).
+    pub prestress_x: f64,
+    /// Pre-stress along the local y axis, in the rest plane and perpendicular
+    /// to the local x axis (Pa).
+    pub prestress_y: f64,
+    /// Reference (undeformed) area (m^2).
+    pub ref_area: f64,
+    /// Whether to enforce tension-only behaviour.
+    pub tension_only: bool,
+    /// Inverse of the rest edge matrix `Dm`; `None` for a degenerate rest
+    /// triangle, which carries no force.
+    rest_inverse: Option<Mat2>,
+}
+
+impl MembraneTriangle {
+    /// Create a new membrane triangle element.
+    ///
+    /// The rest configuration is taken from `positions`.
+    pub fn new(
+        nodes: [usize; 3],
+        thickness: f64,
+        youngs_modulus: f64,
+        poissons_ratio: f64,
+        positions: &[[f64; 3]],
+    ) -> Self {
+        let p0 = positions[nodes[0]];
+        let p1 = positions[nodes[1]];
+        let p2 = positions[nodes[2]];
+        Self {
+            nodes,
+            thickness,
+            youngs_modulus,
+            poissons_ratio,
+            prestress_x: 0.0,
+            prestress_y: 0.0,
+            ref_area: triangle_area(p0, p1, p2),
+            tension_only: true,
+            rest_inverse: reference_edge_inverse(p0, p1, p2),
+        }
+    }
+
+    /// Set pre-stress values for the element.
+    pub fn set_prestress(&mut self, px: f64, py: f64) {
+        self.prestress_x = px;
+        self.prestress_y = py;
+    }
+
+    /// Compute the current area of the triangle.
+    pub fn current_area(&self, positions: &[[f64; 3]]) -> f64 {
+        triangle_area(
+            positions[self.nodes[0]],
+            positions[self.nodes[1]],
+            positions[self.nodes[2]],
+        )
+    }
+
+    /// Compute the area ratio (current / reference).
+    pub fn area_ratio(&self, positions: &[[f64; 3]]) -> f64 {
+        if self.ref_area < 1e-30 {
+            return 1.0;
+        }
+        self.current_area(positions) / self.ref_area
+    }
+
+    /// Compute unit normal of the triangle in current configuration.
+    pub fn normal(&self, positions: &[[f64; 3]]) -> [f64; 3] {
+        let p0 = positions[self.nodes[0]];
+        let p1 = positions[self.nodes[1]];
+        let p2 = positions[self.nodes[2]];
+        let e1 = vec_sub(p1, p0);
+        let e2 = vec_sub(p2, p0);
+        vec_normalize(vec_cross(e1, e2))
+    }
+
+    /// Plane-stress Lame parameters `(lambda_bar, mu)`.
+    fn plane_stress_moduli(&self) -> (f64, f64) {
+        let nu = self.poissons_ratio;
+        let lambda_bar = self.youngs_modulus * nu / (1.0 - nu * nu);
+        let mu = self.youngs_modulus / (2.0 * (1.0 + nu));
+        (lambda_bar, mu)
+    }
+
+    /// Deformation gradient `F = Ds Dm^-1`, returned as its two 3-D columns
+    /// together with `Dm^-1`. `None` for a degenerate rest triangle.
+    fn deformation_gradient(&self, positions: &[[f64; 3]]) -> Option<([[f64; 3]; 2], Mat2)> {
+        let minv = self.rest_inverse?;
+        let x0 = positions[self.nodes[0]];
+        let edge_1 = vec_sub(positions[self.nodes[1]], x0);
+        let edge_2 = vec_sub(positions[self.nodes[2]], x0);
+        let column =
+            |j: usize| vec_add(vec_scale(edge_1, minv[0][j]), vec_scale(edge_2, minv[1][j]));
+        Some(([column(0), column(1)], minv))
+    }
+
+    /// Right Cauchy-Green tensor `C = F^T F` from the columns of `F`.
+    fn right_cauchy_green(f: &[[f64; 3]; 2]) -> Mat2 {
+        let c01 = vec_dot(f[0], f[1]);
+        [[vec_dot(f[0], f[0]), c01], [c01, vec_dot(f[1], f[1])]]
+    }
+
+    /// Green-Lagrange strain `E = (C - I) / 2`.
+    fn green_strain(c: Mat2) -> Mat2 {
+        [
+            [0.5 * (c[0][0] - 1.0), 0.5 * c[0][1]],
+            [0.5 * c[1][0], 0.5 * (c[1][1] - 1.0)],
+        ]
+    }
+
+    /// Second Piola-Kirchhoff stress (Pa) for the Green-Lagrange strain `e`,
+    /// including the pre-stress, before any tension-only relaxation.
+    fn pk2_stress(&self, e: Mat2) -> Mat2 {
+        let (lambda_bar, mu) = self.plane_stress_moduli();
+        let trace = e[0][0] + e[1][1];
+        [
+            [
+                lambda_bar * trace + 2.0 * mu * e[0][0] + self.prestress_x,
+                2.0 * mu * e[0][1],
+            ],
+            [
+                2.0 * mu * e[1][0],
+                lambda_bar * trace + 2.0 * mu * e[1][1] + self.prestress_y,
+            ],
+        ]
+    }
+
+    /// Elastic strain energy (J) of the element, `W = A0 t psi(E)`.
+    ///
+    /// This is the energy of the fully elastic element: the tension-only
+    /// relaxation removes stress without a potential, so with compression
+    /// present the nodal forces are not the gradient of this energy.
+    pub fn strain_energy(&self, positions: &[[f64; 3]]) -> f64 {
+        let Some((f, _)) = self.deformation_gradient(positions) else {
+            return 0.0;
+        };
+        let e = Self::green_strain(Self::right_cauchy_green(&f));
+        let (lambda_bar, mu) = self.plane_stress_moduli();
+        let trace = e[0][0] + e[1][1];
+        let e_double_dot_e = e[0][0] * e[0][0] + 2.0 * e[0][1] * e[0][1] + e[1][1] * e[1][1];
+        let prestress_work = self.prestress_x * e[0][0] + self.prestress_y * e[1][1];
+        self.ref_area
+            * self.thickness
+            * (0.5 * lambda_bar * trace * trace + mu * e_double_dot_e + prestress_work)
+    }
+
+    /// Principal values `(largest, smallest)` of the second Piola-Kirchhoff
+    /// stress (Pa), before any tension-only relaxation.
+    ///
+    /// Their signs equal those of the principal Cauchy stresses. A degenerate
+    /// rest triangle reports `(0, 0)`.
+    pub fn principal_stresses(&self, positions: &[[f64; 3]]) -> (f64, f64) {
+        let Some((f, _)) = self.deformation_gradient(positions) else {
+            return (0.0, 0.0);
+        };
+        let e = Self::green_strain(Self::right_cauchy_green(&f));
+        principal_values(self.pk2_stress(e))
+    }
+
+    /// Compute the mean in-plane membrane tension resultant (N/m).
+    ///
+    /// This is the thickness times the mean principal Cauchy stress,
+    /// `t tr(sigma) / 2` with `sigma = F S F^T / J`, evaluated after the
+    /// tension-only relaxation when `tension_only` is set (so it never
+    /// reports a compressive resultant in that mode).
+    pub fn membrane_tension(&self, positions: &[[f64; 3]]) -> f64 {
+        let Some((f, _)) = self.deformation_gradient(positions) else {
+            return 0.0;
+        };
+        let c = Self::right_cauchy_green(&f);
+        let mut stress = self.pk2_stress(Self::green_strain(c));
+        if self.tension_only {
+            stress = tensile_part(stress);
+        }
+        let area_ratio = (c[0][0] * c[1][1] - c[0][1] * c[1][0]).max(0.0).sqrt();
+        if area_ratio <= 0.0 {
+            return 0.0;
+        }
+        let trace_s_c = stress[0][0] * c[0][0]
+            + stress[0][1] * c[1][0]
+            + stress[1][0] * c[0][1]
+            + stress[1][1] * c[1][1];
+        0.5 * self.thickness * trace_s_c / area_ratio
+    }
+
+    /// Compute the wrinkling state of this element from the signs of its
+    /// principal stresses (tension field theory).
+    pub fn element_wrinkling_state(&self, positions: &[[f64; 3]]) -> WrinklingState {
+        let (sigma_1, sigma_2) = self.principal_stresses(positions);
+        wrinkling_state(sigma_1, sigma_2)
+    }
+
+    /// Accumulate the internal membrane forces of this element into `forces`.
+    ///
+    /// `positions` and `forces` are indexed like the global node array. The
+    /// forces are the negative gradient of the strain energy with respect to
+    /// the three node positions (using the tension-only relaxed stress when
+    /// `tension_only` is set), so they lie in the element's tangent plane for
+    /// an in-plane deformation and sum to zero over the three nodes.
+    pub fn apply_forces(&self, positions: &[[f64; 3]], forces: &mut [[f64; 3]]) {
+        let Some((f, minv)) = self.deformation_gradient(positions) else {
+            return;
+        };
+        let c = Self::right_cauchy_green(&f);
+        let mut stress = self.pk2_stress(Self::green_strain(c));
+        if self.tension_only {
+            stress = tensile_part(stress);
+        }
+        // First Piola-Kirchhoff stress P = F S, as its two columns.
+        let p = [
+            vec_add(vec_scale(f[0], stress[0][0]), vec_scale(f[1], stress[1][0])),
+            vec_add(vec_scale(f[0], stress[0][1]), vec_scale(f[1], stress[1][1])),
+        ];
+        let volume = self.ref_area * self.thickness;
+        // dW/d(edge k) = V0 * sum_j P[:, j] * Dm^-1[k][j]
+        let edge_gradient = |k: usize| {
+            vec_scale(
+                vec_add(vec_scale(p[0], minv[k][0]), vec_scale(p[1], minv[k][1])),
+                volume,
+            )
+        };
+        let grad_1 = edge_gradient(0);
+        let grad_2 = edge_gradient(1);
+        forces[self.nodes[1]] = vec_sub(forces[self.nodes[1]], grad_1);
+        forces[self.nodes[2]] = vec_sub(forces[self.nodes[2]], grad_2);
+        forces[self.nodes[0]] = vec_add(forces[self.nodes[0]], vec_add(grad_1, grad_2));
+    }
+}
+
+/// Compute the area of a triangle defined by three points.
+pub fn triangle_area(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> f64 {
+    let e1 = vec_sub(p1, p0);
+    let e2 = vec_sub(p2, p0);
+    0.5 * vec_len(vec_cross(e1, e2))
+}
+
+/// Compute the normal of a triangle defined by three points.
+pub fn triangle_normal(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> [f64; 3] {
+    let e1 = vec_sub(p1, p0);
+    let e2 = vec_sub(p2, p0);
+    vec_normalize(vec_cross(e1, e2))
+}
+
+// ---------------------------------------------------------------------------
+// Pneumatic pressure loading
+// ---------------------------------------------------------------------------
+
+/// Apply uniform pneumatic pressure to a triangulated membrane surface.
+///
+/// Distributes pressure force (F = p * A * n) equally to the three vertices
+/// of each triangle.
+///
+/// # Arguments
+/// * `nodes` -- mutable slice of membrane nodes.
+/// * `triangles` -- slice of triangle index triples.
+/// * `pressure` -- internal gauge pressure (Pa).
+pub fn apply_pneumatic_pressure(
+    nodes: &mut [MembraneNode],
+    triangles: &[[usize; 3]],
+    pressure: f64,
+) {
+    for tri in triangles {
+        let p0 = nodes[tri[0]].position;
+        let p1 = nodes[tri[1]].position;
+        let p2 = nodes[tri[2]].position;
+        let n = triangle_normal(p0, p1, p2);
+        let area = triangle_area(p0, p1, p2);
+        let f_per_node = vec_scale(n, pressure * area / 3.0);
+        for &idx in tri {
+            if nodes[idx].inv_mass > 0.0 {
+                nodes[idx].force = vec_add(nodes[idx].force, f_per_node);
+            }
+        }
+    }
+}
+
+/// Compute the enclosed volume of a closed triangulated membrane.
+///
+/// Uses the divergence theorem: V = (1/6) * sum(n_i dot p0_i * area_i * 2).
+///
+/// # Arguments
+/// * `positions` -- node positions.
+/// * `triangles` -- triangle index triples.
+///
+/// Returns the enclosed volume (m^3), sign depends on winding order.
+pub fn enclosed_volume(positions: &[[f64; 3]], triangles: &[[usize; 3]]) -> f64 {
+    let mut vol = 0.0;
+    for tri in triangles {
+        let p0 = positions[tri[0]];
+        let p1 = positions[tri[1]];
+        let p2 = positions[tri[2]];
+        // Signed volume of tetrahedron with origin: (1/6) * p0 . (p1 x p2)
+        vol += vec_dot(p0, vec_cross(p1, p2));
+    }
+    vol / 6.0
+}
+
+/// Compute the total surface area of a triangulated membrane.
+///
+/// # Arguments
+/// * `positions` -- node positions.
+/// * `triangles` -- triangle index triples.
+///
+/// Returns the total surface area (m^2).
+pub fn total_surface_area(positions: &[[f64; 3]], triangles: &[[usize; 3]]) -> f64 {
+    let mut area = 0.0;
+    for tri in triangles {
+        area += triangle_area(positions[tri[0]], positions[tri[1]], positions[tri[2]]);
+    }
+    area
+}
+
+// ---------------------------------------------------------------------------
+// Membrane inflation model
+// ---------------------------------------------------------------------------
+
+/// Spherical membrane inflation model (Mooney-Rivlin rubber balloon).
+///
+/// For a thin, incompressible spherical shell of initial radius R0 and
+/// thickness t0 under internal gauge pressure p, the equibiaxial stretch
+/// lambda (circumferential, so `r = R0 lambda`, with wall thickness
+/// `t = t0 / lambda^2`) follows from the Mooney-Rivlin strain energy
+/// `W = C1 (I1 - 3) + C2 (I2 - 3)`:
+///
+/// * equibiaxial Cauchy stress `sigma = 2 (lambda^2 - lambda^-4) (C1 + C2 lambda^2)`,
+/// * Laplace's law for a thin sphere `p = 2 sigma t / r`,
+///
+/// which combine to
+///
+/// `p = 4 (t0 / R0) (1/lambda - 1/lambda^7) (C1 + C2 lambda^2)`.
+///
+/// The pressure is *not* monotonic in the stretch. For C2 = 0 (neo-Hookean) it
+/// has a limit point at `lambda = 7^(1/6) ~ 1.383`: beyond it the balloon keeps
+/// inflating at falling pressure (the classic inflation instability).
+///
+/// # Arguments
+/// * `r0` -- initial (undeformed) radius (m).
+/// * `t0` -- initial wall thickness (m).
+/// * `c1` -- Mooney-Rivlin constant C1 (Pa).
+/// * `c2` -- Mooney-Rivlin constant C2 (Pa).
+/// * `stretch` -- circumferential stretch ratio lambda (dimensionless, > 0;
+///   values below 1 describe a deflated, compressed shell).
+///
+/// Returns the internal pressure (Pa).
+pub fn spherical_inflation_pressure(r0: f64, t0: f64, c1: f64, c2: f64, stretch: f64) -> f64 {
+    let lam = stretch;
+    4.0 * t0 / r0 * (1.0 / lam - 1.0 / lam.powi(7)) * (c1 + c2 * lam * lam)
+}
+
+/// Compute the current radius of a spherical balloon at given stretch.
+///
+/// `R = R0 * lambda`
+///
+/// # Arguments
+/// * `r0` -- initial radius (m).
+/// * `stretch` -- circumferential stretch ratio.
+///
+/// Returns the current radius (m).
+pub fn balloon_current_radius(r0: f64, stretch: f64) -> f64 {
+    r0 * stretch
+}
+
+/// Compute the current thickness of a spherical balloon at given stretch.
+///
+/// `t = t0 / lambda^2` (incompressibility assumption).
+///
+/// # Arguments
+/// * `t0` -- initial thickness (m).
+/// * `stretch` -- circumferential stretch ratio.
+///
+/// Returns the current thickness (m).
+pub fn balloon_current_thickness(t0: f64, stretch: f64) -> f64 {
+    t0 / (stretch * stretch)
+}
+
+/// Compute the volume of a spherical balloon at given stretch.
+///
+/// `V = (4/3) * pi * (R0 * lambda)^3`
+///
+/// # Arguments
+/// * `r0` -- initial radius (m).
+/// * `stretch` -- circumferential stretch ratio.
+///
+/// Returns volume (m^3).
+pub fn balloon_volume(r0: f64, stretch: f64) -> f64 {
+    let r = r0 * stretch;
+    4.0 / 3.0 * PI * r * r * r
+}
+
+// ---------------------------------------------------------------------------
+// Form-finding: force density method
+// ---------------------------------------------------------------------------
+
+/// Force density method for membrane form-finding.
+///
+/// Given a cable/membrane network with `n` free nodes, `n_fixed` fixed nodes,
+/// and connectivity, finds the equilibrium shape under prescribed force densities.
+///
+/// The force density q_e = force_per_length / length_e for each element.
+///
+/// The equilibrium equations are: D^T Q D x = p_ext - D^T Q D_f x_f
+/// where D is the connectivity matrix and Q = diag(q_e).
+///
+/// This simplified solver handles a single-axis (e.g., z-coordinate) for
+/// a planar boundary problem.
+#[derive(Debug, Clone)]
+pub struct ForceDensityMethod {
+    /// Number of free nodes.
+    pub n_free: usize,
+    /// Number of fixed (boundary) nodes.
+    pub n_fixed: usize,
+    /// Element connectivity: (free_or_fixed_node_i, free_or_fixed_node_j).
+    pub elements: Vec<[usize; 2]>,
+    /// Force density for each element (N/m^2).
+    pub force_densities: Vec<f64>,
+    /// Fixed node coordinates (one component, e.g. z).
+    pub fixed_coords: Vec<f64>,
+    /// External load on each free node (one component).
+    pub external_loads: Vec<f64>,
+}
+
+impl ForceDensityMethod {
+    /// Create a new force density method problem.
+    pub fn new(
+        n_free: usize,
+        n_fixed: usize,
+        elements: Vec<[usize; 2]>,
+        force_densities: Vec<f64>,
+        fixed_coords: Vec<f64>,
+        external_loads: Vec<f64>,
+    ) -> Self {
+        Self {
+            n_free,
+            n_fixed,
+            elements,
+            force_densities,
+            fixed_coords,
+            external_loads,
+        }
+    }
+
+    /// Solve for the equilibrium coordinates of free nodes using Gauss-Seidel iteration.
+    ///
+    /// # Arguments
+    /// * `max_iterations` -- maximum number of Gauss-Seidel iterations.
+    /// * `tolerance` -- convergence tolerance on the coordinate change.
+    ///
+    /// Returns the equilibrium coordinates of the `n_free` nodes.
+    pub fn solve(&self, max_iterations: usize, tolerance: f64) -> Vec<f64> {
+        let n = self.n_free;
+        let total = n + self.n_fixed;
+        let mut coords = vec![0.0; total];
+        // Set fixed node coordinates
+        coords[n..n + self.n_fixed].copy_from_slice(&self.fixed_coords[..self.n_fixed]);
+
+        // Build stiffness contributions per node
+        // K_ii = sum of q_e for elements incident on node i
+        // K_ij = -q_e for element connecting i and j
+        let mut diag = vec![0.0; n];
+        for (e, elem) in self.elements.iter().enumerate() {
+            let q = self.force_densities[e];
+            let i = elem[0];
+            let j = elem[1];
+            if i < n {
+                diag[i] += q;
+            }
+            if j < n {
+                diag[j] += q;
+            }
+        }
+
+        // Gauss-Seidel iteration
+        for _iter in 0..max_iterations {
+            let mut max_change = 0.0_f64;
+            for i in 0..n {
+                if diag[i].abs() < 1e-30 {
+                    continue;
+                }
+                let mut rhs = self.external_loads[i];
+                for (e, elem) in self.elements.iter().enumerate() {
+                    let q = self.force_densities[e];
+                    if elem[0] == i {
+                        rhs += q * coords[elem[1]];
+                    } else if elem[1] == i {
+                        rhs += q * coords[elem[0]];
+                    }
+                }
+                let new_val = rhs / diag[i];
+                max_change = max_change.max((new_val - coords[i]).abs());
+                coords[i] = new_val;
+            }
+            if max_change < tolerance {
+                break;
+            }
+        }
+
+        coords[..n].to_vec()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cable element for cable-membrane interaction
+// ---------------------------------------------------------------------------
+
+/// A cable element for cable-membrane interaction.
+///
+/// Cables carry tension only (no compression, no bending).
+#[derive(Debug, Clone)]
+pub struct CableElement {
+    /// Node indices (two endpoints).
+    pub nodes: [usize; 2],
+    /// Rest length (m).
+    pub rest_length: f64,
+    /// Axial stiffness EA (N).
+    pub axial_stiffness: f64,
+    /// Pre-tension force (N).
+    pub pretension: f64,
+}
+
+impl CableElement {
+    /// Create a new cable element.
+    pub fn new(nodes: [usize; 2], rest_length: f64, axial_stiffness: f64, pretension: f64) -> Self {
+        Self {
+            nodes,
+            rest_length,
+            axial_stiffness,
+            pretension,
+        }
+    }
+
+    /// Create a cable element from node positions with zero pretension.
+    pub fn from_positions(nodes: [usize; 2], positions: &[[f64; 3]], axial_stiffness: f64) -> Self {
+        let rest = vec_len(vec_sub(positions[nodes[1]], positions[nodes[0]]));
+        Self::new(nodes, rest, axial_stiffness, 0.0)
+    }
+
+    /// Compute the current length of the cable.
+    pub fn current_length(&self, positions: &[[f64; 3]]) -> f64 {
+        vec_len(vec_sub(positions[self.nodes[1]], positions[self.nodes[0]]))
+    }
+
+    /// Compute the cable tension force (N). Returns 0 if in compression.
+    pub fn tension(&self, positions: &[[f64; 3]]) -> f64 {
+        let l = self.current_length(positions);
+        if l < 1e-15 {
+            return self.pretension.max(0.0);
+        }
+        let strain = (l - self.rest_length) / self.rest_length;
+        let force = self.axial_stiffness * strain + self.pretension;
+        force.max(0.0) // tension only
+    }
+
+    /// Apply cable forces to the nodes.
+    pub fn apply_forces(&self, nodes: &mut [MembraneNode]) {
+        let p0 = nodes[self.nodes[0]].position;
+        let p1 = nodes[self.nodes[1]].position;
+        let diff = vec_sub(p1, p0);
+        let l = vec_len(diff);
+        if l < 1e-15 {
+            return;
+        }
+        let positions: Vec<[f64; 3]> = nodes.iter().map(|n| n.position).collect();
+        let t = self.tension(&positions);
+        if t < 1e-30 {
+            return;
+        }
+        let dir = vec_scale(diff, 1.0 / l);
+        let f = vec_scale(dir, t);
+        if nodes[self.nodes[0]].inv_mass > 0.0 {
+            nodes[self.nodes[0]].force = vec_add(nodes[self.nodes[0]].force, f);
+        }
+        if nodes[self.nodes[1]].inv_mass > 0.0 {
+            nodes[self.nodes[1]].force = vec_add(nodes[self.nodes[1]].force, vec_neg(f));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-stress model
+// ---------------------------------------------------------------------------
+
+/// Isotropic pre-stress state for a membrane.
+#[derive(Debug, Clone)]
+pub struct MembranePreStress {
+    /// Pre-stress in the first principal direction (Pa).
+    pub sigma_1: f64,
+    /// Pre-stress in the second principal direction (Pa).
+    pub sigma_2: f64,
+    /// Orientation angle of the first principal direction (rad).
+    pub theta: f64,
+}
+
+impl MembranePreStress {
+    /// Create a new pre-stress state.
+    pub fn new(sigma_1: f64, sigma_2: f64, theta: f64) -> Self {
+        Self {
+            sigma_1,
+            sigma_2,
+            theta,
+        }
+    }
+
+    /// Create an isotropic (equal biaxial) pre-stress.
+    pub fn isotropic(sigma: f64) -> Self {
+        Self::new(sigma, sigma, 0.0)
+    }
+
+    /// Compute the stress components in global x-y coordinates.
+    ///
+    /// Returns (sigma_xx, sigma_yy, sigma_xy).
+    pub fn global_components(&self) -> (f64, f64, f64) {
+        let c = self.theta.cos();
+        let s = self.theta.sin();
+        let c2 = c * c;
+        let s2 = s * s;
+        let cs = c * s;
+        let sxx = self.sigma_1 * c2 + self.sigma_2 * s2;
+        let syy = self.sigma_1 * s2 + self.sigma_2 * c2;
+        let sxy = (self.sigma_1 - self.sigma_2) * cs;
+        (sxx, syy, sxy)
+    }
+
+    /// Compute the mean pre-stress (Pa).
+    pub fn mean_stress(&self) -> f64 {
+        0.5 * (self.sigma_1 + self.sigma_2)
+    }
+
+    /// Returns true if the pre-stress is purely tensile.
+    pub fn is_tensile(&self) -> bool {
+        self.sigma_1 >= 0.0 && self.sigma_2 >= 0.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Membrane mesh
+// ---------------------------------------------------------------------------
+
+/// A membrane mesh consisting of nodes, triangles, and optional cables.
+#[derive(Debug, Clone)]
+pub struct MembraneMesh {
+    /// Nodes in the mesh.
+    pub nodes: Vec<MembraneNode>,
+    /// Triangle connectivity.
+    pub triangles: Vec<MembraneTriangle>,
+    /// Cable elements.
+    pub cables: Vec<CableElement>,
+    /// Internal gauge pressure (Pa).
+    pub pressure: f64,
+    /// Gravity acceleration vector (m/s^2).
+    pub gravity: [f64; 3],
+    /// Damping coefficient for dynamic relaxation.
+    pub damping: f64,
+}
+
+impl Default for MembraneMesh {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MembraneMesh {
+    /// Create a new empty membrane mesh.
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            triangles: Vec::new(),
+            cables: Vec::new(),
+            pressure: 0.0,
+            gravity: [0.0, -9.81, 0.0],
+            damping: 0.01,
+        }
+    }
+
+    /// Create a flat rectangular membrane mesh in the XZ plane.
+    ///
+    /// # Arguments
+    /// * `nx` -- number of nodes in x direction.
+    /// * `nz` -- number of nodes in z direction.
+    /// * `lx` -- total length in x (m).
+    /// * `lz` -- total length in z (m).
+    /// * `mass_per_node` -- mass assigned to each node (kg).
+    /// * `thickness` -- membrane thickness (m).
+    /// * `youngs_modulus` -- E (Pa).
+    /// * `poissons_ratio` -- nu.
+    pub fn create_rectangular(
+        nx: usize,
+        nz: usize,
+        lx: f64,
+        lz: f64,
+        mass_per_node: f64,
+        thickness: f64,
+        youngs_modulus: f64,
+        poissons_ratio: f64,
+    ) -> Self {
+        let mut mesh = Self::new();
+        let dx = if nx > 1 { lx / (nx - 1) as f64 } else { 0.0 };
+        let dz = if nz > 1 { lz / (nz - 1) as f64 } else { 0.0 };
+
+        // Create nodes
+        for iz in 0..nz {
+            for ix in 0..nx {
+                let pos = [ix as f64 * dx, 0.0, iz as f64 * dz];
+                mesh.nodes.push(MembraneNode::new(pos, mass_per_node));
+            }
+        }
+
+        // Create triangles (two per quad)
+        let positions: Vec<[f64; 3]> = mesh.nodes.iter().map(|n| n.position).collect();
+        for iz in 0..(nz - 1) {
+            for ix in 0..(nx - 1) {
+                let i00 = iz * nx + ix;
+                let i10 = iz * nx + ix + 1;
+                let i01 = (iz + 1) * nx + ix;
+                let i11 = (iz + 1) * nx + ix + 1;
+                // Lower-left triangle
+                mesh.triangles.push(MembraneTriangle::new(
+                    [i00, i10, i01],
+                    thickness,
+                    youngs_modulus,
+                    poissons_ratio,
+                    &positions,
+                ));
+                // Upper-right triangle
+                mesh.triangles.push(MembraneTriangle::new(
+                    [i10, i11, i01],
+                    thickness,
+                    youngs_modulus,
+                    poissons_ratio,
+                    &positions,
+                ));
+            }
+        }
+
+        mesh
+    }
+
+    /// Fix the boundary nodes of a rectangular mesh.
+    pub fn fix_boundary(&mut self, nx: usize, nz: usize) {
+        for iz in 0..nz {
+            for ix in 0..nx {
+                if ix == 0 || ix == nx - 1 || iz == 0 || iz == nz - 1 {
+                    let idx = iz * nx + ix;
+                    self.nodes[idx].inv_mass = 0.0;
+                }
+            }
+        }
+    }
+
+    /// Get positions as a flat vector of \[f64; 3\].
+    pub fn positions(&self) -> Vec<[f64; 3]> {
+        self.nodes.iter().map(|n| n.position).collect()
+    }
+
+    /// Number of nodes in the mesh.
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Number of triangles in the mesh.
+    pub fn num_triangles(&self) -> usize {
+        self.triangles.len()
+    }
+
+    /// Total surface area of the membrane.
+    pub fn surface_area(&self) -> f64 {
+        let pos = self.positions();
+        let tris: Vec<[usize; 3]> = self.triangles.iter().map(|t| t.nodes).collect();
+        total_surface_area(&pos, &tris)
+    }
+
+    /// Clear all force accumulators.
+    pub fn clear_forces(&mut self) {
+        for node in &mut self.nodes {
+            node.force = vec_zero();
+        }
+    }
+
+    /// Apply gravity forces to all nodes.
+    pub fn apply_gravity(&mut self) {
+        let g = self.gravity;
+        for node in &mut self.nodes {
+            if node.inv_mass > 0.0 {
+                let mass = 1.0 / node.inv_mass;
+                let f = vec_scale(g, mass);
+                node.force = vec_add(node.force, f);
+            }
+        }
+    }
+
+    /// Apply pneumatic pressure to the membrane surface.
+    pub fn apply_pressure(&mut self) {
+        let p = self.pressure;
+        if p.abs() < 1e-30 {
+            return;
+        }
+        let tris: Vec<[usize; 3]> = self.triangles.iter().map(|t| t.nodes).collect();
+        apply_pneumatic_pressure(&mut self.nodes, &tris, p);
+    }
+
+    /// Apply cable forces.
+    pub fn apply_cable_forces(&mut self) {
+        let cables = self.cables.clone();
+        for cable in &cables {
+            cable.apply_forces(&mut self.nodes);
+        }
+    }
+
+    /// Accumulate the in-plane elastic forces of every membrane triangle.
+    ///
+    /// The node positions are gathered once and the per-triangle forces
+    /// ([`MembraneTriangle::apply_forces`]) are summed into a scratch array
+    /// that is then added to the force accumulator of every free node (fixed
+    /// nodes, like in the other force routines, receive nothing).
+    pub fn apply_membrane_forces(&mut self) {
+        if self.triangles.is_empty() {
+            return;
+        }
+        let positions = self.positions();
+        let mut forces = vec![vec_zero(); self.nodes.len()];
+        for triangle in &self.triangles {
+            triangle.apply_forces(&positions, &mut forces);
+        }
+        for (node, force) in self.nodes.iter_mut().zip(forces) {
+            if node.inv_mass > 0.0 {
+                node.force = vec_add(node.force, force);
+            }
+        }
+    }
+
+    /// Perform one time step using Verlet integration with damping.
+    ///
+    /// The force accumulator collects gravity, pneumatic pressure, cable
+    /// forces and the elastic forces of the membrane triangles before the
+    /// free nodes are integrated.
+    ///
+    /// # Arguments
+    /// * `dt` -- time step (s).
+    pub fn step(&mut self, dt: f64) {
+        self.clear_forces();
+        self.apply_gravity();
+        self.apply_pressure();
+        self.apply_cable_forces();
+        self.apply_membrane_forces();
+
+        let damping = self.damping;
+        let dt2 = dt * dt;
+
+        for node in &mut self.nodes {
+            if node.inv_mass == 0.0 {
+                continue;
+            }
+            let acc = vec_scale(node.force, node.inv_mass);
+            // Verlet integration with damping
+            let new_pos = [
+                node.position[0] * (2.0 - damping) - node.prev_position[0] * (1.0 - damping)
+                    + acc[0] * dt2,
+                node.position[1] * (2.0 - damping) - node.prev_position[1] * (1.0 - damping)
+                    + acc[1] * dt2,
+                node.position[2] * (2.0 - damping) - node.prev_position[2] * (1.0 - damping)
+                    + acc[2] * dt2,
+            ];
+            node.velocity = vec_scale(vec_sub(new_pos, node.position), 1.0 / dt);
+            node.prev_position = node.position;
+            node.position = new_pos;
+        }
+    }
+
+    /// Run multiple simulation steps.
+    pub fn simulate(&mut self, dt: f64, steps: usize) {
+        for _ in 0..steps {
+            self.step(dt);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Membrane bending stiffness
+// ---------------------------------------------------------------------------
+
+/// Compute membrane/shell bending stiffness D.
+///
+/// `D = E * t^3 / (12 * (1 - nu^2))`
+///
+/// # Arguments
+/// * `youngs_modulus` -- E (Pa).
+/// * `thickness` -- t (m).
+/// * `poissons_ratio` -- nu.
+///
+/// Returns bending stiffness (N m).
+pub fn bending_stiffness(youngs_modulus: f64, thickness: f64, poissons_ratio: f64) -> f64 {
+    youngs_modulus * thickness.powi(3) / (12.0 * (1.0 - poissons_ratio * poissons_ratio))
+}
+
+/// Compute critical buckling stress for a circular membrane under compression.
+///
+/// `sigma_cr = k * D / (R^2 * t)`
+///
+/// where k is a buckling coefficient (k ~ 3.6 for clamped edges).
+///
+/// # Arguments
+/// * `stiffness_d` -- bending stiffness D (N m).
+/// * `radius` -- membrane radius R (m).
+/// * `thickness` -- t (m).
+/// * `buckling_coeff` -- k (dimensionless, ~3.6 for clamped, ~1.22 for simply-supported).
+///
+/// Returns critical buckling stress (Pa).
+pub fn critical_buckling_stress(
+    stiffness_d: f64,
+    radius: f64,
+    thickness: f64,
+    buckling_coeff: f64,
+) -> f64 {
+    buckling_coeff * stiffness_d / (radius * radius * thickness)
+}
+
+// ---------------------------------------------------------------------------
+// Membrane stress from pressure (thin-walled vessels)
+// ---------------------------------------------------------------------------
+
+/// Hoop stress in a thin-walled cylindrical pressure vessel.
+///
+/// `sigma_hoop = p * R / t`
+///
+/// # Arguments
+/// * `pressure` -- internal gauge pressure (Pa).
+/// * `radius` -- cylinder radius (m).
+/// * `thickness` -- wall thickness (m).
+///
+/// Returns hoop stress (Pa).
+pub fn cylindrical_hoop_stress(pressure: f64, radius: f64, thickness: f64) -> f64 {
+    pressure * radius / thickness
+}
+
+/// Hoop stress in a thin-walled spherical pressure vessel.
+///
+/// `sigma = p * R / (2 * t)`
+///
+/// # Arguments
+/// * `pressure` -- internal gauge pressure (Pa).
+/// * `radius` -- sphere radius (m).
+/// * `thickness` -- wall thickness (m).
+///
+/// Returns hoop stress (Pa).
+pub fn spherical_hoop_stress(pressure: f64, radius: f64, thickness: f64) -> f64 {
+    pressure * radius / (2.0 * thickness)
+}
+
+/// Axial stress in a thin-walled cylindrical pressure vessel.
+///
+/// `sigma_axial = p * R / (2 * t)`
+///
+/// # Arguments
+/// * `pressure` -- internal gauge pressure (Pa).
+/// * `radius` -- cylinder radius (m).
+/// * `thickness` -- wall thickness (m).
+///
+/// Returns axial stress (Pa).
+pub fn cylindrical_axial_stress(pressure: f64, radius: f64, thickness: f64) -> f64 {
+    pressure * radius / (2.0 * thickness)
+}
+
+// ---------------------------------------------------------------------------
+// Membrane strain energy
+// ---------------------------------------------------------------------------
+
+/// Compute membrane strain energy density for isotropic plane stress.
+///
+/// `U = (E * t / (2 * (1 - nu^2))) * (eps_x^2 + eps_y^2 + 2*nu*eps_x*eps_y + ((1-nu)/2)*gamma_xy^2)`
+///
+/// # Arguments
+/// * `youngs_modulus` -- E (Pa).
+/// * `thickness` -- t (m).
+/// * `poissons_ratio` -- nu.
+/// * `eps_x` -- normal strain in x.
+/// * `eps_y` -- normal strain in y.
+/// * `gamma_xy` -- shear strain.
+///
+/// Returns strain energy per unit area (J/m^2).
+pub fn membrane_strain_energy_density(
+    youngs_modulus: f64,
+    thickness: f64,
+    poissons_ratio: f64,
+    eps_x: f64,
+    eps_y: f64,
+    gamma_xy: f64,
+) -> f64 {
+    let nu = poissons_ratio;
+    let factor = youngs_modulus * thickness / (2.0 * (1.0 - nu * nu));
+    factor
+        * (eps_x * eps_x
+            + eps_y * eps_y
+            + 2.0 * nu * eps_x * eps_y
+            + (1.0 - nu) / 2.0 * gamma_xy * gamma_xy)
+}
+
+// ---------------------------------------------------------------------------
+// Airbag deployment model
+// ---------------------------------------------------------------------------
+
+/// Simple airbag deployment model: pressure-volume relationship.
+///
+/// Given an ideal gas inflator:
+/// `p * V = n * R_gas * T`
+///
+/// As volume increases from inflation, pressure drops. This function
+/// computes the pressure given inflated volume and gas parameters.
+///
+/// # Arguments
+/// * `moles` -- amount of gas n (mol).
+/// * `temperature` -- gas temperature T (K).
+/// * `volume` -- current volume V (m^3).
+///
+/// Returns internal gauge pressure (Pa, above atmospheric).
+pub fn airbag_pressure(moles: f64, temperature: f64, volume: f64) -> f64 {
+    const R_GAS_CONST: f64 = 8.314;
+    const P_ATM: f64 = 101_325.0;
+    let p_abs = moles * R_GAS_CONST * temperature / volume;
+    (p_abs - P_ATM).max(0.0)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod regression_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPS: f64 = 1e-10;
+
+    // --- wrinkling state ---
+
+    #[test]
+    fn test_wrinkling_taut() {
+        assert_eq!(wrinkling_state(100.0, 50.0), WrinklingState::Taut);
+    }
+
+    #[test]
+    fn test_wrinkling_wrinkled() {
+        assert_eq!(wrinkling_state(100.0, -10.0), WrinklingState::Wrinkled);
+    }
+
+    #[test]
+    fn test_wrinkling_slack() {
+        assert_eq!(wrinkling_state(-5.0, -10.0), WrinklingState::Slack);
+    }
+
+    #[test]
+    fn test_wrinkling_zero_stresses_slack() {
+        assert_eq!(wrinkling_state(0.0, 0.0), WrinklingState::Slack);
+    }
+
+    // --- wrinkle wavelength and amplitude ---
+
+    #[test]
+    fn test_wrinkle_wavelength_positive() {
+        let lam = wrinkle_wavelength(1e-6, 100.0);
+        assert!(
+            lam > 0.0,
+            "wavelength must be positive for positive tension"
+        );
+    }
+
+    #[test]
+    fn test_wrinkle_wavelength_zero_tension() {
+        let lam = wrinkle_wavelength(1e-6, 0.0);
+        assert!((lam).abs() < EPS, "wavelength is zero for zero tension");
+    }
+
+    #[test]
+    fn test_wrinkle_amplitude_positive() {
+        let amp = wrinkle_amplitude(0.01, 0.001);
+        assert!(amp > 0.0, "amplitude must be positive for positive strain");
+    }
+
+    #[test]
+    fn test_wrinkle_amplitude_zero_strain() {
+        let amp = wrinkle_amplitude(0.01, 0.0);
+        assert!(amp.abs() < EPS, "amplitude is zero for zero strain");
+    }
+
+    // --- triangle geometry ---
+
+    #[test]
+    fn test_triangle_area_unit() {
+        let area = triangle_area([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        assert!((area - 0.5).abs() < EPS, "unit right triangle area = 0.5");
+    }
+
+    #[test]
+    fn test_triangle_normal_unit() {
+        let n = triangle_normal([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        assert!((n[2] - 1.0).abs() < EPS, "normal should be +Z");
+    }
+
+    // --- pneumatic pressure ---
+
+    #[test]
+    fn test_pneumatic_pressure_applies_force() {
+        let mut nodes = vec![
+            MembraneNode::new([0.0, 0.0, 0.0], 1.0),
+            MembraneNode::new([1.0, 0.0, 0.0], 1.0),
+            MembraneNode::new([0.0, 0.0, 1.0], 1.0),
+        ];
+        let tris = vec![[0, 1, 2]];
+        apply_pneumatic_pressure(&mut nodes, &tris, 1000.0);
+        // Triangle [0,0,0]->[1,0,0]->[0,0,1] has normal in -Y direction
+        // so positive pressure pushes in -Y. Check that force magnitude is nonzero.
+        let total_fy: f64 = nodes.iter().map(|n| n.force[1]).sum();
+        assert!(
+            total_fy.abs() > 0.0,
+            "pressure should produce force, got {:.6}",
+            total_fy
+        );
+    }
+
+    #[test]
+    fn test_pneumatic_pressure_zero_pressure() {
+        let mut nodes = vec![
+            MembraneNode::new([0.0, 0.0, 0.0], 1.0),
+            MembraneNode::new([1.0, 0.0, 0.0], 1.0),
+            MembraneNode::new([0.0, 0.0, 1.0], 1.0),
+        ];
+        let tris = vec![[0, 1, 2]];
+        apply_pneumatic_pressure(&mut nodes, &tris, 0.0);
+        for n in &nodes {
+            assert!(vec_len(n.force) < EPS, "zero pressure -> zero force");
+        }
+    }
+
+    // --- enclosed volume ---
+
+    #[test]
+    fn test_enclosed_volume_tetrahedron() {
+        // Unit tetrahedron with one vertex at origin
+        let positions = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        // Closed tetrahedron has 4 triangles (outward-facing)
+        let tris = vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]];
+        let vol = enclosed_volume(&positions, &tris).abs();
+        assert!(
+            (vol - 1.0 / 6.0).abs() < 1e-10,
+            "unit tet volume = 1/6, got {:.6}",
+            vol
+        );
+    }
+
+    // --- surface area ---
+
+    #[test]
+    fn test_total_surface_area() {
+        let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let tris = vec![[0, 1, 2]];
+        let area = total_surface_area(&positions, &tris);
+        assert!((area - 0.5).abs() < EPS, "single triangle area");
+    }
+
+    // --- spherical inflation ---
+
+    #[test]
+    fn test_spherical_inflation_zero_stretch_zero_pressure() {
+        let p = spherical_inflation_pressure(0.1, 0.001, 1e5, 0.0, 1.0);
+        assert!(
+            p.abs() < 1e-6,
+            "at lambda=1, pressure should be ~0, got {:.6}",
+            p
+        );
+    }
+
+    #[test]
+    fn test_spherical_inflation_pressure_positive_for_stretch() {
+        let p = spherical_inflation_pressure(0.1, 0.001, 1e5, 5e4, 1.5);
+        assert!(p > 0.0, "stretched balloon -> positive pressure");
+    }
+
+    #[test]
+    fn test_balloon_volume_increases_with_stretch() {
+        let v1 = balloon_volume(0.1, 1.0);
+        let v2 = balloon_volume(0.1, 2.0);
+        assert!(v2 > v1, "larger stretch -> larger volume");
+    }
+
+    #[test]
+    fn test_balloon_thickness_decreases_with_stretch() {
+        let t1 = balloon_current_thickness(0.001, 1.0);
+        let t2 = balloon_current_thickness(0.001, 2.0);
+        assert!(t2 < t1, "stretch thins the wall");
+    }
+
+    // --- force density method ---
+
+    #[test]
+    fn test_force_density_single_free_node() {
+        // One free node connected to two fixed nodes at z=0 and z=1
+        // With equal force densities and no load, solution should be z=0.5
+        let fdm = ForceDensityMethod::new(
+            1,
+            2,
+            vec![[0, 1], [0, 2]], // free node 0 connected to fixed nodes 1 and 2
+            vec![1.0, 1.0],       // equal force densities
+            vec![0.0, 1.0],       // fixed at z=0 and z=1
+            vec![0.0],            // no external load
+        );
+        let result = fdm.solve(100, 1e-12);
+        assert!(
+            (result[0] - 0.5).abs() < 1e-10,
+            "midpoint should be at 0.5, got {:.6}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_force_density_with_load() {
+        // Single free node with downward load, should shift below midpoint
+        let fdm = ForceDensityMethod::new(
+            1,
+            2,
+            vec![[0, 1], [0, 2]],
+            vec![1.0, 1.0],
+            vec![0.0, 1.0],
+            vec![-0.5], // downward load
+        );
+        let result = fdm.solve(100, 1e-12);
+        assert!(
+            result[0] < 0.5,
+            "loaded node should be below midpoint, got {:.6}",
+            result[0]
+        );
+    }
+
+    // --- cable element ---
+
+    #[test]
+    fn test_cable_tension_stretched() {
+        let positions = vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+        let cable = CableElement::new([0, 1], 1.0, 1000.0, 0.0);
+        let t = cable.tension(&positions);
+        assert!(t > 0.0, "stretched cable has positive tension");
+    }
+
+    #[test]
+    fn test_cable_tension_compressed_is_zero() {
+        let positions = vec![[0.0, 0.0, 0.0], [0.3, 0.0, 0.0]];
+        let cable = CableElement::new([0, 1], 1.0, 1000.0, 0.0);
+        let t = cable.tension(&positions);
+        assert!(t.abs() < EPS, "compressed cable has zero tension");
+    }
+
+    #[test]
+    fn test_cable_pretension() {
+        let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        let cable = CableElement::new([0, 1], 1.0, 1000.0, 50.0);
+        let t = cable.tension(&positions);
+        assert!(
+            (t - 50.0).abs() < EPS,
+            "at rest length, tension = pretension, got {:.6}",
+            t
+        );
+    }
+
+    // --- pre-stress ---
+
+    #[test]
+    fn test_prestress_isotropic_components() {
+        let ps = MembranePreStress::isotropic(100e3);
+        let (sxx, syy, sxy) = ps.global_components();
+        assert!((sxx - 100e3).abs() < EPS, "isotropic sxx");
+        assert!((syy - 100e3).abs() < EPS, "isotropic syy");
+        assert!(sxy.abs() < EPS, "isotropic sxy = 0");
+    }
+
+    #[test]
+    fn test_prestress_mean() {
+        let ps = MembranePreStress::new(100e3, 200e3, 0.0);
+        assert!((ps.mean_stress() - 150e3).abs() < EPS, "mean stress");
+    }
+
+    #[test]
+    fn test_prestress_is_tensile() {
+        let ps = MembranePreStress::new(100e3, 200e3, 0.0);
+        assert!(ps.is_tensile(), "both positive -> tensile");
+        let ps2 = MembranePreStress::new(100e3, -50e3, 0.0);
+        assert!(!ps2.is_tensile(), "one negative -> not tensile");
+    }
+
+    // --- bending stiffness and buckling ---
+
+    #[test]
+    fn test_bending_stiffness_formula() {
+        let d = bending_stiffness(200e9, 0.001, 0.3);
+        let expected = 200e9 * 0.001_f64.powi(3) / (12.0 * (1.0 - 0.09));
+        assert!((d - expected).abs() < 1e-6, "D formula");
+    }
+
+    #[test]
+    fn test_critical_buckling_stress_positive() {
+        let d = bending_stiffness(200e9, 0.001, 0.3);
+        let sigma_cr = critical_buckling_stress(d, 0.1, 0.001, 3.6);
+        assert!(sigma_cr > 0.0, "critical stress must be positive");
+    }
+
+    // --- thin-wall stresses ---
+
+    #[test]
+    fn test_cylindrical_hoop_stress_formula() {
+        let sigma = cylindrical_hoop_stress(1e6, 0.5, 0.01);
+        assert!((sigma - 50e6).abs() < 1.0, "hoop = pR/t");
+    }
+
+    #[test]
+    fn test_spherical_hoop_half_cylindrical() {
+        let p = 1e6;
+        let r = 0.5;
+        let t = 0.01;
+        let s_cyl = cylindrical_hoop_stress(p, r, t);
+        let s_sph = spherical_hoop_stress(p, r, t);
+        assert!(
+            (s_sph - s_cyl / 2.0).abs() < 1.0,
+            "spherical hoop = cylindrical hoop / 2"
+        );
+    }
+
+    // --- strain energy density ---
+
+    #[test]
+    fn test_strain_energy_zero_strain() {
+        let u = membrane_strain_energy_density(200e9, 0.001, 0.3, 0.0, 0.0, 0.0);
+        assert!(u.abs() < EPS, "zero strain -> zero energy");
+    }
+
+    #[test]
+    fn test_strain_energy_positive_for_nonzero_strain() {
+        let u = membrane_strain_energy_density(200e9, 0.001, 0.3, 0.01, 0.0, 0.0);
+        assert!(u > 0.0, "nonzero strain -> positive energy");
+    }
+
+    // --- membrane mesh ---
+
+    #[test]
+    fn test_rectangular_mesh_topology() {
+        let mesh = MembraneMesh::create_rectangular(4, 3, 3.0, 2.0, 1.0, 0.001, 1e6, 0.3);
+        assert_eq!(mesh.num_nodes(), 12, "4*3 = 12 nodes");
+        assert_eq!(mesh.num_triangles(), 12, "3*2*2 = 12 triangles");
+    }
+
+    #[test]
+    fn test_rectangular_mesh_surface_area() {
+        let mesh = MembraneMesh::create_rectangular(3, 3, 2.0, 2.0, 1.0, 0.001, 1e6, 0.3);
+        let area = mesh.surface_area();
+        assert!(
+            (area - 4.0).abs() < 1e-10,
+            "2x2 flat membrane area = 4 m^2, got {:.6}",
+            area
+        );
+    }
+
+    #[test]
+    fn test_mesh_step_moves_nodes_under_gravity() {
+        let mut mesh = MembraneMesh::create_rectangular(3, 3, 1.0, 1.0, 1.0, 0.001, 1e6, 0.3);
+        // Fix corners only
+        mesh.nodes[0].inv_mass = 0.0;
+        mesh.nodes[2].inv_mass = 0.0;
+        mesh.nodes[6].inv_mass = 0.0;
+        mesh.nodes[8].inv_mass = 0.0;
+        let y_before = mesh.nodes[4].position[1]; // center node
+        mesh.simulate(1.0 / 60.0, 10);
+        let y_after = mesh.nodes[4].position[1];
+        assert!(
+            y_after < y_before,
+            "center node should sag under gravity, before={:.6} after={:.6}",
+            y_before,
+            y_after
+        );
+    }
+
+    // --- airbag model ---
+
+    #[test]
+    fn test_airbag_pressure_positive_for_small_volume() {
+        let p = airbag_pressure(1.0, 300.0, 0.001);
+        assert!(
+            p > 0.0,
+            "high moles in small volume -> positive gauge pressure"
+        );
+    }
+
+    #[test]
+    fn test_airbag_pressure_decreases_with_volume() {
+        // Use enough moles that both are above atmospheric
+        let p1 = airbag_pressure(1.0, 300.0, 0.01);
+        let p2 = airbag_pressure(1.0, 300.0, 0.1);
+        assert!(p1 > p2, "larger volume -> lower pressure");
+    }
+
+    // --- membrane element ---
+
+    #[test]
+    fn test_membrane_triangle_ref_area() {
+        let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let tri = MembraneTriangle::new([0, 1, 2], 0.001, 1e6, 0.3, &positions);
+        assert!(
+            (tri.ref_area - 0.5).abs() < EPS,
+            "ref area of unit right triangle"
+        );
+    }
+
+    #[test]
+    fn test_membrane_triangle_tension_only() {
+        let positions = vec![
+            [0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0], // compressed (original was at 1.0)
+            [0.0, 0.5, 0.0], // compressed
+        ];
+        let ref_positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut tri = MembraneTriangle::new([0, 1, 2], 0.001, 1e6, 0.3, &ref_positions);
+        tri.tension_only = true;
+        let tension = tri.membrane_tension(&positions);
+        assert!(
+            tension.abs() < EPS,
+            "compressed membrane has zero tension (tension-only)"
+        );
+    }
+}

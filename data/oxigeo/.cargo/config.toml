@@ -1,0 +1,13 @@
+[env]
+DYLD_LIBRARY_PATH = "/Library/Developer/CommandLineTools/usr/lib"
+LIBCLANG_PATH = "/Library/Developer/CommandLineTools/usr/lib"
+
+# Shell alias to use instead of bare `cargo upgrade -i`:
+#   alias upgrade='cargo upgrade-safe && cargo update'
+[alias]
+upgrade-safe = "upgrade -i --ignore-rust-version"
+
+# getrandom 0.4 needs an explicit backend on wasm32-unknown-unknown.
+# Target-scoped: native builds are unaffected.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

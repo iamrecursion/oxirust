@@ -1,0 +1,143 @@
+[package]
+name = "oxirs-arq"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Jena-style SPARQL algebra with extension points and query optimization"
+keywords = ["sparql", "query-engine", "optimization", "rdf", "jena"]
+categories = ["database", "algorithms", "data-structures"]
+readme = "README.md"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxirs-core.workspace = true
+
+# SciRS2 dependencies for query optimization with full feature support
+scirs2-stats = { workspace = true }
+scirs2-core = { workspace = true, features = ["random", "array", "parallel", "simd", "profiling"] }
+
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+rayon = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+async-trait.workspace = true
+# rand functionality now provided by scirs2-core (use scirs2_core::random)
+# fastrand removed - using scirs2_core::random instead
+regex.workspace = true
+reqwest.workspace = true
+md5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+seahash.workspace = true
+hex.workspace = true
+base64.workspace = true
+oxicode.workspace = true  # Replaces bincode per COOLJAPAN Policy
+tempfile.workspace = true
+oxiarc-deflate.workspace = true
+oxiarc-lz4.workspace = true
+oxiarc-zstd.workspace = true
+redis = { workspace = true, features = ["connection-manager"], optional = true }
+lru = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+cranelift-codegen = { workspace = true, optional = true }
+cranelift-frontend = { workspace = true, optional = true }
+cranelift-jit = { workspace = true, optional = true }
+cranelift-module = { workspace = true, optional = true }
+cranelift-native = { workspace = true, optional = true }
+tantivy = { workspace = true, optional = true }
+
+[dev-dependencies]
+oxirs-ttl.workspace = true
+quick-xml.workspace = true
+criterion.workspace = true
+tracing-subscriber.workspace = true
+redis = { workspace = true, features = ["connection-manager"] }
+futures.workspace = true
+
+[features]
+default = ["parallel"]
+star = ["oxirs-star"]
+extensions = []
+parallel = ["rayon", "tokio"]
+distributed-cache = ["redis", "lru", "tokio", "futures"]
+text-search = ["dep:tantivy"]
+jit = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+]
+
+[dependencies.oxirs-star]
+workspace = true
+optional = true
+
+[[bin]]
+name = "jena_parity_report"
+path = "src/bin/jena_parity_report.rs"
+
+[[bench]]
+name = "join_performance"
+harness = false
+
+[[bench]]
+name = "comprehensive_sparql_bench"
+harness = false
+
+[[bench]]
+name = "gpu_operations_bench"
+harness = false
+
+[[bench]]
+name = "sparql_star_bench"
+harness = false
+
+[[bench]]
+name = "simple_optimizer_bench"
+harness = false
+
+[[bench]]
+name = "production_profiles_bench"
+harness = false
+
+[[bench]]
+name = "ml_prediction_bench"
+harness = false
+
+
+[[bench]]
+name = "plan_cache_bench"
+harness = false
+
+[[bench]]
+name = "sparql_bench"
+harness = false
+
+[[bench]]
+name = "analytics_bench"
+harness = false
+
+[[bench]]
+name = "jit_bench"
+harness = false
+required-features = ["jit"]
+
+[[test]]
+name = "w3c_compliance_suite"
+path = "tests/w3c_compliance_suite.rs"

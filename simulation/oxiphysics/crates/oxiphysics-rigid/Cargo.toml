@@ -1,0 +1,23 @@
+[package]
+name = "oxiphysics-rigid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "Rigid body dynamics for the OxiPhysics engine"
+readme = "README.md"
+categories = ["science", "simulation", "game-engines"]
+keywords = ["rigid-body", "physics", "dynamics", "simulation", "game-physics"]
+
+[dependencies]
+rand = { workspace = true }
+thiserror = { workspace = true }
+oxiphysics-core = { workspace = true }
+oxiphysics-collision = { workspace = true }
+oxiphysics-geometry = { workspace = true }
+nalgebra = { workspace = true }
+oxifft = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

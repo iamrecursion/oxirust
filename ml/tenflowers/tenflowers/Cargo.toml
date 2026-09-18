@@ -1,0 +1,95 @@
+[package]
+name = "tenflowers"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Pure Rust implementation of TensorFlow - A comprehensive deep learning framework"
+documentation = "https://docs.rs/tenflowers"
+keywords = ["machine-learning", "neural-network", "tensor", "autograd", "gpu"]
+categories = ["science", "mathematics", "algorithms"]
+readme = "README.md"
+
+[dependencies]
+# Re-export all TenfloweRS subcrates
+tenflowers-core = { workspace = true }
+tenflowers-autograd = { workspace = true }
+tenflowers-neural = { workspace = true }
+tenflowers-dataset = { workspace = true }
+# Scientific computing primitives (ndarray, num_traits, etc.)
+scirs2-core = { workspace = true }
+# Pod trait for tensor serialization helpers
+bytemuck = { workspace = true }
+# Unified error types for the framework
+thiserror = { workspace = true }
+
+# Optional Python bindings (requires Python environment, not published)
+# tenflowers-ffi = { version = "0.1.0", path = "../crates/tenflowers-ffi", optional = true }
+
+[features]
+default = ["std", "parallel"]
+std = ["tenflowers-core/std"]
+parallel = ["tenflowers-core/parallel"]
+
+# Batteries-included presets
+minimal = ["std"]
+standard = ["std", "parallel"]
+
+# Experimental / preview APIs (not covered by stability guarantees)
+experimental = []
+
+# GPU support
+gpu = ["tenflowers-core/gpu"]
+cuda = ["tenflowers-core/cuda"]
+cudnn = ["tenflowers-core/cudnn"]
+opencl = ["tenflowers-core/opencl"]
+metal = ["tenflowers-core/metal"]
+rocm = ["tenflowers-core/rocm"]
+nccl = ["tenflowers-core/nccl"]
+
+# BLAS acceleration
+blas = ["tenflowers-core/blas"]
+blas-openblas = ["tenflowers-core/blas-openblas"]
+blas-oxiblas = ["tenflowers-core/blas-oxiblas"]
+blas-mkl = ["tenflowers-core/blas-mkl"]
+blas-accelerate = ["tenflowers-core/blas-accelerate"]
+
+# SIMD optimization
+simd = ["tenflowers-core/simd"]
+
+# Serialization
+serialize = ["tenflowers-core/serialize"]
+compression = ["tenflowers-core/compression"]
+
+# WASM support
+wasm = ["tenflowers-core/wasm"]
+
+# ONNX support
+onnx = ["tenflowers-core/onnx", "tenflowers-neural/onnx"]
+
+# Autograd
+autograd = ["tenflowers-core/autograd"]
+
+# Python bindings (requires Python environment, not published)
+# python = ["tenflowers-ffi"]
+
+# Benchmarking
+benchmark = ["tenflowers-core/benchmark"]
+
+# All features (python excluded - requires Python environment)
+# Note: Using blas-oxiblas instead of blas-openblas for COOLJAPAN Pure Rust Policy
+full = ["gpu", "blas-oxiblas", "simd", "serialize", "compression", "onnx", "autograd"]
+
+[[test]]
+name = "ml_compat"
+path = "tests/ml_compat.rs"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
